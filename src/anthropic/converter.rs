@@ -83,6 +83,8 @@ Complete all chunked operations without commentary.";
 /// - opus 4.5/4-5 → claude-opus-4.5
 /// - 其他 opus → claude-opus-4.6
 /// - 所有 haiku → claude-haiku-4.5
+/// - 所有 glm → glm-5
+/// - 所有 minimax → minimax-m2.5
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
@@ -100,6 +102,10 @@ pub fn map_model(model: &str) -> Option<String> {
         }
     } else if model_lower.contains("haiku") {
         Some("claude-haiku-4.5".to_string())
+    } else if model_lower.contains("glm") {
+        Some("glm-5".to_string())
+    } else if model_lower.contains("minimax") {
+        Some("minimax-m2.5".to_string())
     } else {
         None
     }
@@ -930,6 +936,18 @@ mod tests {
     #[test]
     fn test_map_model_unsupported() {
         assert!(map_model("gpt-4").is_none());
+    }
+
+    #[test]
+    fn test_map_model_glm() {
+        assert_eq!(map_model("glm-5"), Some("glm-5".to_string()));
+        assert_eq!(map_model("GLM-5"), Some("glm-5".to_string()));
+    }
+
+    #[test]
+    fn test_map_model_minimax() {
+        assert_eq!(map_model("minimax-m2.5"), Some("minimax-m2.5".to_string()));
+        assert_eq!(map_model("MiniMax-M2.5"), Some("minimax-m2.5".to_string()));
     }
 
     #[test]

@@ -164,6 +164,24 @@ pub async fn get_models() -> impl IntoResponse {
             model_type: "chat".to_string(),
             max_tokens: 64000,
         },
+        Model {
+            id: "glm-5".to_string(),
+            object: "model".to_string(),
+            created: 1770314400,
+            owned_by: "zhipu".to_string(),
+            display_name: "GLM-5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "minimax-m2.5".to_string(),
+            object: "model".to_string(),
+            created: 1770314400,
+            owned_by: "minimax".to_string(),
+            display_name: "MiniMax M2.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
     ];
 
     Json(ModelsResponse {
