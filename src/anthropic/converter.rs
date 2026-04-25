@@ -81,7 +81,7 @@ Complete all chunked operations without commentary.";
 /// - sonnet 4.6/4-6 → claude-sonnet-4.6
 /// - 其他 sonnet → claude-sonnet-4.5
 /// - opus 4.5/4-5 → claude-opus-4.5
-/// - 其他 opus → claude-opus-4.6
+/// - 其他 opus（含 4.6/4-6、4.7/4-7）→ claude-opus-4.6
 /// - 所有 haiku → claude-haiku-4.5
 /// - 所有 glm → glm-5
 /// - 所有 minimax → minimax-m2.5

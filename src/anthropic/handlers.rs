@@ -75,6 +75,24 @@ pub async fn get_models() -> impl IntoResponse {
 
     let models = vec![
         Model {
+            id: "claude-opus-4-7".to_string(),
+            object: "model".to_string(),
+            created: 1776384000, // Apr 17, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.7".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-4-7-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1776384000, // Apr 17, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.7 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
             id: "claude-opus-4-6".to_string(),
             object: "model".to_string(),
             created: 1770163200, // Feb 4, 2026
@@ -638,21 +656,40 @@ async fn handle_non_stream_request(
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
-/// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+/// 规整 thinking / output_config，使请求与 Kiro 上游标准一致
 ///
-/// - Opus 4.6：覆写为 adaptive 类型
-/// - 其他模型：覆写为 enabled 类型
-/// - budget_tokens 固定为 20000
+/// 触发条件（满足任一即等价于客户请求了 `*-thinking` 模型）：
+/// 1. 模型名包含 "thinking" 后缀
+/// 2. 请求体 `thinking.type == "adaptive"`
+///    Why：adaptive 是 4.6/4.7 thinking 模式的协议，且不依赖 budget_tokens（自适应分配），
+///    把它视为"虚拟 -thinking 后缀"覆写不会破坏客户的精确控制参数
+///
+/// 注意：`thinking.type == "enabled"` 不触发自动覆写，因为 Claude Code 等客户端会传
+/// 自定义 `budget_tokens`（如 5000/10000）作为精确控制，若强行覆写为 20000 会破坏其行为
+///
+/// 触发后行为（与原 -thinking 后缀路径一致）：
+/// - 4.6/4.7 opus：thinking={adaptive, 20000}，output_config={effort=high}
+/// - 其他模型：thinking={enabled, 20000}
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let model_lower = payload.model.to_lowercase();
-    if !model_lower.contains("thinking") {
+    let has_thinking_suffix = model_lower.contains("thinking");
+    let has_adaptive_thinking = payload
+        .thinking
+        .as_ref()
+        .map(|t| t.thinking_type == "adaptive")
+        .unwrap_or(false);
+
+    if !has_thinking_suffix && !has_adaptive_thinking {
         return;
     }
 
-    let is_opus_4_6 =
-        model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let is_opus_4_6_or_newer = model_lower.contains("opus")
+        && (model_lower.contains("4-6")
+            || model_lower.contains("4.6")
+            || model_lower.contains("4-7")
+            || model_lower.contains("4.7"));
 
-    let thinking_type = if is_opus_4_6 {
+    let thinking_type = if is_opus_4_6_or_newer {
         "adaptive"
     } else {
         "enabled"
@@ -661,15 +698,16 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     tracing::info!(
         model = %payload.model,
         thinking_type = thinking_type,
-        "模型名包含 thinking 后缀，覆写 thinking 配置"
+        trigger = if has_thinking_suffix { "model-suffix" } else { "adaptive-field" },
+        "覆写 thinking 配置（等同于 *-thinking 模型）"
     );
 
     payload.thinking = Some(Thinking {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
     });
-    
-    if is_opus_4_6 {
+
+    if is_opus_4_6_or_newer {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
         });
@@ -953,4 +991,276 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::anthropic::types::MessagesRequest;
+
+    fn parse(model: &str, extra: serde_json::Value) -> MessagesRequest {
+        let mut body = serde_json::json!({
+            "model": model,
+            "max_tokens": 32000,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        if let serde_json::Value::Object(extra_map) = extra {
+            for (k, v) in extra_map {
+                body[k] = v;
+            }
+        }
+        serde_json::from_value(body).expect("valid request body")
+    }
+
+    #[test]
+    fn opus_4_7_with_adaptive_max_effort_is_normalized() {
+        // 客户实际场景（xueding_aws_req.json）：model=claude-opus-4-7 + adaptive + effort=max
+        // 新逻辑：adaptive 字段触发"虚拟 -thinking 后缀"路径，完全覆写
+        let mut req = parse(
+            "claude-opus-4-7",
+            serde_json::json!({
+                "thinking": {"type": "adaptive", "display": "summarized"},
+                "output_config": {"effort": "max"}
+            }),
+        );
+        override_thinking_from_model_name(&mut req);
+
+        let thinking = req.thinking.as_ref().expect("thinking 应被覆写");
+        assert_eq!(thinking.thinking_type, "adaptive");
+        // adaptive 模式 budget_tokens 被覆写为标准 20000（adaptive 不依赖 budget）
+        assert_eq!(thinking.budget_tokens, 20000);
+        // effort 被覆写为 high（覆盖客户传入的 max）
+        assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
+    }
+
+    #[test]
+    fn opus_4_7_adaptive_no_output_config_fills_high() {
+        let mut req = parse(
+            "claude-opus-4-7",
+            serde_json::json!({"thinking": {"type": "adaptive"}}),
+        );
+        override_thinking_from_model_name(&mut req);
+        assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
+        assert_eq!(req.thinking.as_ref().unwrap().thinking_type, "adaptive");
+    }
+
+    #[test]
+    fn opus_4_7_thinking_suffix_full_override() {
+        let mut req = parse("claude-opus-4-7-thinking", serde_json::json!({}));
+        override_thinking_from_model_name(&mut req);
+        let thinking = req.thinking.as_ref().unwrap();
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.budget_tokens, 20000);
+        assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
+    }
+
+    #[test]
+    fn opus_4_7_no_thinking_no_change() {
+        let mut req = parse("claude-opus-4-7", serde_json::json!({}));
+        override_thinking_from_model_name(&mut req);
+        assert!(req.thinking.is_none());
+        assert!(req.output_config.is_none());
+    }
+
+    #[test]
+    fn opus_4_6_enabled_thinking_preserves_budget() {
+        // 关键回归测试：Claude Code 用户用 enabled 模式 + 自定义 budget，绝不能被覆写
+        let mut req = parse(
+            "claude-opus-4-6",
+            serde_json::json!({
+                "thinking": {"type": "enabled", "budget_tokens": 5000}
+            }),
+        );
+        override_thinking_from_model_name(&mut req);
+        // enabled 模式不触发自动覆写
+        let thinking = req.thinking.as_ref().unwrap();
+        assert_eq!(thinking.thinking_type, "enabled");
+        assert_eq!(thinking.budget_tokens, 5000, "客户的 budget_tokens 必须保留");
+        assert!(req.output_config.is_none(), "enabled 模式不应被注入 output_config");
+    }
+
+    #[test]
+    fn haiku_with_enabled_thinking_does_not_change() {
+        // 非 4.6/4.7 模型 + enabled：完全不动
+        let mut req = parse(
+            "claude-haiku-4-5-20251001",
+            serde_json::json!({
+                "thinking": {"type": "enabled", "budget_tokens": 5000},
+                "output_config": {"effort": "max"}
+            }),
+        );
+        override_thinking_from_model_name(&mut req);
+        assert_eq!(req.thinking.as_ref().unwrap().budget_tokens, 5000);
+        assert_eq!(req.output_config.as_ref().unwrap().effort, "max");
+    }
+
+    #[test]
+    fn sonnet_4_5_adaptive_uses_enabled_path() {
+        // adaptive 字段触发但模型不是 4.6/4.7：覆写为 enabled 类型，不设 output_config
+        let mut req = parse(
+            "claude-sonnet-4-5-20250929",
+            serde_json::json!({"thinking": {"type": "adaptive"}}),
+        );
+        override_thinking_from_model_name(&mut req);
+        let t = req.thinking.as_ref().unwrap();
+        assert_eq!(t.thinking_type, "enabled", "非 4.6/4.7 走 enabled 路径");
+        assert_eq!(t.budget_tokens, 20000);
+        assert!(req.output_config.is_none(), "非 4.6/4.7 不设 output_config");
+    }
+
+    /// Claude Code 普通用户：sonnet 4.5 + thinking enabled，不传 output_config
+    /// 验证：override 函数对 sonnet 不规整 effort，注入前缀与旧版完全一致
+    #[test]
+    fn claude_code_sonnet_4_5_thinking_enabled_unaffected() {
+        let mut req = parse(
+            "claude-sonnet-4-5-20250929",
+            serde_json::json!({
+                "thinking": {"type": "enabled", "budget_tokens": 10000}
+            }),
+        );
+        override_thinking_from_model_name(&mut req);
+        // sonnet 不进入规整分支
+        assert!(req.output_config.is_none(), "sonnet 不应被补 output_config");
+        // thinking 配置原样保留
+        assert_eq!(req.thinking.as_ref().unwrap().thinking_type, "enabled");
+        assert_eq!(req.thinking.as_ref().unwrap().budget_tokens, 10000);
+    }
+
+    /// Claude Code 普通用户：opus 4.6 + thinking enabled，不传 output_config
+    /// 验证：补 output_config 不影响 enabled 模式的 prefix 生成
+    #[test]
+    fn claude_code_opus_4_6_thinking_enabled_prefix_unchanged() {
+        let mut req = parse(
+            "claude-opus-4-6",
+            serde_json::json!({
+                "thinking": {"type": "enabled", "budget_tokens": 15000}
+            }),
+        );
+        override_thinking_from_model_name(&mut req);
+
+        // 跑 convert_request 拿到注入的前缀
+        let result = crate::anthropic::converter::convert_request(&req).unwrap();
+        let kiro_json = serde_json::to_value(&result.conversation_state).unwrap();
+        let history = kiro_json.pointer("/history").and_then(|v| v.as_array()).unwrap();
+        let first_user_content = history.iter().find_map(|m| {
+            m.pointer("/userInputMessage/content").and_then(|v| v.as_str())
+        }).unwrap_or("");
+
+        // enabled 模式的前缀是 <max_thinking_length>，不依赖 effort
+        assert!(
+            first_user_content.contains("<thinking_mode>enabled</thinking_mode>"),
+            "enabled 模式前缀必须保留"
+        );
+        assert!(
+            first_user_content.contains("<max_thinking_length>15000</max_thinking_length>"),
+            "客户传入的 budget_tokens 必须保留到上游"
+        );
+        // enabled 模式不应注入 effort 标签
+        assert!(
+            !first_user_content.contains("<thinking_effort>"),
+            "enabled 模式不应有 thinking_effort 标签"
+        );
+    }
+
+    /// Claude Code 普通用户：opus 4.6-thinking 后缀（旧行为路径）
+    /// 验证：has_thinking_suffix 分支与旧代码完全一致
+    #[test]
+    fn claude_code_opus_4_6_thinking_suffix_legacy_path() {
+        let mut req = parse("claude-opus-4-6-thinking", serde_json::json!({}));
+        override_thinking_from_model_name(&mut req);
+        let t = req.thinking.as_ref().unwrap();
+        assert_eq!(t.thinking_type, "adaptive");
+        assert_eq!(t.budget_tokens, 20000);
+        assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
+    }
+
+    /// Claude Code 普通用户：什么都不传 thinking 时，函数应直接 return
+    #[test]
+    fn claude_code_no_thinking_field_short_circuit() {
+        let mut req = parse("claude-sonnet-4-6", serde_json::json!({}));
+        override_thinking_from_model_name(&mut req);
+        assert!(req.thinking.is_none(), "不传 thinking 时不应被注入");
+        assert!(req.output_config.is_none(), "不传 thinking 时不应被注入 output_config");
+    }
+
+    /// 端到端：用客户实际下发的 xueding_aws_req.json 体走全链路
+    /// 1) 反序列化  2) override_thinking_from_model_name  3) convert_request
+    /// 验证：模型映射、thinking 注入、effort 规整、thinking_enabled 判定
+    #[test]
+    fn e2e_xueding_aws_req_full_pipeline() {
+        let raw = serde_json::json!({
+            "model": "claude-opus-4-7",
+            "max_tokens": 32000,
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "output_config": {"effort": "max"},
+            "system": [{
+                "type": "text",
+                "text": "You are OpenCode, the best coding agent on the planet.",
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "思考下，给老板汇报数学进展"}]
+            }],
+            "tool_choice": {"type": "auto"},
+            "stream": false
+        });
+
+        // 步骤 1: 反序列化（display 字段被 serde 忽略，不报错）
+        let mut req: MessagesRequest = serde_json::from_value(raw).expect("反序列化必须成功");
+        assert_eq!(req.model, "claude-opus-4-7");
+        assert_eq!(req.thinking.as_ref().unwrap().thinking_type, "adaptive");
+        assert_eq!(req.output_config.as_ref().unwrap().effort, "max");
+
+        // 步骤 2: 规整 thinking / effort
+        override_thinking_from_model_name(&mut req);
+        // 客户传的 thinking 配置应保留
+        assert_eq!(req.thinking.as_ref().unwrap().thinking_type, "adaptive");
+        // effort 被规整为 high
+        assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
+
+        // 步骤 3: thinking_enabled 判定
+        let thinking_enabled = req.thinking.as_ref().map(|t| t.is_enabled()).unwrap_or(false);
+        assert!(thinking_enabled, "adaptive 类型必须被识别为已启用 thinking");
+
+        // 步骤 4: convert_request 全流程
+        let result = crate::anthropic::converter::convert_request(&req)
+            .expect("convert_request 必须成功");
+
+        // 序列化 Kiro 请求体校验关键字段
+        let kiro_json = serde_json::to_value(&result.conversation_state)
+            .expect("ConversationState 必须可序列化");
+
+        // 模型映射：claude-opus-4-7 → claude-opus-4.6
+        let current_model = kiro_json
+            .pointer("/currentMessage/userInputMessage/modelId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(
+            current_model, "claude-opus-4.6",
+            "上游收到的 modelId 必须是 claude-opus-4.6（4.7 兜底映射）"
+        );
+
+        // thinking 前缀注入：history 第一条 user 消息含 adaptive + effort=high
+        let history = kiro_json.pointer("/history").and_then(|v| v.as_array())
+            .expect("history 必须存在");
+        let first_user_content = history.iter().find_map(|m| {
+            m.pointer("/userInputMessage/content").and_then(|v| v.as_str())
+        }).expect("history 必须包含至少一条 user 消息");
+
+        assert!(
+            first_user_content.contains("<thinking_mode>adaptive</thinking_mode>"),
+            "system message 前缀必须包含 adaptive 模式标签，实际内容: {}",
+            &first_user_content[..first_user_content.len().min(200)]
+        );
+        assert!(
+            first_user_content.contains("<thinking_effort>high</thinking_effort>"),
+            "system message 前缀必须包含 effort=high 标签"
+        );
+
+        // 步骤 5: 响应回写 model 字段验证（这一层在 handle_non_stream_request 内部）
+        // 通过代码审查确认：handlers.rs:334/886 调用时传的是 &payload.model 原始值
+        // 因此响应中的 model 字段会原样回写 "claude-opus-4-7"，对客户透明
+        assert_eq!(req.model, "claude-opus-4-7", "请求体中的 model 字段保持不变");
+    }
 }
