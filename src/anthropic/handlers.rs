@@ -300,6 +300,9 @@ pub async fn post_messages(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
+    // 检测客户是否启用了 prompt caching（决定 usage 字段是否拆分成 cache_*）
+    let has_cache_control = super::cache::request_has_cache_control(&payload);
+
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -325,13 +328,23 @@ pub async fn post_messages(
             &payload.model,
             input_tokens,
             thinking_enabled,
+            has_cache_control,
             tool_name_map,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            has_cache_control,
+            tool_name_map,
+        )
+        .await
     }
 }
 
@@ -342,6 +355,7 @@ async fn handle_stream_request(
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
+    has_cache_control: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
@@ -351,7 +365,13 @@ async fn handle_stream_request(
     };
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx = StreamContext::new_with_thinking(
+        model,
+        input_tokens,
+        thinking_enabled,
+        has_cache_control,
+        tool_name_map,
+    );
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -478,6 +498,7 @@ async fn handle_non_stream_request(
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
+    has_cache_control: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
@@ -613,7 +634,8 @@ async fn handle_non_stream_request(
         if let Some(thinking_text) = thinking {
             content.push(json!({
                 "type": "thinking",
-                "thinking": thinking_text
+                "thinking": thinking_text,
+                "signature": super::signature::generate_fake_signature()
             }));
         }
 
@@ -638,6 +660,9 @@ async fn handle_non_stream_request(
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
 
+    // 根据客户请求意图拆分 usage（带 cache_control → 拆成 I/CR/CC，否则平铺）
+    let usage_breakdown = super::cache::compute_usage_breakdown(final_input_tokens, has_cache_control);
+
     // 构建 Anthropic 响应
     let response_body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
@@ -648,8 +673,10 @@ async fn handle_non_stream_request(
         "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": {
-            "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
+            "input_tokens": usage_breakdown.input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": usage_breakdown.cache_creation_input_tokens,
+            "cache_read_input_tokens": usage_breakdown.cache_read_input_tokens
         }
     });
 
@@ -833,6 +860,9 @@ pub async fn post_messages_cc(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
+    // 检测客户是否启用了 prompt caching（决定 usage 字段是否拆分）
+    let has_cache_control = super::cache::request_has_cache_control(&payload);
+
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -858,13 +888,23 @@ pub async fn post_messages_cc(
             &payload.model,
             input_tokens,
             thinking_enabled,
+            has_cache_control,
             tool_name_map,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            has_cache_control,
+            tool_name_map,
+        )
+        .await
     }
 }
 
@@ -878,6 +918,7 @@ async fn handle_stream_request_buffered(
     model: &str,
     estimated_input_tokens: i32,
     thinking_enabled: bool,
+    has_cache_control: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
@@ -887,7 +928,13 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let ctx = BufferedStreamContext::new(
+        model,
+        estimated_input_tokens,
+        thinking_enabled,
+        has_cache_control,
+        tool_name_map,
+    );
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);
@@ -1262,5 +1309,69 @@ mod tests {
         // 通过代码审查确认：handlers.rs:334/886 调用时传的是 &payload.model 原始值
         // 因此响应中的 model 字段会原样回写 "claude-opus-4-7"，对客户透明
         assert_eq!(req.model, "claude-opus-4-7", "请求体中的 model 字段保持不变");
+    }
+
+    /// 历史 thinking 块带 signature 字段时反序列化必须成功，不被丢弃
+    #[test]
+    fn content_block_signature_field_is_parsed_from_history() {
+        use crate::anthropic::types::ContentBlock;
+
+        let raw = serde_json::json!({
+            "type": "thinking",
+            "thinking": "Let me reason about this problem...",
+            "signature": "Et0EClkIDRgCKkCmVcOauBOD_FAKE_FROM_PRIOR_TURN"
+        });
+        let block: ContentBlock = serde_json::from_value(raw)
+            .expect("含 signature 的 thinking 块必须能被解析");
+        assert_eq!(block.block_type, "thinking");
+        assert_eq!(block.thinking.as_deref(), Some("Let me reason about this problem..."));
+        assert_eq!(
+            block.signature.as_deref(),
+            Some("Et0EClkIDRgCKkCmVcOauBOD_FAKE_FROM_PRIOR_TURN"),
+            "signature 字段必须被保留（即使后续 converter 会忽略它）"
+        );
+    }
+
+    /// 完整历史会话（含上一轮 thinking + signature）能正常通过 convert_request
+    /// 验证 Round-trip 不被前一轮签名破坏
+    #[test]
+    fn convert_request_handles_history_with_thinking_signature() {
+        let raw = serde_json::json!({
+            "model": "claude-opus-4-7",
+            "max_tokens": 1024,
+            "thinking": {"type": "enabled", "budget_tokens": 8000},
+            "messages": [
+                {"role": "user", "content": "What is 17 * 23?"},
+                {"role": "assistant", "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "17 * 23 = 17*20 + 17*3 = 340 + 51 = 391",
+                        "signature": "FAKE_SIG_FROM_PRIOR_TURN_xxxxxxxxxxxxxxxxxxxxxxxx"
+                    },
+                    {"type": "text", "text": "391"}
+                ]},
+                {"role": "user", "content": "Multiply by 2"}
+            ]
+        });
+        let req: MessagesRequest = serde_json::from_value(raw).expect("反序列化必须成功");
+        let result = crate::anthropic::converter::convert_request(&req)
+            .expect("convert_request 不应因 history 中存在 signature 字段而失败");
+
+        // 转给 Kiro 的请求体里不应残留 signature（kiro-rs 主动丢弃，避免泄露伪签名）
+        let kiro_json = serde_json::to_string(&result.conversation_state)
+            .expect("ConversationState 必须可序列化");
+        assert!(
+            !kiro_json.contains("FAKE_SIG_FROM_PRIOR_TURN"),
+            "transferred body 不应包含上一轮的 signature 内容"
+        );
+        assert!(
+            !kiro_json.contains("\"signature\""),
+            "Kiro 上游不需要 signature 字段"
+        );
+        // 但 thinking 文本本身要被保留（converter.rs 拼成 <thinking>...</thinking>）
+        assert!(
+            kiro_json.contains("17*20") || kiro_json.contains("340 + 51"),
+            "上一轮 thinking 内容必须被传给 Kiro，便于模型理解上下文"
+        );
     }
 }

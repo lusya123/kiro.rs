@@ -151,6 +151,7 @@ where
         {
             Ok(Some(vec![SystemMessage {
                 text: value.to_string(),
+                cache_control: None,
             }]))
         }
 
@@ -199,6 +200,10 @@ pub struct Message {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SystemMessage {
     pub text: String,
+    /// Anthropic prompt caching 标记。kiro-rs 仅用于"客户是否启用 cache"的意图识别，
+    /// 不会随请求体转发给 Kiro 上游（Kiro 不支持 prompt caching）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<serde_json::Value>,
 }
 
 /// 工具定义
@@ -223,6 +228,9 @@ pub struct Tool {
     /// 最大使用次数（仅 WebSearch 工具）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<i32>,
+    /// Anthropic prompt caching 标记（同 SystemMessage.cache_control）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<serde_json::Value>,
 }
 
 /// 内容块
@@ -234,6 +242,11 @@ pub struct ContentBlock {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
+    /// Thinking 块签名（Anthropic 协议字段）。kiro-rs 不验签，
+    /// 仅在响应 thinking 块上回填伪签名；history 中的真签名解析后被
+    /// converter 静默丢弃，不会传给 Kiro 上游。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_use_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
