@@ -3,6 +3,8 @@
 use std::convert::Infallible;
 
 use anyhow::Error;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -16,6 +18,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
+use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use serde_json::json;
 use std::time::Duration;
 use tokio::time::interval;
@@ -26,6 +29,144 @@ use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
+
+const MAX_REMOTE_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+const REMOTE_IMAGE_FETCH_TIMEOUT_SECS: u64 = 30;
+
+async fn normalize_remote_image_sources(payload: &mut MessagesRequest) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(REMOTE_IMAGE_FETCH_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .map_err(|e| format!("Failed to create image fetch client: {}", e))?;
+
+    for message in &mut payload.messages {
+        normalize_content_remote_images(&client, &mut message.content).await?;
+    }
+
+    Ok(())
+}
+
+async fn normalize_content_remote_images(
+    client: &reqwest::Client,
+    content: &mut serde_json::Value,
+) -> Result<(), String> {
+    let Some(blocks) = content.as_array_mut() else {
+        return Ok(());
+    };
+
+    for block in blocks {
+        let Some(block_obj) = block.as_object_mut() else {
+            continue;
+        };
+        if block_obj.get("type").and_then(|v| v.as_str()) != Some("image") {
+            continue;
+        }
+
+        let Some(source) = block_obj.get_mut("source").and_then(|v| v.as_object_mut()) else {
+            continue;
+        };
+        if source.get("type").and_then(|v| v.as_str()) != Some("url") {
+            continue;
+        }
+
+        let url = source
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "Image URL source is missing url".to_string())?;
+
+        let parsed_url =
+            reqwest::Url::parse(url).map_err(|e| format!("Invalid image URL: {}", e))?;
+        match parsed_url.scheme() {
+            "http" | "https" => {}
+            _ => return Err("Image URL must use http or https".to_string()),
+        }
+
+        let resp = client
+            .get(parsed_url.clone())
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch image URL: {}", e))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("Image URL returned HTTP {}", status.as_u16()));
+        }
+
+        if let Some(content_length) = resp
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            if content_length > MAX_REMOTE_IMAGE_BYTES {
+                return Err(format!(
+                    "Remote image is too large: {} bytes, max {} bytes",
+                    content_length, MAX_REMOTE_IMAGE_BYTES
+                ));
+            }
+        }
+
+        let media_type = match resp.headers().get(CONTENT_TYPE) {
+            Some(content_type) => content_type
+                .to_str()
+                .ok()
+                .and_then(normalize_supported_image_media_type),
+            None => infer_supported_image_media_type(parsed_url.path()),
+        };
+
+        let media_type =
+            media_type.ok_or_else(|| "Remote image must be JPEG, PNG, GIF, or WebP".to_string())?;
+
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("Failed to read image URL response: {}", e))?;
+        if bytes.len() > MAX_REMOTE_IMAGE_BYTES {
+            return Err(format!(
+                "Remote image is too large: {} bytes, max {} bytes",
+                bytes.len(),
+                MAX_REMOTE_IMAGE_BYTES
+            ));
+        }
+
+        source.insert(
+            "type".to_string(),
+            serde_json::Value::String("base64".to_string()),
+        );
+        source.insert(
+            "media_type".to_string(),
+            serde_json::Value::String(media_type),
+        );
+        source.insert(
+            "data".to_string(),
+            serde_json::Value::String(BASE64.encode(bytes)),
+        );
+        source.remove("url");
+    }
+
+    Ok(())
+}
+
+fn normalize_supported_image_media_type(raw: &str) -> Option<String> {
+    let media_type = raw
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match media_type.as_str() {
+        "image/jpeg" | "image/png" | "image/gif" | "image/webp" => Some(media_type),
+        _ => None,
+    }
+}
+
+fn infer_supported_image_media_type(path: &str) -> Option<String> {
+    let media_type = mime_guess::from_path(path).first_raw()?;
+    normalize_supported_image_media_type(media_type)
+}
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
@@ -240,6 +381,15 @@ pub async fn post_messages(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+
+    if let Err(e) = normalize_remote_image_sources(&mut payload).await {
+        tracing::warn!("远程图片处理失败: {}", e);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invalid_request_error", e)),
+        )
+            .into_response();
+    }
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -801,6 +951,15 @@ pub async fn post_messages_cc(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
+    if let Err(e) = normalize_remote_image_sources(&mut payload).await {
+        tracing::warn!("远程图片处理失败: {}", e);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invalid_request_error", e)),
+        )
+            .into_response();
+    }
+
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
@@ -1057,6 +1216,23 @@ mod tests {
             }
         }
         serde_json::from_value(body).expect("valid request body")
+    }
+
+    #[test]
+    fn supported_image_media_type_strips_parameters() {
+        assert_eq!(
+            normalize_supported_image_media_type("image/png; charset=binary").as_deref(),
+            Some("image/png")
+        );
+    }
+
+    #[test]
+    fn unsupported_image_media_type_is_rejected_even_when_url_extension_looks_valid() {
+        assert!(normalize_supported_image_media_type("text/plain").is_none());
+        assert_eq!(
+            infer_supported_image_media_type("/path/to/file.png").as_deref(),
+            Some("image/png")
+        );
     }
 
     #[test]

@@ -264,12 +264,18 @@ pub struct ContentBlock {
 }
 
 /// 图片数据源
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ImageSource {
     #[serde(rename = "type")]
     pub source_type: String,
-    pub media_type: String,
-    pub data: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
 }
 
 // === Count Tokens 端点类型 ===
