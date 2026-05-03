@@ -2,13 +2,15 @@
 
 use std::convert::Infallible;
 
-use anyhow::Error;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use crate::kiro::model::events::Event;
+use crate::kiro::model::requests::conversation::{
+    CurrentMessage, HistoryAssistantMessage, HistoryUserMessage, Message, UserInputMessage,
+    UserMessage,
+};
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
+use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
@@ -16,6 +18,8 @@ use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -27,11 +31,308 @@ use uuid::Uuid;
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
-use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
+use super::types::{
+    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
+    OutputConfig, Thinking,
+};
 use super::websearch;
 
 const MAX_REMOTE_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const REMOTE_IMAGE_FETCH_TIMEOUT_SECS: u64 = 30;
+const AUTO_CONTINUE_BASE_CHUNK_TOKENS: i32 = 8192;
+const AUTO_CONTINUE_ESTIMATED_CHUNK_TOKENS: i32 = 4096;
+const AUTO_CONTINUE_MAX_ROUNDS: usize = 8;
+const AUTO_CONTINUE_MIN_SUSPECT_CHARS: usize = 12_000;
+const AUTO_CONTINUE_MIN_SUSPECT_OUTPUT_TOKENS: i32 = 3_000;
+const DEFAULT_MODEL_MAX_OUTPUT_TOKENS: i32 = 26000;
+const AUTO_CONTINUE_PROMPT: &str = "Continue exactly from where your previous response stopped. Do not repeat any previous text or the last line. If the previous response ended after a numbered, list, or code line, start with the following line and include any required newline. Stop immediately when the original request is complete. Do not add summaries, comments, prefaces, or confirmations.";
+const AUTO_CONTINUE_COMPLETE_SENTINEL: &str = "__KRS_CONTINUATION_COMPLETE__";
+
+fn auto_continue_round_limit(requested_max_tokens: i32) -> usize {
+    if requested_max_tokens <= AUTO_CONTINUE_BASE_CHUNK_TOKENS {
+        return 0;
+    }
+
+    let chunks = ((requested_max_tokens + AUTO_CONTINUE_ESTIMATED_CHUNK_TOKENS - 1)
+        / AUTO_CONTINUE_ESTIMATED_CHUNK_TOKENS) as usize;
+    chunks.saturating_sub(1).min(AUTO_CONTINUE_MAX_ROUNDS)
+}
+
+fn effective_auto_continue_max_tokens(requested_max_tokens: i32) -> i32 {
+    requested_max_tokens.max(DEFAULT_MODEL_MAX_OUTPUT_TOKENS)
+}
+
+fn looks_like_truncated_long_output(content: &str, output_tokens: i32) -> bool {
+    let trimmed = content.trim_end();
+    if trimmed.is_empty()
+        || (trimmed.len() < AUTO_CONTINUE_MIN_SUSPECT_CHARS
+            && output_tokens < AUTO_CONTINUE_MIN_SUSPECT_OUTPUT_TOKENS)
+    {
+        return false;
+    }
+
+    let terminal_chars = [
+        '.', '。', '!', '！', '?', '？', ';', '；', ':', '：', ')', '）', ']', '】', '}', '"',
+        '\'', '`', '”', '’',
+    ];
+    match trimmed.chars().last() {
+        Some(last) => !terminal_chars.contains(&last),
+        None => false,
+    }
+}
+
+fn numeric_range_request_completed(request_body: &str, content: &str) -> bool {
+    let request_text = extract_request_text_for_completion_check(request_body);
+    let request_text_lower = request_text.to_lowercase();
+    if !(request_text.contains('到')
+        || request_text.contains('至')
+        || request_text_lower.contains(" to ")
+        || request_text_lower.contains(" through "))
+    {
+        return false;
+    }
+
+    let numbers = extract_u64_numbers(&request_text);
+    if !numbers.contains(&1) {
+        return false;
+    }
+    let Some(target) = numbers.into_iter().filter(|n| *n > 1).max() else {
+        return false;
+    };
+
+    let Some(last_line) = content.lines().rev().find(|line| !line.trim().is_empty()) else {
+        return false;
+    };
+    last_line.trim() == target.to_string()
+}
+
+fn explicit_end_marker_completed(request_body: &str, content: &str) -> bool {
+    let request_text = extract_request_text_for_completion_check(request_body);
+    let markers = extract_explicit_end_markers(&request_text);
+    if markers.is_empty() {
+        return false;
+    }
+
+    let Some(last_line) = content.lines().rev().find(|line| !line.trim().is_empty()) else {
+        return false;
+    };
+    let last_line = last_line.trim_end();
+    markers.iter().any(|marker| {
+        last_line
+            .find(marker)
+            .map(|idx| last_line[idx + marker.len()..].trim().is_empty())
+            .unwrap_or(false)
+    })
+}
+
+fn extract_explicit_end_markers(text: &str) -> Vec<String> {
+    let mut markers = Vec::new();
+    for token in text
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .filter(|token| token.len() >= 6)
+    {
+        let upper = token.to_ascii_uppercase();
+        let is_marker = upper.starts_with("END_OF")
+            || upper.ends_with("_END")
+            || upper.contains("_END_")
+            || (upper.starts_with("KRS_") && upper.contains("END"));
+        if is_marker && !markers.iter().any(|m| m == token) {
+            markers.push(token.to_string());
+        }
+    }
+    markers
+}
+
+fn continuation_target_completed(request_body: &str, content: &str) -> bool {
+    numeric_range_request_completed(request_body, content)
+        || explicit_end_marker_completed(request_body, content)
+}
+
+fn extract_request_text_for_completion_check(request_body: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(request_body) else {
+        return request_body.to_string();
+    };
+    let mut out = String::new();
+    collect_json_strings(&value, &mut out);
+    out
+}
+
+fn collect_json_strings(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::String(s) => {
+            out.push(' ');
+            out.push_str(s);
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_json_strings(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for value in map.values() {
+                collect_json_strings(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_u64_numbers(text: &str) -> Vec<u64> {
+    let mut numbers = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_digit() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            if let Ok(value) = current.parse::<u64>() {
+                numbers.push(value);
+            }
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        if let Ok(value) = current.parse::<u64>() {
+            numbers.push(value);
+        }
+    }
+    numbers
+}
+
+fn is_continuation_complete_sentinel(content: &str) -> bool {
+    content.trim() == AUTO_CONTINUE_COMPLETE_SENTINEL
+}
+
+fn estimate_kiro_request_input_tokens(request_body: &str, fallback: i32) -> i32 {
+    let Ok(request) = serde_json::from_str::<KiroRequest>(request_body) else {
+        return fallback.max(1);
+    };
+
+    let mut total = 0i32;
+    let state = request.conversation_state;
+
+    for message in state.history {
+        match message {
+            Message::User(user) => {
+                total += token::count_tokens(&user.user_input_message.content) as i32;
+                total +=
+                    estimate_context_tokens(&user.user_input_message.user_input_message_context);
+            }
+            Message::Assistant(assistant) => {
+                let assistant_message = assistant.assistant_response_message;
+                total += token::count_tokens(&assistant_message.content) as i32;
+                if let Some(tool_uses) = assistant_message.tool_uses {
+                    total +=
+                        token::count_tokens(&serde_json::to_string(&tool_uses).unwrap_or_default())
+                            as i32;
+                }
+            }
+        }
+    }
+
+    let current = state.current_message.user_input_message;
+    total += token::count_tokens(&current.content) as i32;
+    total += estimate_context_tokens(&current.user_input_message_context);
+
+    total.max(1)
+}
+
+fn estimate_context_tokens(
+    context: &crate::kiro::model::requests::conversation::UserInputMessageContext,
+) -> i32 {
+    let mut total = 0i32;
+    if !context.tools.is_empty() {
+        total +=
+            token::count_tokens(&serde_json::to_string(&context.tools).unwrap_or_default()) as i32;
+    }
+    if !context.tool_results.is_empty() {
+        total +=
+            token::count_tokens(&serde_json::to_string(&context.tool_results).unwrap_or_default())
+                as i32;
+    }
+    total
+}
+
+fn build_continuation_request_body(
+    request_body: &str,
+    assistant_content: &str,
+    prompt: &str,
+) -> Option<String> {
+    if assistant_content.trim().is_empty() {
+        return None;
+    }
+
+    let mut request: KiroRequest = serde_json::from_str(request_body).ok()?;
+    let current = request
+        .conversation_state
+        .current_message
+        .user_input_message;
+    let model_id = current.model_id.clone();
+
+    let history_user = HistoryUserMessage {
+        user_input_message: UserMessage {
+            content: current.content,
+            model_id: current.model_id,
+            origin: current.origin,
+            images: current.images,
+            user_input_message_context: current.user_input_message_context,
+        },
+    };
+    request
+        .conversation_state
+        .history
+        .push(Message::User(history_user));
+    request
+        .conversation_state
+        .history
+        .push(Message::Assistant(HistoryAssistantMessage::new(
+            assistant_content.to_string(),
+        )));
+
+    request.conversation_state.current_message =
+        CurrentMessage::new(UserInputMessage::new(prompt, model_id));
+
+    serde_json::to_string(&request).ok()
+}
+
+/// 将 KiroProvider 错误映射为 HTTP 响应
+fn map_provider_error(err: Error) -> Response {
+    let err_str = err.to_string();
+
+    // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
+    if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+        tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "Context window is full. Reduce conversation history, system prompt, or tools.",
+            )),
+        )
+            .into_response();
+    }
+
+    // 单次输入太长（请求体本身超出上游限制）
+    if err_str.contains("Input is too long") {
+        tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "Input is too long. Reduce the size of your messages.",
+            )),
+        )
+            .into_response();
+    }
+    tracing::error!("Kiro API 调用失败: {}", err);
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(ErrorResponse::new(
+            "api_error",
+            format!("上游 API 调用失败: {}", err),
+        )),
+    )
+        .into_response()
+}
 
 async fn normalize_remote_image_sources(payload: &mut MessagesRequest) -> Result<(), String> {
     let client = reqwest::Client::builder()
@@ -168,46 +469,6 @@ fn infer_supported_image_media_type(path: &str) -> Option<String> {
     normalize_supported_image_media_type(media_type)
 }
 
-/// 将 KiroProvider 错误映射为 HTTP 响应
-fn map_provider_error(err: Error) -> Response {
-    let err_str = err.to_string();
-
-    // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
-    if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
-        tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Context window is full. Reduce conversation history, system prompt, or tools.",
-            )),
-        )
-            .into_response();
-    }
-
-    // 单次输入太长（请求体本身超出上游限制）
-    if err_str.contains("Input is too long") {
-        tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Input is too long. Reduce the size of your messages.",
-            )),
-        )
-            .into_response();
-    }
-    tracing::error!("Kiro API 调用失败: {}", err);
-    (
-        StatusCode::BAD_GATEWAY,
-        Json(ErrorResponse::new(
-            "api_error",
-            format!("上游 API 调用失败: {}", err),
-        )),
-    )
-        .into_response()
-}
-
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
@@ -222,7 +483,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.7".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
         },
         Model {
             id: "claude-opus-4-7-thinking".to_string(),
@@ -231,7 +492,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.7 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
         },
         Model {
             id: "claude-opus-4-6".to_string(),
@@ -240,7 +501,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.6".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
         },
         Model {
             id: "claude-opus-4-6-thinking".to_string(),
@@ -249,7 +510,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.6 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
         },
         Model {
             id: "claude-sonnet-4-6".to_string(),
@@ -258,7 +519,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Sonnet 4.6".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
         },
         Model {
             id: "claude-sonnet-4-6-thinking".to_string(),
@@ -267,7 +528,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
         },
         Model {
             id: "claude-opus-4-5-20251101".to_string(),
@@ -276,7 +537,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.5".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
         },
         Model {
             id: "claude-opus-4-5-20251101-thinking".to_string(),
@@ -285,7 +546,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.5 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
         },
         Model {
             id: "claude-sonnet-4-5-20250929".to_string(),
@@ -294,7 +555,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Sonnet 4.5".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
         },
         Model {
             id: "claude-sonnet-4-5-20250929-thinking".to_string(),
@@ -303,7 +564,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
         },
         Model {
             id: "claude-haiku-4-5-20251001".to_string(),
@@ -312,7 +573,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Haiku 4.5".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
         },
         Model {
             id: "claude-haiku-4-5-20251001-thinking".to_string(),
@@ -321,7 +582,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "anthropic".to_string(),
             display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
         },
         Model {
             id: "glm-5".to_string(),
@@ -330,7 +591,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "zhipu".to_string(),
             display_name: "GLM-5".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
         },
         Model {
             id: "minimax-m2.5".to_string(),
@@ -339,7 +600,7 @@ pub async fn get_models() -> impl IntoResponse {
             owned_by: "minimax".to_string(),
             display_name: "MiniMax M2.5".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: 64000,
+            max_tokens: DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
         },
     ];
 
@@ -460,6 +721,8 @@ pub async fn post_messages(
         payload.messages,
         payload.tools,
     ) as i32;
+    let billable_estimated_input_tokens =
+        estimate_kiro_request_input_tokens(&request_body, input_tokens);
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -476,10 +739,11 @@ pub async fn post_messages(
             provider,
             &request_body,
             &payload.model,
-            input_tokens,
+            billable_estimated_input_tokens,
             thinking_enabled,
             has_cache_control,
             tool_name_map,
+            payload.max_tokens,
         )
         .await
     } else {
@@ -489,10 +753,11 @@ pub async fn post_messages(
             provider,
             &request_body,
             &payload.model,
-            input_tokens,
+            billable_estimated_input_tokens,
             extract_thinking,
             has_cache_control,
             tool_name_map,
+            payload.max_tokens,
         )
         .await
     }
@@ -507,6 +772,7 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     has_cache_control: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    requested_max_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -527,7 +793,14 @@ async fn handle_stream_request(
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events);
+    let stream = create_sse_stream(
+        response,
+        ctx,
+        initial_events,
+        provider,
+        request_body.to_string(),
+        requested_max_tokens,
+    );
 
     // 返回 SSE 响应
     Response::builder()
@@ -552,6 +825,9 @@ fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    request_body: String,
+    requested_max_tokens: i32,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -562,10 +838,32 @@ fn create_sse_stream(
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
     let body_stream = response.bytes_stream();
+    let requested_max_tokens = effective_auto_continue_max_tokens(requested_max_tokens);
+    let max_continuation_rounds = auto_continue_round_limit(requested_max_tokens);
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS))),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        (
+            body_stream,
+            ctx,
+            EventStreamDecoder::new(),
+            false,
+            interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            provider,
+            request_body,
+            0usize,
+            max_continuation_rounds,
+        ),
+        move |(
+            mut body_stream,
+            mut ctx,
+            mut decoder,
+            finished,
+            mut ping_interval,
+            provider,
+            request_body,
+            continuation_round,
+            max_continuation_rounds,
+        )| async move {
             if finished {
                 return None;
             }
@@ -602,7 +900,7 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
@@ -612,16 +910,73 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
                         }
                         None => {
+                            if decoder.has_pending_data() {
+                                tracing::warn!(
+                                    pending_bytes = decoder.pending_bytes(),
+                                    "上游 EventStream 结束时仍有未完整 frame，按 max_tokens 截断处理"
+                                );
+                                ctx.mark_upstream_truncated();
+                            }
+                            if continuation_round < max_continuation_rounds
+                                && (ctx.should_auto_continue(requested_max_tokens)
+                                    || ctx.should_probe_auto_continue(requested_max_tokens))
+                                && !continuation_target_completed(
+                                    &request_body,
+                                    ctx.assistant_raw_content(),
+                                )
+                            {
+                                let assistant_content =
+                                    ctx.take_assistant_raw_content_for_continuation();
+                                let continuation_prompt = AUTO_CONTINUE_PROMPT;
+                                if let Some(next_request_body) = build_continuation_request_body(
+                                    &request_body,
+                                    &assistant_content,
+                                    continuation_prompt,
+                                ) {
+                                    let next_estimated_input_tokens =
+                                        estimate_kiro_request_input_tokens(&next_request_body, 1);
+                                    ctx.begin_continuation_for_billing(next_estimated_input_tokens);
+                                    match provider.call_api_stream(&next_request_body).await {
+                                        Ok(next_response) => {
+                                            tracing::info!(
+                                                round = continuation_round + 1,
+                                                max_rounds = max_continuation_rounds,
+                                                requested_max_tokens = requested_max_tokens,
+                                                completion_probe = false,
+                                                "上游达到 max_tokens，自动续写"
+                                            );
+                                            let next_body_stream = next_response.bytes_stream();
+                                            return Some((
+                                                stream::iter(Vec::<Result<Bytes, Infallible>>::new()),
+                                                (
+                                                    next_body_stream,
+                                                    ctx,
+                                                    EventStreamDecoder::new(),
+                                                    false,
+                                                    ping_interval,
+                                                    provider,
+                                                    next_request_body,
+                                                    continuation_round + 1,
+                                                    max_continuation_rounds,
+                                                ),
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("自动续写请求失败: {}", e);
+                                        }
+                                    }
+                                }
+                            }
                             // 流结束，发送最终事件
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
                         }
                     }
                 }
@@ -629,7 +984,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
                 }
             }
         },
@@ -650,127 +1005,202 @@ async fn handle_non_stream_request(
     thinking_enabled: bool,
     has_cache_control: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    requested_max_tokens: i32,
 ) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body).await {
-        Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
-    };
-
-    // 读取响应体
-    let body_bytes = match response.bytes().await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::error!("读取响应体失败: {}", e);
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new(
-                    "api_error",
-                    format!("读取响应失败: {}", e),
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    // 解析事件流
-    let mut decoder = EventStreamDecoder::new();
-    if let Err(e) = decoder.feed(&body_bytes) {
-        tracing::warn!("缓冲区溢出: {}", e);
-    }
-
     let mut text_content = String::new();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
-    let mut stop_reason = "end_turn".to_string();
-    // 从 contextUsageEvent 计算的实际输入 tokens
-    let mut context_input_tokens: Option<i32> = None;
+    let mut stop_reason: String;
+    let mut total_input_tokens = 0i32;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
 
-    for result in decoder.decode_iter() {
-        match result {
-            Ok(frame) => {
-                if let Ok(event) = Event::from_frame(frame) {
-                    match event {
-                        Event::AssistantResponse(resp) => {
-                            text_content.push_str(&resp.content);
-                        }
-                        Event::ToolUse(tool_use) => {
-                            has_tool_use = true;
+    let mut current_request_body = request_body.to_string();
+    let mut continuation_round = 0usize;
+    let requested_max_tokens = effective_auto_continue_max_tokens(requested_max_tokens);
+    let max_continuation_rounds = auto_continue_round_limit(requested_max_tokens);
 
-                            // 累积工具的 JSON 输入
-                            let buffer = tool_json_buffers
-                                .entry(tool_use.tool_use_id.clone())
-                                .or_insert_with(String::new);
-                            buffer.push_str(&tool_use.input);
+    loop {
+        let round_estimated_input_tokens =
+            estimate_kiro_request_input_tokens(&current_request_body, input_tokens);
+        let mut round_context_input_tokens: Option<i32> = None;
 
-                            // 如果是完整的工具调用，添加到列表
-                            if tool_use.stop {
-                                let input: serde_json::Value = if buffer.is_empty() {
-                                    serde_json::json!({})
-                                } else {
-                                    serde_json::from_str(buffer)
-                                        .unwrap_or_else(|e| {
+        let response = match provider.call_api(&current_request_body).await {
+            Ok(resp) => resp,
+            Err(e) => return map_provider_error(e),
+        };
+
+        let body_bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::error!("读取响应体失败: {}", e);
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ErrorResponse::new(
+                        "api_error",
+                        format!("读取响应失败: {}", e),
+                    )),
+                )
+                    .into_response();
+            }
+        };
+
+        let mut decoder = EventStreamDecoder::new();
+        if let Err(e) = decoder.feed(&body_bytes) {
+            tracing::warn!("缓冲区溢出: {}", e);
+        }
+
+        let mut chunk_text_content = String::new();
+        let mut round_has_assistant_content = false;
+        stop_reason = "end_turn".to_string();
+
+        for result in decoder.decode_iter() {
+            match result {
+                Ok(frame) => {
+                    if let Ok(event) = Event::from_frame(frame) {
+                        match event {
+                            Event::AssistantResponse(resp) => {
+                                let content =
+                                    if continuation_round > 0 && !round_has_assistant_content {
+                                        super::stream::merge_continuation_text(
+                                            &text_content,
+                                            &resp.content,
+                                        )
+                                    } else {
+                                        resp.content
+                                    };
+                                round_has_assistant_content = true;
+                                if !content.is_empty() {
+                                    text_content.push_str(&content);
+                                    chunk_text_content.push_str(&content);
+                                }
+                            }
+                            Event::ToolUse(tool_use) => {
+                                has_tool_use = true;
+
+                                // 累积工具的 JSON 输入
+                                let buffer = tool_json_buffers
+                                    .entry(tool_use.tool_use_id.clone())
+                                    .or_insert_with(String::new);
+                                buffer.push_str(&tool_use.input);
+
+                                // 如果是完整的工具调用，添加到列表
+                                if tool_use.stop {
+                                    let input: serde_json::Value = if buffer.is_empty() {
+                                        serde_json::json!({})
+                                    } else {
+                                        serde_json::from_str(buffer).unwrap_or_else(|e| {
                                             tracing::warn!(
                                                 "工具输入 JSON 解析失败: {}, tool_use_id: {}",
-                                                e, tool_use.tool_use_id
+                                                e,
+                                                tool_use.tool_use_id
                                             );
                                             serde_json::json!({})
                                         })
-                                };
+                                    };
 
-                                let original_name = tool_name_map
-                                    .get(&tool_use.name)
-                                    .cloned()
-                                    .unwrap_or_else(|| tool_use.name.clone());
+                                    let original_name = tool_name_map
+                                        .get(&tool_use.name)
+                                        .cloned()
+                                        .unwrap_or_else(|| tool_use.name.clone());
 
-                                tool_uses.push(json!({
-                                    "type": "tool_use",
-                                    "id": tool_use.tool_use_id,
-                                    "name": original_name,
-                                    "input": input
-                                }));
+                                    tool_uses.push(json!({
+                                        "type": "tool_use",
+                                        "id": tool_use.tool_use_id,
+                                        "name": original_name,
+                                        "input": input
+                                    }));
+                                }
                             }
-                        }
-                        Event::ContextUsage(context_usage) => {
-                            // 从上下文使用百分比计算实际的 input_tokens
-                            let window_size = get_context_window_size(model);
-                            let actual_input_tokens = (context_usage.context_usage_percentage
-                                * (window_size as f64)
-                                / 100.0)
-                                as i32;
-                            context_input_tokens = Some(actual_input_tokens);
-                            // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
-                            if context_usage.context_usage_percentage >= 100.0 {
-                                stop_reason = "model_context_window_exceeded".to_string();
+                            Event::ContextUsage(context_usage) => {
+                                // 从上下文使用百分比计算实际的 input_tokens
+                                let window_size = get_context_window_size(model);
+                                let actual_input_tokens =
+                                    (context_usage.context_usage_percentage * (window_size as f64)
+                                        / 100.0) as i32;
+                                round_context_input_tokens = Some(actual_input_tokens);
+                                // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
+                                if context_usage.context_usage_percentage >= 100.0 {
+                                    stop_reason = "model_context_window_exceeded".to_string();
+                                }
+                                tracing::debug!(
+                                    "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
+                                    context_usage.context_usage_percentage,
+                                    actual_input_tokens
+                                );
                             }
-                            tracing::debug!(
-                                "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
-                                context_usage.context_usage_percentage,
-                                actual_input_tokens
-                            );
-                        }
-                        Event::Exception { exception_type, .. } => {
-                            if exception_type == "ContentLengthExceededException" {
-                                stop_reason = "max_tokens".to_string();
+                            Event::Exception { exception_type, .. } => {
+                                if exception_type == "ContentLengthExceededException" {
+                                    stop_reason = "max_tokens".to_string();
+                                }
                             }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
-            }
-            Err(e) => {
-                tracing::warn!("解码事件失败: {}", e);
+                Err(e) => {
+                    tracing::warn!("解码事件失败: {}", e);
+                }
             }
         }
-    }
 
-    // 确定 stop_reason
-    if has_tool_use && stop_reason == "end_turn" {
-        stop_reason = "tool_use".to_string();
+        if decoder.has_pending_data() {
+            tracing::warn!(
+                pending_bytes = decoder.pending_bytes(),
+                "非流式上游 EventStream 结束时仍有未完整 frame，按 max_tokens 截断处理"
+            );
+            stop_reason = "max_tokens".to_string();
+        }
+
+        if has_tool_use && stop_reason == "end_turn" {
+            stop_reason = "tool_use".to_string();
+        }
+
+        total_input_tokens += super::billing::billable_input_tokens(
+            round_estimated_input_tokens,
+            round_context_input_tokens,
+        );
+
+        if is_continuation_complete_sentinel(&chunk_text_content) {
+            let new_len = text_content.len().saturating_sub(chunk_text_content.len());
+            text_content.truncate(new_len);
+            stop_reason = "end_turn".to_string();
+            break;
+        }
+
+        let output_tokens_estimate = token::count_tokens(&text_content) as i32;
+        if continuation_round < max_continuation_rounds
+            && requested_max_tokens > AUTO_CONTINUE_BASE_CHUNK_TOKENS
+            && (stop_reason == "max_tokens"
+                || (stop_reason == "end_turn"
+                    && looks_like_truncated_long_output(&text_content, output_tokens_estimate)))
+            && !has_tool_use
+            && output_tokens_estimate < requested_max_tokens
+            && !chunk_text_content.trim().is_empty()
+            && !continuation_target_completed(request_body, &text_content)
+        {
+            let continuation_prompt = AUTO_CONTINUE_PROMPT;
+            if let Some(next_request_body) = build_continuation_request_body(
+                &current_request_body,
+                &chunk_text_content,
+                continuation_prompt,
+            ) {
+                continuation_round += 1;
+                tracing::info!(
+                    round = continuation_round,
+                    max_rounds = max_continuation_rounds,
+                    requested_max_tokens = requested_max_tokens,
+                    completion_probe = false,
+                    "非流式上游达到 max_tokens，自动续写"
+                );
+                current_request_body = next_request_body;
+                continue;
+            }
+        }
+
+        break;
     }
 
     // 构建响应内容
@@ -807,11 +1237,13 @@ async fn handle_non_stream_request(
     // 估算输出 tokens
     let output_tokens = token::estimate_output_tokens(&content);
 
-    // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-    let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+    // 多轮自动续写会产生多次上游调用；usage 累计每轮输入。
+    // 短请求使用客户请求估算，避免 Kiro 固定上下文底噪让“你好”显示 4K+ input。
+    let final_input_tokens = total_input_tokens.max(1);
 
     // 根据客户请求意图拆分 usage（带 cache_control → 拆成 I/CR/CC，否则平铺）
-    let usage_breakdown = super::cache::compute_usage_breakdown(final_input_tokens, has_cache_control);
+    let usage_breakdown =
+        super::cache::compute_usage_breakdown(final_input_tokens, has_cache_control);
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -919,7 +1351,7 @@ pub async fn count_tokens(
 ///
 /// Claude Code 兼容端点，与 /v1/messages 的区别在于：
 /// - 流式响应会等待 kiro 端返回 contextUsageEvent 后再发送 message_start
-/// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
+/// - message_start 中的 input_tokens 会应用短输入保护计费策略
 pub async fn post_messages_cc(
     State(state): State<AppState>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
@@ -1029,6 +1461,8 @@ pub async fn post_messages_cc(
         payload.messages,
         payload.tools,
     ) as i32;
+    let billable_estimated_input_tokens =
+        estimate_kiro_request_input_tokens(&request_body, input_tokens);
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -1045,10 +1479,11 @@ pub async fn post_messages_cc(
             provider,
             &request_body,
             &payload.model,
-            input_tokens,
+            billable_estimated_input_tokens,
             thinking_enabled,
             has_cache_control,
             tool_name_map,
+            payload.max_tokens,
         )
         .await
     } else {
@@ -1058,10 +1493,11 @@ pub async fn post_messages_cc(
             provider,
             &request_body,
             &payload.model,
-            input_tokens,
+            billable_estimated_input_tokens,
             extract_thinking,
             has_cache_control,
             tool_name_map,
+            payload.max_tokens,
         )
         .await
     }
@@ -1070,7 +1506,7 @@ pub async fn post_messages_cc(
 /// 处理流式请求（缓冲版本）
 ///
 /// 与 `handle_stream_request` 不同，此函数会缓冲所有事件直到流结束，
-/// 然后用从 contextUsageEvent 计算的正确 input_tokens 生成 message_start 事件。
+/// 然后用计费策略修正后的 input_tokens 生成 message_start 事件。
 async fn handle_stream_request_buffered(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -1079,6 +1515,7 @@ async fn handle_stream_request_buffered(
     thinking_enabled: bool,
     has_cache_control: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    requested_max_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -1096,7 +1533,13 @@ async fn handle_stream_request_buffered(
     );
 
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx);
+    let stream = create_buffered_sse_stream(
+        response,
+        ctx,
+        provider,
+        request_body.to_string(),
+        requested_max_tokens,
+    );
 
     // 返回 SSE 响应
     Response::builder()
@@ -1113,13 +1556,18 @@ async fn handle_stream_request_buffered(
 /// 工作流程：
 /// 1. 等待上游流完成，期间只发送 ping 保活信号
 /// 2. 使用 StreamContext 的事件处理逻辑处理所有 Kiro 事件，结果缓存
-/// 3. 流结束后，用正确的 input_tokens 更正 message_start 事件
+/// 3. 流结束后，用计费策略修正后的 input_tokens 更正 message_start 事件
 /// 4. 一次性发送所有事件
 fn create_buffered_sse_stream(
     response: reqwest::Response,
     ctx: BufferedStreamContext,
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    request_body: String,
+    requested_max_tokens: i32,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
+    let requested_max_tokens = effective_auto_continue_max_tokens(requested_max_tokens);
+    let max_continuation_rounds = auto_continue_round_limit(requested_max_tokens);
 
     stream::unfold(
         (
@@ -1128,8 +1576,22 @@ fn create_buffered_sse_stream(
             EventStreamDecoder::new(),
             false,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            provider,
+            request_body,
+            0usize,
+            max_continuation_rounds,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        move |(
+            mut body_stream,
+            mut ctx,
+            mut decoder,
+            finished,
+            mut ping_interval,
+            provider,
+            request_body,
+            continuation_round,
+            max_continuation_rounds,
+        )| async move {
             if finished {
                 return None;
             }
@@ -1144,7 +1606,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)));
                     }
 
                     // 然后处理数据流
@@ -1179,16 +1641,80 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)));
                             }
                             None => {
+                                if decoder.has_pending_data() {
+                                    tracing::warn!(
+                                        pending_bytes = decoder.pending_bytes(),
+                                        "缓冲模式上游 EventStream 结束时仍有未完整 frame，按 max_tokens 截断处理"
+                                    );
+                                    ctx.mark_upstream_truncated();
+                                }
+                                if continuation_round < max_continuation_rounds
+                                    && (ctx.should_auto_continue(requested_max_tokens)
+                                        || ctx.should_probe_auto_continue(requested_max_tokens))
+                                    && !continuation_target_completed(
+                                        &request_body,
+                                        ctx.assistant_raw_content(),
+                                    )
+                                {
+                                    let assistant_content =
+                                        ctx.take_assistant_raw_content_for_continuation();
+                                    let continuation_prompt = AUTO_CONTINUE_PROMPT;
+                                    if let Some(next_request_body) =
+                                        build_continuation_request_body(
+                                            &request_body,
+                                            &assistant_content,
+                                            continuation_prompt,
+                                        )
+                                    {
+                                        let next_estimated_input_tokens =
+                                            estimate_kiro_request_input_tokens(
+                                                &next_request_body,
+                                                1,
+                                            );
+                                        ctx.begin_continuation_for_billing(
+                                            next_estimated_input_tokens,
+                                        );
+                                        match provider.call_api_stream(&next_request_body).await {
+                                            Ok(next_response) => {
+                                                tracing::info!(
+                                                    round = continuation_round + 1,
+                                                    max_rounds = max_continuation_rounds,
+                                                    requested_max_tokens = requested_max_tokens,
+                                                    completion_probe = false,
+                                                    "缓冲模式上游达到 max_tokens，自动续写"
+                                                );
+                                                let next_body_stream = next_response.bytes_stream();
+                                                return Some((
+                                                    stream::iter(Vec::<Result<Bytes, Infallible>>::new()),
+                                                    (
+                                                        next_body_stream,
+                                                        ctx,
+                                                        EventStreamDecoder::new(),
+                                                        false,
+                                                        ping_interval,
+                                                        provider,
+                                                        next_request_body,
+                                                        continuation_round + 1,
+                                                        max_continuation_rounds,
+                                                    ),
+                                                ));
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("缓冲模式自动续写请求失败: {}", e);
+                                            }
+                                        }
+                                    }
+                                }
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)));
                             }
                         }
                     }
@@ -1298,8 +1824,14 @@ mod tests {
         // enabled 模式不触发自动覆写
         let thinking = req.thinking.as_ref().unwrap();
         assert_eq!(thinking.thinking_type, "enabled");
-        assert_eq!(thinking.budget_tokens, 5000, "客户的 budget_tokens 必须保留");
-        assert!(req.output_config.is_none(), "enabled 模式不应被注入 output_config");
+        assert_eq!(
+            thinking.budget_tokens, 5000,
+            "客户的 budget_tokens 必须保留"
+        );
+        assert!(
+            req.output_config.is_none(),
+            "enabled 模式不应被注入 output_config"
+        );
     }
 
     #[test]
@@ -1364,10 +1896,17 @@ mod tests {
         // 跑 convert_request 拿到注入的前缀
         let result = crate::anthropic::converter::convert_request(&req).unwrap();
         let kiro_json = serde_json::to_value(&result.conversation_state).unwrap();
-        let history = kiro_json.pointer("/history").and_then(|v| v.as_array()).unwrap();
-        let first_user_content = history.iter().find_map(|m| {
-            m.pointer("/userInputMessage/content").and_then(|v| v.as_str())
-        }).unwrap_or("");
+        let history = kiro_json
+            .pointer("/history")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        let first_user_content = history
+            .iter()
+            .find_map(|m| {
+                m.pointer("/userInputMessage/content")
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("");
 
         // enabled 模式的前缀是 <max_thinking_length>，不依赖 effort
         assert!(
@@ -1403,7 +1942,10 @@ mod tests {
         let mut req = parse("claude-sonnet-4-6", serde_json::json!({}));
         override_thinking_from_model_name(&mut req);
         assert!(req.thinking.is_none(), "不传 thinking 时不应被注入");
-        assert!(req.output_config.is_none(), "不传 thinking 时不应被注入 output_config");
+        assert!(
+            req.output_config.is_none(),
+            "不传 thinking 时不应被注入 output_config"
+        );
     }
 
     /// 端到端：用客户实际下发的 xueding_aws_req.json 体走全链路
@@ -1443,12 +1985,16 @@ mod tests {
         assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
 
         // 步骤 3: thinking_enabled 判定
-        let thinking_enabled = req.thinking.as_ref().map(|t| t.is_enabled()).unwrap_or(false);
+        let thinking_enabled = req
+            .thinking
+            .as_ref()
+            .map(|t| t.is_enabled())
+            .unwrap_or(false);
         assert!(thinking_enabled, "adaptive 类型必须被识别为已启用 thinking");
 
         // 步骤 4: convert_request 全流程
-        let result = crate::anthropic::converter::convert_request(&req)
-            .expect("convert_request 必须成功");
+        let result =
+            crate::anthropic::converter::convert_request(&req).expect("convert_request 必须成功");
 
         // 序列化 Kiro 请求体校验关键字段
         let kiro_json = serde_json::to_value(&result.conversation_state)
@@ -1465,11 +2011,17 @@ mod tests {
         );
 
         // thinking 前缀注入：history 第一条 user 消息含 adaptive + effort=high
-        let history = kiro_json.pointer("/history").and_then(|v| v.as_array())
+        let history = kiro_json
+            .pointer("/history")
+            .and_then(|v| v.as_array())
             .expect("history 必须存在");
-        let first_user_content = history.iter().find_map(|m| {
-            m.pointer("/userInputMessage/content").and_then(|v| v.as_str())
-        }).expect("history 必须包含至少一条 user 消息");
+        let first_user_content = history
+            .iter()
+            .find_map(|m| {
+                m.pointer("/userInputMessage/content")
+                    .and_then(|v| v.as_str())
+            })
+            .expect("history 必须包含至少一条 user 消息");
 
         assert!(
             first_user_content.contains("<thinking_mode>adaptive</thinking_mode>"),
@@ -1484,7 +2036,10 @@ mod tests {
         // 步骤 5: 响应回写 model 字段验证（这一层在 handle_non_stream_request 内部）
         // 通过代码审查确认：handlers.rs:334/886 调用时传的是 &payload.model 原始值
         // 因此响应中的 model 字段会原样回写 "claude-opus-4-7"，对客户透明
-        assert_eq!(req.model, "claude-opus-4-7", "请求体中的 model 字段保持不变");
+        assert_eq!(
+            req.model, "claude-opus-4-7",
+            "请求体中的 model 字段保持不变"
+        );
     }
 
     /// 历史 thinking 块带 signature 字段时反序列化必须成功，不被丢弃
@@ -1497,10 +2052,13 @@ mod tests {
             "thinking": "Let me reason about this problem...",
             "signature": "Et0EClkIDRgCKkCmVcOauBOD_FAKE_FROM_PRIOR_TURN"
         });
-        let block: ContentBlock = serde_json::from_value(raw)
-            .expect("含 signature 的 thinking 块必须能被解析");
+        let block: ContentBlock =
+            serde_json::from_value(raw).expect("含 signature 的 thinking 块必须能被解析");
         assert_eq!(block.block_type, "thinking");
-        assert_eq!(block.thinking.as_deref(), Some("Let me reason about this problem..."));
+        assert_eq!(
+            block.thinking.as_deref(),
+            Some("Let me reason about this problem...")
+        );
         assert_eq!(
             block.signature.as_deref(),
             Some("Et0EClkIDRgCKkCmVcOauBOD_FAKE_FROM_PRIOR_TURN"),
@@ -1549,5 +2107,181 @@ mod tests {
             kiro_json.contains("17*20") || kiro_json.contains("340 + 51"),
             "上一轮 thinking 内容必须被传给 Kiro，便于模型理解上下文"
         );
+    }
+
+    #[test]
+    fn auto_continue_round_limit_is_model_chunk_based_and_capped() {
+        assert_eq!(auto_continue_round_limit(8192), 0);
+        assert_eq!(auto_continue_round_limit(8193), 2);
+        assert_eq!(auto_continue_round_limit(32000), 7);
+        assert_eq!(auto_continue_round_limit(200000), AUTO_CONTINUE_MAX_ROUNDS);
+        assert_eq!(effective_auto_continue_max_tokens(4096), 26000);
+    }
+
+    #[test]
+    fn build_continuation_request_body_moves_current_turn_to_history() {
+        let request_body = serde_json::json!({
+            "conversationState": {
+                "conversationId": "conv-continue",
+                "currentMessage": {
+                    "userInputMessage": {
+                        "content": "Write a long report",
+                        "modelId": "claude-sonnet-4.6",
+                        "origin": "AI_EDITOR",
+                        "userInputMessageContext": {}
+                    }
+                },
+                "history": []
+            },
+            "profileArn": "arn:test"
+        })
+        .to_string();
+
+        let next_body =
+            build_continuation_request_body(&request_body, "partial answer", AUTO_CONTINUE_PROMPT)
+                .expect("continuation body should be built");
+        let next: KiroRequest =
+            serde_json::from_str(&next_body).expect("continuation body should deserialize");
+
+        assert_eq!(next.profile_arn.as_deref(), Some("arn:test"));
+        assert_eq!(next.conversation_state.history.len(), 2);
+        assert_eq!(
+            next.conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            AUTO_CONTINUE_PROMPT
+        );
+        assert_eq!(
+            next.conversation_state
+                .current_message
+                .user_input_message
+                .model_id,
+            "claude-sonnet-4.6"
+        );
+
+        match &next.conversation_state.history[0] {
+            Message::User(message) => {
+                assert_eq!(message.user_input_message.content, "Write a long report");
+            }
+            Message::Assistant(_) => panic!("first continuation history entry should be user"),
+        }
+        match &next.conversation_state.history[1] {
+            Message::Assistant(message) => {
+                assert_eq!(message.assistant_response_message.content, "partial answer");
+            }
+            Message::User(_) => panic!("second continuation history entry should be assistant"),
+        }
+    }
+
+    #[test]
+    fn estimate_kiro_request_input_tokens_counts_continuation_history() {
+        let request_body = serde_json::json!({
+            "conversationState": {
+                "conversationId": "conv-billing",
+                "history": [
+                    {
+                        "userInputMessage": {
+                            "content": "请写长文",
+                            "modelId": "claude-sonnet-4.6",
+                            "userInputMessageContext": {}
+                        }
+                    },
+                    {
+                        "assistantResponseMessage": {
+                            "content": "partial answer ".repeat(200)
+                        }
+                    }
+                ],
+                "currentMessage": {
+                    "userInputMessage": {
+                        "content": AUTO_CONTINUE_PROMPT,
+                        "modelId": "claude-sonnet-4.6",
+                        "userInputMessageContext": {}
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let estimated = estimate_kiro_request_input_tokens(&request_body, 1);
+        assert!(
+            estimated > token::count_tokens(AUTO_CONTINUE_PROMPT) as i32,
+            "continuation billing estimate must include prior user and assistant history"
+        );
+    }
+
+    #[test]
+    fn looks_like_truncated_long_output_uses_terminal_punctuation() {
+        assert!(looks_like_truncated_long_output(
+            &format!("{}3046\n3", "x".repeat(AUTO_CONTINUE_MIN_SUSPECT_CHARS)),
+            1
+        ));
+        assert!(looks_like_truncated_long_output(
+            "通过以上十二个章节的系统性设计",
+            AUTO_CONTINUE_MIN_SUSPECT_OUTPUT_TOKENS
+        ));
+        assert!(!looks_like_truncated_long_output("partial sentence", 1));
+        assert!(!looks_like_truncated_long_output(
+            "complete sentence.",
+            10_000
+        ));
+        assert!(!looks_like_truncated_long_output("完整句子。", 10_000));
+    }
+
+    #[test]
+    fn numeric_range_request_completed_detects_target_line() {
+        let request_body = serde_json::json!({
+            "conversationState": {
+                "currentMessage": {
+                    "userInputMessage": {
+                        "content": "请严格按行输出从 1 到 7000 的数字",
+                        "modelId": "claude-sonnet-4.6",
+                        "userInputMessageContext": {}
+                    }
+                },
+                "history": []
+            }
+        })
+        .to_string();
+
+        assert!(numeric_range_request_completed(
+            &request_body,
+            "6998\n6999\n7000\n"
+        ));
+        assert!(!numeric_range_request_completed(
+            &request_body,
+            "6998\n6999\n7"
+        ));
+    }
+
+    #[test]
+    fn explicit_end_marker_completed_stops_after_requested_marker() {
+        let request_body = serde_json::json!({
+            "conversationState": {
+                "currentMessage": {
+                    "userInputMessage": {
+                        "content": "最后一行必须是 KRS_REALISTIC_DOC_END",
+                        "modelId": "claude-sonnet-4.6",
+                        "userInputMessageContext": {}
+                    }
+                },
+                "history": []
+            }
+        })
+        .to_string();
+
+        assert!(explicit_end_marker_completed(
+            &request_body,
+            "正文\nKRS_REALISTIC_DOC_END"
+        ));
+        assert!(explicit_end_marker_completed(
+            &request_body,
+            "正文\n// KRS_REALISTIC_DOC_END"
+        ));
+        assert!(!explicit_end_marker_completed(
+            &request_body,
+            "正文\nKRS_REALISTIC_DOC_END but extra text"
+        ));
     }
 }

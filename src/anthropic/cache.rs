@@ -223,7 +223,13 @@ mod tests {
                 + 0.1 * b.cache_read_input_tokens as f64
                 + 1.25 * b.cache_creation_input_tokens as f64;
             let diff = (cost - t as f64).abs();
-            assert!(diff <= 2.0, "成本恒等偏差过大 T={} cost={} diff={}", t, cost, diff);
+            assert!(
+                diff <= 2.0,
+                "成本恒等偏差过大 T={} cost={} diff={}",
+                t,
+                cost,
+                diff
+            );
         }
     }
 

@@ -9,6 +9,93 @@ use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
 
+const AUTO_CONTINUE_COMPLETE_SENTINEL: &str = "__KRS_CONTINUATION_COMPLETE__";
+const AUTO_CONTINUE_MIN_SUSPECT_CHARS: usize = 12_000;
+const AUTO_CONTINUE_MIN_SUSPECT_OUTPUT_TOKENS: i32 = 3_000;
+
+fn looks_like_truncated_long_output(content: &str, output_tokens: i32) -> bool {
+    let trimmed = content.trim_end();
+    if trimmed.is_empty()
+        || (trimmed.len() < AUTO_CONTINUE_MIN_SUSPECT_CHARS
+            && output_tokens < AUTO_CONTINUE_MIN_SUSPECT_OUTPUT_TOKENS)
+    {
+        return false;
+    }
+
+    let terminal_chars = [
+        '.', '。', '!', '！', '?', '？', ';', '；', ':', '：', ')', '）', ']', '】', '}', '"',
+        '\'', '`', '”', '’',
+    ];
+    match trimmed.chars().last() {
+        Some(last) => !terminal_chars.contains(&last),
+        None => false,
+    }
+}
+
+pub fn merge_continuation_text(previous: &str, incoming: &str) -> String {
+    if previous.is_empty() || incoming.is_empty() {
+        return incoming.to_string();
+    }
+
+    let max_overlap = previous.len().min(incoming.len()).min(4096);
+    for overlap in (1..=max_overlap).rev() {
+        let previous_start = previous.len() - overlap;
+        if previous.is_char_boundary(previous_start)
+            && incoming.is_char_boundary(overlap)
+            && previous[previous_start..] == incoming[..overlap]
+        {
+            return incoming[overlap..].to_string();
+        }
+    }
+
+    if needs_numeric_line_separator(previous, incoming) {
+        return format!("\n{incoming}");
+    }
+
+    incoming.to_string()
+}
+
+fn needs_numeric_line_separator(previous: &str, incoming: &str) -> bool {
+    let previous_trimmed = previous.trim_end_matches([' ', '\t']);
+    if previous_trimmed.ends_with('\n') || previous_trimmed.ends_with('\r') {
+        return false;
+    }
+
+    let previous_line = previous_trimmed
+        .rsplit_once(['\n', '\r'])
+        .map(|(_, line)| line.trim())
+        .unwrap_or_else(|| previous_trimmed.trim());
+    if previous_line.is_empty() || !previous_line.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+
+    let incoming_first = incoming.trim_start_matches([' ', '\t']);
+    let incoming_digits: String = incoming_first
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if incoming_digits.is_empty() {
+        return false;
+    }
+
+    match (previous_line.parse::<u64>(), incoming_digits.parse::<u64>()) {
+        (Ok(prev), Ok(next)) => next == prev + 1,
+        _ => false,
+    }
+}
+
+fn content_tail(content: &str, max_bytes: usize) -> String {
+    if content.len() <= max_bytes {
+        return content.to_string();
+    }
+
+    let mut start = content.len() - max_bytes;
+    while start < content.len() && !content.is_char_boundary(start) {
+        start += 1;
+    }
+    content[start..].to_string()
+}
+
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
 /// UTF-8字符可能占用1-4个字节，直接按字节位置切片可能会切在多字节字符中间导致panic。
@@ -189,27 +276,21 @@ pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>
     let after_open = &text[start_pos + "<thinking>".len()..];
 
     // 查找结束标签：优先匹配带 \n\n 后缀的，退而使用末尾匹配
-    let (thinking_raw, text_after) =
-        if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
-            (
-                &after_open[..end_pos],
-                &after_open[end_pos + "</thinking>\n\n".len()..],
-            )
-        } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
-            let after_tag = end_pos + "</thinking>".len();
-            (
-                &after_open[..end_pos],
-                after_open[after_tag..].trim_start(),
-            )
-        } else {
-            // 找不到有效的结束标签，不做提取
-            return (None, text.to_string());
-        };
+    let (thinking_raw, text_after) = if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
+        (
+            &after_open[..end_pos],
+            &after_open[end_pos + "</thinking>\n\n".len()..],
+        )
+    } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
+        let after_tag = end_pos + "</thinking>".len();
+        (&after_open[..end_pos], after_open[after_tag..].trim_start())
+    } else {
+        // 找不到有效的结束标签，不做提取
+        return (None, text.to_string());
+    };
 
     // 剥离开头的换行符（与流式处理一致：模型输出 <thinking>\n）
-    let thinking_content = thinking_raw
-        .strip_prefix('\n')
-        .unwrap_or(thinking_raw);
+    let thinking_content = thinking_raw.strip_prefix('\n').unwrap_or(thinking_raw);
 
     // 组装剩余文本：跳过纯空白的 before 部分
     let mut remaining = String::new();
@@ -329,6 +410,14 @@ impl SseStateManager {
     /// 记录工具调用
     pub fn set_has_tool_use(&mut self, has: bool) {
         self.has_tool_use = has;
+    }
+
+    pub fn has_tool_use(&self) -> bool {
+        self.has_tool_use
+    }
+
+    pub fn clear_stop_reason(&mut self) {
+        self.stop_reason = None;
     }
 
     /// 设置 stop_reason
@@ -523,8 +612,12 @@ pub struct StreamContext {
     pub input_tokens: i32,
     /// 从 contextUsageEvent 计算的实际输入 tokens
     pub context_input_tokens: Option<i32>,
+    /// 自动续写已经完成的上游调用输入 tokens 累计
+    pub accumulated_input_tokens: i32,
     /// 输出 tokens 累计
     pub output_tokens: i32,
+    /// 已收到的上游助手原始文本，用于 max_tokens 截断后的续写上下文
+    pub assistant_raw_content: String,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -546,6 +639,12 @@ pub struct StreamContext {
     strip_thinking_leading_newline: bool,
     /// 客户请求是否包含 cache_control（用于 usage 字段拆分策略）
     pub has_cache_control: bool,
+    /// 疑似截断探测续写时吞掉完成哨兵，避免把内部控制文本发给客户端
+    swallow_complete_sentinel_probe: bool,
+    /// 探测完成哨兵可能被上游拆成多个 chunk，需要短暂缓冲确认
+    complete_sentinel_probe_buffer: String,
+    /// 上一轮结尾文本，用于清理续写开头重复的尾巴
+    continuation_merge_tail: Option<String>,
 }
 
 impl StreamContext {
@@ -563,7 +662,9 @@ impl StreamContext {
             message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             input_tokens,
             context_input_tokens: None,
+            accumulated_input_tokens: 0,
             output_tokens: 0,
+            assistant_raw_content: String::new(),
             tool_block_indices: HashMap::new(),
             tool_name_map,
             thinking_enabled,
@@ -574,12 +675,16 @@ impl StreamContext {
             text_block_index: None,
             strip_thinking_leading_newline: false,
             has_cache_control,
+            swallow_complete_sentinel_probe: false,
+            complete_sentinel_probe_buffer: String::new(),
+            continuation_merge_tail: None,
         }
     }
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
-        let breakdown = super::cache::compute_usage_breakdown(self.input_tokens, self.has_cache_control);
+        let breakdown =
+            super::cache::compute_usage_breakdown(self.input_tokens, self.has_cache_control);
         json!({
             "type": "message_start",
             "message": {
@@ -647,9 +752,8 @@ impl StreamContext {
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
                 let window_size = get_context_window_size(&self.model);
-                let actual_input_tokens = (context_usage.context_usage_percentage
-                    * (window_size as f64)
-                    / 100.0) as i32;
+                let actual_input_tokens =
+                    (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
                 self.context_input_tokens = Some(actual_input_tokens);
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                 if context_usage.context_usage_percentage >= 100.0 {
@@ -691,6 +795,18 @@ impl StreamContext {
             return Vec::new();
         }
 
+        if let Some(events) = self.process_completion_probe_content(content) {
+            return events;
+        }
+
+        let merged_content = self.merge_continuation_boundary(content);
+        if merged_content.is_empty() {
+            return Vec::new();
+        }
+        let content = merged_content.as_str();
+
+        self.assistant_raw_content.push_str(content);
+
         // 估算 tokens
         self.output_tokens += estimate_tokens(content);
 
@@ -702,6 +818,36 @@ impl StreamContext {
         // 非 thinking 模式同样复用统一的 text_delta 发送逻辑，
         // 以便在 tool_use 自动关闭文本块后能够自愈重建新的文本块，避免“吞字”。
         self.create_text_delta_events(content)
+    }
+
+    fn merge_continuation_boundary(&mut self, content: &str) -> String {
+        match self.continuation_merge_tail.take() {
+            Some(previous_tail) => merge_continuation_text(&previous_tail, content),
+            None => content.to_string(),
+        }
+    }
+
+    fn process_completion_probe_content(&mut self, content: &str) -> Option<Vec<SseEvent>> {
+        if !self.swallow_complete_sentinel_probe {
+            return None;
+        }
+
+        self.complete_sentinel_probe_buffer.push_str(content);
+        let trimmed = self.complete_sentinel_probe_buffer.trim();
+
+        if trimmed == AUTO_CONTINUE_COMPLETE_SENTINEL {
+            self.swallow_complete_sentinel_probe = false;
+            self.complete_sentinel_probe_buffer.clear();
+            return Some(Vec::new());
+        }
+
+        if trimmed.is_empty() || AUTO_CONTINUE_COMPLETE_SENTINEL.starts_with(trimmed) {
+            return Some(Vec::new());
+        }
+
+        self.swallow_complete_sentinel_probe = false;
+        let buffered = std::mem::take(&mut self.complete_sentinel_probe_buffer);
+        Some(self.process_assistant_response(&buffered))
     }
 
     /// 处理包含thinking块的内容
@@ -1140,8 +1286,10 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(" "));
         }
 
-        // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-        let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
+        // 自动续写会产生多次上游调用；最终 usage 需要包含所有内部调用的输入。
+        // 短请求使用客户请求估算，避免 Kiro 固定上下文底噪让“你好”显示 4K+ input。
+        let final_input_tokens = self.accumulated_input_tokens
+            + super::billing::billable_input_tokens(self.input_tokens, self.context_input_tokens);
         // 按客户请求意图拆分 usage
         let breakdown =
             super::cache::compute_usage_breakdown(final_input_tokens, self.has_cache_control);
@@ -1152,6 +1300,54 @@ impl StreamContext {
                 .generate_final_events(breakdown, self.output_tokens),
         );
         events
+    }
+
+    /// 当前响应是否适合自动续写。
+    ///
+    /// 只在纯文本/思考输出因 max_tokens 停止时续写；工具调用中续写可能重复执行工具，
+    /// 因此显式禁用。
+    pub fn should_auto_continue(&self, requested_max_tokens: i32) -> bool {
+        requested_max_tokens > 8192
+            && self.state_manager.get_stop_reason() == "max_tokens"
+            && !self.state_manager.has_tool_use()
+            && !self.assistant_raw_content.trim().is_empty()
+            && self.output_tokens < requested_max_tokens
+    }
+
+    pub fn should_probe_auto_continue(&self, requested_max_tokens: i32) -> bool {
+        requested_max_tokens > 8192
+            && self.state_manager.get_stop_reason() == "end_turn"
+            && !self.state_manager.has_tool_use()
+            && self.output_tokens < requested_max_tokens
+            && looks_like_truncated_long_output(&self.assistant_raw_content, self.output_tokens)
+    }
+
+    pub fn take_assistant_raw_content_for_continuation(&mut self) -> String {
+        self.state_manager.clear_stop_reason();
+        let content = std::mem::take(&mut self.assistant_raw_content);
+        self.continuation_merge_tail = Some(content_tail(&content, 4096));
+        content
+    }
+
+    pub fn assistant_raw_content(&self) -> &str {
+        &self.assistant_raw_content
+    }
+
+    pub fn begin_continuation_for_billing(&mut self, next_estimated_input_tokens: i32) {
+        self.accumulated_input_tokens +=
+            super::billing::billable_input_tokens(self.input_tokens, self.context_input_tokens);
+        self.input_tokens = next_estimated_input_tokens.max(1);
+        self.context_input_tokens = None;
+    }
+
+    #[allow(dead_code)]
+    pub fn begin_completion_probe_for_billing(&mut self, next_estimated_input_tokens: i32) {
+        self.begin_continuation_for_billing(next_estimated_input_tokens);
+        self.swallow_complete_sentinel_probe = true;
+    }
+
+    pub fn mark_upstream_truncated(&mut self) {
+        self.state_manager.set_stop_reason("max_tokens");
     }
 }
 
@@ -1170,8 +1366,6 @@ pub struct BufferedStreamContext {
     inner: StreamContext,
     /// 缓冲的所有事件（包括 message_start、content_block_start 等）
     event_buffer: Vec<SseEvent>,
-    /// 估算的 input_tokens（用于回退）
-    estimated_input_tokens: i32,
     /// 是否已经生成了初始事件
     initial_events_generated: bool,
 }
@@ -1195,7 +1389,6 @@ impl BufferedStreamContext {
         Self {
             inner,
             event_buffer: Vec::new(),
-            estimated_input_tokens,
             initial_events_generated: false,
         }
     }
@@ -1234,15 +1427,14 @@ impl BufferedStreamContext {
         let final_events = self.inner.generate_final_events();
         self.event_buffer.extend(final_events);
 
-        // 获取正确的 input_tokens 并按 has_cache_control 拆分
-        let final_input_tokens = self
-            .inner
-            .context_input_tokens
-            .unwrap_or(self.estimated_input_tokens);
-        let breakdown = super::cache::compute_usage_breakdown(
-            final_input_tokens,
-            self.inner.has_cache_control,
-        );
+        // 获取 billable input_tokens 并按 has_cache_control 拆分；自动续写时包含所有内部上游调用。
+        let final_input_tokens = self.inner.accumulated_input_tokens
+            + super::billing::billable_input_tokens(
+                self.inner.input_tokens,
+                self.inner.context_input_tokens,
+            );
+        let breakdown =
+            super::cache::compute_usage_breakdown(final_input_tokens, self.inner.has_cache_control);
 
         // 更正 message_start 事件中的 usage（input + cache 字段全部按拆分后回填）
         for event in &mut self.event_buffer {
@@ -1260,6 +1452,37 @@ impl BufferedStreamContext {
         }
 
         std::mem::take(&mut self.event_buffer)
+    }
+
+    pub fn should_auto_continue(&self, requested_max_tokens: i32) -> bool {
+        self.inner.should_auto_continue(requested_max_tokens)
+    }
+
+    pub fn should_probe_auto_continue(&self, requested_max_tokens: i32) -> bool {
+        self.inner.should_probe_auto_continue(requested_max_tokens)
+    }
+
+    pub fn take_assistant_raw_content_for_continuation(&mut self) -> String {
+        self.inner.take_assistant_raw_content_for_continuation()
+    }
+
+    pub fn assistant_raw_content(&self) -> &str {
+        self.inner.assistant_raw_content()
+    }
+
+    pub fn begin_continuation_for_billing(&mut self, next_estimated_input_tokens: i32) {
+        self.inner
+            .begin_continuation_for_billing(next_estimated_input_tokens);
+    }
+
+    #[allow(dead_code)]
+    pub fn begin_completion_probe_for_billing(&mut self, next_estimated_input_tokens: i32) {
+        self.inner
+            .begin_completion_probe_for_billing(next_estimated_input_tokens);
+    }
+
+    pub fn mark_upstream_truncated(&mut self) {
+        self.inner.mark_upstream_truncated();
     }
 }
 
@@ -1337,7 +1560,10 @@ mod tests {
         use crate::kiro::model::events::ToolUseEvent;
 
         let mut map = HashMap::new();
-        map.insert("short_abc12345".to_string(), "mcp__very_long_original_tool_name".to_string());
+        map.insert(
+            "short_abc12345".to_string(),
+            "mcp__very_long_original_tool_name".to_string(),
+        );
 
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, false, map);
         let _ = ctx.generate_initial_events();
@@ -1353,17 +1579,20 @@ mod tests {
         let events = ctx.process_kiro_event(&tool_event);
 
         // content_block_start 中的 name 应该是原始长名称
-        let start_event = events.iter().find(|e| e.event == "content_block_start").unwrap();
+        let start_event = events
+            .iter()
+            .find(|e| e.event == "content_block_start")
+            .unwrap();
         assert_eq!(
-            start_event.data["content_block"]["name"],
-            "mcp__very_long_original_tool_name",
+            start_event.data["content_block"]["name"], "mcp__very_long_original_tool_name",
             "应还原为原始工具名称"
         );
     }
 
     #[test]
     fn test_text_delta_after_tool_use_restarts_text_block() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, false, HashMap::new());
 
         let initial_events = ctx.generate_initial_events();
         assert!(
@@ -1424,7 +1653,8 @@ mod tests {
     fn test_tool_use_flushes_pending_thinking_buffer_text_before_tool_block() {
         // thinking 模式下，短文本可能被暂存在 thinking_buffer 以等待 `<thinking>` 的跨 chunk 匹配。
         // 当紧接着出现 tool_use 时，应先 flush 这段文本，再开始 tool_use block。
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         // 两段短文本（各 2 个中文字符），总长度仍可能不足以满足 safe_len>0 的输出条件，
@@ -1541,19 +1771,20 @@ mod tests {
     /// 并在 content_block_stop 之前发出 signature_delta 事件。
     #[test]
     fn thinking_stream_emits_signature_start_and_delta() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
         let _initial = ctx.generate_initial_events();
 
         // 模拟一个完整的 thinking 块
         let mut all_events: Vec<SseEvent> = Vec::new();
         all_events.extend(ctx.process_assistant_response("<thinking>"));
-        all_events.extend(ctx.process_assistant_response("Step by step reasoning here.</thinking>\n\n"));
+        all_events
+            .extend(ctx.process_assistant_response("Step by step reasoning here.</thinking>\n\n"));
         all_events.extend(ctx.process_assistant_response("Final answer is 42."));
 
         // 1) content_block_start 必须含 signature: ""
         let thinking_start = all_events.iter().find(|e| {
-            e.event == "content_block_start"
-                && e.data["content_block"]["type"] == "thinking"
+            e.event == "content_block_start" && e.data["content_block"]["type"] == "thinking"
         });
         let start = thinking_start.expect("应有 thinking content_block_start 事件");
         assert_eq!(
@@ -1579,7 +1810,9 @@ mod tests {
         // 3) 顺序：signature_delta 必须在对应的 content_block_stop 之前
         let pos_signature = all_events
             .iter()
-            .position(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta")
+            .position(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
+            })
             .expect("signature_delta 必须存在");
         let thinking_idx = sig.data["index"].as_i64().expect("delta 必须有 index");
         let pos_stop = all_events
@@ -1597,7 +1830,8 @@ mod tests {
     /// generate_final_events 兜底关闭路径也必须发 signature_delta
     #[test]
     fn thinking_stream_final_events_path_emits_signature() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
         let _initial = ctx.generate_initial_events();
 
         // 进入 thinking 块但故意不闭合（不带 </thinking>），让 generate_final_events 兜底
@@ -1746,7 +1980,8 @@ mod tests {
 
     #[test]
     fn test_tool_use_immediately_after_thinking_filters_end_tag_and_closes_thinking_block() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -1798,7 +2033,8 @@ mod tests {
 
     #[test]
     fn test_final_flush_filters_standalone_thinking_end_tag() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -1818,7 +2054,8 @@ mod tests {
     #[test]
     fn test_thinking_strips_leading_newline_same_chunk() {
         // <thinking>\n 在同一个 chunk 中，\n 应被剥离
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>\nHello world");
@@ -1847,7 +2084,8 @@ mod tests {
     #[test]
     fn test_thinking_strips_leading_newline_cross_chunk() {
         // <thinking> 在第一个 chunk 末尾，\n 在第二个 chunk 开头
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let events1 = ctx.process_assistant_response("<thinking>");
@@ -1879,7 +2117,8 @@ mod tests {
     #[test]
     fn test_thinking_no_strip_when_no_leading_newline() {
         // <thinking> 后直接跟内容（无 \n），内容应完整保留
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>abc</thinking>\n\ntext");
@@ -1893,7 +2132,12 @@ mod tests {
 
         let full_thinking: String = thinking_deltas
             .iter()
-            .filter(|e| !e.data["delta"]["thinking"].as_str().unwrap_or("").is_empty())
+            .filter(|e| {
+                !e.data["delta"]["thinking"]
+                    .as_str()
+                    .unwrap_or("")
+                    .is_empty()
+            })
             .map(|e| e.data["delta"]["thinking"].as_str().unwrap_or(""))
             .collect();
 
@@ -1903,17 +2147,15 @@ mod tests {
     #[test]
     fn test_text_after_thinking_strips_leading_newlines() {
         // `</thinking>\n\n` 后的文本不应以 \n\n 开头
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
-        let events =
-            ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
+        let events = ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
 
         let text_deltas: Vec<_> = events
             .iter()
-            .filter(|e| {
-                e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
-            })
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
             .collect();
 
         let full_text: String = text_deltas
@@ -1945,18 +2187,148 @@ mod tests {
     fn collect_text_content(events: &[SseEvent]) -> String {
         events
             .iter()
-            .filter(|e| {
-                e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
-            })
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
             .map(|e| e.data["delta"]["text"].as_str().unwrap_or(""))
             .collect()
+    }
+
+    #[test]
+    fn merge_continuation_text_removes_repeated_tail() {
+        assert_eq!(
+            merge_continuation_text("3061\n3062\n3063", "3063\n3064\n3065"),
+            "\n3064\n3065"
+        );
+    }
+
+    #[test]
+    fn merge_continuation_text_inserts_numeric_line_separator() {
+        assert_eq!(
+            merge_continuation_text("5792\n5793", "5794\n5795"),
+            "\n5794\n5795"
+        );
+    }
+
+    #[test]
+    fn merge_continuation_text_leaves_regular_text_alone() {
+        assert_eq!(
+            merge_continuation_text("hello world", " and more"),
+            " and more"
+        );
+    }
+
+    #[test]
+    fn auto_continue_probe_requires_long_unfinished_text() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 10, false, false, HashMap::new());
+        ctx.process_assistant_response("short unfinished");
+        assert!(
+            !ctx.should_probe_auto_continue(26000),
+            "short answers must not trigger speculative continuation"
+        );
+
+        let mut long_ctx =
+            StreamContext::new_with_thinking("test-model", 10, false, false, HashMap::new());
+        long_ctx.process_assistant_response(&format!("{}3046\n3", "x".repeat(12_000)));
+        assert!(
+            long_ctx.should_probe_auto_continue(26000),
+            "long non-terminal output should be probed"
+        );
+
+        long_ctx.state_manager.set_has_tool_use(true);
+        assert!(
+            !long_ctx.should_probe_auto_continue(26000),
+            "tool-use responses must not be auto-continued"
+        );
+    }
+
+    #[test]
+    fn completion_probe_sentinel_is_swallowed_and_billed() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 2000, false, false, HashMap::new());
+        ctx.context_input_tokens = Some(5000);
+        ctx.begin_completion_probe_for_billing(7000);
+
+        let sentinel_events = ctx.process_assistant_response("__KRS_CONTINUATION_COMPLETE__");
+        assert_eq!(
+            collect_text_content(&sentinel_events),
+            "",
+            "internal completion sentinel must not be sent to the client"
+        );
+
+        let final_events = ctx.generate_final_events();
+        let message_delta = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("message_delta should be emitted");
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 12_000);
+        assert_eq!(message_delta.data["usage"]["output_tokens"], 0);
+    }
+
+    #[test]
+    fn completion_probe_sentinel_split_across_chunks_is_swallowed() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 2000, false, false, HashMap::new());
+        ctx.begin_completion_probe_for_billing(7000);
+
+        let mut events = Vec::new();
+        events.extend(ctx.process_assistant_response("__KRS_"));
+        events.extend(ctx.process_assistant_response("CONTINUATION_"));
+        events.extend(ctx.process_assistant_response("COMPLETE__"));
+
+        assert_eq!(
+            collect_text_content(&events),
+            "",
+            "split internal sentinel must not leak to streamed clients"
+        );
+        assert_eq!(ctx.output_tokens, 0);
+    }
+
+    #[test]
+    fn completion_probe_releases_real_continuation_when_prefix_diverges() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 2000, false, false, HashMap::new());
+        ctx.begin_completion_probe_for_billing(7000);
+
+        let mut events = Vec::new();
+        events.extend(ctx.process_assistant_response("__KRS_"));
+        events.extend(ctx.process_assistant_response("but this is real text"));
+
+        assert_eq!(
+            collect_text_content(&events),
+            "__KRS_but this is real text",
+            "non-sentinel content that shares a prefix must still be delivered"
+        );
+        assert!(ctx.output_tokens > 0);
+    }
+
+    #[test]
+    fn continuation_billing_accumulates_each_round_input() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 2000, false, false, HashMap::new());
+        ctx.context_input_tokens = Some(5000);
+        ctx.begin_continuation_for_billing(7000);
+        ctx.process_assistant_response("continued text");
+
+        let final_events = ctx.generate_final_events();
+        let message_delta = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("message_delta should be emitted");
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 12_000);
+        assert!(
+            message_delta.data["usage"]["output_tokens"]
+                .as_i64()
+                .unwrap()
+                > 0
+        );
     }
 
     #[test]
     fn test_end_tag_newlines_split_across_events() {
         // `</thinking>\n` 在 chunk 1，`\n` 在 chunk 2，`text` 在 chunk 3
         // 确保 `</thinking>` 不会被部分当作 thinking 内容发出
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1966,7 +2338,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "你好", "text should be '你好', got: {:?}", text);
@@ -1975,7 +2351,8 @@ mod tests {
     #[test]
     fn test_end_tag_alone_in_chunk_then_newlines_in_next() {
         // `</thinking>` 单独在一个 chunk，`\n\ntext` 在下一个 chunk
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1984,7 +2361,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "你好", "text should be '你好', got: {:?}", text);
@@ -1993,7 +2374,8 @@ mod tests {
     #[test]
     fn test_start_tag_newline_split_across_events() {
         // `\n\n` 在 chunk 1，`<thinking>` 在 chunk 2，`\n` 在 chunk 3
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -2004,7 +2386,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "abc",
+            "thinking should be 'abc', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "text", "text should be 'text', got: {:?}", text);
@@ -2013,7 +2399,8 @@ mod tests {
     #[test]
     fn test_full_flow_maximally_split() {
         // 极端拆分：每个关键边界都在不同 chunk
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -2033,7 +2420,11 @@ mod tests {
         all.extend(ctx.generate_final_events());
 
         let thinking = collect_thinking_content(&all);
-        assert_eq!(thinking, "hello", "thinking should be 'hello', got: {:?}", thinking);
+        assert_eq!(
+            thinking, "hello",
+            "thinking should be 'hello', got: {:?}",
+            thinking
+        );
 
         let text = collect_text_content(&all);
         assert_eq!(text, "world", "text should be 'world', got: {:?}", text);
@@ -2042,7 +2433,8 @@ mod tests {
     #[test]
     fn test_thinking_only_sets_max_tokens_stop_reason() {
         // 整个流只有 thinking 块，没有 text 也没有 tool_use，stop_reason 应为 max_tokens
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -2097,7 +2489,8 @@ mod tests {
     #[test]
     fn test_thinking_with_text_keeps_end_turn_stop_reason() {
         // thinking + text 的情况，stop_reason 应为 end_turn
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -2118,17 +2511,20 @@ mod tests {
     #[test]
     fn test_thinking_with_tool_use_keeps_tool_use_stop_reason() {
         // thinking + tool_use 的情况，stop_reason 应为 tool_use
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
-        all_events.extend(ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
-            name: "test_tool".to_string(),
-            tool_use_id: "tool_1".to_string(),
-            input: "{}".to_string(),
-            stop: true,
-        }));
+        all_events.extend(
+            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "test_tool".to_string(),
+                tool_use_id: "tool_1".to_string(),
+                input: "{}".to_string(),
+                stop: true,
+            }),
+        );
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events
