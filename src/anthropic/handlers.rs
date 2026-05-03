@@ -913,12 +913,14 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
                         }
                         None => {
+                            let mut continuation_reason = "unknown";
                             if decoder.has_pending_data() {
                                 tracing::warn!(
                                     pending_bytes = decoder.pending_bytes(),
                                     "上游 EventStream 结束时仍有未完整 frame，按 max_tokens 截断处理"
                                 );
                                 ctx.mark_upstream_truncated();
+                                continuation_reason = "pending_frame";
                             }
                             if continuation_round < max_continuation_rounds
                                 && (ctx.should_auto_continue(requested_max_tokens)
@@ -928,6 +930,14 @@ fn create_sse_stream(
                                     ctx.assistant_raw_content(),
                                 )
                             {
+                                if continuation_reason == "unknown" {
+                                    continuation_reason =
+                                        if ctx.should_auto_continue(requested_max_tokens) {
+                                            "max_tokens"
+                                        } else {
+                                            "suspect_end_turn"
+                                        };
+                                }
                                 let assistant_content =
                                     ctx.take_assistant_raw_content_for_continuation();
                                 let continuation_prompt = AUTO_CONTINUE_PROMPT;
@@ -945,8 +955,9 @@ fn create_sse_stream(
                                                 round = continuation_round + 1,
                                                 max_rounds = max_continuation_rounds,
                                                 requested_max_tokens = requested_max_tokens,
+                                                reason = continuation_reason,
                                                 completion_probe = false,
-                                                "上游达到 max_tokens，自动续写"
+                                                "上游自动续写"
                                             );
                                             let next_body_stream = next_response.bytes_stream();
                                             return Some((
@@ -1146,12 +1157,18 @@ async fn handle_non_stream_request(
             }
         }
 
+        let mut continuation_reason = if stop_reason == "max_tokens" {
+            "max_tokens"
+        } else {
+            "unknown"
+        };
         if decoder.has_pending_data() {
             tracing::warn!(
                 pending_bytes = decoder.pending_bytes(),
                 "非流式上游 EventStream 结束时仍有未完整 frame，按 max_tokens 截断处理"
             );
             stop_reason = "max_tokens".to_string();
+            continuation_reason = "pending_frame";
         }
 
         if has_tool_use && stop_reason == "end_turn" {
@@ -1192,8 +1209,13 @@ async fn handle_non_stream_request(
                     round = continuation_round,
                     max_rounds = max_continuation_rounds,
                     requested_max_tokens = requested_max_tokens,
+                    reason = if continuation_reason == "unknown" {
+                        "suspect_end_turn"
+                    } else {
+                        continuation_reason
+                    },
                     completion_probe = false,
-                    "非流式上游达到 max_tokens，自动续写"
+                    "非流式上游自动续写"
                 );
                 current_request_body = next_request_body;
                 continue;
@@ -1644,12 +1666,14 @@ fn create_buffered_sse_stream(
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)));
                             }
                             None => {
+                                let mut continuation_reason = "unknown";
                                 if decoder.has_pending_data() {
                                     tracing::warn!(
                                         pending_bytes = decoder.pending_bytes(),
                                         "缓冲模式上游 EventStream 结束时仍有未完整 frame，按 max_tokens 截断处理"
                                     );
                                     ctx.mark_upstream_truncated();
+                                    continuation_reason = "pending_frame";
                                 }
                                 if continuation_round < max_continuation_rounds
                                     && (ctx.should_auto_continue(requested_max_tokens)
@@ -1659,6 +1683,14 @@ fn create_buffered_sse_stream(
                                         ctx.assistant_raw_content(),
                                     )
                                 {
+                                    if continuation_reason == "unknown" {
+                                        continuation_reason =
+                                            if ctx.should_auto_continue(requested_max_tokens) {
+                                                "max_tokens"
+                                            } else {
+                                                "suspect_end_turn"
+                                            };
+                                    }
                                     let assistant_content =
                                         ctx.take_assistant_raw_content_for_continuation();
                                     let continuation_prompt = AUTO_CONTINUE_PROMPT;
@@ -1683,8 +1715,9 @@ fn create_buffered_sse_stream(
                                                     round = continuation_round + 1,
                                                     max_rounds = max_continuation_rounds,
                                                     requested_max_tokens = requested_max_tokens,
+                                                    reason = continuation_reason,
                                                     completion_probe = false,
-                                                    "缓冲模式上游达到 max_tokens，自动续写"
+                                                    "缓冲模式上游自动续写"
                                                 );
                                                 let next_body_stream = next_response.bytes_stream();
                                                 return Some((
