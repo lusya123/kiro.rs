@@ -42,8 +42,6 @@ const REMOTE_IMAGE_FETCH_TIMEOUT_SECS: u64 = 30;
 const AUTO_CONTINUE_BASE_CHUNK_TOKENS: i32 = 8192;
 const AUTO_CONTINUE_ESTIMATED_CHUNK_TOKENS: i32 = 4096;
 const AUTO_CONTINUE_MAX_ROUNDS: usize = 8;
-const AUTO_CONTINUE_MIN_SUSPECT_CHARS: usize = 12_000;
-const AUTO_CONTINUE_MIN_SUSPECT_OUTPUT_TOKENS: i32 = 3_000;
 const DEFAULT_MODEL_MAX_OUTPUT_TOKENS: i32 = 26000;
 const AUTO_CONTINUE_PROMPT: &str = "Continue exactly from where your previous response stopped. Do not repeat any previous text or the last line. If the previous response ended after a numbered, list, or code line, start with the following line and include any required newline. Stop immediately when the original request is complete. Do not add summaries, comments, prefaces, or confirmations.";
 const AUTO_CONTINUE_COMPLETE_SENTINEL: &str = "__KRS_CONTINUATION_COMPLETE__";
@@ -60,25 +58,6 @@ fn auto_continue_round_limit(requested_max_tokens: i32) -> usize {
 
 fn effective_auto_continue_max_tokens(requested_max_tokens: i32) -> i32 {
     requested_max_tokens.max(DEFAULT_MODEL_MAX_OUTPUT_TOKENS)
-}
-
-fn looks_like_truncated_long_output(content: &str, output_tokens: i32) -> bool {
-    let trimmed = content.trim_end();
-    if trimmed.is_empty()
-        || (trimmed.len() < AUTO_CONTINUE_MIN_SUSPECT_CHARS
-            && output_tokens < AUTO_CONTINUE_MIN_SUSPECT_OUTPUT_TOKENS)
-    {
-        return false;
-    }
-
-    let terminal_chars = [
-        '.', '。', '!', '！', '?', '？', ';', '；', ':', '：', ')', '）', ']', '】', '}', '"',
-        '\'', '`', '”', '’',
-    ];
-    match trimmed.chars().last() {
-        Some(last) => !terminal_chars.contains(&last),
-        None => false,
-    }
 }
 
 fn numeric_range_request_completed(request_body: &str, content: &str) -> bool {
@@ -923,20 +902,14 @@ fn create_sse_stream(
                                 continuation_reason = "pending_frame";
                             }
                             if continuation_round < max_continuation_rounds
-                                && (ctx.should_auto_continue(requested_max_tokens)
-                                    || ctx.should_probe_auto_continue(requested_max_tokens))
+                                && ctx.should_auto_continue(requested_max_tokens)
                                 && !continuation_target_completed(
                                     &request_body,
                                     ctx.assistant_raw_content(),
                                 )
                             {
                                 if continuation_reason == "unknown" {
-                                    continuation_reason =
-                                        if ctx.should_auto_continue(requested_max_tokens) {
-                                            "max_tokens"
-                                        } else {
-                                            "suspect_end_turn"
-                                        };
+                                    continuation_reason = "max_tokens";
                                 }
                                 let assistant_content =
                                     ctx.take_assistant_raw_content_for_continuation();
@@ -1190,9 +1163,7 @@ async fn handle_non_stream_request(
         let output_tokens_estimate = token::count_tokens(&text_content) as i32;
         if continuation_round < max_continuation_rounds
             && requested_max_tokens > AUTO_CONTINUE_BASE_CHUNK_TOKENS
-            && (stop_reason == "max_tokens"
-                || (stop_reason == "end_turn"
-                    && looks_like_truncated_long_output(&text_content, output_tokens_estimate)))
+            && stop_reason == "max_tokens"
             && !has_tool_use
             && output_tokens_estimate < requested_max_tokens
             && !chunk_text_content.trim().is_empty()
@@ -1210,7 +1181,7 @@ async fn handle_non_stream_request(
                     max_rounds = max_continuation_rounds,
                     requested_max_tokens = requested_max_tokens,
                     reason = if continuation_reason == "unknown" {
-                        "suspect_end_turn"
+                        "max_tokens"
                     } else {
                         continuation_reason
                     },
@@ -1676,20 +1647,14 @@ fn create_buffered_sse_stream(
                                     continuation_reason = "pending_frame";
                                 }
                                 if continuation_round < max_continuation_rounds
-                                    && (ctx.should_auto_continue(requested_max_tokens)
-                                        || ctx.should_probe_auto_continue(requested_max_tokens))
+                                    && ctx.should_auto_continue(requested_max_tokens)
                                     && !continuation_target_completed(
                                         &request_body,
                                         ctx.assistant_raw_content(),
                                     )
                                 {
                                     if continuation_reason == "unknown" {
-                                        continuation_reason =
-                                            if ctx.should_auto_continue(requested_max_tokens) {
-                                                "max_tokens"
-                                            } else {
-                                                "suspect_end_turn"
-                                            };
+                                        continuation_reason = "max_tokens";
                                     }
                                     let assistant_content =
                                         ctx.take_assistant_raw_content_for_continuation();
@@ -2242,24 +2207,6 @@ mod tests {
             estimated > token::count_tokens(AUTO_CONTINUE_PROMPT) as i32,
             "continuation billing estimate must include prior user and assistant history"
         );
-    }
-
-    #[test]
-    fn looks_like_truncated_long_output_uses_terminal_punctuation() {
-        assert!(looks_like_truncated_long_output(
-            &format!("{}3046\n3", "x".repeat(AUTO_CONTINUE_MIN_SUSPECT_CHARS)),
-            1
-        ));
-        assert!(looks_like_truncated_long_output(
-            "通过以上十二个章节的系统性设计",
-            AUTO_CONTINUE_MIN_SUSPECT_OUTPUT_TOKENS
-        ));
-        assert!(!looks_like_truncated_long_output("partial sentence", 1));
-        assert!(!looks_like_truncated_long_output(
-            "complete sentence.",
-            10_000
-        ));
-        assert!(!looks_like_truncated_long_output("完整句子。", 10_000));
     }
 
     #[test]

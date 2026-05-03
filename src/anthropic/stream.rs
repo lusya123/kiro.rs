@@ -10,27 +10,6 @@ use uuid::Uuid;
 use crate::kiro::model::events::Event;
 
 const AUTO_CONTINUE_COMPLETE_SENTINEL: &str = "__KRS_CONTINUATION_COMPLETE__";
-const AUTO_CONTINUE_MIN_SUSPECT_CHARS: usize = 12_000;
-const AUTO_CONTINUE_MIN_SUSPECT_OUTPUT_TOKENS: i32 = 3_000;
-
-fn looks_like_truncated_long_output(content: &str, output_tokens: i32) -> bool {
-    let trimmed = content.trim_end();
-    if trimmed.is_empty()
-        || (trimmed.len() < AUTO_CONTINUE_MIN_SUSPECT_CHARS
-            && output_tokens < AUTO_CONTINUE_MIN_SUSPECT_OUTPUT_TOKENS)
-    {
-        return false;
-    }
-
-    let terminal_chars = [
-        '.', '。', '!', '！', '?', '？', ';', '；', ':', '：', ')', '）', ']', '】', '}', '"',
-        '\'', '`', '”', '’',
-    ];
-    match trimmed.chars().last() {
-        Some(last) => !terminal_chars.contains(&last),
-        None => false,
-    }
-}
 
 pub fn merge_continuation_text(previous: &str, incoming: &str) -> String {
     if previous.is_empty() || incoming.is_empty() {
@@ -1314,12 +1293,10 @@ impl StreamContext {
             && self.output_tokens < requested_max_tokens
     }
 
+    #[cfg(test)]
     pub fn should_probe_auto_continue(&self, requested_max_tokens: i32) -> bool {
-        requested_max_tokens > 8192
-            && self.state_manager.get_stop_reason() == "end_turn"
-            && !self.state_manager.has_tool_use()
-            && self.output_tokens < requested_max_tokens
-            && looks_like_truncated_long_output(&self.assistant_raw_content, self.output_tokens)
+        let _ = requested_max_tokens;
+        false
     }
 
     pub fn take_assistant_raw_content_for_continuation(&mut self) -> String {
@@ -1456,10 +1433,6 @@ impl BufferedStreamContext {
 
     pub fn should_auto_continue(&self, requested_max_tokens: i32) -> bool {
         self.inner.should_auto_continue(requested_max_tokens)
-    }
-
-    pub fn should_probe_auto_continue(&self, requested_max_tokens: i32) -> bool {
-        self.inner.should_probe_auto_continue(requested_max_tokens)
     }
 
     pub fn take_assistant_raw_content_for_continuation(&mut self) -> String {
@@ -2217,7 +2190,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_continue_probe_requires_long_unfinished_text() {
+    fn suspect_end_turn_auto_continue_is_disabled() {
         let mut ctx =
             StreamContext::new_with_thinking("test-model", 10, false, false, HashMap::new());
         ctx.process_assistant_response("short unfinished");
@@ -2230,8 +2203,8 @@ mod tests {
             StreamContext::new_with_thinking("test-model", 10, false, false, HashMap::new());
         long_ctx.process_assistant_response(&format!("{}3046\n3", "x".repeat(12_000)));
         assert!(
-            long_ctx.should_probe_auto_continue(26000),
-            "long non-terminal output should be probed"
+            !long_ctx.should_probe_auto_continue(26000),
+            "suspect end_turn continuation is disabled to avoid over-billing"
         );
 
         long_ctx.state_manager.set_has_tool_use(true);
