@@ -692,7 +692,6 @@ pub async fn post_messages(
 
     // 检测客户是否启用了 prompt caching（决定 usage 字段是否拆分成 cache_*）
     let has_cache_control = super::cache::request_has_cache_control(&payload);
-
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -723,6 +722,7 @@ pub async fn post_messages(
             has_cache_control,
             tool_name_map,
             payload.max_tokens,
+            true,
         )
         .await
     } else {
@@ -737,6 +737,7 @@ pub async fn post_messages(
             has_cache_control,
             tool_name_map,
             payload.max_tokens,
+            true,
         )
         .await
     }
@@ -752,6 +753,7 @@ async fn handle_stream_request(
     has_cache_control: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     requested_max_tokens: i32,
+    identity_sanitization: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -767,6 +769,9 @@ async fn handle_stream_request(
         has_cache_control,
         tool_name_map,
     );
+    if identity_sanitization {
+        ctx.enable_identity_sanitization();
+    }
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -990,6 +995,7 @@ async fn handle_non_stream_request(
     has_cache_control: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     requested_max_tokens: i32,
+    identity_sanitization: bool,
 ) -> Response {
     let mut text_content = String::new();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
@@ -1212,16 +1218,27 @@ async fn handle_non_stream_request(
             }));
         }
 
-        if !remaining_text.is_empty() {
+        let visible_text = if identity_sanitization {
+            super::identity::sanitize_identity_text(&remaining_text)
+        } else {
+            remaining_text
+        };
+
+        if !visible_text.is_empty() {
             content.push(json!({
                 "type": "text",
-                "text": remaining_text
+                "text": visible_text
             }));
         }
     } else if !text_content.is_empty() {
+        let visible_text = if identity_sanitization {
+            super::identity::sanitize_identity_text(&text_content)
+        } else {
+            text_content
+        };
         content.push(json!({
             "type": "text",
-            "text": text_content
+            "text": visible_text
         }));
     }
 
@@ -1446,7 +1463,6 @@ pub async fn post_messages_cc(
 
     // 检测客户是否启用了 prompt caching（决定 usage 字段是否拆分）
     let has_cache_control = super::cache::request_has_cache_control(&payload);
-
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -1477,6 +1493,7 @@ pub async fn post_messages_cc(
             has_cache_control,
             tool_name_map,
             payload.max_tokens,
+            true,
         )
         .await
     } else {
@@ -1491,6 +1508,7 @@ pub async fn post_messages_cc(
             has_cache_control,
             tool_name_map,
             payload.max_tokens,
+            true,
         )
         .await
     }
@@ -1509,6 +1527,7 @@ async fn handle_stream_request_buffered(
     has_cache_control: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     requested_max_tokens: i32,
+    identity_sanitization: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -1517,13 +1536,16 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(
+    let mut ctx = BufferedStreamContext::new(
         model,
         estimated_input_tokens,
         thinking_enabled,
         has_cache_control,
         tool_name_map,
     );
+    if identity_sanitization {
+        ctx.enable_identity_sanitization();
+    }
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(

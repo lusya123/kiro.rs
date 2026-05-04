@@ -624,6 +624,8 @@ pub struct StreamContext {
     complete_sentinel_probe_buffer: String,
     /// 上一轮结尾文本，用于清理续写开头重复的尾巴
     continuation_merge_tail: Option<String>,
+    /// 输出侧规整可见文本中的上游产品自称；规则会跳过代码并保留普通 Kiro 技术提及。
+    identity_sanitizer: Option<super::identity::IdentityOutputSanitizer>,
 }
 
 impl StreamContext {
@@ -657,7 +659,13 @@ impl StreamContext {
             swallow_complete_sentinel_probe: false,
             complete_sentinel_probe_buffer: String::new(),
             continuation_merge_tail: None,
+            identity_sanitizer: None,
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn enable_identity_sanitization(&mut self) {
+        self.identity_sanitizer = Some(super::identity::IdentityOutputSanitizer::new());
     }
 
     /// 生成 message_start 事件
@@ -982,6 +990,18 @@ impl StreamContext {
     ///
     /// 返回值包含可能的 content_block_start 事件和 content_block_delta 事件。
     fn create_text_delta_events(&mut self, text: &str) -> Vec<SseEvent> {
+        if let Some(sanitizer) = self.identity_sanitizer.as_mut() {
+            let sanitized = sanitizer.push(text);
+            if sanitized.is_empty() {
+                return Vec::new();
+            }
+            return self.emit_text_delta_events(&sanitized);
+        }
+
+        self.emit_text_delta_events(text)
+    }
+
+    fn emit_text_delta_events(&mut self, text: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
         // 如果当前 text_block_index 指向的块已经被关闭（例如 tool_use 开始时自动 stop），
@@ -1254,6 +1274,13 @@ impl StreamContext {
             self.thinking_buffer.clear();
         }
 
+        if let Some(sanitizer) = self.identity_sanitizer.as_mut() {
+            let remaining = sanitizer.finish();
+            if !remaining.is_empty() {
+                events.extend(self.emit_text_delta_events(&remaining));
+            }
+        }
+
         // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
         // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
         // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
@@ -1262,7 +1289,7 @@ impl StreamContext {
             && !self.state_manager.has_non_thinking_blocks()
         {
             self.state_manager.set_stop_reason("max_tokens");
-            events.extend(self.create_text_delta_events(" "));
+            events.extend(self.emit_text_delta_events(" "));
         }
 
         // 自动续写会产生多次上游调用；最终 usage 需要包含所有内部调用的输入。
@@ -1446,6 +1473,11 @@ impl BufferedStreamContext {
     pub fn begin_continuation_for_billing(&mut self, next_estimated_input_tokens: i32) {
         self.inner
             .begin_continuation_for_billing(next_estimated_input_tokens);
+    }
+
+    #[allow(dead_code)]
+    pub fn enable_identity_sanitization(&mut self) {
+        self.inner.enable_identity_sanitization();
     }
 
     #[allow(dead_code)]
@@ -2166,6 +2198,26 @@ mod tests {
     }
 
     #[test]
+    fn identity_sanitizer_applies_to_stream_text_deltas() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4-6", 10, false, false, HashMap::new());
+        ctx.enable_identity_sanitization();
+
+        let mut all_events = Vec::new();
+        let response_event = serde_json::from_value(serde_json::json!({
+            "content": "I'm Kiro, an AI-powered development environment."
+        }))
+        .expect("assistant response event");
+        all_events.extend(ctx.process_kiro_event(&Event::AssistantResponse(response_event)));
+        all_events.extend(ctx.generate_final_events());
+
+        assert_eq!(
+            collect_text_content(&all_events),
+            "I'm Claude, an Anthropic-created AI assistant."
+        );
+    }
+
+    #[test]
     fn merge_continuation_text_removes_repeated_tail() {
         assert_eq!(
             merge_continuation_text("3061\n3062\n3063", "3063\n3064\n3065"),
@@ -2456,6 +2508,27 @@ mod tests {
                     && e.data["index"].as_i64() == Some(text_block_index)
             }),
             "text block should be stopped"
+        );
+    }
+
+    #[test]
+    fn test_thinking_only_with_identity_sanitizer_emits_fallback_text() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, true, false, HashMap::new());
+        ctx.enable_identity_sanitization();
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
+        all_events.extend(ctx.generate_final_events());
+
+        assert!(
+            all_events.iter().any(|e| {
+                e.event == "content_block_delta"
+                    && e.data["delta"]["type"] == "text_delta"
+                    && e.data["delta"]["text"] == " "
+            }),
+            "identity sanitizer must not buffer away thinking-only fallback text"
         );
     }
 
