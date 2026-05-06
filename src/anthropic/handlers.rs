@@ -26,9 +26,9 @@ use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use serde_json::json;
 use std::time::Duration;
 use tokio::time::interval;
-use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
+use super::id;
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
@@ -1257,7 +1257,7 @@ async fn handle_non_stream_request(
 
     // 构建 Anthropic 响应
     let response_body = json!({
-        "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+        "id": id::message_id(),
         "type": "message",
         "role": "assistant",
         "content": content,

@@ -13,8 +13,8 @@ use bytes::Bytes;
 use futures::{Stream, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use uuid::Uuid;
 
+use super::id;
 use super::stream::SseEvent;
 use super::types::{ErrorResponse, MessagesRequest};
 
@@ -181,10 +181,7 @@ pub fn create_mcp_request(query: &str) -> (String, McpRequest) {
     );
 
     // tool_use_id 使用相同格式
-    let tool_use_id = format!(
-        "srvtoolu_{}",
-        Uuid::new_v4().to_string().replace('-', "")[..32].to_string()
-    );
+    let tool_use_id = id::server_tool_use_id();
 
     let request = McpRequest {
         id: request_id,
@@ -240,10 +237,7 @@ fn generate_websearch_events(
     input_tokens: i32,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
-    let message_id = format!(
-        "msg_{}",
-        Uuid::new_v4().to_string().replace('-', "")[..24].to_string()
-    );
+    let message_id = id::message_id();
 
     // 1. message_start
     events.push(SseEvent::new(

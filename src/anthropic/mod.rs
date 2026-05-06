@@ -26,6 +26,7 @@ mod billing;
 mod cache;
 mod converter;
 mod handlers;
+mod id;
 mod identity;
 mod middleware;
 mod router;
