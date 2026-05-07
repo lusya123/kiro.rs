@@ -41,8 +41,12 @@ const CACHE_CREATION_TO_READ_RATIO: f64 = 3.6;
 /// I 不为负的最大 readRatio：1 / (1 + 3.6) ≈ 0.2174
 const MAX_SAFE_READ_RATIO: f64 = 1.0 / (1.0 + CACHE_CREATION_TO_READ_RATIO);
 
-/// 默认 readRatio（与 sub2api virtual_cache 默认值一致）
-const DEFAULT_READ_RATIO: f64 = 0.15;
+/// 默认 readRatio。
+///
+/// 这里控制的是 usage 展示里的虚拟 cache_read 占比；cache_creation 会按
+/// 成本恒等公式联动计算。0.15 会让 creation 约占总输入的 54%，用户观感偏高；
+/// 0.08 时 creation 约占 29%，同时把差额回收到普通 input_tokens，避免少计费。
+const DEFAULT_READ_RATIO: f64 = 0.08;
 
 /// Usage 拆分结果（满足 token 数恒等 + 成本恒等）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,12 +202,12 @@ mod tests {
     #[test]
     fn split_when_has_cache_control() {
         let b = compute_usage_breakdown(2990, true);
-        // CR = floor(2990 × 0.15) = 448
-        // CC = floor(3.6 × 448) = 1612
-        // I = 2990 - 448 - 1612 = 930
-        assert_eq!(b.cache_read_input_tokens, 448);
-        assert_eq!(b.cache_creation_input_tokens, 1612);
-        assert_eq!(b.input_tokens, 930);
+        // CR = floor(2990 × 0.08) = 239
+        // CC = floor(3.6 × 239) = 860
+        // I = 2990 - 239 - 860 = 1891
+        assert_eq!(b.cache_read_input_tokens, 239);
+        assert_eq!(b.cache_creation_input_tokens, 860);
+        assert_eq!(b.input_tokens, 1891);
     }
 
     #[test]
