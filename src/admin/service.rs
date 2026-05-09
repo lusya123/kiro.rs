@@ -10,11 +10,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::tls_sidecar::SidecarManager;
 
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
     CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    SidecarConfigDto, SidecarConfigUpdateRequest, SidecarConfigUpdateResponse, SidecarStatusDto,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -38,12 +40,20 @@ pub struct AdminService {
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
+    /// TLS Sidecar 管理器（None 表示 sidecar 未启用）
+    sidecar_manager: Option<Arc<SidecarManager>>,
+    /// config.json 路径（写回 sidecar 配置时用）
+    config_path: Option<PathBuf>,
+    /// 串行化 sidecar 配置写入：避免并发 PUT 的 read-modify-write 竞争
+    sidecar_write_lock: Mutex<()>,
 }
 
 impl AdminService {
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
         known_endpoints: impl IntoIterator<Item = String>,
+        sidecar_manager: Option<Arc<SidecarManager>>,
+        config_path: Option<PathBuf>,
     ) -> Self {
         let cache_path = token_manager
             .cache_dir()
@@ -56,6 +66,9 @@ impl AdminService {
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
+            sidecar_manager,
+            config_path,
+            sidecar_write_lock: Mutex::new(()),
         }
     }
 
@@ -305,6 +318,202 @@ impl AdminService {
             .force_refresh_token_for(id)
             .await
             .map_err(|e| self.classify_balance_error(e, id))
+    }
+
+    // ============ TLS Sidecar 管理 ============
+
+    /// 获取 sidecar 实时运行状态
+    pub fn get_sidecar_status(&self) -> SidecarStatusDto {
+        match &self.sidecar_manager {
+            Some(mgr) => SidecarStatusDto {
+                enabled: true,
+                running: mgr.is_running(),
+                port: mgr.port(),
+                binary_path: Some(mgr.binary_path()),
+                upstream_proxy: crate::tls_sidecar::current_upstream_proxy(),
+                last_health_check: mgr.last_health_check().map(|t| t.to_rfc3339()),
+                last_health_ok: mgr.last_health_ok(),
+                total_restarts: mgr.total_restarts(),
+            },
+            None => SidecarStatusDto {
+                enabled: false,
+                running: false,
+                port: 0,
+                binary_path: None,
+                upstream_proxy: None,
+                last_health_check: None,
+                last_health_ok: false,
+                total_restarts: 0,
+            },
+        }
+    }
+
+    /// 获取 config.json 中持久化的 sidecar 配置
+    ///
+    /// 直接读取 config.json，避免使用启动时的快照（admin PUT 后 token_manager.config() 不更新）
+    pub fn get_sidecar_config(&self) -> SidecarConfigDto {
+        // 优先读磁盘上的 config.json，失败则回退到启动快照
+        if let Some(path) = &self.config_path {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+                    let cfg = self.token_manager.config();
+                    return SidecarConfigDto {
+                        enabled: value
+                            .get("tlsSidecarEnabled")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(cfg.tls_sidecar_enabled),
+                        port: value
+                            .get("tlsSidecarPort")
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n as u16)
+                            .unwrap_or(cfg.tls_sidecar_port),
+                        binary_path: value
+                            .get("tlsSidecarBinaryPath")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        upstream_proxy: value
+                            .get("tlsSidecarProxyUrl")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                    };
+                }
+            }
+        }
+        let cfg = self.token_manager.config();
+        SidecarConfigDto {
+            enabled: cfg.tls_sidecar_enabled,
+            port: cfg.tls_sidecar_port,
+            binary_path: cfg.tls_sidecar_binary_path.clone(),
+            upstream_proxy: cfg.tls_sidecar_proxy_url.clone(),
+        }
+    }
+
+    /// 更新 sidecar 配置
+    ///
+    /// - `tlsSidecarProxyUrl` 改动会立即生效（热更新）
+    /// - 其他字段写回 config.json，但需要重启进程才能生效
+    pub fn update_sidecar_config(
+        &self,
+        req: SidecarConfigUpdateRequest,
+    ) -> Result<SidecarConfigUpdateResponse, AdminServiceError> {
+        // 串行化 read-modify-write，避免并发 PUT 互相覆盖
+        let _write_guard = self.sidecar_write_lock.lock();
+
+        // 端口非零校验（u16 已限制 0-65535，但 0 不可绑定）
+        if let Some(p) = req.port {
+            if p == 0 {
+                return Err(AdminServiceError::InvalidCredential(
+                    "port 必须是 1-65535 之间的整数（0 不可绑定）".to_string(),
+                ));
+            }
+        }
+
+        // 持久化前先取出当前持久值，做 diff 判断哪些字段需要重启
+        let current = self.get_sidecar_config();
+
+        let mut requires_restart = false;
+
+        let new_enabled = req.enabled.unwrap_or(current.enabled);
+        let new_port = req.port.unwrap_or(current.port);
+        let new_binary_path = match &req.binary_path {
+            Some(v) if v.trim().is_empty() => None,
+            Some(v) => Some(v.clone()),
+            None => current.binary_path.clone(),
+        };
+        let new_proxy = match &req.upstream_proxy {
+            Some(v) if v.trim().is_empty() => None,
+            Some(v) => Some(v.clone()),
+            None => current.upstream_proxy.clone(),
+        };
+
+        if new_enabled != current.enabled {
+            requires_restart = true;
+        }
+        if new_port != current.port {
+            requires_restart = true;
+        }
+        if new_binary_path != current.binary_path {
+            requires_restart = true;
+        }
+        // proxy 改动不需要重启
+
+        // 持久化到 config.json
+        self.persist_sidecar_config(new_enabled, new_port, new_binary_path.clone(), new_proxy.clone())?;
+
+        // 热更新 proxy（用 RwLock 里的实时值做 diff 基准，避免与 token_manager 启动快照对比导致漏更新）
+        let live_proxy = crate::tls_sidecar::current_upstream_proxy();
+        if new_proxy != live_proxy {
+            crate::tls_sidecar::set_upstream_proxy(new_proxy.clone());
+            tracing::info!(
+                "TLS Sidecar 上游代理已热更新：{}",
+                new_proxy.as_deref().unwrap_or("(无)")
+            );
+        }
+
+        Ok(SidecarConfigUpdateResponse {
+            success: true,
+            requires_restart,
+            message: if requires_restart {
+                "配置已保存，但 enabled/port/binaryPath 改动需要重启进程才能生效".to_string()
+            } else {
+                "配置已保存并实时生效".to_string()
+            },
+            config: SidecarConfigDto {
+                enabled: new_enabled,
+                port: new_port,
+                binary_path: new_binary_path,
+                upstream_proxy: new_proxy,
+            },
+        })
+    }
+
+    /// 把更新后的 sidecar 字段写回 config.json
+    fn persist_sidecar_config(
+        &self,
+        enabled: bool,
+        port: u16,
+        binary_path: Option<String>,
+        upstream_proxy: Option<String>,
+    ) -> Result<(), AdminServiceError> {
+        let path = self.config_path.as_ref().ok_or_else(|| {
+            AdminServiceError::InternalError("无法定位 config.json 路径，配置无法持久化".to_string())
+        })?;
+
+        // 读 → 改 → 写：用 serde_json::Value 避免破坏未识别字段
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| AdminServiceError::InternalError(format!("读 config.json 失败: {}", e)))?;
+        let mut value: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| AdminServiceError::InternalError(format!("解析 config.json 失败: {}", e)))?;
+
+        let obj = value.as_object_mut().ok_or_else(|| {
+            AdminServiceError::InternalError("config.json 顶层不是对象".to_string())
+        })?;
+
+        obj.insert("tlsSidecarEnabled".to_string(), serde_json::json!(enabled));
+        obj.insert("tlsSidecarPort".to_string(), serde_json::json!(port));
+        match binary_path {
+            Some(p) => {
+                obj.insert("tlsSidecarBinaryPath".to_string(), serde_json::json!(p));
+            }
+            None => {
+                obj.remove("tlsSidecarBinaryPath");
+            }
+        }
+        match upstream_proxy {
+            Some(p) => {
+                obj.insert("tlsSidecarProxyUrl".to_string(), serde_json::json!(p));
+            }
+            None => {
+                obj.remove("tlsSidecarProxyUrl");
+            }
+        }
+
+        let new_content = serde_json::to_string_pretty(&value).map_err(|e| {
+            AdminServiceError::InternalError(format!("序列化 config.json 失败: {}", e))
+        })?;
+        std::fs::write(path, new_content)
+            .map_err(|e| AdminServiceError::InternalError(format!("写 config.json 失败: {}", e)))?;
+        Ok(())
     }
 
     // ============ 余额缓存持久化 ============

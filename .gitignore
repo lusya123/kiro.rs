@@ -12,3 +12,4 @@
 /credentials.*
 /kiro_balance_cache.json
 /kiro_stats.json
+.gstack/

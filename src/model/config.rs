@@ -83,6 +83,24 @@ pub struct Config {
     #[serde(default)]
     pub proxy_password: Option<String>,
 
+    /// 是否启用 TLS Sidecar（Go uTLS 子进程，伪装 Chrome TLS 指纹）
+    /// 默认 true：所有上游 HTTPS 请求经由 sidecar 转发，避免 JA3/JA4 指纹封号
+    #[serde(default = "default_tls_sidecar_enabled")]
+    pub tls_sidecar_enabled: bool,
+
+    /// TLS Sidecar 监听端口（默认 9090）
+    #[serde(default = "default_tls_sidecar_port")]
+    pub tls_sidecar_port: u16,
+
+    /// TLS Sidecar 二进制路径（可选，未配置时按默认路径查找）
+    #[serde(default)]
+    pub tls_sidecar_binary_path: Option<String>,
+
+    /// TLS Sidecar 上游代理（可选，sidecar 与目标服务器之间走的代理）
+    /// 格式: http://host:port, socks5://host:port
+    #[serde(default)]
+    pub tls_sidecar_proxy_url: Option<String>,
+
     /// Admin API 密钥（可选，启用 Admin API 功能）
     #[serde(default)]
     pub admin_api_key: Option<String>,
@@ -151,6 +169,14 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_tls_sidecar_enabled() -> bool {
+    true
+}
+
+fn default_tls_sidecar_port() -> u16 {
+    9090
+}
+
 fn default_extract_thinking() -> bool {
     true
 }
@@ -179,6 +205,10 @@ impl Default for Config {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            tls_sidecar_enabled: default_tls_sidecar_enabled(),
+            tls_sidecar_port: default_tls_sidecar_port(),
+            tls_sidecar_binary_path: None,
+            tls_sidecar_proxy_url: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),

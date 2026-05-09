@@ -196,6 +196,66 @@ pub struct SetLoadBalancingModeRequest {
     pub mode: String,
 }
 
+// ============ TLS Sidecar 管理 ============
+
+/// Sidecar 实时运行状态（来自 SidecarManager）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SidecarStatusDto {
+    /// 是否启用（来自 config.json，启用即有 manager）
+    pub enabled: bool,
+    /// 子进程是否在运行且健康
+    pub running: bool,
+    /// 监听端口（disabled 时为 0）
+    pub port: u16,
+    /// 二进制路径（disabled 时为 None）
+    pub binary_path: Option<String>,
+    /// 当前生效的上游代理 URL（热更新值）
+    pub upstream_proxy: Option<String>,
+    /// 上次健康检查时间（RFC3339）
+    pub last_health_check: Option<String>,
+    /// 上次健康检查结果
+    pub last_health_ok: bool,
+    /// 累计成功重启次数
+    pub total_restarts: u64,
+}
+
+/// Sidecar 持久化配置（来自 config.json）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SidecarConfigDto {
+    pub enabled: bool,
+    pub port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_proxy: Option<String>,
+}
+
+/// 更新 sidecar 配置请求（所有字段可选，不传即不改）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SidecarConfigUpdateRequest {
+    pub enabled: Option<bool>,
+    pub port: Option<u16>,
+    /// 空字符串视为清空（变 None）
+    pub binary_path: Option<String>,
+    /// 空字符串视为清空（变 None）
+    pub upstream_proxy: Option<String>,
+}
+
+/// 更新 sidecar 配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SidecarConfigUpdateResponse {
+    pub success: bool,
+    /// 是否需要重启进程（enabled/port/binaryPath 改动时为 true）
+    pub requires_restart: bool,
+    pub message: String,
+    /// 更新后的完整配置
+    pub config: SidecarConfigDto,
+}
+
 // ============ 通用响应 ============
 
 /// 操作成功响应

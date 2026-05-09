@@ -87,3 +87,37 @@ export interface AddCredentialResponse {
   credentialId: number
   email?: string
 }
+
+// ============ TLS Sidecar ============
+
+export interface SidecarStatus {
+  enabled: boolean
+  running: boolean
+  port: number
+  binaryPath?: string | null
+  upstreamProxy?: string | null
+  lastHealthCheck?: string | null
+  lastHealthOk: boolean
+  totalRestarts: number
+}
+
+export interface SidecarConfig {
+  enabled: boolean
+  port: number
+  binaryPath?: string | null
+  upstreamProxy?: string | null
+}
+
+export interface SidecarConfigUpdateRequest {
+  enabled?: boolean
+  port?: number
+  binaryPath?: string
+  upstreamProxy?: string
+}
+
+export interface SidecarConfigUpdateResponse {
+  success: boolean
+  requiresRestart: boolean
+  message: string
+  config: SidecarConfig
+}

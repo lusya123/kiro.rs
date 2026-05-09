@@ -10,7 +10,7 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        SidecarConfigUpdateRequest, SuccessResponse,
     },
 };
 
@@ -136,6 +136,30 @@ pub async fn set_load_balancing_mode(
     Json(payload): Json<SetLoadBalancingModeRequest>,
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/sidecar/status
+/// 获取 TLS Sidecar 实时运行状态
+pub async fn get_sidecar_status(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_sidecar_status())
+}
+
+/// GET /api/admin/sidecar/config
+/// 获取 TLS Sidecar 持久化配置（来自 config.json）
+pub async fn get_sidecar_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_sidecar_config())
+}
+
+/// PUT /api/admin/sidecar/config
+/// 更新 TLS Sidecar 配置（proxy 热更新；其他字段需重启）
+pub async fn update_sidecar_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SidecarConfigUpdateRequest>,
+) -> impl IntoResponse {
+    match state.service.update_sidecar_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

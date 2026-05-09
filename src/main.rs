@@ -5,6 +5,7 @@ mod common;
 mod http_client;
 mod kiro;
 mod model;
+mod tls_sidecar;
 pub mod token;
 
 use std::collections::HashMap;
@@ -96,6 +97,67 @@ async fn main() {
         tracing::info!("已配置 HTTP 代理: {}", config.proxy_url.as_ref().unwrap());
     }
 
+    // 初始化 TLS Sidecar（伪装 Chrome TLS 指纹，防止上游基于 JA3/JA4 封号）
+    let _sidecar_handle = if config.tls_sidecar_enabled {
+        // 选择 sidecar 上游代理：tlsSidecarProxyUrl > proxyUrl（向后兼容：自动迁移）
+        let sidecar_upstream_proxy = config
+            .tls_sidecar_proxy_url
+            .clone()
+            .or_else(|| config.proxy_url.clone());
+        if config.tls_sidecar_proxy_url.is_none() && config.proxy_url.is_some() {
+            tracing::info!(
+                "未设置 tlsSidecarProxyUrl，已自动沿用 proxyUrl 作为 sidecar 上游代理"
+            );
+        }
+        // 警告：sidecar 启用时，per-credential proxy 不再生效（reqwest 仅与 localhost 通讯）
+        let has_per_credential_proxy = credentials_list.iter().any(|c| c.proxy_url.is_some());
+        if has_per_credential_proxy {
+            tracing::warn!(
+                "检测到凭据级 proxyUrl 配置，但 TLS Sidecar 启用时仅 tlsSidecarProxyUrl 生效，凭据级 proxy 将被忽略"
+            );
+        }
+
+        match tls_sidecar::find_binary(config.tls_sidecar_binary_path.as_deref()) {
+            Some(binary_path) => {
+                let sidecar_config = tls_sidecar::SidecarConfig {
+                    port: config.tls_sidecar_port,
+                    binary_path,
+                };
+                match tls_sidecar::SidecarManager::start(sidecar_config).await {
+                    Ok(handle) => {
+                        tls_sidecar::init_policy(
+                            tls_sidecar::SidecarPolicy::enabled(config.tls_sidecar_port),
+                            sidecar_upstream_proxy,
+                        );
+                        tracing::info!(
+                            "TLS Sidecar 已启用：所有上游 HTTPS 经由 127.0.0.1:{} 转发（Chrome uTLS）",
+                            config.tls_sidecar_port
+                        );
+                        Some(handle)
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "TLS Sidecar 启动失败: {}（默认开启状态下视为致命错误，请检查二进制或在 config.json 中设置 tlsSidecarEnabled=false）",
+                            e
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+            None => {
+                tracing::error!(
+                    "TLS Sidecar 二进制未找到。已搜索: {:?}。请确认镜像构建包含 sidecar，或在 config.json 中设置 tlsSidecarEnabled=false",
+                    tls_sidecar::binary_search_hints()
+                );
+                std::process::exit(1);
+            }
+        }
+    } else {
+        tls_sidecar::init_policy(tls_sidecar::SidecarPolicy::disabled(), None);
+        tracing::warn!("TLS Sidecar 已禁用，上游请求将使用原生 rustls 指纹，存在被识别封号的风险");
+        None
+    };
+
     // 构建端点注册表
     let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
     {
@@ -174,8 +236,12 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
-            let admin_service =
-                admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
+            let admin_service = admin::AdminService::new(
+                token_manager.clone(),
+                endpoint_names.clone(),
+                _sidecar_handle.clone(),
+                Some(std::path::PathBuf::from(&config_path)),
+            );
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 

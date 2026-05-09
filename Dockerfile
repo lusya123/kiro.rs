@@ -1,3 +1,11 @@
+FROM golang:1.22-alpine AS sidecar-builder
+
+WORKDIR /src
+COPY tls-sidecar/go.mod tls-sidecar/go.sum ./
+RUN go mod download
+COPY tls-sidecar/main.go ./
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/tls-sidecar .
+
 FROM node:22-alpine AS frontend-builder
 
 WORKDIR /app/admin-ui
@@ -23,6 +31,7 @@ RUN apk add --no-cache ca-certificates
 
 WORKDIR /app
 COPY --from=builder /app/target/release/kiro-rs /app/kiro-rs
+COPY --from=sidecar-builder /out/tls-sidecar /app/tls-sidecar
 
 VOLUME ["/app/config"]
 

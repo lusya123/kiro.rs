@@ -67,7 +67,19 @@ pub fn build_client(
         }
     }
 
-    if let Some(proxy_config) = proxy {
+    // 当 TLS Sidecar 启用时，所有请求实际上发往 127.0.0.1:9090。
+    // 若仍把 proxy 注入 reqwest，reqwest 会把 localhost 流量也丢给 proxy，连接必然失败。
+    // 此时 reqwest 必须 no_proxy；上游代理走 sidecar 的 X-Proxy-Url 通道（tlsSidecarProxyUrl）。
+    let sidecar_active = crate::tls_sidecar::is_active();
+
+    if sidecar_active {
+        builder = builder.no_proxy();
+        if proxy.is_some() {
+            tracing::debug!(
+                "TLS Sidecar 启用：忽略 reqwest 层 proxy 配置（sidecar 通过 tlsSidecarProxyUrl 转发）"
+            );
+        }
+    } else if let Some(proxy_config) = proxy {
         let mut proxy = Proxy::all(&proxy_config.url)?;
 
         // 设置代理认证

@@ -17,6 +17,7 @@ use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
+use crate::tls_sidecar;
 use parking_lot::Mutex;
 
 /// 每个凭据的最大重试次数
@@ -162,9 +163,8 @@ impl KiroProvider {
             let url = endpoint.mcp_url(&rctx);
             let body = endpoint.transform_mcp_body(request_body, &rctx);
 
-            let base = self
-                .client_for(&ctx.credentials)?
-                .post(&url)
+            let client = self.client_for(&ctx.credentials)?;
+            let base = tls_sidecar::post(&client, &url)
                 .body(body)
                 .header("content-type", "application/json")
                 .header("Connection", "close");
@@ -324,9 +324,8 @@ impl KiroProvider {
             let url = endpoint.api_url(&rctx);
             let body = endpoint.transform_api_body(request_body, &rctx);
 
-            let base = self
-                .client_for(&ctx.credentials)?
-                .post(&url)
+            let client = self.client_for(&ctx.credentials)?;
+            let base = tls_sidecar::post(&client, &url)
                 .body(body)
                 .header("content-type", "application/json")
                 .header("Connection", "close");

@@ -23,6 +23,7 @@ use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
+use crate::tls_sidecar;
 use crate::model::config::Config;
 
 /// 检查 Token 是否在指定时间内过期
@@ -160,8 +161,7 @@ async fn refresh_social_token(
         refresh_token: refresh_token.to_string(),
     };
 
-    let response = client
-        .post(&refresh_url)
+    let response = tls_sidecar::post(&client, &refresh_url)
         .header("Accept", "application/json, text/plain, */*")
         .header("Content-Type", "application/json")
         .header(
@@ -259,8 +259,7 @@ async fn refresh_idc_token(
         grant_type: "refresh_token".to_string(),
     };
 
-    let response = client
-        .post(&refresh_url)
+    let response = tls_sidecar::post(&client, &refresh_url)
         .header("content-type", "application/json")
         .header("x-amz-user-agent", x_amz_user_agent)
         .header("user-agent", &user_agent)
@@ -356,8 +355,7 @@ pub(crate) async fn get_usage_limits(
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
-    let mut request = client
-        .get(&url)
+    let mut request = tls_sidecar::get(&client, &url)
         .header("x-amz-user-agent", &amz_user_agent)
         .header("user-agent", &user_agent)
         .header("host", &host)
