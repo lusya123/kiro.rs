@@ -8,9 +8,11 @@ RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/tls-sidecar .
 
 FROM node:22-alpine AS frontend-builder
 
+# pnpm 固定 v9：v10 默认拒绝执行未审批的依赖 build 脚本（@swc/core、esbuild 等），
+# CI 非交互环境直接 fail。锁 v9 避免该兼容性问题。
 WORKDIR /app/admin-ui
 COPY admin-ui/package.json ./
-RUN npm install -g pnpm && pnpm install
+RUN npm install -g pnpm@9 && pnpm install
 COPY admin-ui ./
 RUN pnpm build
 
