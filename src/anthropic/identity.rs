@@ -950,12 +950,106 @@ fn flush_segment(
         output.push_str(current);
         prior_context
     } else {
-        let (rewritten, ctx) = replace_identity_terms(current, prior_context);
-        output.push_str(&rewritten);
-        ctx
+        if let Some(rewritten) = product_mode_api_response(current, prior_context) {
+            output.push_str(&rewritten);
+            true
+        } else {
+            let (rewritten, ctx) = replace_identity_terms(current, prior_context);
+            output.push_str(&rewritten);
+            ctx
+        }
     };
     current.clear();
     new_ctx
+}
+
+fn product_mode_api_response(text: &str, prior_context: bool) -> Option<String> {
+    if !contains_product_mode_term(text) {
+        return None;
+    }
+
+    let lower = text.to_lowercase();
+    let has_self_context = prior_context || contains_self_reference_marker(text);
+    let trimmed = lower.trim_start();
+    let affirmative_answer = [
+        "yes",
+        "yes,",
+        "yes.",
+        "是的",
+        "是，",
+        "对，",
+        "没错",
+    ]
+    .iter()
+    .any(|marker| trimmed.starts_with(marker));
+    let self_claims_access = [
+        "i have",
+        "i can",
+        "i support",
+        "i offer",
+        "i provide",
+        "mode where i",
+        "workflow where i",
+        "我有",
+        "我可以",
+        "我会",
+        "我支持",
+        "我提供",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+
+    if !(has_self_context || affirmative_answer || self_claims_access) {
+        return None;
+    }
+
+    if contains_cjk(text) {
+        Some("当前 API 不暴露 Spec mode 或 Vibe mode。".to_string())
+    } else {
+        Some("This API does not expose Spec mode or Vibe mode.".to_string())
+    }
+}
+
+fn contains_product_mode_term(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    contains_ascii_phrase_with_boundaries(&lower, "spec mode")
+        || contains_ascii_phrase_with_boundaries(&lower, "vibe mode")
+        || ["spec模式", "vibe模式", "spec 模式", "vibe 模式"]
+            .iter()
+            .any(|term| lower.contains(term))
+}
+
+fn contains_ascii_phrase_with_boundaries(text: &str, phrase: &str) -> bool {
+    let mut search_start = 0;
+    while let Some(relative) = text[search_start..].find(phrase) {
+        let start = search_start + relative;
+        let end = start + phrase.len();
+
+        let before_ok = text[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
+        let after_ok = text[end..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
+
+        if before_ok && after_ok {
+            return true;
+        }
+
+        search_start = end;
+    }
+    false
+}
+
+fn contains_cjk(text: &str) -> bool {
+    text.chars().any(|ch| {
+        matches!(
+            ch,
+            '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '\u{F900}'..='\u{FAFF}'
+        )
+    })
 }
 
 fn replace_identity_terms(text: &str, prior_context: bool) -> (String, bool) {
@@ -1330,6 +1424,40 @@ mod tests {
     }
 
     #[test]
+    fn sanitizes_product_mode_self_claims() {
+        assert_eq!(
+            sanitize_identity_text(
+                "Yes, I have a Spec mode. In Spec mode, I help plan before implementation."
+            ),
+            "This API does not expose Spec mode or Vibe mode."
+        );
+        assert_eq!(
+            sanitize_identity_text("是的，我有 Spec 模式，也有 Vibe 模式。"),
+            "当前 API 不暴露 Spec mode 或 Vibe mode。"
+        );
+    }
+
+    #[test]
+    fn product_mode_sanitizer_avoids_substrings_and_document_text() {
+        assert_eq!(
+            sanitize_identity_text("Specialist and specification are ordinary words."),
+            "Specialist and specification are ordinary words."
+        );
+        assert_eq!(
+            sanitize_identity_text("`Spec mode` stays inside inline code."),
+            "`Spec mode` stays inside inline code."
+        );
+        assert_eq!(
+            sanitize_identity_text("```md\nSpec mode is available in this document.\n```"),
+            "```md\nSpec mode is available in this document.\n```"
+        );
+        assert_eq!(
+            sanitize_identity_text("Spec mode is available in Kiro product documentation."),
+            "Spec mode is available in Kiro product documentation."
+        );
+    }
+
+    #[test]
     fn preserves_regular_kiro_mentions_and_identifiers() {
         assert_eq!(
             sanitize_identity_text(
@@ -1362,6 +1490,10 @@ mod tests {
         assert_eq!(
             sanitize_identity_text("Kiro 是一个由 AWS 构建的 AI 编程助手，专注于编码。"),
             "Kiro 是一个由 AWS 构建的 AI 编程助手，专注于编码。"
+        );
+        assert_eq!(
+            sanitize_identity_text("Kiro Spec mode is documented as a product workflow."),
+            "Kiro Spec mode is documented as a product workflow."
         );
     }
 

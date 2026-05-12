@@ -57,7 +57,36 @@ fn auto_continue_round_limit(requested_max_tokens: i32) -> usize {
 }
 
 fn effective_auto_continue_max_tokens(requested_max_tokens: i32) -> i32 {
-    requested_max_tokens.max(DEFAULT_MODEL_MAX_OUTPUT_TOKENS)
+    requested_max_tokens.max(1)
+}
+
+fn enforce_content_max_tokens(content: &mut Vec<serde_json::Value>, max_tokens: i32) -> bool {
+    let mut remaining = max_tokens.max(0);
+
+    for index in 0..content.len() {
+        let field = match content[index].get("type").and_then(|v| v.as_str()) {
+            Some("thinking") => "thinking",
+            Some("text") => "text",
+            _ => continue,
+        };
+
+        let Some(text) = content[index].get(field).and_then(|v| v.as_str()) else {
+            continue;
+        };
+
+        let tokens = token::count_tokens(text) as i32;
+        if tokens <= remaining {
+            remaining -= tokens;
+            continue;
+        }
+
+        let (limited, _) = token::truncate_to_token_limit(text, remaining);
+        content[index][field] = serde_json::Value::String(limited);
+        content.truncate(index + 1);
+        return true;
+    }
+
+    false
 }
 
 fn numeric_range_request_completed(request_body: &str, content: &str) -> bool {
@@ -769,6 +798,7 @@ async fn handle_stream_request(
         has_cache_control,
         tool_name_map,
     );
+    ctx.set_output_token_limit(requested_max_tokens);
     if identity_sanitization {
         ctx.enable_identity_sanitization();
     }
@@ -1242,7 +1272,12 @@ async fn handle_non_stream_request(
         }));
     }
 
-    content.extend(tool_uses);
+    let output_truncated = enforce_content_max_tokens(&mut content, requested_max_tokens);
+    if output_truncated {
+        stop_reason = "max_tokens".to_string();
+    } else {
+        content.extend(tool_uses);
+    }
 
     // 估算输出 tokens
     let output_tokens = token::estimate_output_tokens(&content);
@@ -1543,6 +1578,7 @@ async fn handle_stream_request_buffered(
         has_cache_control,
         tool_name_map,
     );
+    ctx.set_output_token_limit(requested_max_tokens);
     if identity_sanitization {
         ctx.enable_identity_sanitization();
     }
@@ -2135,7 +2171,22 @@ mod tests {
         assert_eq!(auto_continue_round_limit(8193), 2);
         assert_eq!(auto_continue_round_limit(32000), 7);
         assert_eq!(auto_continue_round_limit(200000), AUTO_CONTINUE_MAX_ROUNDS);
-        assert_eq!(effective_auto_continue_max_tokens(4096), 26000);
+        assert_eq!(effective_auto_continue_max_tokens(4096), 4096);
+        assert_eq!(effective_auto_continue_max_tokens(0), 1);
+    }
+
+    #[test]
+    fn enforce_content_max_tokens_truncates_text_and_drops_later_blocks() {
+        let mut content = vec![
+            serde_json::json!({"type": "text", "text": "abcdefghij"}),
+            serde_json::json!({"type": "text", "text": "should be dropped"}),
+        ];
+
+        let truncated = enforce_content_max_tokens(&mut content, 1);
+
+        assert!(truncated);
+        assert_eq!(content.len(), 1);
+        assert!(content[0]["text"].as_str().unwrap().len() < "abcdefghij".len());
     }
 
     #[test]

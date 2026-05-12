@@ -596,6 +596,10 @@ pub struct StreamContext {
     pub accumulated_input_tokens: i32,
     /// 输出 tokens 累计
     pub output_tokens: i32,
+    /// 客户请求的输出 token 上限
+    output_token_limit: Option<i32>,
+    /// 是否已经因为输出 token 上限停止向客户端发送文本
+    output_token_limit_reached: bool,
     /// 已收到的上游助手原始文本，用于 max_tokens 截断后的续写上下文
     pub assistant_raw_content: String,
     /// 工具块索引映射 (tool_id -> block_index)
@@ -646,6 +650,8 @@ impl StreamContext {
             context_input_tokens: None,
             accumulated_input_tokens: 0,
             output_tokens: 0,
+            output_token_limit: None,
+            output_token_limit_reached: false,
             assistant_raw_content: String::new(),
             tool_block_indices: HashMap::new(),
             tool_name_map,
@@ -667,6 +673,10 @@ impl StreamContext {
     #[allow(dead_code)]
     pub fn enable_identity_sanitization(&mut self) {
         self.identity_sanitizer = Some(super::identity::IdentityOutputSanitizer::new());
+    }
+
+    pub fn set_output_token_limit(&mut self, max_tokens: i32) {
+        self.output_token_limit = Some(max_tokens.max(1));
     }
 
     /// 生成 message_start 事件
@@ -734,6 +744,10 @@ impl StreamContext {
 
     /// 处理 Kiro 事件并转换为 Anthropic SSE 事件
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
+        if self.output_token_limit_reached {
+            return Vec::new();
+        }
+
         match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
@@ -779,6 +793,10 @@ impl StreamContext {
 
     /// 处理助手响应事件
     fn process_assistant_response(&mut self, content: &str) -> Vec<SseEvent> {
+        if self.output_token_limit_reached {
+            return Vec::new();
+        }
+
         if content.is_empty() {
             return Vec::new();
         }
@@ -794,9 +812,6 @@ impl StreamContext {
         let content = merged_content.as_str();
 
         self.assistant_raw_content.push_str(content);
-
-        // 估算 tokens
-        self.output_tokens += estimate_tokens(content);
 
         // 如果启用了thinking，需要处理thinking块
         if self.thinking_enabled {
@@ -1004,6 +1019,13 @@ impl StreamContext {
 
     fn emit_text_delta_events(&mut self, text: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
+        let Some(text) = self.apply_output_token_limit(text) else {
+            return events;
+        };
+        if text.is_empty() {
+            return events;
+        }
+        self.output_tokens += estimate_tokens(&text);
 
         // 如果当前 text_block_index 指向的块已经被关闭（例如 tool_use 开始时自动 stop），
         // 则丢弃该索引并创建新的文本块继续输出，避免 delta 被状态机拒绝导致“吞字”。
@@ -1045,11 +1067,11 @@ impl StreamContext {
                 "type": "content_block_delta",
                 "index": text_index,
                 "delta": {
-                    "type": "text_delta",
-                    "text": text
-                }
-            }),
-        ) {
+                        "type": "text_delta",
+                        "text": text
+                    }
+                }),
+            ) {
             events.push(delta_event);
         }
 
@@ -1091,6 +1113,10 @@ impl StreamContext {
         &mut self,
         tool_use: &crate::kiro::model::events::ToolUseEvent,
     ) -> Vec<SseEvent> {
+        if self.output_token_limit_reached {
+            return Vec::new();
+        }
+
         let mut events = Vec::new();
 
         self.state_manager.set_has_tool_use(true);
@@ -1318,6 +1344,7 @@ impl StreamContext {
             && self.state_manager.get_stop_reason() == "max_tokens"
             && !self.state_manager.has_tool_use()
             && !self.assistant_raw_content.trim().is_empty()
+            && !self.output_token_limit_reached
             && self.output_tokens < requested_max_tokens
     }
 
@@ -1353,6 +1380,29 @@ impl StreamContext {
 
     pub fn mark_upstream_truncated(&mut self) {
         self.state_manager.set_stop_reason("max_tokens");
+    }
+
+    fn apply_output_token_limit(&mut self, text: &str) -> Option<String> {
+        let Some(limit) = self.output_token_limit else {
+            return Some(text.to_string());
+        };
+
+        let remaining = limit - self.output_tokens;
+        if remaining <= 0 {
+            self.output_token_limit_reached = true;
+            self.state_manager.set_stop_reason("max_tokens");
+            return None;
+        }
+
+        let tokens = estimate_tokens(text);
+        if tokens <= remaining {
+            return Some(text.to_string());
+        }
+
+        let (limited, _) = truncate_to_estimated_token_limit(text, remaining);
+        self.output_token_limit_reached = true;
+        self.state_manager.set_stop_reason("max_tokens");
+        Some(limited)
     }
 }
 
@@ -1463,6 +1513,10 @@ impl BufferedStreamContext {
         self.inner.should_auto_continue(requested_max_tokens)
     }
 
+    pub fn set_output_token_limit(&mut self, max_tokens: i32) {
+        self.inner.set_output_token_limit(max_tokens);
+    }
+
     pub fn take_assistant_raw_content_for_continuation(&mut self) -> String {
         self.inner.take_assistant_raw_content_for_continuation()
     }
@@ -1511,6 +1565,30 @@ fn estimate_tokens(text: &str) -> i32 {
     let other_tokens = (other_count + 3) / 4;
 
     (chinese_tokens + other_tokens).max(1)
+}
+
+fn truncate_to_estimated_token_limit(text: &str, max_tokens: i32) -> (String, bool) {
+    if text.is_empty() {
+        return (String::new(), false);
+    }
+    if max_tokens <= 0 {
+        return (String::new(), true);
+    }
+    if estimate_tokens(text) <= max_tokens {
+        return (text.to_string(), false);
+    }
+
+    let mut candidate = String::new();
+    let mut last_good = String::new();
+    for ch in text.chars() {
+        candidate.push(ch);
+        if estimate_tokens(&candidate) > max_tokens {
+            return (last_good, true);
+        }
+        last_good = candidate.clone();
+    }
+
+    (candidate, false)
 }
 
 #[cfg(test)]
@@ -2216,6 +2294,29 @@ mod tests {
             collect_text_content(&all_events),
             "I'm Claude, an Anthropic-created AI assistant."
         );
+    }
+
+    #[test]
+    fn stream_respects_output_token_limit_for_text_deltas() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4-6", 10, false, false, HashMap::new());
+        ctx.set_output_token_limit(2);
+        let mut events = Vec::new();
+        events.extend(ctx.generate_initial_events());
+        events.extend(ctx.process_assistant_response("abcdefghijklmnopqrstuvwxyz"));
+        events.extend(ctx.process_assistant_response("this should not be emitted"));
+        events.extend(ctx.generate_final_events());
+
+        let text = collect_text_content(&events);
+        assert!(text.len() < "abcdefghijklmnopqrstuvwxyz".len());
+        assert!(!text.contains("this should not be emitted"));
+
+        let message_delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("message_delta should be emitted");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "max_tokens");
+        assert!(message_delta.data["usage"]["output_tokens"].as_i64().unwrap() <= 2);
     }
 
     #[test]
