@@ -211,9 +211,23 @@ mod tests {
     }
 
     #[test]
+    fn large_context_without_cache_control_never_injects_cache() {
+        let b = compute_usage_breakdown(100_000, false);
+        assert_eq!(b, UsageBreakdown::flat(100_000));
+    }
+
+    #[test]
     fn short_request_with_cache_control_stays_flat() {
         let b = compute_usage_breakdown(2990, true);
         assert_eq!(b, UsageBreakdown::flat(2990));
+    }
+
+    #[test]
+    fn cache_control_at_display_threshold_shows_creation_without_read() {
+        let b = compute_usage_breakdown(4000, true);
+        assert_eq!(b.cache_creation_input_tokens, 600);
+        assert_eq!(b.cache_read_input_tokens, 0);
+        assert_eq!(b.input_tokens, 3400);
     }
 
     #[test]
