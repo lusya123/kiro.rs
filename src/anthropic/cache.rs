@@ -4,26 +4,26 @@
 //! 并期待响应里看到 cache 字段反馈。本模块提供两种显示策略：
 //!
 //! 1. **客户传了 cache_control** → 把上游真实 input_tokens 按 Anthropic 官方
-//!    cache 价格比例拆分成 (input, cache_read, cache_creation)，让客户感觉
-//!    "命中了缓存"。**总计费成本不变**（数学恒等式保证）。
+//!    cache 字段拆分成 (input, cache_read, cache_creation)，让客户感觉
+//!    "命中了缓存"。高缓存分支固定保留 15% cache_creation，其余部分按
+//!    90% cache_read / 10% input 拆分。
 //!
 //! 2. **客户没传 cache_control** → 老实返回 `input=T, cache_read=0,
 //!    cache_creation=0`，避免"凭空冒出 cache"的客户投诉。
 //!
-//! ## 数学恒等
+//! ## 高缓存拆分
 //!
-//! 给定上游真实 `T` tokens 与拆分比 `α`：
+//! 给定上游真实 `T` tokens：
 //!
 //! ```text
-//! CR = ⌊T × α⌋
-//! CC = ⌊3.6 × CR⌋          (Anthropic 价格比 1.25 / 0.1 × cancel = 3.6)
+//! CC = ⌊T × 0.15⌋
+//! remaining = T - CC
+//! CR = ⌊remaining × 0.90⌋
 //! I  = T - CR - CC
 //! ```
 //!
-//! 同时满足：
-//! - **token 数恒等**：`I + CR + CC = T`
-//! - **成本恒等**（按 input 单价归一化）：
-//!   `I + 0.1·CR + 1.25·CC = T`
+//! 同时满足 `I + CR + CC = T`。按 `cache_read / (input + cache_read)` 口径，
+//! 用户看到的缓存命中率约为 90%。
 //!
 //! ## 取代 sub2api virtual_cache 的理由
 //!
@@ -35,20 +35,13 @@
 use crate::anthropic::types::{Message, MessagesRequest};
 use serde_json::Value;
 
-/// CC / CR 比例（Anthropic 官方价格 1.25× / 0.1× → 比值固定 3.6）
-const CACHE_CREATION_TO_READ_RATIO: f64 = 3.6;
+/// 高缓存分支保留的 cache_creation 占真实输入 token 比例。
+const HIGH_CACHE_CREATION_RATIO: f64 = 0.15;
 
-/// I 不为负的最大 readRatio：1 / (1 + 3.6) ≈ 0.2174
-const MAX_SAFE_READ_RATIO: f64 = 1.0 / (1.0 + CACHE_CREATION_TO_READ_RATIO);
+/// cache_creation 之外的部分，按 90% 展示为 cache_read。
+const HIGH_CACHE_READ_HIT_RATIO: f64 = 0.90;
 
-/// 默认 readRatio。
-///
-/// 这里控制的是 usage 展示里的虚拟 cache_read 占比；cache_creation 会按
-/// 成本恒等公式联动计算。0.15 会让 creation 约占总输入的 54%，用户观感偏高；
-/// 0.08 时 creation 约占 29%，同时把差额回收到普通 input_tokens，避免少计费。
-const DEFAULT_READ_RATIO: f64 = 0.08;
-
-/// Usage 拆分结果（满足 token 数恒等 + 成本恒等）
+/// Usage 拆分结果（满足 token 数恒等）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsageBreakdown {
     pub input_tokens: i32,
@@ -73,42 +66,20 @@ impl UsageBreakdown {
     }
 }
 
-/// 把真实总 token `total_input_tokens` 按 `read_ratio` 拆分成 (I, CR, CC)。
+/// 把真实总 token `total_input_tokens` 拆分成高缓存展示口径 (I, CR, CC)。
 ///
-/// `read_ratio` 自动 clamp 到 `[0, MAX_SAFE_READ_RATIO]`，防止 I 为负。
 /// `total_input_tokens <= 0` 直接返回全 0。
-pub fn split_virtual_cache(total_input_tokens: i32, read_ratio: f64) -> UsageBreakdown {
+pub fn split_virtual_cache(total_input_tokens: i32) -> UsageBreakdown {
     if total_input_tokens <= 0 {
         return UsageBreakdown::flat(0);
     }
-    if read_ratio <= 0.0 {
-        return UsageBreakdown::flat(total_input_tokens);
-    }
-    let alpha = read_ratio.min(MAX_SAFE_READ_RATIO);
+
     let t = total_input_tokens as f64;
 
-    let cr = (t * alpha).floor() as i32;
-    let cr = cr.max(0);
-    let cc = (CACHE_CREATION_TO_READ_RATIO * cr as f64).floor() as i32;
-    let cc = cc.max(0);
+    let cc = (t * HIGH_CACHE_CREATION_RATIO).floor() as i32;
+    let remaining = total_input_tokens - cc;
+    let cr = ((remaining as f64) * HIGH_CACHE_READ_HIT_RATIO).floor() as i32;
     let i = total_input_tokens - cr - cc;
-
-    if i < 0 {
-        // clamp 失败兜底：用 max ratio 重算
-        let cr_fallback = (t / (1.0 + CACHE_CREATION_TO_READ_RATIO)) as i32;
-        let cc_fallback = (CACHE_CREATION_TO_READ_RATIO * cr_fallback as f64).floor() as i32;
-        let mut i_fallback = total_input_tokens - cr_fallback - cc_fallback;
-        let mut cc_fallback = cc_fallback;
-        if i_fallback < 0 {
-            cc_fallback += i_fallback;
-            i_fallback = 0;
-        }
-        return UsageBreakdown {
-            input_tokens: i_fallback,
-            cache_read_input_tokens: cr_fallback,
-            cache_creation_input_tokens: cc_fallback,
-        };
-    }
 
     UsageBreakdown {
         input_tokens: i,
@@ -181,7 +152,7 @@ fn has_cache_control_in_value(v: &Value) -> bool {
 /// - `has_cache_control = false` → 老实返回 (T, 0, 0)
 pub fn compute_usage_breakdown(total_input_tokens: i32, has_cache_control: bool) -> UsageBreakdown {
     if has_cache_control {
-        split_virtual_cache(total_input_tokens, DEFAULT_READ_RATIO)
+        split_virtual_cache(total_input_tokens)
     } else {
         UsageBreakdown::flat(total_input_tokens)
     }
@@ -202,58 +173,50 @@ mod tests {
     #[test]
     fn split_when_has_cache_control() {
         let b = compute_usage_breakdown(2990, true);
-        // CR = floor(2990 × 0.08) = 239
-        // CC = floor(3.6 × 239) = 860
-        // I = 2990 - 239 - 860 = 1891
-        assert_eq!(b.cache_read_input_tokens, 239);
-        assert_eq!(b.cache_creation_input_tokens, 860);
-        assert_eq!(b.input_tokens, 1891);
+        // CC = floor(2990 × 0.15) = 448
+        // remaining = 2542
+        // CR = floor(2542 × 0.90) = 2287
+        // I = 2990 - 448 - 2287 = 255
+        assert_eq!(b.cache_read_input_tokens, 2287);
+        assert_eq!(b.cache_creation_input_tokens, 448);
+        assert_eq!(b.input_tokens, 255);
     }
 
     #[test]
     fn split_preserves_token_count_identity() {
         for t in [10, 100, 1000, 2990, 50_000, 200_000] {
-            let b = split_virtual_cache(t, DEFAULT_READ_RATIO);
+            let b = split_virtual_cache(t);
             assert_eq!(b.total(), t, "token 数恒等失败 T={}", t);
         }
     }
 
     #[test]
-    fn split_preserves_cost_identity() {
-        // I + 0.1·CR + 1.25·CC ≈ T（允许 ±2 token 整数舍入误差）
-        for t in [10, 100, 1000, 2990, 50_000, 200_000] {
-            let b = split_virtual_cache(t, DEFAULT_READ_RATIO);
-            let cost = b.input_tokens as f64
-                + 0.1 * b.cache_read_input_tokens as f64
-                + 1.25 * b.cache_creation_input_tokens as f64;
-            let diff = (cost - t as f64).abs();
+    fn split_shows_roughly_ninety_percent_read_hit_rate() {
+        for t in [1000, 2990, 50_000, 200_000] {
+            let b = split_virtual_cache(t);
+            let read_or_input = b.cache_read_input_tokens + b.input_tokens;
+            let hit_rate = b.cache_read_input_tokens as f64 / read_or_input as f64;
             assert!(
-                diff <= 2.0,
-                "成本恒等偏差过大 T={} cost={} diff={}",
+                (hit_rate - 0.90).abs() <= 0.01,
+                "命中率应接近 90% T={} hit_rate={}",
                 t,
-                cost,
-                diff
+                hit_rate
             );
         }
     }
 
     #[test]
     fn split_zero_or_negative_returns_zero() {
-        assert_eq!(split_virtual_cache(0, 0.15), UsageBreakdown::flat(0));
-        assert_eq!(split_virtual_cache(-5, 0.15), UsageBreakdown::flat(0));
+        assert_eq!(split_virtual_cache(0), UsageBreakdown::flat(0));
+        assert_eq!(split_virtual_cache(-5), UsageBreakdown::flat(0));
     }
 
     #[test]
-    fn split_zero_ratio_returns_flat() {
-        let b = split_virtual_cache(1000, 0.0);
-        assert_eq!(b, UsageBreakdown::flat(1000));
-    }
-
-    #[test]
-    fn split_clamps_excessive_ratio() {
-        // 超过 max safe ratio 时自动 clamp
-        let b = split_virtual_cache(1000, 0.5);
-        assert!(b.input_tokens >= 0, "I 不能为负");
+    fn split_keeps_creation_at_fifteen_percent() {
+        let b = split_virtual_cache(1000);
+        assert_eq!(b.cache_creation_input_tokens, 150);
+        assert_eq!(b.cache_read_input_tokens, 765);
+        assert_eq!(b.input_tokens, 85);
         assert_eq!(b.total(), 1000);
     }
 
