@@ -209,6 +209,36 @@ fn find_real_thinking_end_tag_at_buffer_end(buffer: &str) -> Option<usize> {
     None
 }
 
+/// 查找完整非流式文本中的 thinking 结束标签。
+///
+/// 非流式响应已经拿到了完整文本，因此 `</thinking>\nvisible text` 也可以安全
+/// 识别为结束标签；流式路径仍保留更严格的双换行/缓冲区末尾判断。
+fn find_real_thinking_end_tag_in_complete_text(buffer: &str) -> Option<usize> {
+    const TAG: &str = "</thinking>";
+    let mut search_start = 0;
+
+    while let Some(pos) = buffer[search_start..].find(TAG) {
+        let absolute_pos = search_start + pos;
+        let has_quote_before = absolute_pos > 0 && is_quote_char(buffer, absolute_pos - 1);
+        let after_pos = absolute_pos + TAG.len();
+        let has_quote_after = is_quote_char(buffer, after_pos);
+
+        if has_quote_before || has_quote_after {
+            search_start = absolute_pos + 1;
+            continue;
+        }
+
+        let after_content = &buffer[after_pos..];
+        if after_content.starts_with('\n') || after_content.starts_with("\r\n") {
+            return Some(absolute_pos);
+        }
+
+        search_start = absolute_pos + 1;
+    }
+
+    None
+}
+
 /// 查找真正的 thinking 开始标签（不被引用字符包裹）
 ///
 /// 与 `find_real_thinking_end_tag` 类似，跳过被引用字符包裹的开始标签。
@@ -261,6 +291,9 @@ pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>
             &after_open[..end_pos],
             &after_open[end_pos + "</thinking>\n\n".len()..],
         )
+    } else if let Some(end_pos) = find_real_thinking_end_tag_in_complete_text(after_open) {
+        let after_tag = end_pos + "</thinking>".len();
+        (&after_open[..end_pos], after_open[after_tag..].trim_start())
     } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
         let after_tag = end_pos + "</thinking>".len();
         (&after_open[..end_pos], after_open[after_tag..].trim_start())
@@ -1932,6 +1965,24 @@ mod tests {
             has_sig_delta,
             "generate_final_events 关闭未闭合 thinking 块时也必须发 signature_delta"
         );
+    }
+
+    #[test]
+    fn complete_thinking_extracts_single_newline_before_visible_text() {
+        let (thinking, text) =
+            extract_thinking_from_complete_text("<thinking>private</thinking>\nvisible");
+
+        assert_eq!(thinking.as_deref(), Some("private"));
+        assert_eq!(text, "visible");
+    }
+
+    #[test]
+    fn complete_thinking_ignores_quoted_end_tag() {
+        let original = "<thinking>about `</thinking>` tag</thinking>\nvisible";
+        let (thinking, text) = extract_thinking_from_complete_text(original);
+
+        assert_eq!(thinking.as_deref(), Some("about `</thinking>` tag"));
+        assert_eq!(text, "visible");
     }
 
     #[test]

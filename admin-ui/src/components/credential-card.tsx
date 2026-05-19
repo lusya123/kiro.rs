@@ -143,15 +143,15 @@ export function CredentialCard({
 
   return (
     <>
-      <Card className={credential.isCurrent ? 'ring-2 ring-primary' : ''}>
+      <Card className={`min-w-0 max-w-full ${credential.isCurrent ? 'ring-2 ring-primary' : ''}`}>
         <CardHeader className="pb-2">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
+          <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex min-w-0 flex-wrap items-center gap-2">
               <Checkbox
                 checked={selected}
                 onCheckedChange={onToggleSelect}
               />
-              <CardTitle className="text-lg flex items-center gap-2">
+              <CardTitle className="flex min-w-0 flex-wrap items-center gap-2 break-words text-lg">
                 {credential.email || `凭据 #${credential.id}`}
                 {credential.isCurrent && (
                   <Badge variant="success">当前</Badge>
@@ -175,7 +175,7 @@ export function CredentialCard({
                 )}
               </CardTitle>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex shrink-0 items-center gap-2">
               <span className="text-sm text-muted-foreground">启用</span>
               <Switch
                 checked={!credential.disabled}
@@ -187,7 +187,7 @@ export function CredentialCard({
         </CardHeader>
         <CardContent className="space-y-4">
           {/* 信息网格 */}
-          <div className="grid grid-cols-2 gap-4 text-sm">
+          <div className="grid grid-cols-1 gap-3 text-sm sm:grid-cols-2 sm:gap-4">
             <div>
               <span className="text-muted-foreground">优先级：</span>
               {editingPriority ? (
@@ -254,17 +254,17 @@ export function CredentialCard({
               <span className="text-muted-foreground">成功次数：</span>
               <span className="font-medium">{credential.successCount}</span>
             </div>
-            <div className="col-span-2">
+            <div className="sm:col-span-2">
               <span className="text-muted-foreground">最后调用：</span>
               <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
             </div>
             {credential.maskedApiKey && (
-              <div className="col-span-2">
+              <div className="sm:col-span-2">
                 <span className="text-muted-foreground">API Key：</span>
                 <span className="font-mono font-medium">{credential.maskedApiKey}</span>
               </div>
             )}
-            <div className="col-span-2">
+            <div className="sm:col-span-2">
               <span className="text-muted-foreground">剩余用量：</span>
               {loadingBalance ? (
                 <span className="text-sm ml-1">
@@ -282,13 +282,13 @@ export function CredentialCard({
               )}
             </div>
             {credential.hasProxy && (
-              <div className="col-span-2">
+              <div className="sm:col-span-2">
                 <span className="text-muted-foreground">代理：</span>
                 <span className="font-medium">{credential.proxyUrl}</span>
               </div>
             )}
             {credential.hasProfileArn && (
-              <div className="col-span-2">
+              <div className="sm:col-span-2">
                 <Badge variant="secondary">有 Profile ARN</Badge>
               </div>
             )}
