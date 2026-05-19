@@ -5,6 +5,7 @@ on:
     branches:
       - master
       - custom
+      - codex/high-cache-container
     tags:
       - 'v*'
   workflow_dispatch:
@@ -45,6 +46,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       is_beta: ${{ steps.version.outputs.is_beta }}
+      alias_tag: ${{ steps.version.outputs.alias_tag }}
 
     strategy:
       fail-fast: false
@@ -64,15 +66,29 @@ jobs:
       - name: Determine version
         id: version
         run: |
+          HIGH_CACHE_BRANCH="codex/high-cache-container"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            if [ "${{ github.ref_name }}" = "${HIGH_CACHE_BRANCH}" ]; then
+              echo "version=high-cache-${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+              echo "alias_tag=high-cache" >> $GITHUB_OUTPUT
+            else
+              echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+              echo "alias_tag=latest" >> $GITHUB_OUTPUT
+            fi
             echo "is_beta=false" >> $GITHUB_OUTPUT
           elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
             echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "alias_tag=latest" >> $GITHUB_OUTPUT
             echo "is_beta=false" >> $GITHUB_OUTPUT
           else
             SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-6)
-            echo "version=beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
+            if [ "${{ github.ref_name }}" = "${HIGH_CACHE_BRANCH}" ]; then
+              echo "version=high-cache-beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
+              echo "alias_tag=high-cache" >> $GITHUB_OUTPUT
+            else
+              echo "version=beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
+              echo "alias_tag=beta" >> $GITHUB_OUTPUT
+            fi
             echo "is_beta=true" >> $GITHUB_OUTPUT
           fi
 
@@ -114,7 +130,6 @@ jobs:
       - name: Create and push multi-arch manifest
         run: |
           VERSION="${{ needs.build.outputs.version }}"
-          IS_BETA="${{ needs.build.outputs.is_beta }}"
           IMAGE="ghcr.io/${{ github.repository_owner }}/kiro-rs"
 
           # Create manifest for version tag
@@ -123,12 +138,8 @@ jobs:
             ${IMAGE}:${VERSION}-arm64
           docker manifest push ${IMAGE}:${VERSION}
 
-          # Create manifest for latest/beta alias tag
-          if [ "${IS_BETA}" = "true" ]; then
-            ALIAS_TAG="beta"
-          else
-            ALIAS_TAG="latest"
-          fi
+          # Create manifest for latest/beta/high-cache alias tag
+          ALIAS_TAG="${{ needs.build.outputs.alias_tag }}"
           docker manifest create ${IMAGE}:${ALIAS_TAG} \
             ${IMAGE}:${VERSION}-amd64 \
             ${IMAGE}:${VERSION}-arm64
