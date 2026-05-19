@@ -2394,7 +2394,7 @@ mod tests {
             .iter()
             .find(|e| e.event == "message_delta")
             .expect("message_delta should be emitted");
-        assert_eq!(message_delta.data["usage"]["input_tokens"], 12_000);
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 9000);
         assert_eq!(message_delta.data["usage"]["output_tokens"], 0);
     }
 
@@ -2448,7 +2448,7 @@ mod tests {
             .iter()
             .find(|e| e.event == "message_delta")
             .expect("message_delta should be emitted");
-        assert_eq!(message_delta.data["usage"]["input_tokens"], 12_000);
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 9000);
         assert!(
             message_delta.data["usage"]["output_tokens"]
                 .as_i64()

@@ -8,7 +8,7 @@
 
 /// Below this estimated client-request size, ignore Kiro's fixed context floor
 /// when reporting billable input tokens.
-pub const SHORT_INPUT_BILLING_THRESHOLD: i32 = 512;
+pub const SHORT_INPUT_BILLING_THRESHOLD: i32 = 4096;
 
 pub fn billable_input_tokens(
     estimated_input_tokens: i32,
@@ -30,12 +30,12 @@ mod tests {
     #[test]
     fn short_requests_ignore_kiro_context_floor() {
         assert_eq!(billable_input_tokens(3, Some(4120)), 3);
-        assert_eq!(billable_input_tokens(512, Some(4612)), 512);
+        assert_eq!(billable_input_tokens(4096, Some(8196)), 4096);
     }
 
     #[test]
     fn large_requests_use_kiro_context_usage() {
-        assert_eq!(billable_input_tokens(513, Some(4613)), 4613);
+        assert_eq!(billable_input_tokens(4097, Some(8197)), 8197);
     }
 
     #[test]
