@@ -4,26 +4,19 @@
 //! 并期待响应里看到 cache 字段反馈。本模块提供两种显示策略：
 //!
 //! 1. **客户传了 cache_control** → 把上游真实 input_tokens 按 Anthropic 官方
-//!    cache 字段拆分成 (input, cache_read, cache_creation)，让客户感觉
-//!    "命中了缓存"。高缓存分支固定保留 15% cache_creation，其余部分按
-//!    90% cache_read / 10% input 拆分。
+//!    cache 字段拆分成 (input, cache_read, cache_creation)。高缓存分支按
+//!    输入规模渐进展示 cache：短请求不造缓存，中等上下文少量 read，大上下文
+//!    才展示较高 read。
 //!
 //! 2. **客户没传 cache_control** → 老实返回 `input=T, cache_read=0,
 //!    cache_creation=0`，避免"凭空冒出 cache"的客户投诉。
 //!
-//! ## 高缓存拆分
+//! ## 渐进式高缓存拆分
 //!
-//! 给定上游真实 `T` tokens：
-//!
-//! ```text
-//! CC = ⌊T × 0.15⌋
-//! remaining = T - CC
-//! CR = ⌊remaining × 0.90⌋
-//! I  = T - CR - CC
-//! ```
-//!
-//! 同时满足 `I + CR + CC = T`。按 `cache_read / (input + cache_read)` 口径，
-//! 用户看到的缓存命中率约为 90%。
+//! - `T < 4k`：全部显示为普通 input，避免短请求凭空出现 cache。
+//! - `4k <= T < 20k`：保留 15% creation，read 从 0% 平滑涨到 30%。
+//! - `T >= 20k`：creation 从 15% 平滑降到 12%，read 从 70% 平滑涨到 80%。
+//! - 始终满足 `input + cache_read + cache_creation = T`。
 //!
 //! ## 取代 sub2api virtual_cache 的理由
 //!
@@ -35,11 +28,29 @@
 use crate::anthropic::types::{Message, MessagesRequest};
 use serde_json::Value;
 
-/// 高缓存分支保留的 cache_creation 占真实输入 token 比例。
-const HIGH_CACHE_CREATION_RATIO: f64 = 0.15;
+/// 小于这个规模的请求不展示虚拟缓存，避免短请求看起来明显不真实。
+const CACHE_DISPLAY_MIN_TOKENS: i32 = 4_000;
 
-/// cache_creation 之外的部分，按 90% 展示为 cache_read。
-const HIGH_CACHE_READ_HIT_RATIO: f64 = 0.90;
+/// 从这个规模开始展示高缓存读取。
+const HIGH_CACHE_MIN_TOKENS: i32 = 20_000;
+
+/// 高缓存读取比例在这个规模后达到上限。
+const HIGH_CACHE_FULL_RAMP_TOKENS: i32 = 100_000;
+
+/// 中等上下文保留的 cache_creation 比例。
+const MID_CACHE_CREATION_RATIO: f64 = 0.15;
+
+/// 大上下文最终保留的 cache_creation 比例。
+const HIGH_CACHE_CREATION_RATIO: f64 = 0.12;
+
+/// 中等上下文最高展示的 cache_read 命中比例。
+const MID_MAX_READ_HIT_RATIO: f64 = 0.30;
+
+/// 大上下文起始展示的 cache_read 命中比例。
+const HIGH_MIN_READ_HIT_RATIO: f64 = 0.70;
+
+/// 大上下文最终展示的 cache_read 命中比例。
+const HIGH_MAX_READ_HIT_RATIO: f64 = 0.80;
 
 /// Usage 拆分结果（满足 token 数恒等）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,15 +81,15 @@ impl UsageBreakdown {
 ///
 /// `total_input_tokens <= 0` 直接返回全 0。
 pub fn split_virtual_cache(total_input_tokens: i32) -> UsageBreakdown {
-    if total_input_tokens <= 0 {
-        return UsageBreakdown::flat(0);
+    if total_input_tokens <= 0 || total_input_tokens < CACHE_DISPLAY_MIN_TOKENS {
+        return UsageBreakdown::flat(total_input_tokens.max(0));
     }
 
-    let t = total_input_tokens as f64;
+    let (creation_ratio, read_hit_ratio) = cache_display_ratios(total_input_tokens);
 
-    let cc = (t * HIGH_CACHE_CREATION_RATIO).floor() as i32;
+    let cc = ((total_input_tokens as f64) * creation_ratio).floor() as i32;
     let remaining = total_input_tokens - cc;
-    let cr = ((remaining as f64) * HIGH_CACHE_READ_HIT_RATIO).floor() as i32;
+    let cr = ((remaining as f64) * read_hit_ratio).floor() as i32;
     let i = total_input_tokens - cr - cc;
 
     UsageBreakdown {
@@ -86,6 +97,35 @@ pub fn split_virtual_cache(total_input_tokens: i32) -> UsageBreakdown {
         cache_read_input_tokens: cr,
         cache_creation_input_tokens: cc,
     }
+}
+
+fn cache_display_ratios(total_input_tokens: i32) -> (f64, f64) {
+    if total_input_tokens < HIGH_CACHE_MIN_TOKENS {
+        let progress = progress_between(
+            total_input_tokens,
+            CACHE_DISPLAY_MIN_TOKENS,
+            HIGH_CACHE_MIN_TOKENS,
+        );
+        return (MID_CACHE_CREATION_RATIO, MID_MAX_READ_HIT_RATIO * progress);
+    }
+
+    let progress = progress_between(
+        total_input_tokens,
+        HIGH_CACHE_MIN_TOKENS,
+        HIGH_CACHE_FULL_RAMP_TOKENS,
+    );
+    let creation_ratio = MID_CACHE_CREATION_RATIO
+        + (HIGH_CACHE_CREATION_RATIO - MID_CACHE_CREATION_RATIO) * progress;
+    let read_hit_ratio =
+        HIGH_MIN_READ_HIT_RATIO + (HIGH_MAX_READ_HIT_RATIO - HIGH_MIN_READ_HIT_RATIO) * progress;
+    (creation_ratio, read_hit_ratio)
+}
+
+fn progress_between(value: i32, start: i32, end: i32) -> f64 {
+    if end <= start {
+        return 1.0;
+    }
+    ((value - start) as f64 / (end - start) as f64).clamp(0.0, 1.0)
 }
 
 /// 检查请求里有没有 `cache_control` 字段。
@@ -171,38 +211,56 @@ mod tests {
     }
 
     #[test]
-    fn split_when_has_cache_control() {
+    fn short_request_with_cache_control_stays_flat() {
         let b = compute_usage_breakdown(2990, true);
-        // CC = floor(2990 × 0.15) = 448
-        // remaining = 2542
-        // CR = floor(2542 × 0.90) = 2287
-        // I = 2990 - 448 - 2287 = 255
-        assert_eq!(b.cache_read_input_tokens, 2287);
-        assert_eq!(b.cache_creation_input_tokens, 448);
-        assert_eq!(b.input_tokens, 255);
+        assert_eq!(b, UsageBreakdown::flat(2990));
+    }
+
+    #[test]
+    fn medium_context_shows_limited_cache_read() {
+        let b = compute_usage_breakdown(12_000, true);
+        // progress = (12000 - 4000) / (20000 - 4000) = 0.5
+        // read hit ratio = 30% * 0.5 = 15%
+        // CC = floor(12000 * 0.15) = 1800
+        // CR = floor((12000 - 1800) * 0.15) = 1530
+        assert_eq!(b.cache_creation_input_tokens, 1800);
+        assert_eq!(b.cache_read_input_tokens, 1530);
+        assert_eq!(b.input_tokens, 8670);
+    }
+
+    #[test]
+    fn large_context_starts_high_cache_read() {
+        let b = compute_usage_breakdown(20_000, true);
+        // 20k 是高缓存起点：15% creation，剩余部分 70% read。
+        assert_eq!(b.cache_creation_input_tokens, 3000);
+        assert_eq!(b.cache_read_input_tokens, 11900);
+        assert_eq!(b.input_tokens, 5100);
+    }
+
+    #[test]
+    fn very_large_context_caps_cache_read_and_reduces_creation() {
+        let b = compute_usage_breakdown(100_000, true);
+        // 100k 后达到上限：12% creation，剩余部分 80% read。
+        assert_eq!(b.cache_creation_input_tokens, 12_000);
+        assert_eq!(b.cache_read_input_tokens, 70_400);
+        assert_eq!(b.input_tokens, 17_600);
     }
 
     #[test]
     fn split_preserves_token_count_identity() {
-        for t in [10, 100, 1000, 2990, 50_000, 200_000] {
+        for t in [10, 100, 1000, 2990, 4000, 12_000, 20_000, 50_000, 200_000] {
             let b = split_virtual_cache(t);
             assert_eq!(b.total(), t, "token 数恒等失败 T={}", t);
         }
     }
 
     #[test]
-    fn split_shows_roughly_ninety_percent_read_hit_rate() {
-        for t in [1000, 2990, 50_000, 200_000] {
-            let b = split_virtual_cache(t);
-            let read_or_input = b.cache_read_input_tokens + b.input_tokens;
-            let hit_rate = b.cache_read_input_tokens as f64 / read_or_input as f64;
-            assert!(
-                (hit_rate - 0.90).abs() <= 0.01,
-                "命中率应接近 90% T={} hit_rate={}",
-                t,
-                hit_rate
-            );
-        }
+    fn split_uses_progressive_read_hit_rates() {
+        assert_eq!(read_hit_rate(split_virtual_cache(3999)), 0.0);
+        assert_eq!(read_hit_rate(split_virtual_cache(4000)), 0.0);
+        assert!((read_hit_rate(split_virtual_cache(12_000)) - 0.15).abs() <= 0.01);
+        assert!((read_hit_rate(split_virtual_cache(20_000)) - 0.70).abs() <= 0.01);
+        assert!((read_hit_rate(split_virtual_cache(100_000)) - 0.80).abs() <= 0.01);
     }
 
     #[test]
@@ -212,12 +270,23 @@ mod tests {
     }
 
     #[test]
-    fn split_keeps_creation_at_fifteen_percent() {
-        let b = split_virtual_cache(1000);
-        assert_eq!(b.cache_creation_input_tokens, 150);
-        assert_eq!(b.cache_read_input_tokens, 765);
-        assert_eq!(b.input_tokens, 85);
-        assert_eq!(b.total(), 1000);
+    fn split_reduces_creation_for_very_large_context() {
+        assert_eq!(
+            split_virtual_cache(20_000).cache_creation_input_tokens,
+            3000
+        );
+        assert_eq!(
+            split_virtual_cache(100_000).cache_creation_input_tokens,
+            12_000
+        );
+    }
+
+    fn read_hit_rate(b: UsageBreakdown) -> f64 {
+        let read_or_input = b.cache_read_input_tokens + b.input_tokens;
+        if read_or_input == 0 {
+            return 0.0;
+        }
+        b.cache_read_input_tokens as f64 / read_or_input as f64
     }
 
     fn parse_request(extra: serde_json::Value) -> MessagesRequest {

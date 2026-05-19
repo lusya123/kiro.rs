@@ -1064,14 +1064,14 @@ impl StreamContext {
         if let Some(delta_event) = self.state_manager.handle_content_block_delta(
             text_index,
             json!({
-                "type": "content_block_delta",
-                "index": text_index,
-                "delta": {
-                        "type": "text_delta",
-                        "text": text
-                    }
-                }),
-            ) {
+            "type": "content_block_delta",
+            "index": text_index,
+            "delta": {
+                    "type": "text_delta",
+                    "text": text
+                }
+            }),
+        ) {
             events.push(delta_event);
         }
 
@@ -1831,13 +1831,13 @@ mod tests {
         assert_eq!(usage["cache_read_input_tokens"], 0);
     }
 
-    /// 客户传了 cache_control 时，message_start 的 usage 必须按比例拆分，
+    /// 客户传了 cache_control 且上下文足够大时，message_start 的 usage 才按比例拆分，
     /// 且总和等于真实 input_tokens（token 数恒等）
     #[test]
-    fn message_start_with_cache_control_splits_usage() {
+    fn message_start_with_cache_control_splits_large_usage() {
         let ctx = StreamContext::new_with_thinking(
             "claude-opus-4-7",
-            2990,
+            20_000,
             false,
             true, // has_cache_control = true
             HashMap::new(),
@@ -1848,7 +1848,9 @@ mod tests {
         let cc = usage["cache_creation_input_tokens"].as_i64().unwrap();
         let cr = usage["cache_read_input_tokens"].as_i64().unwrap();
         assert!(i > 0 && cc > 0 && cr > 0, "三个字段都应非零");
-        assert_eq!(i + cc + cr, 2990, "token 数恒等失败");
+        assert_eq!(i + cc + cr, 20_000, "token 数恒等失败");
+        assert_eq!(cc, 3000);
+        assert_eq!(cr, 11900);
     }
 
     /// 流式 thinking 块必须在 content_block_start 带 signature: ""，
@@ -2316,7 +2318,12 @@ mod tests {
             .find(|e| e.event == "message_delta")
             .expect("message_delta should be emitted");
         assert_eq!(message_delta.data["delta"]["stop_reason"], "max_tokens");
-        assert!(message_delta.data["usage"]["output_tokens"].as_i64().unwrap() <= 2);
+        assert!(
+            message_delta.data["usage"]["output_tokens"]
+                .as_i64()
+                .unwrap()
+                <= 2
+        );
     }
 
     #[test]
