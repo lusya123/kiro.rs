@@ -1850,7 +1850,7 @@ mod tests {
         assert!(i > 0 && cc > 0 && cr > 0, "三个字段都应非零");
         assert_eq!(i + cc + cr, 20_000, "token 数恒等失败");
         assert_eq!(cc, 3000);
-        assert_eq!(cr, 11900);
+        assert_eq!(cr, 5100);
     }
 
     /// 流式 thinking 块必须在 content_block_start 带 signature: ""，
