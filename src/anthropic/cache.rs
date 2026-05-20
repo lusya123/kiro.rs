@@ -14,9 +14,9 @@
 //! ## 渐进式高缓存拆分
 //!
 //! - `T < 4k`：全部显示为普通 input，避免短请求凭空出现 cache。
-//! - `4k <= T < 20k`：保留 15% creation，read 从 0% 平滑涨到 30%。
-//! - `20k <= T < 50k`：creation 从 15% 平滑降到 13%，read 从 30% 平滑涨到 70%。
-//! - `T >= 50k`：creation 从 13% 平滑降到 12%，read 从 70% 平滑涨到 80%。
+//! - `4k <= T < 20k`：保留 15% creation，read 从 10% 平滑涨到 45%。
+//! - `20k <= T < 50k`：creation 从 15% 平滑降到 13%，read 从 45% 平滑涨到 80%。
+//! - `T >= 50k`：creation 从 13% 平滑降到 10%，read 从 80% 平滑涨到 90%。
 //! - 始终满足 `input + cache_read + cache_creation = T`。
 //!
 //! ## 取代 sub2api virtual_cache 的理由
@@ -45,19 +45,22 @@ const HIGH_CACHE_FULL_RAMP_TOKENS: i32 = 100_000;
 const MID_CACHE_CREATION_RATIO: f64 = 0.15;
 
 /// 大上下文最终保留的 cache_creation 比例。
-const HIGH_CACHE_CREATION_RATIO: f64 = 0.12;
+const HIGH_CACHE_CREATION_RATIO: f64 = 0.10;
 
 /// 强缓存起始保留的 cache_creation 比例。
 const HIGH_CACHE_STRONG_CREATION_RATIO: f64 = 0.13;
 
+/// 中等上下文起始展示的 cache_read 命中比例。
+const MID_MIN_READ_HIT_RATIO: f64 = 0.10;
+
 /// 中等上下文最高展示的 cache_read 命中比例。
-const MID_MAX_READ_HIT_RATIO: f64 = 0.30;
+const MID_MAX_READ_HIT_RATIO: f64 = 0.45;
 
 /// 大上下文起始展示的 cache_read 命中比例。
-const HIGH_MIN_READ_HIT_RATIO: f64 = 0.70;
+const HIGH_MIN_READ_HIT_RATIO: f64 = 0.80;
 
 /// 大上下文最终展示的 cache_read 命中比例。
-const HIGH_MAX_READ_HIT_RATIO: f64 = 0.80;
+const HIGH_MAX_READ_HIT_RATIO: f64 = 0.90;
 
 /// Usage 拆分结果（满足 token 数恒等）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,7 +116,9 @@ fn cache_display_ratios(total_input_tokens: i32) -> (f64, f64) {
             CACHE_DISPLAY_MIN_TOKENS,
             HIGH_CACHE_MIN_TOKENS,
         );
-        return (MID_CACHE_CREATION_RATIO, MID_MAX_READ_HIT_RATIO * progress);
+        let read_hit_ratio =
+            MID_MIN_READ_HIT_RATIO + (MID_MAX_READ_HIT_RATIO - MID_MIN_READ_HIT_RATIO) * progress;
+        return (MID_CACHE_CREATION_RATIO, read_hit_ratio);
     }
 
     if total_input_tokens < HIGH_CACHE_STRONG_TOKENS {
@@ -243,50 +248,50 @@ mod tests {
     }
 
     #[test]
-    fn cache_control_at_display_threshold_shows_creation_without_read() {
+    fn cache_control_at_display_threshold_shows_initial_read() {
         let b = compute_usage_breakdown(4000, true);
         assert_eq!(b.cache_creation_input_tokens, 600);
-        assert_eq!(b.cache_read_input_tokens, 0);
-        assert_eq!(b.input_tokens, 3400);
+        assert_eq!(b.cache_read_input_tokens, 340);
+        assert_eq!(b.input_tokens, 3060);
     }
 
     #[test]
     fn medium_context_shows_limited_cache_read() {
         let b = compute_usage_breakdown(12_000, true);
         // progress = (12000 - 4000) / (20000 - 4000) = 0.5
-        // read hit ratio = 30% * 0.5 = 15%
+        // read hit ratio = 10% + (45% - 10%) * 0.5 = 27.5%
         // CC = floor(12000 * 0.15) = 1800
-        // CR = floor((12000 - 1800) * 0.15) = 1530
+        // CR = floor((12000 - 1800) * 0.275) = 2805
         assert_eq!(b.cache_creation_input_tokens, 1800);
-        assert_eq!(b.cache_read_input_tokens, 1530);
-        assert_eq!(b.input_tokens, 8670);
+        assert_eq!(b.cache_read_input_tokens, 2805);
+        assert_eq!(b.input_tokens, 7395);
     }
 
     #[test]
     fn large_context_starts_high_cache_read() {
         let b = compute_usage_breakdown(20_000, true);
-        // 20k 是高缓存平滑过渡起点：15% creation，剩余部分 30% read。
+        // 20k 是高缓存平滑过渡起点：15% creation，剩余部分 45% read。
         assert_eq!(b.cache_creation_input_tokens, 3000);
-        assert_eq!(b.cache_read_input_tokens, 5100);
-        assert_eq!(b.input_tokens, 11900);
+        assert_eq!(b.cache_read_input_tokens, 7650);
+        assert_eq!(b.input_tokens, 9350);
     }
 
     #[test]
     fn strong_context_reaches_high_cache_read() {
         let b = compute_usage_breakdown(50_000, true);
-        // 50k 达到强缓存起点：13% creation，剩余部分 70% read。
+        // 50k 达到强缓存起点：13% creation，剩余部分 80% read。
         assert_eq!(b.cache_creation_input_tokens, 6500);
-        assert_eq!(b.cache_read_input_tokens, 30449);
-        assert_eq!(b.input_tokens, 13051);
+        assert_eq!(b.cache_read_input_tokens, 34800);
+        assert_eq!(b.input_tokens, 8700);
     }
 
     #[test]
     fn very_large_context_caps_cache_read_and_reduces_creation() {
         let b = compute_usage_breakdown(100_000, true);
-        // 100k 后达到上限：12% creation，剩余部分 80% read。
-        assert_eq!(b.cache_creation_input_tokens, 12_000);
-        assert_eq!(b.cache_read_input_tokens, 70_400);
-        assert_eq!(b.input_tokens, 17_600);
+        // 100k 后达到上限：10% creation，剩余部分 90% read。
+        assert_eq!(b.cache_creation_input_tokens, 10_000);
+        assert_eq!(b.cache_read_input_tokens, 81_000);
+        assert_eq!(b.input_tokens, 9000);
     }
 
     #[test]
@@ -300,11 +305,11 @@ mod tests {
     #[test]
     fn split_uses_progressive_read_hit_rates() {
         assert_eq!(read_hit_rate(split_virtual_cache(3999)), 0.0);
-        assert_eq!(read_hit_rate(split_virtual_cache(4000)), 0.0);
-        assert!((read_hit_rate(split_virtual_cache(12_000)) - 0.15).abs() <= 0.01);
-        assert!((read_hit_rate(split_virtual_cache(20_000)) - 0.30).abs() <= 0.01);
-        assert!((read_hit_rate(split_virtual_cache(50_000)) - 0.70).abs() <= 0.01);
-        assert!((read_hit_rate(split_virtual_cache(100_000)) - 0.80).abs() <= 0.01);
+        assert!((read_hit_rate(split_virtual_cache(4000)) - 0.10).abs() <= 0.01);
+        assert!((read_hit_rate(split_virtual_cache(12_000)) - 0.275).abs() <= 0.01);
+        assert!((read_hit_rate(split_virtual_cache(20_000)) - 0.45).abs() <= 0.01);
+        assert!((read_hit_rate(split_virtual_cache(50_000)) - 0.80).abs() <= 0.01);
+        assert!((read_hit_rate(split_virtual_cache(100_000)) - 0.90).abs() <= 0.01);
     }
 
     #[test]
@@ -325,7 +330,7 @@ mod tests {
         );
         assert_eq!(
             split_virtual_cache(100_000).cache_creation_input_tokens,
-            12_000
+            10_000
         );
     }
 
