@@ -105,9 +105,7 @@ async fn main() {
             .clone()
             .or_else(|| config.proxy_url.clone());
         if config.tls_sidecar_proxy_url.is_none() && config.proxy_url.is_some() {
-            tracing::info!(
-                "未设置 tlsSidecarProxyUrl，已自动沿用 proxyUrl 作为 sidecar 上游代理"
-            );
+            tracing::info!("未设置 tlsSidecarProxyUrl，已自动沿用 proxyUrl 作为 sidecar 上游代理");
         }
         // 警告：sidecar 启用时，per-credential proxy 不再生效（reqwest 仅与 localhost 通讯）
         let has_per_credential_proxy = credentials_list.iter().any(|c| c.proxy_url.is_some());
