@@ -11,8 +11,9 @@ FROM node:22-alpine AS frontend-builder
 # pnpm 固定 v9：v10 默认拒绝执行未审批的依赖 build 脚本（@swc/core、esbuild 等），
 # CI 非交互环境直接 fail。锁 v9 避免该兼容性问题。
 WORKDIR /app/admin-ui
-COPY admin-ui/package.json ./
-RUN npm install -g pnpm@9 && pnpm install
+COPY admin-ui/package.json admin-ui/pnpm-lock.yaml admin-ui/.npmrc admin-ui/pnpm-workspace.yaml ./
+RUN npm install -g pnpm@11
+RUN pnpm install --frozen-lockfile
 COPY admin-ui ./
 RUN pnpm build
 

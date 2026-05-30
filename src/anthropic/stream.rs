@@ -1064,14 +1064,14 @@ impl StreamContext {
         if let Some(delta_event) = self.state_manager.handle_content_block_delta(
             text_index,
             json!({
-                "type": "content_block_delta",
-                "index": text_index,
-                "delta": {
-                        "type": "text_delta",
-                        "text": text
-                    }
-                }),
-            ) {
+            "type": "content_block_delta",
+            "index": text_index,
+            "delta": {
+                    "type": "text_delta",
+                    "text": text
+                }
+            }),
+        ) {
             events.push(delta_event);
         }
 
@@ -2316,7 +2316,12 @@ mod tests {
             .find(|e| e.event == "message_delta")
             .expect("message_delta should be emitted");
         assert_eq!(message_delta.data["delta"]["stop_reason"], "max_tokens");
-        assert!(message_delta.data["usage"]["output_tokens"].as_i64().unwrap() <= 2);
+        assert!(
+            message_delta.data["usage"]["output_tokens"]
+                .as_i64()
+                .unwrap()
+                <= 2
+        );
     }
 
     #[test]

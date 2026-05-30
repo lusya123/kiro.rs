@@ -438,7 +438,12 @@ impl AdminService {
         // proxy 改动不需要重启
 
         // 持久化到 config.json
-        self.persist_sidecar_config(new_enabled, new_port, new_binary_path.clone(), new_proxy.clone())?;
+        self.persist_sidecar_config(
+            new_enabled,
+            new_port,
+            new_binary_path.clone(),
+            new_proxy.clone(),
+        )?;
 
         // 热更新 proxy（用 RwLock 里的实时值做 diff 基准，避免与 token_manager 启动快照对比导致漏更新）
         let live_proxy = crate::tls_sidecar::current_upstream_proxy();
@@ -476,14 +481,17 @@ impl AdminService {
         upstream_proxy: Option<String>,
     ) -> Result<(), AdminServiceError> {
         let path = self.config_path.as_ref().ok_or_else(|| {
-            AdminServiceError::InternalError("无法定位 config.json 路径，配置无法持久化".to_string())
+            AdminServiceError::InternalError(
+                "无法定位 config.json 路径，配置无法持久化".to_string(),
+            )
         })?;
 
         // 读 → 改 → 写：用 serde_json::Value 避免破坏未识别字段
         let content = std::fs::read_to_string(path)
             .map_err(|e| AdminServiceError::InternalError(format!("读 config.json 失败: {}", e)))?;
-        let mut value: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| AdminServiceError::InternalError(format!("解析 config.json 失败: {}", e)))?;
+        let mut value: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+            AdminServiceError::InternalError(format!("解析 config.json 失败: {}", e))
+        })?;
 
         let obj = value.as_object_mut().ok_or_else(|| {
             AdminServiceError::InternalError("config.json 顶层不是对象".to_string())

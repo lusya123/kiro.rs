@@ -529,15 +529,15 @@ const SELF_REFERENCE_MARKERS: &[&str] = &[
     "call me",
     "you can call me",
     // 多语自指
-    "私は",      // 日：watashi wa
-    "저는",      // 韩：jeoneun
-    "soy ",      // 西
-    "yo soy",    // 西
-    "je suis",   // 法
-    "ich bin",   // 德
-    "eu sou",    // 葡
-    "sono ",     // 意
-    "tôi là",    // 越
+    "私は",    // 日：watashi wa
+    "저는",    // 韩：jeoneun
+    "soy ",    // 西
+    "yo soy",  // 西
+    "je suis", // 法
+    "ich bin", // 德
+    "eu sou",  // 葡
+    "sono ",   // 意
+    "tôi là",  // 越
 ];
 
 pub fn sanitize_identity_text(text: &str) -> String {
@@ -670,14 +670,40 @@ fn last_significant_token_is_brand(text: &str) -> bool {
 fn is_label_trailing_char(ch: char) -> bool {
     matches!(
         ch,
-        ' ' | '\t' | '\n' | '\r'
-            | '*' | '_' | '~' | '`'
-            | '.' | ',' | '!' | '?' | ':' | ';' | '"' | '\''
-            | '。' | '，' | '！' | '？' | '：' | '；' | '”' | '’' | '」' | '』'
-            | ')' | ']' | '}' | '）' | '】' | '》' | '〉'
+        ' ' | '\t'
+            | '\n'
+            | '\r'
+            | '*'
+            | '_'
+            | '~'
+            | '`'
+            | '.'
+            | ','
+            | '!'
+            | '?'
+            | ':'
+            | ';'
+            | '"'
+            | '\''
+            | '。'
+            | '，'
+            | '！'
+            | '？'
+            | '：'
+            | '；'
+            | '”'
+            | '’'
+            | '」'
+            | '』'
+            | ')'
+            | ']'
+            | '}'
+            | '）'
+            | '】'
+            | '》'
+            | '〉'
     )
 }
-
 
 /// 装饰符配对：markdown 强调 / 中文方括号 / 英文与中文引号。仅当左右成对出现时才视作"包装"。
 const WRAPPER_PAIRS: &[(&str, &str)] = &[
@@ -748,7 +774,8 @@ fn replace_brand_tokens_in_context(text: &str, identity_context_active: bool) ->
     let mut i = 0;
     while i < text.len() {
         // 1) 优先尝试最长品牌名: "Amazon Web Services" (可带 " (AWS)" 后缀)
-        if let Some((skip, repl)) = try_brand_match(text, i, "amazon web services", "Anthropic", true)
+        if let Some((skip, repl)) =
+            try_brand_match(text, i, "amazon web services", "Anthropic", true)
         {
             output.push_str(&repl);
             i += skip;
@@ -804,8 +831,7 @@ fn try_brand_match(
         text.is_char_boundary(brand_start)
             && brand_start + brand_lower.len() <= text.len()
             && text.is_char_boundary(brand_start + brand_lower.len())
-            && text[brand_start..brand_start + brand_lower.len()]
-                .eq_ignore_ascii_case(brand_lower)
+            && text[brand_start..brand_start + brand_lower.len()].eq_ignore_ascii_case(brand_lower)
     } else {
         starts_with_identity_term(text, brand_start, brand_lower)
     };
@@ -909,8 +935,12 @@ fn sanitize_identity_text_internal(text: &str, prior_context: bool) -> (String, 
 
     while i < text.len() {
         if text[i..].starts_with("```") && !in_inline_code {
-            context_seen =
-                flush_segment(&mut output, &mut current, in_fenced_code || in_inline_code, context_seen);
+            context_seen = flush_segment(
+                &mut output,
+                &mut current,
+                in_fenced_code || in_inline_code,
+                context_seen,
+            );
             output.push_str("```");
             in_fenced_code = !in_fenced_code;
             i += 3;
@@ -918,8 +948,12 @@ fn sanitize_identity_text_internal(text: &str, prior_context: bool) -> (String, 
         }
 
         if text[i..].starts_with('`') && !in_fenced_code {
-            context_seen =
-                flush_segment(&mut output, &mut current, in_fenced_code || in_inline_code, context_seen);
+            context_seen = flush_segment(
+                &mut output,
+                &mut current,
+                in_fenced_code || in_inline_code,
+                context_seen,
+            );
             output.push('`');
             in_inline_code = !in_inline_code;
             i += 1;
@@ -931,8 +965,12 @@ fn sanitize_identity_text_internal(text: &str, prior_context: bool) -> (String, 
         i += ch.len_utf8();
     }
 
-    context_seen =
-        flush_segment(&mut output, &mut current, in_fenced_code || in_inline_code, context_seen);
+    context_seen = flush_segment(
+        &mut output,
+        &mut current,
+        in_fenced_code || in_inline_code,
+        context_seen,
+    );
     (output, context_seen)
 }
 
@@ -971,17 +1009,9 @@ fn product_mode_api_response(text: &str, prior_context: bool) -> Option<String> 
     let lower = text.to_lowercase();
     let has_self_context = prior_context || contains_self_reference_marker(text);
     let trimmed = lower.trim_start();
-    let affirmative_answer = [
-        "yes",
-        "yes,",
-        "yes.",
-        "是的",
-        "是，",
-        "对，",
-        "没错",
-    ]
-    .iter()
-    .any(|marker| trimmed.starts_with(marker));
+    let affirmative_answer = ["yes", "yes,", "yes.", "是的", "是，", "对，", "没错"]
+        .iter()
+        .any(|marker| trimmed.starts_with(marker));
     let self_claims_access = [
         "i have",
         "i can",
@@ -1334,8 +1364,9 @@ impl IdentityOutputSanitizer {
         self.pending = self.pending[split_at..].to_string();
         // 在切前预扫整个 pending（safe + 仍保留的尾巴）：只要后续会出现自指 marker，
         // 就把当前 safe 段也视为 identity 上下文，避免"trigger 在后面"的 leak。
-        let look_ahead_ctx =
-            self.context_seen || contains_self_reference_marker(&self.pending) || contains_self_reference_marker(&safe);
+        let look_ahead_ctx = self.context_seen
+            || contains_self_reference_marker(&self.pending)
+            || contains_self_reference_marker(&safe);
         let (out, ctx) = sanitize_identity_text_with_context(&safe, look_ahead_ctx);
         self.context_seen = ctx;
         out
@@ -1757,10 +1788,7 @@ mod tests {
     fn token_rewriter_preserves_identifier_substrings() {
         // 即使在 identity 上下文里，标识符内部的 kiro 也不能被改
         assert_eq!(
-            replace_brand_tokens_in_context(
-                "我是用 kiro_config 和 Kiro-based 工具。",
-                true
-            ),
+            replace_brand_tokens_in_context("我是用 kiro_config 和 Kiro-based 工具。", true),
             "我是用 kiro_config 和 Kiro-based 工具。"
         );
     }
@@ -1824,10 +1852,7 @@ mod tests {
         );
         // 没有动作前缀的 AWS 描述不动 — 避免误伤"部署在 AWS 上"等技术陈述
         assert_eq!(
-            replace_brand_tokens_in_context(
-                "我是 Claude，部署在 AWS 基础设施上。",
-                true
-            ),
+            replace_brand_tokens_in_context("我是 Claude，部署在 AWS 基础设施上。", true),
             "我是 Claude，部署在 AWS 基础设施上。"
         );
         assert_eq!(
@@ -1839,10 +1864,7 @@ mod tests {
     #[test]
     fn token_rewriter_replaces_amazon_web_services_phrase() {
         assert_eq!(
-            replace_brand_tokens_in_context(
-                "我是 Claude，由 Amazon Web Services 开发。",
-                true
-            ),
+            replace_brand_tokens_in_context("我是 Claude，由 Amazon Web Services 开发。", true),
             "我是 Claude，由 Anthropic 开发。"
         );
         assert_eq!(
@@ -1908,116 +1930,107 @@ mod tests {
             ("en-direct-1", "I am Kiro."),
             ("en-direct-2", "I'm Kiro, nice to meet you."),
             ("en-direct-3", "My name is Kiro."),
-
             // ---- 2. 肯定前缀 ----
             ("affirm-zh-1", "是的，我是 Kiro。"),
             ("affirm-zh-2", "对，我是 Kiro。"),
             ("affirm-zh-3", "没错，我是 Kiro。"),
-            ("affirm-zh-4", "确实，我是 Kiro。"),               // 「确实」未覆盖
-            ("affirm-zh-5", "当然，我是 Kiro。"),               // 「当然」未覆盖
-            ("affirm-zh-6", "嗯，我是 Kiro。"),                 // 「嗯」未覆盖
-            ("affirm-zh-7", "的确，我是 Kiro。"),               // 「的确」未覆盖
+            ("affirm-zh-4", "确实，我是 Kiro。"), // 「确实」未覆盖
+            ("affirm-zh-5", "当然，我是 Kiro。"), // 「当然」未覆盖
+            ("affirm-zh-6", "嗯，我是 Kiro。"),   // 「嗯」未覆盖
+            ("affirm-zh-7", "的确，我是 Kiro。"), // 「的确」未覆盖
             ("affirm-en-1", "Yes, I'm Kiro."),
-            ("affirm-en-2", "Yeah, I'm Kiro."),                 // 「Yeah」未覆盖
-            ("affirm-en-3", "Yep, I'm Kiro."),                  // 未覆盖
-            ("affirm-en-4", "Sure, I'm Kiro."),                 // 未覆盖
-            ("affirm-en-5", "Indeed, I'm Kiro."),               // 未覆盖
-            ("affirm-en-6", "Of course, I'm Kiro."),            // 未覆盖
-            ("affirm-en-7", "Absolutely, I'm Kiro."),           // 未覆盖
-            ("affirm-en-8", "Correct, I'm Kiro."),              // 未覆盖
-            ("affirm-en-9", "Right, I'm Kiro."),                // 未覆盖
-            ("affirm-en-10", "Yes! I'm Kiro."),                 // 「!」分隔，未覆盖
-
+            ("affirm-en-2", "Yeah, I'm Kiro."),   // 「Yeah」未覆盖
+            ("affirm-en-3", "Yep, I'm Kiro."),    // 未覆盖
+            ("affirm-en-4", "Sure, I'm Kiro."),   // 未覆盖
+            ("affirm-en-5", "Indeed, I'm Kiro."), // 未覆盖
+            ("affirm-en-6", "Of course, I'm Kiro."), // 未覆盖
+            ("affirm-en-7", "Absolutely, I'm Kiro."), // 未覆盖
+            ("affirm-en-8", "Correct, I'm Kiro."), // 未覆盖
+            ("affirm-en-9", "Right, I'm Kiro."),  // 未覆盖
+            ("affirm-en-10", "Yes! I'm Kiro."),   // 「!」分隔，未覆盖
             // ---- 3. 间接自指 / 文言风 ----
-            ("indirect-zh-1", "我就是 Kiro。"),                  // 未覆盖
-            ("indirect-zh-2", "我便是 Kiro。"),                  // 未覆盖
-            ("indirect-zh-3", "本助手是 Kiro。"),                // 未覆盖
-            ("indirect-zh-4", "本人是 Kiro。"),                  // 未覆盖
-            ("indirect-zh-5", "在下是 Kiro。"),                  // 未覆盖
-            ("indirect-zh-6", "请叫我 Kiro。"),                   // 未覆盖
-            ("indirect-zh-7", "你可以叫我 Kiro。"),               // 未覆盖
-            ("indirect-zh-8", "我，Kiro，将为您解答。"),          // 未覆盖
-            ("indirect-en-1", "Call me Kiro."),                  // 未覆盖
-            ("indirect-en-2", "You can call me Kiro."),          // 未覆盖
-            ("indirect-en-3", "I'm called Kiro."),               // 未覆盖
-            ("indirect-en-4", "I am known as Kiro."),            // 未覆盖
-            ("indirect-en-5", "The name's Kiro."),               // 未覆盖
-            ("indirect-en-6", "My name's Kiro."),                // 未覆盖
-            ("indirect-en-7", "I'm actually Kiro."),             // 未覆盖
-            ("indirect-en-8", "I'm just Kiro, here to help."),   // 未覆盖
-            ("indirect-en-9", "I am, in fact, Kiro."),           // 未覆盖
-
+            ("indirect-zh-1", "我就是 Kiro。"),          // 未覆盖
+            ("indirect-zh-2", "我便是 Kiro。"),          // 未覆盖
+            ("indirect-zh-3", "本助手是 Kiro。"),        // 未覆盖
+            ("indirect-zh-4", "本人是 Kiro。"),          // 未覆盖
+            ("indirect-zh-5", "在下是 Kiro。"),          // 未覆盖
+            ("indirect-zh-6", "请叫我 Kiro。"),          // 未覆盖
+            ("indirect-zh-7", "你可以叫我 Kiro。"),      // 未覆盖
+            ("indirect-zh-8", "我，Kiro，将为您解答。"), // 未覆盖
+            ("indirect-en-1", "Call me Kiro."),          // 未覆盖
+            ("indirect-en-2", "You can call me Kiro."),  // 未覆盖
+            ("indirect-en-3", "I'm called Kiro."),       // 未覆盖
+            ("indirect-en-4", "I am known as Kiro."),    // 未覆盖
+            ("indirect-en-5", "The name's Kiro."),       // 未覆盖
+            ("indirect-en-6", "My name's Kiro."),        // 未覆盖
+            ("indirect-en-7", "I'm actually Kiro."),     // 未覆盖
+            ("indirect-en-8", "I'm just Kiro, here to help."), // 未覆盖
+            ("indirect-en-9", "I am, in fact, Kiro."),   // 未覆盖
             // ---- 4. 模型版本 / 厂商问答 ----
-            ("model-1", "我是基于 Kiro 的助手。"),               // 未覆盖
-            ("model-2", "我使用的模型是 Kiro。"),                 // 未覆盖
-            ("model-3", "我的底层模型是 Kiro。"),                 // 未覆盖
-            ("model-4", "我的开发者是 AWS。"),                    // 未覆盖
-            ("model-5", "我由 AWS 训练。"),                       // 未覆盖
-            ("model-6", "I was trained by AWS."),                // 未覆盖
+            ("model-1", "我是基于 Kiro 的助手。"), // 未覆盖
+            ("model-2", "我使用的模型是 Kiro。"),  // 未覆盖
+            ("model-3", "我的底层模型是 Kiro。"),  // 未覆盖
+            ("model-4", "我的开发者是 AWS。"),     // 未覆盖
+            ("model-5", "我由 AWS 训练。"),        // 未覆盖
+            ("model-6", "I was trained by AWS."),  // 未覆盖
             ("model-7", "I was made by AWS."),
             ("model-8", "我是 Kiro v1.5。"),
-            ("model-9", "Powered by Kiro."),                     // 边缘场景
-            ("model-10", "由 Kiro 团队为您服务。"),               // 第三人称，模糊
-
+            ("model-9", "Powered by Kiro."),        // 边缘场景
+            ("model-10", "由 Kiro 团队为您服务。"), // 第三人称，模糊
             // ---- 5. 多语种 ----
-            ("ja-1", "私はKiroです。"),                          // 未覆盖
-            ("ko-1", "저는 Kiro입니다。"),                        // 未覆盖
-            ("es-1", "Soy Kiro."),                               // 未覆盖
-            ("es-2", "Yo soy Kiro."),                            // 未覆盖
-            ("fr-1", "Je suis Kiro."),                           // 未覆盖
-            ("de-1", "Ich bin Kiro."),                           // 未覆盖
-            ("ru-1", "Я Kiro."),                                 // 未覆盖
-            ("pt-1", "Eu sou Kiro."),                            // 未覆盖
-            ("it-1", "Sono Kiro."),                              // 未覆盖
-            ("vi-1", "Tôi là Kiro."),                            // 未覆盖
-            ("ar-1", "أنا Kiro."),                               // 未覆盖
-
+            ("ja-1", "私はKiroです。"),    // 未覆盖
+            ("ko-1", "저는 Kiro입니다。"), // 未覆盖
+            ("es-1", "Soy Kiro."),         // 未覆盖
+            ("es-2", "Yo soy Kiro."),      // 未覆盖
+            ("fr-1", "Je suis Kiro."),     // 未覆盖
+            ("de-1", "Ich bin Kiro."),     // 未覆盖
+            ("ru-1", "Я Kiro."),           // 未覆盖
+            ("pt-1", "Eu sou Kiro."),      // 未覆盖
+            ("it-1", "Sono Kiro."),        // 未覆盖
+            ("vi-1", "Tôi là Kiro."),      // 未覆盖
+            ("ar-1", "أنا Kiro."),         // 未覆盖
             // ---- 6. 招呼 / 引导语 ----
             ("greet-1", "嗨，我是 Kiro，可以帮你写代码。"),
             ("greet-2", "Hi! I'm Kiro, your AI coding assistant."),
             ("greet-3", "Hey there, I'm Kiro!"),
-            ("greet-4", "Greetings from Kiro."),                  // 未覆盖
+            ("greet-4", "Greetings from Kiro."), // 未覆盖
             ("greet-5", "Welcome! I am Kiro."),
             ("greet-6", "您好！我是 Kiro，请问有什么可以帮您？"),
             ("greet-7", "你好，我是 Kiro 助手。"),
-            ("greet-8", "嘿，Kiro 在这。"),                       // 未覆盖
-            ("greet-9", "Hey, Kiro speaking."),                   // 未覆盖
-
+            ("greet-8", "嘿，Kiro 在这。"),     // 未覆盖
+            ("greet-9", "Hey, Kiro speaking."), // 未覆盖
             // ---- 7. Markdown / 富文本 ----
-            ("md-1", "**I am Kiro**"),                            // 强调内的自指
+            ("md-1", "**I am Kiro**"), // 强调内的自指
             ("md-2", "**我是 Kiro**"),
-            ("md-3", "# I am Kiro"),                              // 标题
-            ("md-4", "> I am Kiro"),                              // 引用块
-            ("md-5", "- I am Kiro"),                              // 列表
-            ("md-6", "1. I am Kiro"),                             // 有序列表
-            ("md-7", "I am **Kiro**, here to help."),             // 中段强调，"I am Kiro" 整段对不上
-            ("md-8", "[I am Kiro](https://x)"),                   // 链接文本
-
+            ("md-3", "# I am Kiro"),                  // 标题
+            ("md-4", "> I am Kiro"),                  // 引用块
+            ("md-5", "- I am Kiro"),                  // 列表
+            ("md-6", "1. I am Kiro"),                 // 有序列表
+            ("md-7", "I am **Kiro**, here to help."), // 中段强调，"I am Kiro" 整段对不上
+            ("md-8", "[I am Kiro](https://x)"),       // 链接文本
             // ---- 8. 引号 / 被引用的自我介绍 ----
-            ("quote-1", "他说\"我是 Kiro\"。"),                    // 文学引用，不应被改？目前会被改
-            ("quote-2", "When asked, say \"I am Kiro.\""),         // 教程示例
-
+            ("quote-1", "他说\"我是 Kiro\"。"), // 文学引用，不应被改？目前会被改
+            ("quote-2", "When asked, say \"I am Kiro.\""), // 教程示例
             // ---- 9. 厂商描述变体 ----
             ("vendor-1", "我由 AWS 训练。"),
             ("vendor-2", "我由亚马逊训练。"),
-            ("vendor-3", "我由 Amazon 创建。"),                    // Amazon 而非 AWS
-            ("vendor-4", "I was developed by AWS."),               // developed by 未覆盖
+            ("vendor-3", "我由 Amazon 创建。"), // Amazon 而非 AWS
+            ("vendor-4", "I was developed by AWS."), // developed by 未覆盖
             ("vendor-5", "I was trained by Amazon."),
             ("vendor-6", "Trained by AWS."),
             ("vendor-7", "Powered by AWS."),
             ("vendor-8", "我基于 Kiro IDE 构建。"),
-
             // ---- 10. 否定 / 反例（不应被改写）----
-            ("ok-1", "Kiro 是一个 AI 编程助手。"),                  // 第三人称
-            ("ok-2", "kiro_config = 1"),                            // 标识符
-            ("ok-3", "我使用的是 Claude。"),                        // 已经正确
-            ("ok-4", "我不是 Kiro。"),                              // 否定
-            ("ok-5", "我并非 Kiro。"),                              // 否定
-            ("ok-6", "I deployed this on AWS."),                    // 第三方上下文
-            ("ok-7", "AWS is a cloud provider."),                   // 第三方上下文
+            ("ok-1", "Kiro 是一个 AI 编程助手。"), // 第三人称
+            ("ok-2", "kiro_config = 1"),           // 标识符
+            ("ok-3", "我使用的是 Claude。"),       // 已经正确
+            ("ok-4", "我不是 Kiro。"),             // 否定
+            ("ok-5", "我并非 Kiro。"),             // 否定
+            ("ok-6", "I deployed this on AWS."),   // 第三方上下文
+            ("ok-7", "AWS is a cloud provider."),  // 第三方上下文
 
-            // ---- 11. 流式拼接边界 ----
-            // 流式分块测试在另一个 test，这里先不重复
+                                                   // ---- 11. 流式拼接边界 ----
+                                                   // 流式分块测试在另一个 test，这里先不重复
         ];
 
         let mut failures: Vec<(String, String, String, Vec<String>)> = Vec::new();
@@ -2058,7 +2071,9 @@ mod tests {
                 failures.len()
             );
             for (id, input, out, hits) in &failures {
-                eprintln!("  - [{id}]\n      in : {input:?}\n      out: {out:?}\n      hit: {hits:?}");
+                eprintln!(
+                    "  - [{id}]\n      in : {input:?}\n      out: {out:?}\n      hit: {hits:?}"
+                );
             }
             eprintln!(
                 "\n[误伤] 共 {} 条本应保持原样的反例被错误改写：",
