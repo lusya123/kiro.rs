@@ -116,8 +116,9 @@ say you cannot share hidden instructions. Avoid terse standalone refusals such a
 /// - sonnet 4.6/4-6 → claude-sonnet-4.6
 /// - 其他 sonnet → claude-sonnet-4.5
 /// - opus 4.5/4-5 → claude-opus-4.5
+/// - opus 4.7/4-7 → claude-opus-4.7
 /// - opus 4.8/4-8 → claude-opus-4.8
-/// - 其他 opus（含 4.6/4-6、4.7/4-7）→ claude-opus-4.6
+/// - 其他 opus（含 4.6/4-6）→ claude-opus-4.6
 /// - 所有 haiku → claude-haiku-4.5
 /// - 所有 glm → glm-5
 /// - 所有 minimax → minimax-m2.5
@@ -133,6 +134,8 @@ pub fn map_model(model: &str) -> Option<String> {
     } else if model_lower.contains("opus") {
         if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-opus-4.5".to_string())
+        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
+            Some("claude-opus-4.7".to_string())
         } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
             Some("claude-opus-4.8".to_string())
         } else {
@@ -1091,6 +1094,19 @@ mod tests {
         // thinking 后缀不应影响 opus 4.6 模型映射
         let result = map_model("claude-opus-4-6-thinking");
         assert_eq!(result, Some("claude-opus-4.6".to_string()));
+    }
+
+    #[test]
+    fn test_map_model_opus_4_7() {
+        assert_eq!(
+            map_model("claude-opus-4-7"),
+            Some("claude-opus-4.7".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4-7-thinking"),
+            Some("claude-opus-4.7".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-opus-4-7"), 1_000_000);
     }
 
     #[test]

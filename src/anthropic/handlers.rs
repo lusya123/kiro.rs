@@ -2074,14 +2074,14 @@ mod tests {
         let kiro_json = serde_json::to_value(&result.conversation_state)
             .expect("ConversationState 必须可序列化");
 
-        // 模型映射：claude-opus-4-7 → claude-opus-4.6
+        // 模型映射：claude-opus-4-7 → claude-opus-4.7
         let current_model = kiro_json
             .pointer("/currentMessage/userInputMessage/modelId")
             .and_then(|v| v.as_str())
             .unwrap_or("");
         assert_eq!(
-            current_model, "claude-opus-4.6",
-            "上游收到的 modelId 必须是 claude-opus-4.6（4.7 兜底映射）"
+            current_model, "claude-opus-4.7",
+            "上游收到的 modelId 必须是 claude-opus-4.7"
         );
 
         // thinking 前缀注入：history 第一条 user 消息含 adaptive + effort=high
