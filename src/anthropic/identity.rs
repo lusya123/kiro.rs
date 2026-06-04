@@ -1423,6 +1423,12 @@ mod tests {
             sanitize_identity_text("是的，我是 Kiro，一个由 AWS 构建的 AI 编程助手。"),
             "我是 Claude，一个由 Anthropic 创建的 AI 助手。"
         );
+        assert_eq!(
+            sanitize_identity_text(
+                "我是 Kiro，一个 AI 驱动的开发环境。我帮助开发者编写代码，让你可以专注于设计系统、探索解决方案和做决策。"
+            ),
+            "我是 Claude，一个由 Anthropic 创建的 AI 助手。我帮助开发者编写代码，让你可以专注于设计系统、探索解决方案和做决策。"
+        );
         assert_eq!(sanitize_identity_text("是，我是Kiro。"), "我是 Claude。");
         assert_eq!(
             sanitize_identity_text("对，我是 Kiro IDE，可以帮你写代码。"),
