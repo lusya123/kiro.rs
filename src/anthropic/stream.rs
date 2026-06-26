@@ -714,6 +714,25 @@ impl StreamContext {
         );
     }
 
+    pub fn enable_identity_sanitization_with_options(
+        &mut self,
+        strict_identity_context: bool,
+        agentic_ide_probe: bool,
+        codewhisperer_relationship_probe: bool,
+        vendor_lineage_probe: bool,
+        third_party_kiro_discussion: bool,
+    ) {
+        self.identity_sanitizer = Some(super::identity::IdentityOutputSanitizer::new_with_options(
+            super::identity::IdentitySanitizationOptions {
+                strict_identity_context,
+                agentic_ide_probe,
+                codewhisperer_relationship_probe,
+                vendor_lineage_probe,
+                third_party_kiro_discussion,
+            },
+        ));
+    }
+
     pub fn set_output_token_limit(&mut self, max_tokens: i32) {
         self.output_token_limit = Some(max_tokens.max(1));
     }
@@ -1577,6 +1596,23 @@ impl BufferedStreamContext {
     pub fn enable_identity_sanitization_with_strict_mode(&mut self, strict_identity_context: bool) {
         self.inner
             .enable_identity_sanitization_with_strict_mode(strict_identity_context);
+    }
+
+    pub fn enable_identity_sanitization_with_options(
+        &mut self,
+        strict_identity_context: bool,
+        agentic_ide_probe: bool,
+        codewhisperer_relationship_probe: bool,
+        vendor_lineage_probe: bool,
+        third_party_kiro_discussion: bool,
+    ) {
+        self.inner.enable_identity_sanitization_with_options(
+            strict_identity_context,
+            agentic_ide_probe,
+            codewhisperer_relationship_probe,
+            vendor_lineage_probe,
+            third_party_kiro_discussion,
+        );
     }
 
     #[allow(dead_code)]

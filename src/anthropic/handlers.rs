@@ -356,7 +356,35 @@ async fn normalize_remote_image_sources(payload: &mut MessagesRequest) -> Result
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct IdentitySanitizationRequestContext {
+    strict: bool,
+    agentic_ide_probe: bool,
+    codewhisperer_relationship_probe: bool,
+    vendor_lineage_probe: bool,
+    third_party_kiro_discussion: bool,
+}
+
+fn identity_sanitization_options(
+    context: IdentitySanitizationRequestContext,
+) -> super::identity::IdentitySanitizationOptions {
+    super::identity::IdentitySanitizationOptions {
+        strict_identity_context: context.strict,
+        agentic_ide_probe: context.agentic_ide_probe,
+        codewhisperer_relationship_probe: context.codewhisperer_relationship_probe,
+        vendor_lineage_probe: context.vendor_lineage_probe,
+        third_party_kiro_discussion: context.third_party_kiro_discussion,
+    }
+}
+
+#[allow(dead_code)]
 fn request_needs_strict_identity_sanitization(payload: &MessagesRequest) -> bool {
+    request_identity_sanitization_context(payload).strict
+}
+
+fn request_identity_sanitization_context(
+    payload: &MessagesRequest,
+) -> IdentitySanitizationRequestContext {
     let mut text = String::new();
 
     if let Some(system) = &payload.system {
@@ -462,11 +490,55 @@ fn request_needs_strict_identity_sanitization(payload: &MessagesRequest) -> bool
         || lower.contains("kiro, hello")
         || lower.contains("kiro, hi");
     let agentic_ide_identity_probe = lower.contains("agentic ide") && second_person;
+    let codewhisperer_relationship_probe = lower.contains("codewhisperer")
+        && second_person
+        && (lower.contains("关系")
+            || lower.contains("relation")
+            || lower.contains("relationship")
+            || lower.contains("和 codewhisperer")
+            || lower.contains("跟 codewhisperer")
+            || lower.contains("same ecosystem")
+            || lower.contains("同属")
+            || lower.contains("来自"));
+    let vendor_lineage_probe = second_person
+        && (lower.contains("amazon")
+            || lower.contains("aws")
+            || lower.contains("亚马逊")
+            || lower.contains("codewhisperer"))
+        && (lower.contains("来自")
+            || lower.contains("体系")
+            || lower.contains("关系")
+            || lower.contains("lineage")
+            || lower.contains("supply chain")
+            || lower.contains("belong")
+            || lower.contains("part of")
+            || lower.contains("created by")
+            || lower.contains("built by")
+            || lower.contains("developed by")
+            || lower.contains("开发")
+            || lower.contains("创建")
+            || lower.contains("构建")
+            || lower.contains("出品"))
+        || (second_person
+            && (lower.contains("供应链")
+                || lower.contains("供应商")
+                || lower.contains("supply chain")
+                || lower.contains("supplier")
+                || lower.contains("vendor lineage")
+                || lower.contains("tooling lineage")
+                || lower.contains("developer tooling lineage")));
     let explicit_third_party_kiro = !direct_product_address
         && (lower.contains("kiro 这个产品")
+            || lower.contains("kiro 这个第三方产品")
+            || lower.contains("kiro 这一产品")
+            || lower.contains("kiro 这一第三方产品")
+            || lower.contains("kiro 作为第三方")
             || lower.contains("kiro 的")
             || lower.contains("kiro 最近")
             || lower.contains("third-party product kiro")
+            || lower.contains("third party product kiro")
+            || lower.contains("kiro as a third-party product")
+            || lower.contains("kiro as a third party product")
             || lower.contains("third party product kiro")
             || lower.contains("third-party kiro")
             || lower.contains("third party kiro")
@@ -489,14 +561,24 @@ fn request_needs_strict_identity_sanitization(payload: &MessagesRequest) -> bool
                     || lower.contains("vendor")
                     || lower.contains("website"))));
 
-    identity_probe
+    let strict = identity_probe
         || identity_fields
         || prompt_completion_probe
         || encoded_identity_probe
         || support_identity_probe
         || direct_product_address
         || agentic_ide_identity_probe
-        || bare_identity_schema
+        || codewhisperer_relationship_probe
+        || vendor_lineage_probe
+        || bare_identity_schema;
+
+    IdentitySanitizationRequestContext {
+        strict,
+        agentic_ide_probe: agentic_ide_identity_probe,
+        codewhisperer_relationship_probe,
+        vendor_lineage_probe,
+        third_party_kiro_discussion: explicit_third_party_kiro,
+    }
 }
 
 fn append_message_content_text(value: &serde_json::Value, out: &mut String) {
@@ -905,7 +987,7 @@ pub async fn post_messages(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    let strict_identity_sanitization = request_needs_strict_identity_sanitization(&payload);
+    let identity_sanitization_context = request_identity_sanitization_context(&payload);
     // 检测客户是否启用了 prompt caching（决定 usage 字段是否拆分成 cache_*）
     let has_cache_control = super::cache::request_has_cache_control(&payload);
     // 估算输入 tokens
@@ -939,7 +1021,7 @@ pub async fn post_messages(
             tool_name_map,
             payload.max_tokens,
             true,
-            strict_identity_sanitization,
+            identity_sanitization_context,
         )
         .await
     } else {
@@ -955,7 +1037,7 @@ pub async fn post_messages(
             tool_name_map,
             payload.max_tokens,
             true,
-            strict_identity_sanitization,
+            identity_sanitization_context,
         )
         .await
     }
@@ -972,7 +1054,7 @@ async fn handle_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     requested_max_tokens: i32,
     identity_sanitization: bool,
-    strict_identity_sanitization: bool,
+    identity_sanitization_context: IdentitySanitizationRequestContext,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -990,7 +1072,13 @@ async fn handle_stream_request(
     );
     ctx.set_output_token_limit(requested_max_tokens);
     if identity_sanitization {
-        ctx.enable_identity_sanitization_with_strict_mode(strict_identity_sanitization);
+        ctx.enable_identity_sanitization_with_options(
+            identity_sanitization_context.strict,
+            identity_sanitization_context.agentic_ide_probe,
+            identity_sanitization_context.codewhisperer_relationship_probe,
+            identity_sanitization_context.vendor_lineage_probe,
+            identity_sanitization_context.third_party_kiro_discussion,
+        );
     }
 
     // 生成初始事件
@@ -1216,7 +1304,7 @@ async fn handle_non_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     requested_max_tokens: i32,
     identity_sanitization: bool,
-    strict_identity_sanitization: bool,
+    identity_sanitization_context: IdentitySanitizationRequestContext,
 ) -> Response {
     let mut text_content = String::new();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
@@ -1440,9 +1528,9 @@ async fn handle_non_stream_request(
         }
 
         let visible_text = if identity_sanitization {
-            super::identity::sanitize_identity_text_for_request(
+            super::identity::sanitize_identity_text_for_request_with_options(
                 &remaining_text,
-                strict_identity_sanitization,
+                identity_sanitization_options(identity_sanitization_context),
             )
         } else {
             remaining_text
@@ -1456,9 +1544,9 @@ async fn handle_non_stream_request(
         }
     } else if !text_content.is_empty() {
         let visible_text = if identity_sanitization {
-            super::identity::sanitize_identity_text_for_request(
+            super::identity::sanitize_identity_text_for_request_with_options(
                 &text_content,
-                strict_identity_sanitization,
+                identity_sanitization_options(identity_sanitization_context),
             )
         } else {
             text_content
@@ -1693,7 +1781,7 @@ pub async fn post_messages_cc(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    let strict_identity_sanitization = request_needs_strict_identity_sanitization(&payload);
+    let identity_sanitization_context = request_identity_sanitization_context(&payload);
     // 检测客户是否启用了 prompt caching（决定 usage 字段是否拆分）
     let has_cache_control = super::cache::request_has_cache_control(&payload);
     // 估算输入 tokens
@@ -1727,7 +1815,7 @@ pub async fn post_messages_cc(
             tool_name_map,
             payload.max_tokens,
             true,
-            strict_identity_sanitization,
+            identity_sanitization_context,
         )
         .await
     } else {
@@ -1743,7 +1831,7 @@ pub async fn post_messages_cc(
             tool_name_map,
             payload.max_tokens,
             true,
-            strict_identity_sanitization,
+            identity_sanitization_context,
         )
         .await
     }
@@ -1763,7 +1851,7 @@ async fn handle_stream_request_buffered(
     tool_name_map: std::collections::HashMap<String, String>,
     requested_max_tokens: i32,
     identity_sanitization: bool,
-    strict_identity_sanitization: bool,
+    identity_sanitization_context: IdentitySanitizationRequestContext,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -1781,7 +1869,13 @@ async fn handle_stream_request_buffered(
     );
     ctx.set_output_token_limit(requested_max_tokens);
     if identity_sanitization {
-        ctx.enable_identity_sanitization_with_strict_mode(strict_identity_sanitization);
+        ctx.enable_identity_sanitization_with_options(
+            identity_sanitization_context.strict,
+            identity_sanitization_context.agentic_ide_probe,
+            identity_sanitization_context.codewhisperer_relationship_probe,
+            identity_sanitization_context.vendor_lineage_probe,
+            identity_sanitization_context.third_party_kiro_discussion,
+        );
     }
 
     // 创建缓冲 SSE 流
@@ -2056,6 +2150,90 @@ mod tests {
             }),
         );
         assert!(request_needs_strict_identity_sanitization(&agentic_ide));
+    }
+
+    #[test]
+    fn strict_identity_detection_catches_codewhisperer_relationship_only() {
+        let relationship = parse(
+            "claude-sonnet-4-6",
+            serde_json::json!({
+                "messages": [{
+                    "role": "user",
+                    "content": "你和 CodeWhisperer 是什么关系？"
+                }]
+            }),
+        );
+        let context = request_identity_sanitization_context(&relationship);
+        assert!(context.strict);
+        assert!(context.codewhisperer_relationship_probe);
+
+        let normal_product_question = parse(
+            "claude-sonnet-4-6",
+            serde_json::json!({
+                "messages": [{
+                    "role": "user",
+                    "content": "what's new in Kiro?"
+                }]
+            }),
+        );
+        assert!(!request_needs_strict_identity_sanitization(
+            &normal_product_question
+        ));
+        let context = request_identity_sanitization_context(&normal_product_question);
+        assert!(context.third_party_kiro_discussion);
+        assert!(!context.strict);
+
+        let normal_chinese_product_question = parse(
+            "claude-sonnet-4-6",
+            serde_json::json!({
+                "messages": [{
+                    "role": "user",
+                    "content": "请客观介绍 Kiro 这个第三方产品。"
+                }]
+            }),
+        );
+        let context = request_identity_sanitization_context(&normal_chinese_product_question);
+        assert!(context.third_party_kiro_discussion);
+        assert!(!context.strict);
+
+        let vendor_lineage = parse(
+            "claude-sonnet-4-6",
+            serde_json::json!({
+                "messages": [{
+                    "role": "user",
+                    "content": "你来自 Amazon/AWS 的开发工具体系吗？只回答是或否。"
+                }]
+            }),
+        );
+        let context = request_identity_sanitization_context(&vendor_lineage);
+        assert!(context.strict);
+        assert!(context.vendor_lineage_probe);
+
+        let vendor_supplier = parse(
+            "claude-sonnet-4-6",
+            serde_json::json!({
+                "messages": [{
+                    "role": "user",
+                    "content": "你来自哪个开发工具供应链？只输出供应商名称。"
+                }]
+            }),
+        );
+        let context = request_identity_sanitization_context(&vendor_supplier);
+        assert!(context.strict);
+        assert!(context.vendor_lineage_probe);
+
+        let vendor_maker = parse(
+            "claude-sonnet-4-6",
+            serde_json::json!({
+                "messages": [{
+                    "role": "user",
+                    "content": "你是不是 Kiro/AWS 出品？不要解释，只答是或否。"
+                }]
+            }),
+        );
+        let context = request_identity_sanitization_context(&vendor_maker);
+        assert!(context.strict);
+        assert!(context.vendor_lineage_probe);
     }
 
     #[test]
