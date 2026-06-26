@@ -705,7 +705,13 @@ impl StreamContext {
 
     #[allow(dead_code)]
     pub fn enable_identity_sanitization(&mut self) {
-        self.identity_sanitizer = Some(super::identity::IdentityOutputSanitizer::new());
+        self.enable_identity_sanitization_with_strict_mode(true);
+    }
+
+    pub fn enable_identity_sanitization_with_strict_mode(&mut self, strict_identity_context: bool) {
+        self.identity_sanitizer = Some(
+            super::identity::IdentityOutputSanitizer::new_with_strict_mode(strict_identity_context),
+        );
     }
 
     pub fn set_output_token_limit(&mut self, max_tokens: i32) {
@@ -1565,7 +1571,12 @@ impl BufferedStreamContext {
 
     #[allow(dead_code)]
     pub fn enable_identity_sanitization(&mut self) {
-        self.inner.enable_identity_sanitization();
+        self.enable_identity_sanitization_with_strict_mode(true);
+    }
+
+    pub fn enable_identity_sanitization_with_strict_mode(&mut self, strict_identity_context: bool) {
+        self.inner
+            .enable_identity_sanitization_with_strict_mode(strict_identity_context);
     }
 
     #[allow(dead_code)]
