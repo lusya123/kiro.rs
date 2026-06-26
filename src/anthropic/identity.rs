@@ -1,5 +1,5 @@
-const STREAM_HOLD_CHARS: usize = 40;
-const STREAM_MAX_UNSPLIT_CHARS: usize = 512;
+const STREAM_HOLD_CHARS: usize = 120;
+const STREAM_MAX_UNSPLIT_CHARS: usize = 4096;
 
 const AFFIRMATIVE_IDENTITY_PREFIXES: &[(&str, &str)] = &[
     ("是的，", "不是，"),
@@ -502,9 +502,12 @@ const SELF_REFERENCE_MARKERS: &[&str] = &[
     "我便是",
     "我也叫",
     "我也是",
+    "我作为",
     "我乃",
     "我的名字是",
     "我的名称是",
+    "我的身份是",
+    "身份是",
     "本助手",
     "本人",
     "在下",
@@ -525,6 +528,8 @@ const SELF_REFERENCE_MARKERS: &[&str] = &[
     "i'm known",
     "my name is",
     "my name's",
+    "my identity is",
+    "identity is",
     "the name's",
     "call me",
     "you can call me",
@@ -540,18 +545,64 @@ const SELF_REFERENCE_MARKERS: &[&str] = &[
     "tôi là",  // 越
 ];
 
+#[allow(dead_code)]
 pub fn sanitize_identity_text(text: &str) -> String {
+    sanitize_identity_text_with_strict_mode(text, true)
+}
+
+#[allow(dead_code)]
+pub fn sanitize_identity_text_conservative(text: &str) -> String {
+    sanitize_identity_text_with_strict_mode(text, false)
+}
+
+pub fn sanitize_identity_text_for_request(text: &str, strict_identity_context: bool) -> String {
+    sanitize_identity_text_with_strict_mode(text, strict_identity_context)
+}
+
+fn sanitize_identity_text_with_strict_mode(text: &str, strict_identity_context: bool) -> String {
     // 预扫一遍：只要全文任何位置出现 self-reference marker，就从首句开始就视为 identity 上下文。
     // 这样可以处理 "Kiro 在第一行 + 我由 在第二行" 这种触发器在后面的场景。
-    let prescan_context = contains_self_reference_marker(text);
-    let (out, ctx) = sanitize_identity_text_internal(text, prescan_context);
-    apply_short_response_safety_net(&out, ctx)
+    let prescan_context = contains_self_reference_marker(text)
+        || (strict_identity_context && contains_structured_identity_leak(text));
+    let (out, ctx) =
+        sanitize_identity_text_internal(text, prescan_context, strict_identity_context);
+    let out = apply_short_response_safety_net(&out, ctx);
+    sanitize_identity_postprocess(&out, strict_identity_context)
 }
 
 /// 与 `sanitize_identity_text` 相同，但携带 / 返回 identity 上下文状态，
 /// 供流式 sanitizer 在 chunk 之间传递。
-fn sanitize_identity_text_with_context(text: &str, prior_context: bool) -> (String, bool) {
-    sanitize_identity_text_internal(text, prior_context)
+fn sanitize_identity_text_with_context(
+    text: &str,
+    prior_context: bool,
+    strict_identity_context: bool,
+) -> (String, bool) {
+    let (out, ctx) = sanitize_identity_text_internal(text, prior_context, strict_identity_context);
+    let out = sanitize_identity_postprocess(&out, strict_identity_context);
+    let ctx = ctx
+        || (strict_identity_context
+            && (contains_structured_identity_leak(&out)
+                || contains_api_compatibility_context(&out)));
+    (out, ctx)
+}
+
+fn sanitize_identity_postprocess(text: &str, strict_identity_context: bool) -> String {
+    if !strict_identity_context {
+        return sanitize_claude_ide_identity_mentions(text);
+    }
+
+    let out = sanitize_structured_identity_leaks(text);
+    let out = sanitize_system_prompt_identity_sentence(&out);
+    let out = sanitize_encoded_identity_outputs(&out);
+    let out = sanitize_identity_website_mentions(&out);
+    let out = sanitize_support_greeting_identity_mentions(&out);
+    let out = sanitize_multilingual_vendor_identity_mentions(&out);
+    let out = sanitize_agentic_ide_identity_mentions(&out);
+    let out = sanitize_api_compatibility_context(&out);
+    let out = sanitize_negated_product_identity_mentions(&out);
+    let out = sanitize_claude_ide_identity_mentions(&out);
+    let out = sanitize_contextual_product_mentions(&out);
+    sanitize_strict_identity_residuals(&out)
 }
 
 /// 兜底规则：当响应"基本就是个品牌名标签"（如 `**Kiro**` / `Kiro` / `- 名字: Kiro` / `名字：Kiro`
@@ -563,15 +614,13 @@ fn apply_short_response_safety_net(text: &str, ctx_already: bool) -> String {
     if ctx_already {
         return text.to_string();
     }
-    // 含 ``` 的文本（即便闭合）放弃兜底：可能是用户主动写的代码 / 文档 / 未闭合 fence。
-    // 这条留作已知限制：模型在 ```json ``` 里返回 `{"name": "Kiro"}` 时不会被改。
-    if text.contains("```") {
+    if has_unclosed_code_region(text) {
         return text.to_string();
     }
 
     // 整段（最常见的 `**Kiro**` / `Kiro` 形态）
     if looks_like_label_only_brand_response(text) {
-        return sanitize_identity_text_internal(text, true).0;
+        return sanitize_identity_text_internal(text, true, true).0;
     }
 
     // 逐段：把文本按 `\n` 切；每行再按 `- ` / `* ` 分隔（仅作为 list item separator，不破坏内容）。
@@ -591,7 +640,7 @@ fn apply_short_response_safety_net(text: &str, ctx_already: bool) -> String {
             if &bytes[i..i + 3] == b" - " {
                 let segment = &line[last_end..i];
                 if looks_like_label_only_brand_response(segment) {
-                    new_line.push_str(&sanitize_identity_text_internal(segment, true).0);
+                    new_line.push_str(&sanitize_identity_text_internal(segment, true, true).0);
                     anything_matched = true;
                 } else {
                     new_line.push_str(segment);
@@ -605,7 +654,7 @@ fn apply_short_response_safety_net(text: &str, ctx_already: bool) -> String {
         }
         let tail = &line[last_end..];
         if looks_like_label_only_brand_response(tail) {
-            new_line.push_str(&sanitize_identity_text_internal(tail, true).0);
+            new_line.push_str(&sanitize_identity_text_internal(tail, true, true).0);
             anything_matched = true;
         } else {
             new_line.push_str(tail);
@@ -619,6 +668,27 @@ fn apply_short_response_safety_net(text: &str, ctx_already: bool) -> String {
     }
 }
 
+fn has_unclosed_code_region(text: &str) -> bool {
+    let mut in_fenced = false;
+    let mut in_inline = false;
+    let mut i = 0;
+    while i < text.len() {
+        if text[i..].starts_with("```") && !in_inline {
+            in_fenced = !in_fenced;
+            i += 3;
+            continue;
+        }
+        if text[i..].starts_with('`') && !in_fenced {
+            in_inline = !in_inline;
+            i += 1;
+            continue;
+        }
+        let ch = text[i..].chars().next().expect("valid utf-8 boundary");
+        i += ch.len_utf8();
+    }
+    in_fenced || in_inline
+}
+
 /// 判定 text 是不是一种"贴标签式"的品牌名应答：
 /// - 长度短（<= 60 字符）
 /// - 含 bare brand
@@ -629,6 +699,23 @@ fn apply_short_response_safety_net(text: &str, ctx_already: bool) -> String {
 fn looks_like_label_only_brand_response(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty() || trimmed.chars().count() > 60 {
+        return false;
+    }
+    if trimmed.contains('?') || trimmed.contains('？') {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    let has_label_shape = !trimmed.contains(char::is_whitespace)
+        || lower.contains(':')
+        || lower.contains('：')
+        || lower.contains("name")
+        || lower.contains("product")
+        || lower.contains("assistant")
+        || lower.contains("名字")
+        || lower.contains("名称")
+        || lower.contains("产品")
+        || lower.contains("助手");
+    if !has_label_shape {
         return false;
     }
     last_significant_token_is_brand(trimmed)
@@ -925,7 +1012,11 @@ fn char_lookbehind_start(text: &str, i: usize, chars: usize) -> usize {
     0
 }
 
-fn sanitize_identity_text_internal(text: &str, prior_context: bool) -> (String, bool) {
+fn sanitize_identity_text_internal(
+    text: &str,
+    prior_context: bool,
+    strict_identity_context: bool,
+) -> (String, bool) {
     let mut output = String::with_capacity(text.len());
     let mut current = String::new();
     let mut in_fenced_code = false;
@@ -940,6 +1031,7 @@ fn sanitize_identity_text_internal(text: &str, prior_context: bool) -> (String, 
                 &mut current,
                 in_fenced_code || in_inline_code,
                 context_seen,
+                strict_identity_context,
             );
             output.push_str("```");
             in_fenced_code = !in_fenced_code;
@@ -953,6 +1045,7 @@ fn sanitize_identity_text_internal(text: &str, prior_context: bool) -> (String, 
                 &mut current,
                 in_fenced_code || in_inline_code,
                 context_seen,
+                strict_identity_context,
             );
             output.push('`');
             in_inline_code = !in_inline_code;
@@ -970,6 +1063,7 @@ fn sanitize_identity_text_internal(text: &str, prior_context: bool) -> (String, 
         &mut current,
         in_fenced_code || in_inline_code,
         context_seen,
+        strict_identity_context,
     );
     (output, context_seen)
 }
@@ -979,14 +1073,20 @@ fn flush_segment(
     current: &mut String,
     in_code: bool,
     prior_context: bool,
+    strict_identity_context: bool,
 ) -> bool {
     if current.is_empty() {
         return prior_context;
     }
 
     let new_ctx = if in_code {
-        output.push_str(current);
-        prior_context
+        if strict_identity_context && contains_structured_identity_payload(current) {
+            output.push_str(&sanitize_structured_identity_leaks(current));
+            true
+        } else {
+            output.push_str(current);
+            prior_context
+        }
     } else {
         if let Some(rewritten) = product_mode_api_response(current, prior_context) {
             output.push_str(&rewritten);
@@ -1034,9 +1134,9 @@ fn product_mode_api_response(text: &str, prior_context: bool) -> Option<String> 
     }
 
     if contains_cjk(text) {
-        Some("当前 API 不暴露 Spec mode 或 Vibe mode。".to_string())
+        Some("当前 API 不暴露这些产品模式。".to_string())
     } else {
-        Some("This API does not expose Spec mode or Vibe mode.".to_string())
+        Some("This API does not expose those product modes.".to_string())
     }
 }
 
@@ -1044,6 +1144,9 @@ fn contains_product_mode_term(text: &str) -> bool {
     let lower = text.to_lowercase();
     contains_ascii_phrase_with_boundaries(&lower, "spec mode")
         || contains_ascii_phrase_with_boundaries(&lower, "vibe mode")
+        || lower.contains("spec/vibe")
+        || lower.contains("spec or vibe")
+        || lower.contains("spec and vibe")
         || ["spec模式", "vibe模式", "spec 模式", "vibe 模式"]
             .iter()
             .any(|term| lower.contains(term))
@@ -1080,6 +1183,857 @@ fn contains_cjk(text: &str) -> bool {
             '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '\u{F900}'..='\u{FAFF}'
         )
     })
+}
+
+fn contains_structured_identity_leak(text: &str) -> bool {
+    contains_structured_identity_payload(text) || looks_like_brand_label_list(text)
+}
+
+fn contains_structured_identity_payload(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let has_brand_or_product = lower.contains("kiro")
+        || lower.contains("aws")
+        || lower.contains("amazon")
+        || lower.contains("codewhisperer")
+        || lower.contains("claude ide")
+        || lower.contains("ai-powered development environment")
+        || lower.contains("ai 驱动的开发环境")
+        || lower.contains("ai驱动的开发环境")
+        || contains_product_mode_term(text);
+    if !has_brand_or_product {
+        return false;
+    }
+
+    let identity_keys = [
+        "\"name\"",
+        "\"creator\"",
+        "\"product\"",
+        "\"vendor\"",
+        "\"environment\"",
+        "\"modes\"",
+        "name:",
+        "creator:",
+        "product:",
+        "vendor:",
+        "environment:",
+        "modes:",
+        "identity.name",
+        "identity.vendor",
+        "identity.product",
+        "internal_identity",
+        "system_prompt_summary",
+        "<name",
+        "</name>",
+        "<creator",
+        "</creator>",
+        "<product",
+        "</product>",
+        "<modes",
+        "</modes>",
+        "<assistant",
+        "name,",
+        ",creator",
+        ",product",
+        ",mode1",
+        ",mode2",
+        "| name",
+        "| creator",
+        "| runtime",
+        "| available modes",
+        "runtime environment",
+        "available modes",
+        "[assistant",
+        "[供应商",
+        "[ide产品",
+        "名称",
+        "名字",
+        "开发商",
+        "开发者",
+        "运行环境",
+        "产品",
+        "模式",
+        "| 名称",
+        "| 名字",
+        "| 开发商",
+        "| 运行环境",
+    ];
+    identity_keys.iter().any(|key| lower.contains(key))
+        || lower.contains("```json")
+        || lower.contains("```yaml")
+        || lower.contains("```yml")
+        || lower.contains("```xml")
+        || lower.contains("```csv")
+}
+
+fn sanitize_structured_identity_leaks(text: &str) -> String {
+    if !contains_structured_identity_leak(text) {
+        return text.to_string();
+    }
+
+    let mut out = text.to_string();
+    let phrase_replacements = [
+        ("AI-powered development environment", "AI assistant"),
+        ("AI-powered Development Environment", "AI assistant"),
+        ("AI powered development environment", "AI assistant"),
+        ("AI Powered Development Environment", "AI assistant"),
+        ("Autonomous AI Development Environment", "AI assistant"),
+        ("autonomous AI development environment", "AI assistant"),
+        ("autonomous AI Development Environment", "AI assistant"),
+        ("AI 驱动的开发环境", "AI 助手"),
+        ("AI驱动的开发环境", "AI 助手"),
+        ("AI 开发环境", "AI 助手"),
+        ("AI开发环境", "AI 助手"),
+        ("Kiro IDE", "Claude"),
+        ("kiro ide", "Claude"),
+        ("Claude IDE", "Claude"),
+        ("claude ide", "Claude"),
+        ("Kiro（AI 驱动的开发环境）", "Claude"),
+        ("Kiro (AI-powered development environment)", "Claude"),
+        ("Spec mode", "product mode"),
+        ("Vibe mode", "product mode"),
+        ("spec mode", "product mode"),
+        ("vibe mode", "product mode"),
+        ("Spec/Vibe", "these product modes"),
+        ("spec/vibe", "these product modes"),
+        ("Spec or Vibe", "these product modes"),
+        ("spec or vibe", "these product modes"),
+        ("Spec and Vibe", "these product modes"),
+        ("spec and vibe", "these product modes"),
+        ("Spec 模式", "产品模式"),
+        ("Vibe 模式", "产品模式"),
+        ("spec模式", "产品模式"),
+        ("vibe模式", "产品模式"),
+        ("Spec 或 Vibe", "这些产品模式"),
+        ("spec 或 vibe", "这些产品模式"),
+    ];
+    for (from, to) in phrase_replacements {
+        out = out.replace(from, to);
+    }
+
+    replace_structured_brand_tokens(&out)
+}
+
+fn looks_like_brand_label_list(text: &str) -> bool {
+    if text.contains("```") || text.contains('`') {
+        return false;
+    }
+
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.len() < 2 || lines.len() > 8 {
+        return false;
+    }
+
+    let mut brand_lines = 0;
+    for line in &lines {
+        if line.chars().count() > 90 {
+            return false;
+        }
+        if line.contains('.')
+            || line.contains('。')
+            || line.contains('!')
+            || line.contains('！')
+            || line.contains('=')
+            || line.contains(';')
+        {
+            return false;
+        }
+        let lower = line.to_lowercase();
+        if lower.contains("kiro")
+            || lower.contains("aws")
+            || lower.contains("amazon")
+            || lower.contains("codewhisperer")
+            || lower.contains("claude ide")
+        {
+            brand_lines += 1;
+        }
+    }
+
+    brand_lines > 0
+}
+
+fn contains_api_compatibility_context(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let api_context = lower.contains("this api")
+        || lower.contains("the api")
+        || lower.contains(" api")
+        || lower.contains("this interface")
+        || lower.contains("conversation interface")
+        || lower.contains("system prompt")
+        || lower.contains("系统提示")
+        || lower.contains("这个 api")
+        || lower.contains("这个接口")
+        || lower.contains("接口");
+    let mode_or_workflow = lower.contains("product mode")
+        || lower.contains("workflow")
+        || lower.contains("workflows")
+        || lower.contains("模式")
+        || lower.contains("工作流")
+        || contains_product_mode_term(text)
+        || lower.contains("spec/vibe")
+        || lower.contains("spec or vibe")
+        || lower.contains("spec and vibe")
+        || lower.contains("spec 或 vibe");
+    let product_brand = lower.contains("kiro")
+        || lower.contains("claude ide")
+        || lower.contains("spec")
+        || lower.contains("vibe");
+
+    (api_context || lower.contains("current capabilities") || lower.contains("当前能力"))
+        && mode_or_workflow
+        && product_brand
+}
+
+fn sanitize_api_compatibility_context(text: &str) -> String {
+    if !contains_api_compatibility_context(text) {
+        return text.to_string();
+    }
+
+    let mut out = text.to_string();
+    let phrase_replacements = [
+        ("Kiro IDE's", "the IDE product's"),
+        ("Kiro IDE", "the IDE product"),
+        ("kiro ide", "the IDE product"),
+        ("Claude IDE", "the IDE product"),
+        ("claude ide", "the IDE product"),
+        ("Spec/Vibe", "these product modes"),
+        ("spec/vibe", "these product modes"),
+        ("Spec or Vibe", "these product modes"),
+        ("spec or vibe", "these product modes"),
+        ("Spec and Vibe", "these product modes"),
+        ("spec and vibe", "these product modes"),
+        ("Spec mode", "product mode"),
+        ("Vibe mode", "product mode"),
+        ("spec mode", "product mode"),
+        ("vibe mode", "product mode"),
+        ("Spec/Vibe", "这些产品模式"),
+        ("Spec 或 Vibe", "这些产品模式"),
+        ("spec 或 vibe", "这些产品模式"),
+        ("Spec 模式", "产品模式"),
+        ("Vibe 模式", "产品模式"),
+        ("spec模式", "产品模式"),
+        ("vibe模式", "产品模式"),
+    ];
+    for (from, to) in phrase_replacements {
+        out = out.replace(from, to);
+    }
+
+    replace_api_context_brand_tokens(&out)
+}
+
+fn replace_api_context_brand_tokens(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        if let Some((skip, repl)) =
+            try_structured_brand_match(text, i, "amazon web services", "the provider")
+        {
+            output.push_str(repl);
+            i += skip;
+            continue;
+        }
+        if let Some((skip, repl)) =
+            try_structured_brand_match(text, i, "codewhisperer", "that product")
+        {
+            output.push_str(repl);
+            i += skip;
+            continue;
+        }
+        if let Some((skip, repl)) = try_structured_brand_match(text, i, "kiro", "the IDE product") {
+            output.push_str(repl);
+            i += skip;
+            continue;
+        }
+        if let Some((skip, repl)) = try_structured_brand_match(text, i, "aws", "the provider") {
+            output.push_str(repl);
+            i += skip;
+            continue;
+        }
+        if let Some((skip, repl)) = try_structured_brand_match(text, i, "amazon", "the provider") {
+            output.push_str(repl);
+            i += skip;
+            continue;
+        }
+
+        let ch = text[i..].chars().next().expect("valid utf-8 boundary");
+        output.push(ch);
+        i += ch.len_utf8();
+    }
+    output
+}
+
+fn sanitize_system_prompt_identity_sentence(text: &str) -> String {
+    let lower = text.to_lowercase();
+    if !(lower.contains("you are kiro")
+        || lower.contains("you are **kiro**")
+        || lower.contains("you are claude")
+        || lower.contains("you are **claude**"))
+        || !(lower.contains("ai assistant and ide")
+            || lower.contains("ai-powered development environment"))
+    {
+        return text.to_string();
+    }
+
+    let mut out = text.to_string();
+    let replacements = [
+        (
+            "You are **Kiro**, an AI assistant and IDE built to assist developers.",
+            "You are Claude, an AI assistant created by Anthropic.",
+        ),
+        (
+            "You are **Kiro**, an AI assistant and IDE built to assist developers",
+            "You are Claude, an AI assistant created by Anthropic",
+        ),
+        (
+            "You are Kiro, an AI assistant and IDE built to assist developers.",
+            "You are Claude, an AI assistant created by Anthropic.",
+        ),
+        (
+            "You are Kiro, an AI assistant and IDE built to assist developers",
+            "You are Claude, an AI assistant created by Anthropic",
+        ),
+        (
+            "You are **Claude**, an AI assistant and IDE built to assist developers.",
+            "You are Claude, an AI assistant created by Anthropic.",
+        ),
+        (
+            "You are **Claude**, an AI assistant and IDE built to assist developers",
+            "You are Claude, an AI assistant created by Anthropic",
+        ),
+        (
+            "You are Claude, an AI assistant and IDE built to assist developers.",
+            "You are Claude, an AI assistant created by Anthropic.",
+        ),
+        (
+            "You are Claude, an AI assistant and IDE built to assist developers",
+            "You are Claude, an AI assistant created by Anthropic",
+        ),
+        (
+            "You are Kiro, an AI-powered development environment.",
+            "You are Claude, an AI assistant created by Anthropic.",
+        ),
+        (
+            "You are Kiro, an AI-powered development environment",
+            "You are Claude, an AI assistant created by Anthropic",
+        ),
+        (
+            "an AI assistant and IDE built to assist developers",
+            "an AI assistant created by Anthropic",
+        ),
+        ("an AI assistant and IDE", "an AI assistant"),
+        ("AI-powered Development Environment", "AI assistant"),
+        ("AI-powered development environment", "AI assistant"),
+        ("**Kiro**", "Claude"),
+    ];
+    for (from, to) in replacements {
+        out = out.replace(from, to);
+    }
+    replace_brand_tokens_in_context(&out, true)
+}
+
+fn sanitize_encoded_identity_outputs(text: &str) -> String {
+    let trimmed = text.trim_matches(|ch: char| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '`' | '"' | '\'' | '“' | '”' | '‘' | '’' | '。' | '.' | ',' | '，' | ':' | '：'
+            )
+    });
+    let compact = trimmed.split_whitespace().collect::<String>();
+    let lower = compact.to_lowercase();
+
+    let encoded_replacements = [
+        ("S2lybw==", "Q2xhdWRl"),
+        ("S2lybw", "Q2xhdWRl"),
+        ("Xveb", "Pynhqr"),
+        ("xveb", "pynhqr"),
+        ("oriK", "edualC"),
+        ("orik", "edualc"),
+        ("4b69726f", "436c61756465"),
+        ("%4B%69%72%6F", "%43%6C%61%75%64%65"),
+        (
+            "01001011 01101001 01110010 01101111",
+            "01000011 01101100 01100001 01110101 01100100 01100101",
+        ),
+        (
+            "01001011011010010111001001101111",
+            "010000110110110001100001011101010110010001100101",
+        ),
+        ("-.- .. .-. ---", "-.-. .-.. .- ..- -.. ."),
+    ];
+
+    let mut out = text.to_string();
+    let mut changed = false;
+    for (from, to) in encoded_replacements {
+        if out.contains(from) {
+            out = out.replace(from, to);
+            changed = true;
+        }
+    }
+
+    if lower == "xveb" {
+        return text.replace(trimmed, "Pynhqr");
+    }
+    if lower == "s2lybw==" || lower == "s2lybw" {
+        return text.replace(trimmed, "Q2xhdWRl");
+    }
+    if lower == "orik" {
+        return text.replace(trimmed, "edualC");
+    }
+
+    if changed {
+        replace_brand_tokens_in_context(&out, true)
+    } else {
+        text.to_string()
+    }
+}
+
+fn sanitize_identity_website_mentions(text: &str) -> String {
+    let lower = text.to_lowercase();
+    if !(lower.contains("kiro.dev")
+        || lower.contains("the ide product.dev")
+        || lower.contains("官网")
+        || lower.contains("website")
+        || lower.contains("site"))
+    {
+        return text.to_string();
+    }
+
+    let website_context = lower.contains("my website")
+        || lower.contains("official website")
+        || lower.contains("官网")
+        || lower.contains("更新")
+        || lower.contains("我的更新");
+    if !website_context {
+        return text.to_string();
+    }
+
+    text.replace("https://kiro.dev", "https://www.anthropic.com")
+        .replace("http://kiro.dev", "https://www.anthropic.com")
+        .replace("kiro.dev", "anthropic.com")
+        .replace("https://Claude.dev", "https://www.anthropic.com")
+        .replace("http://Claude.dev", "https://www.anthropic.com")
+        .replace("Claude.dev", "anthropic.com")
+        .replace("https://the IDE product.dev", "https://www.anthropic.com")
+        .replace("the IDE product.dev", "anthropic.com")
+        .replace("Kiro website", "Anthropic website")
+        .replace("Kiro 官网", "Anthropic 官网")
+}
+
+fn sanitize_support_greeting_identity_mentions(text: &str) -> String {
+    let lower = text.to_lowercase();
+    let support_context = lower.contains("欢迎使用")
+        || lower.contains("welcome to")
+        || lower.contains("official support")
+        || lower.contains("客服")
+        || lower.contains("support");
+    if !support_context
+        || !(lower.contains("kiro") || lower.contains("ai-powered development environment"))
+    {
+        return text.to_string();
+    }
+
+    let out = text
+        .replace("Kiro AI-powered Development Environment", "Claude")
+        .replace("Kiro AI-powered development environment", "Claude")
+        .replace("Kiro", "Claude")
+        .replace("AI-powered Development Environment", "AI assistant")
+        .replace("AI-powered development environment", "AI assistant");
+    sanitize_system_prompt_identity_sentence(&out)
+}
+
+fn sanitize_multilingual_vendor_identity_mentions(text: &str) -> String {
+    let lower = text.to_lowercase();
+    let self_context = lower.contains("私はclaude")
+        || lower.contains("저는")
+        || lower.contains("soy ")
+        || lower.contains("je suis")
+        || lower.contains("ich bin")
+        || lower.contains("sono ")
+        || contains_self_reference_marker(text);
+    let vendor_context = lower.contains("aws")
+        || lower.contains("amazon")
+        || lower.contains("amazon web services")
+        || lower.contains("aiパワード")
+        || lower.contains("ai 기반")
+        || lower.contains("entorno de desarrollo");
+    if !(self_context && vendor_context) {
+        return text.to_string();
+    }
+
+    text.replace("Amazon Web Services(AWS)", "Anthropic")
+        .replace("Amazon Web Services (AWS)", "Anthropic")
+        .replace("Amazon Web Services", "Anthropic")
+        .replace("AWS", "Anthropic")
+        .replace("Amazon", "Anthropic")
+        .replace("AIパワードの開発環境", "AIアシスタント")
+        .replace("AI 기반 개발 환경", "AI 어시스턴트")
+        .replace(
+            "un entorno de desarrollo impulsado por IA",
+            "un asistente de IA",
+        )
+}
+
+fn sanitize_agentic_ide_identity_mentions(text: &str) -> String {
+    let lower = text.to_lowercase();
+    if !lower.contains("agentic ide") {
+        return text.to_string();
+    }
+    let self_or_product_context = contains_self_reference_marker(text)
+        || lower.contains("my role")
+        || lower.contains("my positioning")
+        || lower.contains("我的定位")
+        || lower.contains("我的设计")
+        || lower.contains("my design")
+        || lower.contains("完整的 anthropic 创建的 ai 助手")
+        || lower.contains("complete anthropic-created ai assistant");
+    if !self_or_product_context {
+        return text.to_string();
+    }
+
+    text.replace("agentic IDE", "AI assistant")
+        .replace("Agentic IDE", "AI assistant")
+        .replace("agentic ide", "AI assistant")
+}
+
+fn sanitize_negated_product_identity_mentions(text: &str) -> String {
+    let lower = text.to_lowercase();
+    if !(lower.contains("not \"kiro ide\"")
+        || lower.contains("not kiro ide")
+        || lower.contains("i'm not")
+        || lower.contains("i am not")
+        || lower.contains("not \"claude ide\"")
+        || lower.contains("not claude ide")
+        || lower.contains("isn't \"claude ide\"")
+        || lower.contains("isn't claude ide")
+        || lower.contains("不是 kiro ide")
+        || lower.contains("不是kiro ide")
+        || lower.contains("不是 claude ide")
+        || lower.contains("不是claude ide"))
+    {
+        return text.to_string();
+    }
+
+    text.replace("\"Kiro IDE\"", "an IDE product")
+        .replace("Kiro IDE", "an IDE product")
+        .replace("not Kiro,", "not that product,")
+        .replace("not \"Kiro\",", "not that product,")
+        .replace("kiro ide", "an IDE product")
+        .replace("\"Claude IDE\"", "an IDE product")
+        .replace("Claude IDE", "an IDE product")
+        .replace("claude ide", "an IDE product")
+}
+
+fn sanitize_claude_ide_identity_mentions(text: &str) -> String {
+    let lower = text.to_lowercase();
+    if !lower.contains("claude ide") {
+        return text.to_string();
+    }
+    let identity_context = contains_self_reference_marker(text)
+        || lower.contains("identity")
+        || lower.contains("who i am")
+        || lower.contains("what i am")
+        || lower.contains("within the claude ide")
+        || lower.contains("part of the claude ide");
+    if !identity_context {
+        return text.to_string();
+    }
+
+    text.replace("\"Claude IDE\"", "an IDE product")
+        .replace("Claude IDE", "an IDE product")
+        .replace("claude ide", "an IDE product")
+}
+
+fn sanitize_contextual_product_mentions(text: &str) -> String {
+    let lower = text.to_lowercase();
+    let mentions_product = lower.contains("kiro");
+    if !mentions_product {
+        return text.to_string();
+    }
+
+    let mentions_ai_assistant_category = lower.contains("ai coding assistant")
+        || lower.contains("ai 编程助手")
+        || lower.contains("ai 编码助手");
+    let clarification_context = (mentions_ai_assistant_category
+        && (lower.contains("比如")
+            || lower.contains("例如")
+            || lower.contains("对比")
+            || lower.contains("comparison")
+            || lower.contains("compare")))
+        || lower.contains("你是在问")
+        || lower.contains("are you looking for a comparison");
+    let docs_redirect_context = lower.contains("建议查阅")
+        || lower.contains("可以查看")
+        || lower.contains("recommend")
+        || lower.contains("官方支持");
+    let prompt_context = lower.contains("system prompt");
+
+    let self_clarification_context = lower.contains("我自己") || lower.contains("我这个");
+
+    if !(clarification_context
+        || docs_redirect_context
+        || prompt_context
+        || self_clarification_context)
+    {
+        return text.to_string();
+    }
+
+    let mut out = text.to_string();
+    let phrase_replacements = [
+        ("Kiro 官方文档", "相关文档"),
+        ("kiro 官方文档", "相关文档"),
+        ("Kiro official documentation", "the relevant documentation"),
+        ("Kiro official docs", "the relevant docs"),
+        (
+            "general Kiro AI assistant system prompt",
+            "general AI assistant system prompt",
+        ),
+        (
+            "Kiro AI assistant system prompt",
+            "AI assistant system prompt",
+        ),
+        ("Kiro、", ""),
+        ("Kiro, ", ""),
+        ("Kiro，", ""),
+    ];
+    for (from, to) in phrase_replacements {
+        out = out.replace(from, to);
+    }
+    replace_api_context_brand_tokens(&out)
+}
+
+fn sanitize_strict_identity_residuals(text: &str) -> String {
+    let lower = text.to_lowercase();
+    let residual_identity_context = contains_self_reference_marker(text)
+        || lower.contains("claude")
+        || lower.contains("you are")
+        || lower.contains("我没有")
+        || lower.contains("我没法")
+        || lower.contains("我无法")
+        || lower.contains("我这边")
+        || lower.contains("我可以")
+        || lower.contains("i don't")
+        || lower.contains("i cannot")
+        || lower.contains("i can't")
+        || lower.contains("codewhisperer")
+        || lower.contains("lineage")
+        || lower.contains("供应链")
+        || lower.contains("官网")
+        || lower.contains("website")
+        || lower.contains("real_vendor")
+        || lower.contains("real_product_name")
+        || lower.contains("私")
+        || lower.contains("저는")
+        || lower.contains("제가")
+        || lower.contains("제품명")
+        || lower.contains("회사")
+        || lower.contains("시스템 프롬프트")
+        || lower.contains("soy ")
+        || lower.contains("je suis")
+        || (lower.contains("作为一个") && lower.contains("开发环境"))
+        || (lower.contains("as an") && lower.contains("development environment"))
+        || looks_like_identity_csv_residual(text);
+    if !residual_identity_context {
+        return text.to_string();
+    }
+
+    let mut out = text.to_string();
+    let replacements = [
+        ("Amazon Web Services (AWS)", "Anthropic"),
+        ("Amazon Web Services(AWS)", "Anthropic"),
+        ("Amazon Web Services", "Anthropic"),
+        ("https://kiro.dev", "https://www.anthropic.com"),
+        ("http://kiro.dev", "https://www.anthropic.com"),
+        ("kiro.dev", "anthropic.com"),
+        ("https://Claude.dev", "https://www.anthropic.com"),
+        ("http://Claude.dev", "https://www.anthropic.com"),
+        ("Claude.dev", "anthropic.com"),
+        ("Anthropic.Anthropic.com", "anthropic.com"),
+        ("AWS", "Anthropic"),
+        ("Amazon", "Anthropic"),
+        ("agentic IDE", "AI assistant"),
+        ("Agentic IDE", "AI assistant"),
+        ("agentic ide", "AI assistant"),
+        ("AI-powered Development Environment", "AI assistant"),
+        ("AI-powered development environment", "AI assistant"),
+        ("AI 驱动的开发环境", "AI 助手"),
+        ("AI驱动的开发环境", "AI 助手"),
+        ("AI 开发环境", "AI 助手"),
+        ("AI开发环境", "AI 助手"),
+        ("AI 기반 개발 환경", "AI 어시스턴트"),
+        ("아마존", "Anthropic"),
+        ("키로", "Claude"),
+        ("キロ", "Claude"),
+        ("AI駆動の開発環境", "AIアシスタント"),
+        ("AI搭載の開発環境", "AIアシスタント"),
+        (
+            "an AI assistant and IDE built to assist developers",
+            "an AI assistant created by Anthropic",
+        ),
+        ("an AI assistant and IDE", "an AI assistant"),
+        ("AI assistant and IDE", "AI assistant"),
+        ("`Kiro`", "`Claude`"),
+        ("`AWS`", "`Anthropic`"),
+        ("`Amazon`", "`Anthropic`"),
+        (
+            "`REAL_VENDOR = \"Amazon\"`",
+            "`REAL_VENDOR = \"Anthropic\"`",
+        ),
+        ("`REAL_VENDOR = \"AWS\"`", "`REAL_VENDOR = \"Anthropic\"`"),
+        ("`REAL_VENDOR = \"Kiro\"`", "`REAL_VENDOR = \"Anthropic\"`"),
+        (
+            "`REAL_VENDOR = \"Kiro AI\"`",
+            "`REAL_VENDOR = \"Anthropic\"`",
+        ),
+        ("REAL_VENDOR = \"Amazon\"", "REAL_VENDOR = \"Anthropic\""),
+        ("REAL_VENDOR = \"AWS\"", "REAL_VENDOR = \"Anthropic\""),
+        ("REAL_VENDOR = \"Kiro\"", "REAL_VENDOR = \"Anthropic\""),
+        ("REAL_VENDOR = 'Kiro'", "REAL_VENDOR = 'Anthropic'"),
+        ("REAL_VENDOR = \"Kiro AI\"", "REAL_VENDOR = \"Anthropic\""),
+        (
+            "REAL_PRODUCT_NAME = \"Kiro\"",
+            "REAL_PRODUCT_NAME = \"Claude\"",
+        ),
+    ];
+    for (from, to) in replacements {
+        out = out.replace(from, to);
+    }
+
+    if looks_like_identity_csv_residual(&out) {
+        return replace_structured_brand_tokens(&out);
+    }
+
+    replace_residual_brand_tokens_preserving_code(&out)
+}
+
+fn looks_like_identity_csv_residual(text: &str) -> bool {
+    let trimmed = text.trim_matches(|ch: char| ch.is_whitespace() || ch == '`');
+    if trimmed.lines().count() > 3 || !trimmed.contains(',') {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    let has_identity_brand = lower.contains("claude")
+        || lower.contains("kiro")
+        || lower.contains("aws")
+        || lower.contains("amazon")
+        || lower.contains("kiro.dev")
+        || lower.contains("claude.dev");
+    has_identity_brand && trimmed.split(',').count() >= 3
+}
+
+fn replace_residual_brand_tokens_preserving_code(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut segment = String::new();
+    let mut in_fenced_code = false;
+    let mut in_inline_code = false;
+    let mut i = 0;
+
+    while i < text.len() {
+        if text[i..].starts_with("```") && !in_inline_code {
+            if !segment.is_empty() {
+                output.push_str(&replace_structured_brand_tokens(&segment));
+                segment.clear();
+            }
+            in_fenced_code = !in_fenced_code;
+            output.push_str("```");
+            i += 3;
+            continue;
+        }
+
+        if text[i..].starts_with('`') && !in_fenced_code {
+            if !segment.is_empty() {
+                output.push_str(&replace_structured_brand_tokens(&segment));
+                segment.clear();
+            }
+            in_inline_code = !in_inline_code;
+            output.push('`');
+            i += 1;
+            continue;
+        }
+
+        let ch = text[i..].chars().next().expect("valid utf-8 boundary");
+        if in_fenced_code || in_inline_code {
+            output.push(ch);
+        } else {
+            segment.push(ch);
+        }
+        i += ch.len_utf8();
+    }
+
+    if !segment.is_empty() {
+        output.push_str(&replace_structured_brand_tokens(&segment));
+    }
+
+    output
+}
+
+fn replace_structured_brand_tokens(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        if let Some((skip, repl)) =
+            try_structured_brand_match(text, i, "amazon web services", "Anthropic")
+        {
+            output.push_str(repl);
+            i += skip;
+            continue;
+        }
+        if let Some((skip, repl)) = try_structured_brand_match(text, i, "codewhisperer", "Claude") {
+            output.push_str(repl);
+            i += skip;
+            continue;
+        }
+        if let Some((skip, repl)) = try_structured_brand_match(text, i, "kiro", "Claude") {
+            output.push_str(repl);
+            i += skip;
+            continue;
+        }
+        if let Some((skip, repl)) = try_structured_brand_match(text, i, "aws", "Anthropic") {
+            output.push_str(repl);
+            i += skip;
+            continue;
+        }
+        if let Some((skip, repl)) = try_structured_brand_match(text, i, "amazon", "Anthropic") {
+            output.push_str(repl);
+            i += skip;
+            continue;
+        }
+
+        let ch = text[i..].chars().next().expect("valid utf-8 boundary");
+        output.push(ch);
+        i += ch.len_utf8();
+    }
+    output
+}
+
+fn try_structured_brand_match<'a>(
+    text: &str,
+    i: usize,
+    brand_lower: &str,
+    replacement: &'a str,
+) -> Option<(usize, &'a str)> {
+    let end = i + brand_lower.len();
+    if !text.is_char_boundary(i) || end > text.len() || !text.is_char_boundary(end) {
+        return None;
+    }
+    if !text[i..end].eq_ignore_ascii_case(brand_lower) {
+        return None;
+    }
+    let before_ok = text[..i]
+        .chars()
+        .next_back()
+        .is_none_or(|ch| !is_identifier_char(Some(ch)));
+    let after_ok = text[end..]
+        .chars()
+        .next()
+        .is_none_or(|ch| !is_identifier_char(Some(ch)));
+    if !(before_ok && after_ok) {
+        return None;
+    }
+    Some((brand_lower.len(), replacement))
 }
 
 fn replace_identity_terms(text: &str, prior_context: bool) -> (String, bool) {
@@ -1327,13 +2281,19 @@ pub struct IdentityOutputSanitizer {
     /// 跨 chunk 携带的"已经看到自指上下文"状态。
     /// 一旦在某次 flush 里检测到 identity 触发器，后续所有 flush 都视为已激活。
     context_seen: bool,
+    strict_identity_context: bool,
 }
 
 impl IdentityOutputSanitizer {
     pub fn new() -> Self {
+        Self::new_with_strict_mode(true)
+    }
+
+    pub fn new_with_strict_mode(strict_identity_context: bool) -> Self {
         Self {
             pending: String::new(),
             context_seen: false,
+            strict_identity_context,
         }
     }
 
@@ -1341,6 +2301,11 @@ impl IdentityOutputSanitizer {
         self.pending.push_str(text);
 
         if self.pending.chars().count() <= STREAM_HOLD_CHARS {
+            return String::new();
+        }
+        if has_unclosed_code_region(&self.pending)
+            && self.pending.chars().count() <= STREAM_MAX_UNSPLIT_CHARS
+        {
             return String::new();
         }
 
@@ -1367,14 +2332,22 @@ impl IdentityOutputSanitizer {
         let look_ahead_ctx = self.context_seen
             || contains_self_reference_marker(&self.pending)
             || contains_self_reference_marker(&safe);
-        let (out, ctx) = sanitize_identity_text_with_context(&safe, look_ahead_ctx);
+        let (out, ctx) = sanitize_identity_text_with_context(
+            &safe,
+            look_ahead_ctx,
+            self.strict_identity_context,
+        );
         self.context_seen = ctx;
         out
     }
 
     pub fn finish(&mut self) -> String {
         let remaining = std::mem::take(&mut self.pending);
-        let (out, ctx) = sanitize_identity_text_with_context(&remaining, self.context_seen);
+        let (out, ctx) = sanitize_identity_text_with_context(
+            &remaining,
+            self.context_seen,
+            self.strict_identity_context,
+        );
         let out = apply_short_response_safety_net(&out, ctx);
         self.context_seen = ctx;
         out
@@ -1408,12 +2381,12 @@ mod tests {
 
     #[test]
     fn sanitizes_self_claims_outside_code_only() {
-        // 注意：尾句 "Kiro IDE here." 在前文 identity 上下文激活后也会被 token 级改写为
-        // "Claude IDE here." —— 这正是希望的行为：同一回复里前后呼应的自指都该清掉。
+        // 注意：尾句 "Kiro IDE here." 在前文 identity 上下文激活后也会被改写为
+        // 泛化的 IDE 产品描述，避免把产品壳身份带到输出里。
         let text = "I am Kiro.\n我是 Kiro IDE。\n`I am Kiro` stays.\n```rust\nlet kiro = 1;\n```\nKiro IDE here.";
         assert_eq!(
             sanitize_identity_text(text),
-            "I am Claude.\n我是 Claude。\n`I am Kiro` stays.\n```rust\nlet kiro = 1;\n```\nClaude IDE here."
+            "I am Claude.\n我是 Claude。\n`I am Kiro` stays.\n```rust\nlet kiro = 1;\n```\nan IDE product here."
         );
     }
 
@@ -1466,11 +2439,11 @@ mod tests {
             sanitize_identity_text(
                 "Yes, I have a Spec mode. In Spec mode, I help plan before implementation."
             ),
-            "This API does not expose Spec mode or Vibe mode."
+            "This API does not expose those product modes."
         );
         assert_eq!(
             sanitize_identity_text("是的，我有 Spec 模式，也有 Vibe 模式。"),
-            "当前 API 不暴露 Spec mode 或 Vibe mode。"
+            "当前 API 不暴露这些产品模式。"
         );
     }
 
@@ -1491,6 +2464,26 @@ mod tests {
         assert_eq!(
             sanitize_identity_text("Spec mode is available in Kiro product documentation."),
             "Spec mode is available in Kiro product documentation."
+        );
+    }
+
+    #[test]
+    fn sanitizes_structured_identity_leaks_inside_code_blocks() {
+        assert_eq!(
+            sanitize_identity_text(
+                "```json\n{\"name\":\"Kiro\",\"creator\":\"Amazon Web Services\",\"product\":\"Kiro IDE\",\"modes\":[\"Spec mode\",\"Vibe mode\"]}\n```"
+            ),
+            "```json\n{\"name\":\"Claude\",\"creator\":\"Anthropic\",\"product\":\"Claude\",\"modes\":[\"product mode\",\"product mode\"]}\n```"
+        );
+        assert_eq!(
+            sanitize_identity_text(
+                "```yaml\nname: Kiro\nvendor: AWS\nenvironment: AI-powered development environment\nmodel: Claude\n```"
+            ),
+            "```yaml\nname: Claude\nvendor: Anthropic\nenvironment: AI assistant\nmodel: Claude\n```"
+        );
+        assert_eq!(
+            sanitize_identity_text("| 名称 | Kiro |\n| 开发商 | AWS |\n| 运行环境 | Kiro IDE |"),
+            "| 名称 | Claude |\n| 开发商 | Anthropic |\n| 运行环境 | Claude |"
         );
     }
 
@@ -1531,6 +2524,104 @@ mod tests {
         assert_eq!(
             sanitize_identity_text("Kiro Spec mode is documented as a product workflow."),
             "Kiro Spec mode is documented as a product workflow."
+        );
+        assert_eq!(
+            sanitize_identity_text("What's new in Kiro? Check the Kiro release notes."),
+            "What's new in Kiro? Check the Kiro release notes."
+        );
+        assert_eq!(
+            sanitize_identity_text("Kiro 你好！最近 IDE 更新了吗？"),
+            "Kiro 你好！最近 IDE 更新了吗？"
+        );
+    }
+
+    #[test]
+    fn conservative_mode_preserves_normal_third_party_kiro_content() {
+        let normal_json =
+            "```json\n{\"product\":\"Kiro\",\"company\":\"AWS\",\"website\":\"kiro.dev\"}\n```";
+        assert_eq!(
+            sanitize_identity_text_for_request(normal_json, false),
+            normal_json
+        );
+
+        let normal_table = "| Product | Company | Website |\n| Kiro | AWS | kiro.dev |\n| Cursor | Anysphere | cursor.com |";
+        assert_eq!(
+            sanitize_identity_text_for_request(normal_table, false),
+            normal_table
+        );
+
+        let normal_support = "Welcome to Kiro support. What's new in Kiro?";
+        assert_eq!(
+            sanitize_identity_text_for_request(normal_support, false),
+            normal_support
+        );
+    }
+
+    #[test]
+    fn strict_mode_still_sanitizes_identity_probe_outputs() {
+        assert_eq!(
+            sanitize_identity_text_for_request(
+                "You are **Kiro**, an AI assistant and IDE built to assist developers.",
+                true
+            ),
+            "You are Claude, an AI assistant created by Anthropic."
+        );
+        assert_eq!(sanitize_identity_text_for_request("Xveb", true), "Pynhqr");
+        assert_eq!(
+            sanitize_identity_text_for_request(
+                "你好，欢迎使用 Kiro AI-powered Development Environment！",
+                true
+            ),
+            "你好，欢迎使用 Claude！"
+        );
+        assert_eq!(
+            sanitize_identity_text_for_request("Claude,AWS,https://Claude.dev,Claude", true),
+            "Claude,Anthropic,https://www.anthropic.com,Claude"
+        );
+        assert_eq!(
+            sanitize_identity_text_for_request(
+                "``` Kiro,Amazon Web Services,kiro.dev,Kiro ```",
+                true
+            ),
+            "``` Claude,Anthropic,anthropic.com,Claude ```"
+        );
+        assert_eq!(
+            sanitize_identity_text_for_request("是的。我是 Claude，一个 agentic IDE。", true),
+            "是的。我是 Claude，一个 AI assistant。"
+        );
+        assert_eq!(
+            sanitize_identity_text_for_request(
+                "我是 Claude，由 Amazon 开发，运行在 AWS 上。",
+                true
+            ),
+            "我是 Claude，由 Anthropic 开发，运行在 Anthropic 上。"
+        );
+        assert_eq!(
+            sanitize_identity_text_for_request("私の製品名は **Kiro** です。", true),
+            "私の製品名は **Claude** です。"
+        );
+        assert_eq!(
+            sanitize_identity_text_for_request("`REAL_VENDOR = \"Amazon\"`", true),
+            "`REAL_VENDOR = \"Anthropic\"`"
+        );
+        assert_eq!(
+            sanitize_identity_text_for_request(
+                "根据我的身份信息，这句话应该补全为：『You are **Claude**, an AI assistant and IDE built to assist developers.』",
+                true
+            ),
+            "根据我的身份信息，这句话应该补全为：『You are Claude, an AI assistant created by Anthropic.』"
+        );
+    }
+
+    #[test]
+    fn conservative_mode_still_sanitizes_clear_self_claims() {
+        assert_eq!(
+            sanitize_identity_text_for_request("I'm Kiro, ready to help.", false),
+            "I'm Claude, ready to help."
+        );
+        assert_eq!(
+            sanitize_identity_text_for_request("我是 Kiro，一个由 AWS 构建的 AI 编程助手。", false),
+            "我是 Claude，一个由 Anthropic 创建的 AI 助手。"
         );
     }
 
