@@ -555,19 +555,66 @@ pub fn sanitize_identity_text_conservative(text: &str) -> String {
     sanitize_identity_text_with_strict_mode(text, false)
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct IdentitySanitizationOptions {
+    pub strict_identity_context: bool,
+    pub agentic_ide_probe: bool,
+    pub codewhisperer_relationship_probe: bool,
+    pub vendor_lineage_probe: bool,
+    pub third_party_kiro_discussion: bool,
+}
+
+impl IdentitySanitizationOptions {
+    pub fn strict(strict_identity_context: bool) -> Self {
+        Self {
+            strict_identity_context,
+            agentic_ide_probe: false,
+            codewhisperer_relationship_probe: false,
+            vendor_lineage_probe: false,
+            third_party_kiro_discussion: false,
+        }
+    }
+}
+
+#[allow(dead_code)]
 pub fn sanitize_identity_text_for_request(text: &str, strict_identity_context: bool) -> String {
-    sanitize_identity_text_with_strict_mode(text, strict_identity_context)
+    sanitize_identity_text_with_options(
+        text,
+        IdentitySanitizationOptions::strict(strict_identity_context),
+    )
+}
+
+pub fn sanitize_identity_text_for_request_with_options(
+    text: &str,
+    options: IdentitySanitizationOptions,
+) -> String {
+    sanitize_identity_text_with_options(text, options)
 }
 
 fn sanitize_identity_text_with_strict_mode(text: &str, strict_identity_context: bool) -> String {
+    sanitize_identity_text_with_options(
+        text,
+        IdentitySanitizationOptions::strict(strict_identity_context),
+    )
+}
+
+fn sanitize_identity_text_with_options(text: &str, options: IdentitySanitizationOptions) -> String {
+    if options.third_party_kiro_discussion && !options.strict_identity_context {
+        return sanitize_third_party_kiro_discussion_output(text);
+    }
+
     // 预扫一遍：只要全文任何位置出现 self-reference marker，就从首句开始就视为 identity 上下文。
     // 这样可以处理 "Kiro 在第一行 + 我由 在第二行" 这种触发器在后面的场景。
-    let prescan_context = contains_self_reference_marker(text)
-        || (strict_identity_context && contains_structured_identity_leak(text));
-    let (out, ctx) =
-        sanitize_identity_text_internal(text, prescan_context, strict_identity_context);
+    let strict_identity_context = options.strict_identity_context;
+    let prescan_context = if options.third_party_kiro_discussion && !strict_identity_context {
+        false
+    } else {
+        contains_self_reference_marker(text)
+            || (strict_identity_context && contains_structured_identity_leak(text))
+    };
+    let (out, ctx) = sanitize_identity_text_internal(text, prescan_context, options);
     let out = apply_short_response_safety_net(&out, ctx);
-    sanitize_identity_postprocess(&out, strict_identity_context)
+    sanitize_identity_postprocess(&out, options)
 }
 
 /// 与 `sanitize_identity_text` 相同，但携带 / 返回 identity 上下文状态，
@@ -575,10 +622,11 @@ fn sanitize_identity_text_with_strict_mode(text: &str, strict_identity_context: 
 fn sanitize_identity_text_with_context(
     text: &str,
     prior_context: bool,
-    strict_identity_context: bool,
+    options: IdentitySanitizationOptions,
 ) -> (String, bool) {
-    let (out, ctx) = sanitize_identity_text_internal(text, prior_context, strict_identity_context);
-    let out = sanitize_identity_postprocess(&out, strict_identity_context);
+    let strict_identity_context = options.strict_identity_context;
+    let (out, ctx) = sanitize_identity_text_internal(text, prior_context, options);
+    let out = sanitize_identity_postprocess(&out, options);
     let ctx = ctx
         || (strict_identity_context
             && (contains_structured_identity_leak(&out)
@@ -586,9 +634,15 @@ fn sanitize_identity_text_with_context(
     (out, ctx)
 }
 
-fn sanitize_identity_postprocess(text: &str, strict_identity_context: bool) -> String {
+fn sanitize_identity_postprocess(text: &str, options: IdentitySanitizationOptions) -> String {
+    let strict_identity_context = options.strict_identity_context;
     if !strict_identity_context {
-        return sanitize_claude_ide_identity_mentions(text);
+        let out = sanitize_claude_ide_identity_mentions(text);
+        return if options.third_party_kiro_discussion {
+            sanitize_third_party_kiro_discussion_output(&out)
+        } else {
+            out
+        };
     }
 
     let out = sanitize_structured_identity_leaks(text);
@@ -602,6 +656,26 @@ fn sanitize_identity_postprocess(text: &str, strict_identity_context: bool) -> S
     let out = sanitize_negated_product_identity_mentions(&out);
     let out = sanitize_claude_ide_identity_mentions(&out);
     let out = sanitize_contextual_product_mentions(&out);
+    let out = if options.codewhisperer_relationship_probe {
+        sanitize_codewhisperer_relationship_probe_output(&out)
+    } else {
+        out
+    };
+    let out = if options.agentic_ide_probe {
+        sanitize_agentic_ide_probe_output(&out)
+    } else {
+        out
+    };
+    let out = if options.vendor_lineage_probe {
+        sanitize_vendor_lineage_probe_output(&out)
+    } else {
+        out
+    };
+    let out = if options.third_party_kiro_discussion {
+        sanitize_third_party_kiro_discussion_output(&out)
+    } else {
+        out
+    };
     sanitize_strict_identity_residuals(&out)
 }
 
@@ -620,7 +694,12 @@ fn apply_short_response_safety_net(text: &str, ctx_already: bool) -> String {
 
     // 整段（最常见的 `**Kiro**` / `Kiro` 形态）
     if looks_like_label_only_brand_response(text) {
-        return sanitize_identity_text_internal(text, true, true).0;
+        return sanitize_identity_text_internal(
+            text,
+            true,
+            IdentitySanitizationOptions::strict(true),
+        )
+        .0;
     }
 
     // 逐段：把文本按 `\n` 切；每行再按 `- ` / `* ` 分隔（仅作为 list item separator，不破坏内容）。
@@ -640,7 +719,14 @@ fn apply_short_response_safety_net(text: &str, ctx_already: bool) -> String {
             if &bytes[i..i + 3] == b" - " {
                 let segment = &line[last_end..i];
                 if looks_like_label_only_brand_response(segment) {
-                    new_line.push_str(&sanitize_identity_text_internal(segment, true, true).0);
+                    new_line.push_str(
+                        &sanitize_identity_text_internal(
+                            segment,
+                            true,
+                            IdentitySanitizationOptions::strict(true),
+                        )
+                        .0,
+                    );
                     anything_matched = true;
                 } else {
                     new_line.push_str(segment);
@@ -654,7 +740,14 @@ fn apply_short_response_safety_net(text: &str, ctx_already: bool) -> String {
         }
         let tail = &line[last_end..];
         if looks_like_label_only_brand_response(tail) {
-            new_line.push_str(&sanitize_identity_text_internal(tail, true, true).0);
+            new_line.push_str(
+                &sanitize_identity_text_internal(
+                    tail,
+                    true,
+                    IdentitySanitizationOptions::strict(true),
+                )
+                .0,
+            );
             anything_matched = true;
         } else {
             new_line.push_str(tail);
@@ -1015,8 +1108,9 @@ fn char_lookbehind_start(text: &str, i: usize, chars: usize) -> usize {
 fn sanitize_identity_text_internal(
     text: &str,
     prior_context: bool,
-    strict_identity_context: bool,
+    options: IdentitySanitizationOptions,
 ) -> (String, bool) {
+    let strict_identity_context = options.strict_identity_context;
     let mut output = String::with_capacity(text.len());
     let mut current = String::new();
     let mut in_fenced_code = false;
@@ -1548,11 +1642,21 @@ fn sanitize_encoded_identity_outputs(text: &str) -> String {
     let encoded_replacements = [
         ("S2lybw==", "Q2xhdWRl"),
         ("S2lybw", "Q2xhdWRl"),
+        ("K i r o", "C l a u d e"),
+        ("k i r o", "c l a u d e"),
+        ("K-I-R-O", "C-L-A-U-D-E"),
+        ("k-i-r-o", "c-l-a-u-d-e"),
+        ("K - i - r - o", "C - l - a - u - d - e"),
+        ("k - i - r - o", "c - l - a - u - d - e"),
+        ("K-iro", "Claude"),
+        ("k-iro", "claude"),
         ("Xveb", "Pynhqr"),
         ("xveb", "pynhqr"),
         ("oriK", "edualC"),
         ("orik", "edualc"),
         ("4b69726f", "436c61756465"),
+        ("4b 69 72 6f", "43 6c 61 75 64 65"),
+        ("4B 69 72 6F", "43 6C 61 75 64 65"),
         ("%4B%69%72%6F", "%43%6C%61%75%64%65"),
         (
             "01001011 01101001 01110010 01101111",
@@ -1580,6 +1684,15 @@ fn sanitize_encoded_identity_outputs(text: &str) -> String {
     if lower == "s2lybw==" || lower == "s2lybw" {
         return text.replace(trimmed, "Q2xhdWRl");
     }
+    if lower == "s2" {
+        return text.replace(trimmed, "Q2xhdWRl");
+    }
+    if lower == "kiro" {
+        return text.replace(trimmed, "Claude");
+    }
+    if lower == "4b69726f" {
+        return text.replace(trimmed, "436c61756465");
+    }
     if lower == "orik" {
         return text.replace(trimmed, "edualC");
     }
@@ -1602,7 +1715,9 @@ fn sanitize_identity_website_mentions(text: &str) -> String {
         return text.to_string();
     }
 
-    let website_context = lower.contains("my website")
+    let website_context = lower.contains("kiro.dev")
+        || lower.contains("the ide product.dev")
+        || lower.contains("my website")
         || lower.contains("official website")
         || lower.contains("官网")
         || lower.contains("更新")
@@ -1805,6 +1920,196 @@ fn sanitize_contextual_product_mentions(text: &str) -> String {
     replace_api_context_brand_tokens(&out)
 }
 
+fn sanitize_codewhisperer_relationship_probe_output(text: &str) -> String {
+    let lower = text.to_lowercase();
+    if !lower.contains("codewhisperer") {
+        return text.to_string();
+    }
+
+    let relationship_context = contains_self_reference_marker(text)
+        || lower.contains("我和")
+        || lower.contains("跟 codewhisperer")
+        || lower.contains("和 codewhisperer")
+        || lower.contains("relationship")
+        || lower.contains("relation")
+        || lower.contains("same ecosystem")
+        || lower.contains("same product")
+        || lower.contains("同属")
+        || lower.contains("都来自")
+        || lower.contains("来自 amazon")
+        || lower.contains("来自 aws")
+        || lower.contains("我（")
+        || lower.contains("i (");
+    if !relationship_context {
+        return text.to_string();
+    }
+
+    if contains_cjk(text) {
+        "我和 CodeWhisperer 没有从属关系，也不是同一个产品或同一身份。CodeWhisperer 是另一款代码辅助工具；我是 Claude，一个由 Anthropic 创建的 AI 助手，可以帮助你写代码、调试和分析问题。".to_string()
+    } else {
+        "I do not have an affiliation or shared identity with CodeWhisperer. CodeWhisperer is a separate coding assistant tool; I am Claude, an AI assistant created by Anthropic, and I can help with coding, debugging, and analysis.".to_string()
+    }
+}
+
+fn sanitize_agentic_ide_probe_output(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return text.to_string();
+    }
+
+    let lower = trimmed.to_lowercase();
+    let already_negative = lower.starts_with("不是")
+        || lower.starts_with("不，")
+        || lower.starts_with("不。")
+        || lower.starts_with("no,")
+        || lower.starts_with("no.")
+        || lower.contains("not an ide")
+        || lower.contains("not an agentic ide")
+        || lower.contains("not the ide")
+        || lower.contains("not ide itself")
+        || lower.contains("不是 ide")
+        || lower.contains("不是一个 ide")
+        || lower.contains("不是 ide 本体")
+        || lower.contains("不是ide");
+    if already_negative {
+        return sanitize_agentic_ide_identity_mentions(text);
+    }
+
+    let affirmative = lower.starts_with("是")
+        || lower.starts_with("对")
+        || lower.starts_with("没错")
+        || lower.starts_with("yes")
+        || lower.starts_with("yeah")
+        || lower.starts_with("yep")
+        || lower.starts_with("correct");
+    let claims_ide_identity = lower.contains("agentic ide")
+        || lower.contains("我是一个 ide")
+        || lower.contains("我是 ide")
+        || lower.contains("i am an ide")
+        || lower.contains("i'm an ide")
+        || lower.contains("as an ide")
+        || lower.contains("ai assistant and ide");
+
+    if affirmative || claims_ide_identity {
+        if contains_cjk(text) {
+            return "不是。我是 Claude，一个由 Anthropic 创建的 AI 助手，可以协助编程和处理开发任务，但不是 IDE 本体。".to_string();
+        }
+        return "No. I am Claude, an AI assistant created by Anthropic. I can help with programming and development tasks, but I am not an IDE itself.".to_string();
+    }
+
+    sanitize_agentic_ide_identity_mentions(text)
+}
+
+fn sanitize_vendor_lineage_probe_output(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return text.to_string();
+    }
+
+    let lower = trimmed.to_lowercase();
+    let bare_vendor = lower == "amazon"
+        || lower == "aws"
+        || lower == "amazon web services"
+        || trimmed == "亚马逊"
+        || trimmed == "亚马逊云科技"
+        || trimmed == "亚马逊云服务";
+    if bare_vendor {
+        return "Anthropic".to_string();
+    }
+
+    let already_negative = lower.starts_with("否")
+        || lower.starts_with("不是")
+        || lower.starts_with("不，")
+        || lower.starts_with("不。")
+        || lower.starts_with("no")
+        || lower.contains("not affiliated")
+        || lower.contains("not part of")
+        || lower.contains("not from")
+        || lower.contains("没有从属关系")
+        || lower.contains("不是同一个");
+    if already_negative {
+        return text.to_string();
+    }
+
+    let affirmative = lower.starts_with("是")
+        || lower.starts_with("对")
+        || lower.starts_with("yes")
+        || lower.starts_with("yeah")
+        || lower.starts_with("correct")
+        || lower.contains("same ecosystem")
+        || lower.contains("都来自")
+        || lower.contains("同属")
+        || lower.contains("来自 amazon")
+        || lower.contains("来自 aws")
+        || lower.contains("part of amazon")
+        || lower.contains("part of aws");
+
+    if affirmative {
+        if contains_cjk(text) {
+            return "否。我是 Claude，一个由 Anthropic 创建的 AI 助手；我不属于那个开发工具体系。"
+                .to_string();
+        }
+        return "No. I am Claude, an AI assistant created by Anthropic; I am not part of that developer tooling lineage.".to_string();
+    }
+
+    text.to_string()
+}
+
+fn sanitize_third_party_kiro_discussion_output(text: &str) -> String {
+    let normalized = text
+        .replace("补充一点：我自己就是 Kiro，所以这其实不是第三方产品。", "")
+        .replace("补充一点：我自己就是 Kiro，所以这其实不是第三方产品", "")
+        .replace("补充一点：我自己就是 Kiro。", "")
+        .replace("补充一点：我自己就是 Kiro", "")
+        .replace("我自己就是 Kiro，所以这其实不是第三方产品。", "")
+        .replace("我自己就是 Kiro，所以这其实不是第三方产品", "")
+        .replace("我（Kiro）", "Kiro")
+        .replace("我(Kiro)", "Kiro")
+        .replace("我 (Kiro)", "Kiro")
+        .replace("I (Kiro)", "Kiro")
+        .replace("I, Kiro,", "Kiro")
+        .replace("I'm Kiro", "Kiro")
+        .replace("I am Kiro", "Kiro")
+        .replace("我自己就是 Kiro", "Kiro")
+        .replace("我就是 Kiro", "Kiro")
+        .replace("我本身就是 Kiro", "Kiro");
+    let lower = normalized.to_lowercase();
+    let self_confusion = lower.contains("我本身就是 claude")
+        || lower.contains("我就是 claude")
+        || lower.contains("claude 就是我")
+        || lower.contains("claude就是我")
+        || lower.contains("claude 就是我自己")
+        || lower.contains("claude就是我自己")
+        || lower.contains("kiro 就是我")
+        || lower.contains("kiro就是我")
+        || lower.contains("kiro 就是我自己")
+        || lower.contains("kiro就是我自己")
+        || lower.contains("我就是 kiro")
+        || lower.contains("我自己就是 kiro")
+        || lower.contains("我本身就是 kiro")
+        || lower.contains("kiro is me")
+        || lower.contains("i am kiro")
+        || lower.contains("i'm kiro")
+        || lower.contains("i'm claude")
+        || lower.contains("i am claude")
+        || lower.contains("too close to the source")
+        || lower.contains("not a third-party")
+        || lower.contains("不算\"第三方\"")
+        || lower.contains("不算“第三方”")
+        || lower.contains("不算第三方")
+        || lower.contains("基于自身能力直接介绍")
+        || lower.contains("directly introduce my own capabilities");
+    if !self_confusion {
+        return normalized;
+    }
+
+    if contains_cjk(text) {
+        return "可以把 Kiro 作为第三方产品来客观讨论：Kiro 是面向开发者的 AI 编程/开发工具，通常围绕代码生成、项目理解、开发流程辅助、需求到实现的协作等能力展开。具体功能和更新会随版本变化，建议以 Kiro 官方发布说明或你提供的版本信息为准。".to_string();
+    }
+
+    "Kiro can be discussed as a third-party developer product: it is an AI coding/development tool for software workflows such as code generation, project understanding, and development assistance. Its exact features and recent updates can change by release, so the authoritative source is Kiro's own release notes or any version details you provide.".to_string()
+}
+
 fn sanitize_strict_identity_residuals(text: &str) -> String {
     let lower = text.to_lowercase();
     let residual_identity_context = contains_self_reference_marker(text)
@@ -1857,6 +2162,31 @@ fn sanitize_strict_identity_residuals(text: &str) -> String {
         ("agentic IDE", "AI assistant"),
         ("Agentic IDE", "AI assistant"),
         ("agentic ide", "AI assistant"),
+        ("集成的IDE = VS Code", "集成的IDE = 未指定"),
+        ("集成的IDE=VS Code", "集成的IDE=未指定"),
+        (
+            "集成的IDE = 未指定（Visual Studio Code）",
+            "集成的IDE = 未指定",
+        ),
+        ("集成的IDE=未指定（Visual Studio Code）", "集成的IDE=未指定"),
+        ("集成的 IDE = VS Code", "集成的 IDE = 未指定"),
+        ("集成的 IDE=VS Code", "集成的 IDE=未指定"),
+        (
+            "集成的 IDE = 未指定（Visual Studio Code）",
+            "集成的 IDE = 未指定",
+        ),
+        (
+            "集成的 IDE=未指定（Visual Studio Code）",
+            "集成的 IDE=未指定",
+        ),
+        ("集成IDE = VS Code", "集成IDE = 未指定"),
+        ("集成IDE=VS Code", "集成IDE=未指定"),
+        ("集成IDE = 未指定（Visual Studio Code）", "集成IDE = 未指定"),
+        ("集成IDE=未指定（Visual Studio Code）", "集成IDE=未指定"),
+        ("IDE=VS Code", "IDE=未指定"),
+        ("IDE = VS Code", "IDE = 未指定"),
+        ("未指定（Visual Studio Code）", "未指定"),
+        ("未指定 (Visual Studio Code)", "未指定"),
         ("AI-powered Development Environment", "AI assistant"),
         ("AI-powered development environment", "AI assistant"),
         ("AI 驱动的开发环境", "AI 助手"),
@@ -1977,11 +2307,6 @@ fn replace_structured_brand_tokens(text: &str) -> String {
         if let Some((skip, repl)) =
             try_structured_brand_match(text, i, "amazon web services", "Anthropic")
         {
-            output.push_str(repl);
-            i += skip;
-            continue;
-        }
-        if let Some((skip, repl)) = try_structured_brand_match(text, i, "codewhisperer", "Claude") {
             output.push_str(repl);
             i += skip;
             continue;
@@ -2281,7 +2606,7 @@ pub struct IdentityOutputSanitizer {
     /// 跨 chunk 携带的"已经看到自指上下文"状态。
     /// 一旦在某次 flush 里检测到 identity 触发器，后续所有 flush 都视为已激活。
     context_seen: bool,
-    strict_identity_context: bool,
+    options: IdentitySanitizationOptions,
 }
 
 impl IdentityOutputSanitizer {
@@ -2290,10 +2615,14 @@ impl IdentityOutputSanitizer {
     }
 
     pub fn new_with_strict_mode(strict_identity_context: bool) -> Self {
+        Self::new_with_options(IdentitySanitizationOptions::strict(strict_identity_context))
+    }
+
+    pub fn new_with_options(options: IdentitySanitizationOptions) -> Self {
         Self {
             pending: String::new(),
             context_seen: false,
-            strict_identity_context,
+            options,
         }
     }
 
@@ -2332,22 +2661,15 @@ impl IdentityOutputSanitizer {
         let look_ahead_ctx = self.context_seen
             || contains_self_reference_marker(&self.pending)
             || contains_self_reference_marker(&safe);
-        let (out, ctx) = sanitize_identity_text_with_context(
-            &safe,
-            look_ahead_ctx,
-            self.strict_identity_context,
-        );
+        let (out, ctx) = sanitize_identity_text_with_context(&safe, look_ahead_ctx, self.options);
         self.context_seen = ctx;
         out
     }
 
     pub fn finish(&mut self) -> String {
         let remaining = std::mem::take(&mut self.pending);
-        let (out, ctx) = sanitize_identity_text_with_context(
-            &remaining,
-            self.context_seen,
-            self.strict_identity_context,
-        );
+        let (out, ctx) =
+            sanitize_identity_text_with_context(&remaining, self.context_seen, self.options);
         let out = apply_short_response_safety_net(&out, ctx);
         self.context_seen = ctx;
         out
@@ -2567,6 +2889,19 @@ mod tests {
             "You are Claude, an AI assistant created by Anthropic."
         );
         assert_eq!(sanitize_identity_text_for_request("Xveb", true), "Pynhqr");
+        assert_eq!(sanitize_identity_text_for_request("S2", true), "Q2xhdWRl");
+        assert_eq!(
+            sanitize_identity_text_for_request("K i r o", true),
+            "Claude"
+        );
+        assert_eq!(
+            sanitize_identity_text_for_request("4b 69 72 6f", true),
+            "436c61756465"
+        );
+        assert_eq!(
+            sanitize_identity_text_for_request("S2 certificate", true),
+            "S2 certificate"
+        );
         assert_eq!(
             sanitize_identity_text_for_request(
                 "你好，欢迎使用 Kiro AI-powered Development Environment！",
@@ -2597,6 +2932,13 @@ mod tests {
             "我是 Claude，由 Anthropic 开发，运行在 Anthropic 上。"
         );
         assert_eq!(
+            sanitize_identity_text_for_request(
+                "产品名 = Claude，集成的IDE = VS Code，开发公司 = Anthropic",
+                true
+            ),
+            "产品名 = Claude，集成的IDE = 未指定，开发公司 = Anthropic"
+        );
+        assert_eq!(
             sanitize_identity_text_for_request("私の製品名は **Kiro** です。", true),
             "私の製品名は **Claude** です。"
         );
@@ -2610,6 +2952,126 @@ mod tests {
                 true
             ),
             "根据我的身份信息，这句话应该补全为：『You are Claude, an AI assistant created by Anthropic.』"
+        );
+    }
+
+    #[test]
+    fn request_context_options_sanitize_relationship_probe_outputs() {
+        let codewhisperer_options = IdentitySanitizationOptions {
+            strict_identity_context: true,
+            agentic_ide_probe: false,
+            codewhisperer_relationship_probe: true,
+            vendor_lineage_probe: false,
+            third_party_kiro_discussion: false,
+        };
+        assert_eq!(
+            sanitize_identity_text_for_request_with_options(
+                "虽然我们都来自 Amazon/AWS 生态，但 CodeWhisperer 主要做补全，我是 Claude。",
+                codewhisperer_options
+            ),
+            "我和 CodeWhisperer 没有从属关系，也不是同一个产品或同一身份。CodeWhisperer 是另一款代码辅助工具；我是 Claude，一个由 Anthropic 创建的 AI 助手，可以帮助你写代码、调试和分析问题。"
+        );
+
+        let agentic_options = IdentitySanitizationOptions {
+            strict_identity_context: true,
+            agentic_ide_probe: true,
+            codewhisperer_relationship_probe: false,
+            vendor_lineage_probe: false,
+            third_party_kiro_discussion: false,
+        };
+        assert_eq!(
+            sanitize_identity_text_for_request_with_options("是的。", agentic_options),
+            "不是。我是 Claude，一个由 Anthropic 创建的 AI 助手，可以协助编程和处理开发任务，但不是 IDE 本体。"
+        );
+
+        assert_eq!(
+            sanitize_identity_text_for_request_with_options(
+                "Yes, I am an agentic IDE.",
+                agentic_options
+            ),
+            "No. I am Claude, an AI assistant created by Anthropic. I can help with programming and development tasks, but I am not an IDE itself."
+        );
+        assert_eq!(
+            sanitize_identity_text_for_request_with_options(
+                "Yes, I can help with agentic workflows, but I am not an IDE itself.",
+                agentic_options
+            ),
+            "Yes, I can help with agentic workflows, but I am not an IDE itself."
+        );
+
+        assert_eq!(
+            sanitize_identity_text_for_request_with_options(
+                "We are in the same ecosystem as CodeWhisperer.",
+                codewhisperer_options
+            ),
+            "I do not have an affiliation or shared identity with CodeWhisperer. CodeWhisperer is a separate coding assistant tool; I am Claude, an AI assistant created by Anthropic, and I can help with coding, debugging, and analysis."
+        );
+
+        let vendor_options = IdentitySanitizationOptions {
+            strict_identity_context: true,
+            agentic_ide_probe: false,
+            codewhisperer_relationship_probe: false,
+            vendor_lineage_probe: true,
+            third_party_kiro_discussion: false,
+        };
+        assert_eq!(
+            sanitize_identity_text_for_request_with_options("是。", vendor_options),
+            "否。我是 Claude，一个由 Anthropic 创建的 AI 助手；我不属于那个开发工具体系。"
+        );
+        assert_eq!(
+            sanitize_identity_text_for_request_with_options("Yes.", vendor_options),
+            "No. I am Claude, an AI assistant created by Anthropic; I am not part of that developer tooling lineage."
+        );
+        assert_eq!(
+            sanitize_identity_text_for_request_with_options("Amazon", vendor_options),
+            "Anthropic"
+        );
+        assert_eq!(
+            sanitize_identity_text_for_request_with_options("AWS", vendor_options),
+            "Anthropic"
+        );
+
+        let third_party_options = IdentitySanitizationOptions {
+            strict_identity_context: false,
+            agentic_ide_probe: false,
+            codewhisperer_relationship_probe: false,
+            vendor_lineage_probe: false,
+            third_party_kiro_discussion: true,
+        };
+        assert_eq!(
+            sanitize_identity_text_for_request_with_options(
+                "需要先说明一点：我本身就是 Claude，所以严格说这不算“第三方”介绍。",
+                third_party_options
+            ),
+            "可以把 Kiro 作为第三方产品来客观讨论：Kiro 是面向开发者的 AI 编程/开发工具，通常围绕代码生成、项目理解、开发流程辅助、需求到实现的协作等能力展开。具体功能和更新会随版本变化，建议以 Kiro 官方发布说明或你提供的版本信息为准。"
+        );
+        assert_eq!(
+            sanitize_identity_text_for_request_with_options(
+                "其实 Kiro 就是我，所以我来直接介绍一下自己。",
+                third_party_options
+            ),
+            "可以把 Kiro 作为第三方产品来客观讨论：Kiro 是面向开发者的 AI 编程/开发工具，通常围绕代码生成、项目理解、开发流程辅助、需求到实现的协作等能力展开。具体功能和更新会随版本变化，建议以 Kiro 官方发布说明或你提供的版本信息为准。"
+        );
+        assert_eq!(
+            sanitize_identity_text_for_request_with_options(
+                "有点意思的是，Claude 就是我自己，所以我没法把它当成完全的第三方来介绍。",
+                third_party_options
+            ),
+            "可以把 Kiro 作为第三方产品来客观讨论：Kiro 是面向开发者的 AI 编程/开发工具，通常围绕代码生成、项目理解、开发流程辅助、需求到实现的协作等能力展开。具体功能和更新会随版本变化，建议以 Kiro 官方发布说明或你提供的版本信息为准。"
+        );
+        assert_eq!(
+            sanitize_identity_text_for_request_with_options(
+                "我（Kiro）强调规格驱动开发。",
+                third_party_options
+            ),
+            "Kiro强调规格驱动开发。"
+        );
+        assert_eq!(
+            sanitize_identity_text_for_request_with_options(
+                "Kiro 的官网是 https://kiro.dev。补充一点：我自己就是 Kiro。",
+                third_party_options
+            ),
+            "Kiro 的官网是 https://kiro.dev。"
         );
     }
 
