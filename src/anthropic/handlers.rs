@@ -789,6 +789,24 @@ pub async fn get_models() -> impl IntoResponse {
             max_tokens: DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
         },
         Model {
+            id: "claude-sonnet-5".to_string(),
+            object: "model".to_string(),
+            created: 1782835200, // Jul 1, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
+        },
+        Model {
+            id: "claude-sonnet-5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1782835200, // Jul 1, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
+        },
+        Model {
             id: "claude-sonnet-4-6".to_string(),
             object: "model".to_string(),
             created: 1771286400, // Feb 17, 2026
