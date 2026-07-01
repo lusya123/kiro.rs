@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, StatusCode},
+    http::{Request, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
@@ -57,6 +57,26 @@ pub async fn auth_middleware(
             (StatusCode::UNAUTHORIZED, Json(error)).into_response()
         }
     }
+}
+
+/// Adds aws-p/ccmin-like public response headers to `/v1` and `/cc/v1`.
+pub async fn compat_headers_middleware(request: Request<Body>, next: Next) -> Response {
+    let include_official_headers = request.uri().path().ends_with("/messages");
+    let mut response = next.run(request).await;
+    let is_stream = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.starts_with("text/event-stream"))
+        .unwrap_or(false);
+    let status = response.status();
+    super::compat::add_response_headers(
+        response.headers_mut(),
+        status,
+        is_stream,
+        include_official_headers,
+    );
+    response
 }
 
 /// CORS 中间件层

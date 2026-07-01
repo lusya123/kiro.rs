@@ -1054,6 +1054,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            cache_control: None,
             metadata: None,
         };
         assert_eq!(determine_chat_trigger_type(&req), "MANUAL");
@@ -1174,6 +1175,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
             output_config: None,
+            cache_control: None,
             metadata: None,
         };
 
@@ -1243,6 +1245,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
             output_config: None,
+            cache_control: None,
             metadata: None,
         };
 
@@ -1300,6 +1303,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            cache_control: None,
             metadata: None,
         };
 
@@ -1384,6 +1388,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            cache_control: None,
             metadata: Some(Metadata {
                 user_id: Some(
                     "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd_account__session_a0662283-7fd3-4399-a7eb-52b9a717ae88".to_string(),
@@ -1416,6 +1421,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            cache_control: None,
             metadata: None,
         };
 
@@ -1450,6 +1456,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            cache_control: None,
             metadata: None,
         };
 
@@ -1489,6 +1496,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            cache_control: None,
             metadata: None,
         };
 
@@ -1520,6 +1528,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            cache_control: None,
             metadata: None,
         };
 
@@ -1556,6 +1565,7 @@ mod tests {
                 budget_tokens: 4096,
             }),
             output_config: None,
+            cache_control: None,
             metadata: None,
         };
 
@@ -1989,6 +1999,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            cache_control: None,
             metadata: None,
         };
 

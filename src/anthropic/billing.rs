@@ -1,26 +1,16 @@
 //! Usage billing policy.
 //!
-//! Kiro's `contextUsageEvent` includes a fixed service-side context floor of about
-//! 4K tokens for even tiny prompts. Returning that floor directly makes short
-//! user inputs look heavily overcharged, while it is much less visible on large
-//! requests. For short requests we therefore expose the client request estimate;
-//! once the request itself is substantial, we switch back to Kiro context usage.
-
-/// Below this estimated client-request size, ignore Kiro's fixed context floor
-/// when reporting billable input tokens.
-pub const SHORT_INPUT_BILLING_THRESHOLD: i32 = 2048;
+//! `input_tokens` 一律采用本地 BPE 估算口径(与对标的 pomoai/真 Anthropic 一致)。
+//! **不**回落到 Kiro 的 `contextUsageEvent`：Kiro 的计数对 JSON/密集文本系统性虚高
+//! (实测某 JSON Kiro 记 8104，而 Claude 口径仅 ~3807)、且对小请求带 ~4K 固定上下文底噪。
+//! 用本地估算才能与 pomoai 拟合,且对客户的计费口径与真 Anthropic 一致。
+//! 多轮 auto-continue 的累加仍保留(见 `cache::with_additional_input`)。
 
 pub fn billable_input_tokens(
     estimated_input_tokens: i32,
-    context_input_tokens: Option<i32>,
+    _context_input_tokens: Option<i32>,
 ) -> i32 {
-    let estimated = estimated_input_tokens.max(1);
-
-    if estimated <= SHORT_INPUT_BILLING_THRESHOLD {
-        return estimated;
-    }
-
-    context_input_tokens.unwrap_or(estimated).max(1)
+    estimated_input_tokens.max(1)
 }
 
 #[cfg(test)]
@@ -28,14 +18,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn short_requests_ignore_kiro_context_floor() {
+    fn always_uses_local_estimate_not_kiro_context() {
+        // 一律返回本地估算，忽略 Kiro 的(虚高/带底噪)contextUsageEvent。
         assert_eq!(billable_input_tokens(3, Some(4120)), 3);
         assert_eq!(billable_input_tokens(2048, Some(6148)), 2048);
-    }
-
-    #[test]
-    fn large_requests_use_kiro_context_usage() {
-        assert_eq!(billable_input_tokens(2049, Some(6149)), 6149);
+        assert_eq!(billable_input_tokens(2049, Some(6149)), 2049);
+        assert_eq!(billable_input_tokens(3681, Some(8104)), 3681);
     }
 
     #[test]

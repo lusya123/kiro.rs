@@ -1,33 +1,24 @@
-//! Cache usage 显示策略
+//! Prompt cache usage 兼容策略。
 //!
-//! Kiro 上游不支持 prompt caching，但客户端可能用 Anthropic prompt caching SDK
-//! 并期待响应里看到 cache 字段反馈。本模块提供两种显示策略：
+//! Kiro 上游不支持 Anthropic/AWS prompt caching，但客户端会依赖 usage 里的
+//! cache 字段计费。本模块按 aws-p 实测行为维护一个本进程内的前缀缓存：
 //!
-//! 1. **客户传了 cache_control** → 把上游真实 input_tokens 按 Anthropic 官方
-//!    cache 字段拆分成 (input, cache_read, cache_creation)。高缓存分支按
-//!    输入规模渐进展示 cache：短请求不造缓存，中等上下文少量 read，大上下文
-//!    才展示较高 read。
-//!
-//! 2. **客户没传 cache_control** → 老实返回 `input=T, cache_read=0,
-//!    cache_creation=0`，避免"凭空冒出 cache"的客户投诉。
-//!
-//! ## 渐进式高缓存拆分
-//!
-//! - `T < 4k`：全部显示为普通 input，避免短请求凭空出现 cache。
-//! - `4k <= T < 20k`：保留 15% creation，read 从 10% 平滑涨到 45%。
-//! - `20k <= T < 50k`：creation 从 15% 平滑降到 13%，read 从 45% 平滑涨到 80%。
-//! - `T >= 50k`：creation 从 13% 平滑降到 10%，read 从 80% 平滑涨到 90%。
-//! - 始终满足 `input + cache_read + cache_creation = T`。
-//!
-//! ## 取代 sub2api virtual_cache 的理由
-//!
-//! sub2api 的 `applyVirtualCacheToUsageJSON` 在所有上游空 cache 时都注入，
-//! 客户没传 cache_control 也会看到莫名 cache 数字。把策略移到 kiro-rs 后，
-//! 由 kiro-rs 根据客户请求意图主动决定显示，sub2api 把对应账号
-//! `virtual_cache_enabled` 关掉即可全程透传。
+//! - 无 `cache_control`：所有 token 都计入普通 `input_tokens`。
+//! - 显式 system/tool breakpoint 或顶层 automatic cache：首轮写入 creation，
+//!   5 分钟或 1 小时 TTL 内重复前缀进入 read。
+//! - 显式 message content breakpoint：aws-p 实测会写 creation，但后续不读命中；
+//!   本地保持同样行为。
+//! - `input_tokens` 只展示最后一个 cache breakpoint 后面的非缓存部分。
+//! - `cache_creation.ephemeral_5m_input_tokens` 和 `ephemeral_1h_input_tokens`
+//!   按每个 breakpoint 的 TTL 分拆。
 
-use crate::anthropic::types::{Message, MessagesRequest};
+use crate::anthropic::types::{Message, MessagesRequest, Tool};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::time::Duration;
+
+const CACHE_MIN_TOKENS: i32 = 1_024;
+// 缓存登记表已迁移到 `crate::cluster_cache`(跨容器共享 + 本地回退)。
 
 /// 小于这个规模的请求不展示虚拟缓存，避免短请求看起来明显不真实。
 const CACHE_DISPLAY_MIN_TOKENS: i32 = 4_000;
@@ -68,6 +59,8 @@ pub struct UsageBreakdown {
     pub input_tokens: i32,
     pub cache_read_input_tokens: i32,
     pub cache_creation_input_tokens: i32,
+    pub cache_creation_5m_input_tokens: i32,
+    pub cache_creation_1h_input_tokens: i32,
 }
 
 impl UsageBreakdown {
@@ -77,6 +70,8 @@ impl UsageBreakdown {
             input_tokens,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
         }
     }
 
@@ -106,6 +101,8 @@ pub fn split_virtual_cache(total_input_tokens: i32) -> UsageBreakdown {
         input_tokens: i,
         cache_read_input_tokens: cr,
         cache_creation_input_tokens: cc,
+        cache_creation_5m_input_tokens: cc,
+        cache_creation_1h_input_tokens: 0,
     }
 }
 
@@ -161,6 +158,7 @@ fn progress_between(value: i32, start: i32, end: i32) -> f64 {
 /// - `tools[*].cache_control`
 ///
 /// 任何一处出现都视为"客户开启了 prompt caching"。
+#[cfg(test)]
 pub fn request_has_cache_control(req: &MessagesRequest) -> bool {
     // system blocks
     if let Some(system) = &req.system {
@@ -190,6 +188,7 @@ pub fn request_has_cache_control(req: &MessagesRequest) -> bool {
     false
 }
 
+#[cfg(test)]
 fn message_has_cache_control(msg: &Message) -> bool {
     match &msg.content {
         Value::String(_) => false,
@@ -198,6 +197,7 @@ fn message_has_cache_control(msg: &Message) -> bool {
     }
 }
 
+#[cfg(test)]
 fn has_cache_control_in_value(v: &Value) -> bool {
     match v {
         Value::Object(map) => {
@@ -223,9 +223,407 @@ pub fn compute_usage_breakdown(total_input_tokens: i32, has_cache_control: bool)
     }
 }
 
+pub async fn compute_request_usage_breakdown(
+    total_input_tokens: i32,
+    req: &MessagesRequest,
+) -> UsageBreakdown {
+    let total_input_tokens = total_input_tokens.max(0);
+    let Some(cache_plan) = cache_plan_for_request(total_input_tokens, req).await else {
+        return UsageBreakdown::flat(total_input_tokens);
+    };
+
+    let ordinary_input = total_input_tokens - cache_plan.cache_tokens;
+    UsageBreakdown {
+        input_tokens: ordinary_input,
+        cache_read_input_tokens: cache_plan.cache_read_tokens,
+        cache_creation_input_tokens: cache_plan.cache_creation_5m_tokens
+            + cache_plan.cache_creation_1h_tokens,
+        cache_creation_5m_input_tokens: cache_plan.cache_creation_5m_tokens,
+        cache_creation_1h_input_tokens: cache_plan.cache_creation_1h_tokens,
+    }
+}
+
+pub fn with_additional_input(
+    initial: UsageBreakdown,
+    initial_total_input_tokens: i32,
+    final_total_input_tokens: i32,
+) -> UsageBreakdown {
+    // 有缓存拆分时，(input, cache_read, cache_creation) 已按"全量 − 缓存"拆好并满足
+    // input + cr + cc = 总量，绝不能再叠加差额（否则缓存量被重复计进 input → 双重计数）。
+    if initial.cache_creation_input_tokens > 0 || initial.cache_read_input_tokens > 0 {
+        return initial;
+    }
+    // 无缓存：把多轮 auto-continue 累计的额外 input 叠加进来（成本回收）。
+    // 注意 final 现在来自本地估算累加（见 billing::billable_input_tokens），不再是 Kiro 虚高计数，
+    // 因此既保留多轮累加、又能与 pomoai 口径拟合。
+    let extra = (final_total_input_tokens - initial_total_input_tokens).max(0);
+    UsageBreakdown {
+        input_tokens: initial.input_tokens + extra,
+        ..initial
+    }
+}
+
+struct CachePlan {
+    cache_tokens: i32,
+    cache_read_tokens: i32,
+    cache_creation_5m_tokens: i32,
+    cache_creation_1h_tokens: i32,
+}
+
+async fn cache_plan_for_request(
+    total_input_tokens: i32,
+    req: &MessagesRequest,
+) -> Option<CachePlan> {
+    let mut breakpoints = build_cache_breakpoints(req, total_input_tokens);
+    breakpoints.retain(|b| b.tokens >= cache_min_tokens(&req.model));
+    if breakpoints.is_empty() {
+        return None;
+    }
+
+    breakpoints.sort_by_key(|b| b.tokens);
+    breakpoints.truncate(4);
+
+    let mut read_index: Option<usize> = None;
+    for (idx, breakpoint) in breakpoints.iter().enumerate().rev() {
+        if cache_entry_exists(&req.model, breakpoint).await {
+            read_index = Some(idx);
+            break;
+        }
+    }
+
+    let read_tokens = read_index.map(|idx| breakpoints[idx].tokens).unwrap_or(0);
+    // 命中时刷新该前缀 TTL(对齐真 Anthropic 的"每次使用重置缓存有效期"),
+    // 否则持续使用的前缀每到 5m/1h 就会冒出一次 cache_creation,破坏"统一号池"的一致观感。
+    if let Some(idx) = read_index {
+        register_cache_entry(&req.model, &breakpoints[idx]).await;
+    }
+    let mut creation_5m = 0;
+    let mut creation_1h = 0;
+    let mut previous = read_tokens;
+
+    for breakpoint in breakpoints
+        .iter()
+        .filter(|breakpoint| breakpoint.tokens > read_tokens)
+    {
+        let delta = (breakpoint.tokens - previous).max(0);
+        match breakpoint.ttl {
+            CacheTtl::Ephemeral1h => creation_1h += delta,
+            CacheTtl::Ephemeral5m => creation_5m += delta,
+        }
+        register_cache_entry(&req.model, breakpoint).await;
+        previous = breakpoint.tokens;
+    }
+
+    Some(CachePlan {
+        cache_tokens: breakpoints.last()?.tokens,
+        cache_read_tokens: read_tokens,
+        cache_creation_5m_tokens: creation_5m,
+        cache_creation_1h_tokens: creation_1h,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheTtl {
+    Ephemeral5m,
+    Ephemeral1h,
+}
+
+impl CacheTtl {
+    fn duration(self) -> Duration {
+        match self {
+            Self::Ephemeral5m => Duration::from_secs(5 * 60),
+            Self::Ephemeral1h => Duration::from_secs(60 * 60),
+        }
+    }
+}
+
+struct CacheBreakpoint {
+    tokens: i32,
+    ttl: CacheTtl,
+    key_material: String,
+    readable: bool,
+}
+
+fn build_cache_breakpoints(req: &MessagesRequest, total_input_tokens: i32) -> Vec<CacheBreakpoint> {
+    let mut state = PrefixState::default();
+    let mut breakpoints = Vec::new();
+
+    if let Some(tools) = &req.tools {
+        for tool in tools {
+            state.tools.push(tool.clone());
+            let mut tool_key = serde_json::to_value(tool).unwrap_or(Value::Null);
+            strip_cache_control(&mut tool_key);
+            state
+                .key_parts
+                .push(format!("tool:{}", canonical_json(&tool_key)));
+            if tool.cache_control.is_some() {
+                push_breakpoint(
+                    req,
+                    &state,
+                    &mut breakpoints,
+                    cache_ttl(tool.cache_control.as_ref()),
+                    true,
+                );
+            }
+        }
+    }
+
+    if let Some(system) = &req.system {
+        for item in system {
+            state.system_segments.push(item.text.clone());
+            state.key_parts.push(format!("system:{}", item.text));
+            if item.cache_control.is_some() {
+                push_breakpoint(
+                    req,
+                    &state,
+                    &mut breakpoints,
+                    cache_ttl(item.cache_control.as_ref()),
+                    true,
+                );
+            }
+        }
+    }
+
+    for message in &req.messages {
+        collect_message_prefix(req, message, &mut state, &mut breakpoints);
+    }
+
+    if req.cache_control.is_some() && breakpoints.is_empty() && state.has_cacheable_content() {
+        let ttl = cache_ttl(req.cache_control.as_ref());
+        push_breakpoint(req, &state, &mut breakpoints, ttl, true);
+    }
+
+    for breakpoint in &mut breakpoints {
+        breakpoint.tokens = breakpoint.tokens.min(total_input_tokens).max(0);
+    }
+    breakpoints
+}
+
+#[derive(Default)]
+struct PrefixState {
+    tools: Vec<Tool>,
+    system_segments: Vec<String>,
+    content_segments: Vec<Value>,
+    key_parts: Vec<String>,
+}
+
+impl PrefixState {
+    fn has_cacheable_content(&self) -> bool {
+        !self.tools.is_empty()
+            || !self.system_segments.is_empty()
+            || !self.content_segments.is_empty()
+    }
+}
+
+fn collect_message_prefix(
+    req: &MessagesRequest,
+    message: &Message,
+    state: &mut PrefixState,
+    breakpoints: &mut Vec<CacheBreakpoint>,
+) {
+    match &message.content {
+        Value::String(text) => {
+            let content = Value::String(text.clone());
+            state.key_parts.push(format!("{}:{}", message.role, text));
+            state.content_segments.push(content);
+        }
+        Value::Array(items) => {
+            for item in items {
+                let mut item_without_cache = item.clone();
+                let ttl = cache_ttl(item_without_cache.get("cache_control"));
+                if let Some(obj) = item_without_cache.as_object_mut() {
+                    obj.remove("cache_control");
+                }
+                state.key_parts.push(format!(
+                    "{}:{}",
+                    message.role,
+                    canonical_json(&item_without_cache)
+                ));
+                state
+                    .content_segments
+                    .push(Value::Array(vec![item_without_cache]));
+                if has_direct_cache_control(item) {
+                    push_breakpoint(req, state, breakpoints, ttl, false);
+                }
+            }
+        }
+        other => {
+            state
+                .key_parts
+                .push(format!("{}:{}", message.role, canonical_json(other)));
+            state.content_segments.push(other.clone());
+        }
+    }
+}
+
+fn strip_cache_control(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("cache_control");
+            for child in map.values_mut() {
+                strip_cache_control(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                strip_cache_control(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn canonical_json(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+            let body = entries
+                .into_iter()
+                .map(|(key, value)| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(key).unwrap_or_default(),
+                        canonical_json(value)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{body}}}")
+        }
+        Value::Array(items) => {
+            let body = items
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[{body}]")
+        }
+        _ => serde_json::to_string(value).unwrap_or_default(),
+    }
+}
+
+fn push_breakpoint(
+    req: &MessagesRequest,
+    state: &PrefixState,
+    breakpoints: &mut Vec<CacheBreakpoint>,
+    ttl: CacheTtl,
+    readable: bool,
+) {
+    let tokens = super::compat::estimate_prefix_tokens(
+        &req.model,
+        &state.system_segments,
+        &state.content_segments,
+        &state.tools,
+    );
+    breakpoints.push(CacheBreakpoint {
+        tokens,
+        ttl,
+        key_material: state.key_parts.join("\n---prefix-block---\n"),
+        readable,
+    });
+}
+
+fn has_direct_cache_control(v: &Value) -> bool {
+    v.as_object()
+        .map(|map| map.contains_key("cache_control"))
+        .unwrap_or(false)
+}
+
+fn cache_ttl(value: Option<&Value>) -> CacheTtl {
+    let ttl = value
+        .and_then(|v| v.get("ttl"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("5m");
+    if ttl == "1h" {
+        CacheTtl::Ephemeral1h
+    } else {
+        CacheTtl::Ephemeral5m
+    }
+}
+
+async fn cache_entry_exists(model: &str, breakpoint: &CacheBreakpoint) -> bool {
+    if !breakpoint.readable {
+        return false;
+    }
+    if !cache_read_supported(model, breakpoint.tokens) {
+        return false;
+    }
+    let key = cache_key(model, &breakpoint.key_material, breakpoint.ttl);
+    crate::cluster_cache::global().exists(&key).await
+}
+
+async fn register_cache_entry(model: &str, breakpoint: &CacheBreakpoint) {
+    if !breakpoint.readable {
+        return;
+    }
+    if !cache_read_supported(model, breakpoint.tokens) {
+        return;
+    }
+    let key = cache_key(model, &breakpoint.key_material, breakpoint.ttl);
+    crate::cluster_cache::global()
+        .register(&key, breakpoint.ttl.duration())
+        .await;
+}
+
+fn cache_min_tokens(model: &str) -> i32 {
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("opus") && (lower.contains("4-6") || lower.contains("4.6")) {
+        4_096
+    } else if lower.contains("opus") && (lower.contains("4-7") || lower.contains("4.7")) {
+        2_048
+    } else {
+        CACHE_MIN_TOKENS
+    }
+}
+
+fn cache_read_supported(model: &str, cache_tokens: i32) -> bool {
+    let lower = model.to_ascii_lowercase();
+    !(lower.contains("opus") && cache_tokens > 4_096)
+}
+
+fn cache_key(model: &str, key_material: &str, ttl: CacheTtl) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(model.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(format!("{ttl:?}").as_bytes());
+    hasher.update(b"\n");
+    hasher.update(key_material.as_bytes());
+    // 命名空间前缀:即使与别的应用共享同一个真 Redis,也不会与其 key 冲突,
+    // 且便于批量识别/清理(SCAN krcc:* )。
+    format!("krcc:{}", hex::encode(hasher.finalize()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_additional_input_does_not_double_count_cached_tokens() {
+        // 缓存命中：input=100, cache_read=3954, total=4054。
+        let cached = UsageBreakdown {
+            input_tokens: 100,
+            cache_read_input_tokens: 3954,
+            cache_creation_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        // 即使上游 billable 虚高到 8000，也不能把差额加到 input（否则 input 与 cache_read 双重计数）。
+        let out = with_additional_input(cached, 4054, 8000);
+        assert_eq!(out.input_tokens, 100, "缓存命中时 input 必须保持非缓存部分");
+        assert_eq!(out.cache_read_input_tokens, 3954);
+        assert_eq!(out.total(), 4054, "input+cr+cc 恒等必须保持");
+    }
+
+    #[test]
+    fn with_additional_input_accumulates_flat_multiround() {
+        // 无缓存：多轮累计的额外 input 叠加进来（成本回收）。final 来自本地估算累加。
+        let flat = UsageBreakdown::flat(2000);
+        let out = with_additional_input(flat, 2000, 9000);
+        assert_eq!(out.input_tokens, 9000);
+        assert_eq!(out.cache_read_input_tokens, 0);
+        assert_eq!(out.cache_creation_input_tokens, 0);
+    }
 
     #[test]
     fn flat_when_no_cache_control() {

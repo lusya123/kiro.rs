@@ -24,6 +24,8 @@
 
 mod billing;
 mod cache;
+mod claude_tok;
+mod compat;
 mod converter;
 mod handlers;
 mod id;
