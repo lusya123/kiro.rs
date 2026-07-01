@@ -95,6 +95,7 @@ Complete all chunked operations without commentary.";
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
 /// 按照用户要求：
+/// - sonnet 5/5.0 → claude-sonnet-5
 /// - sonnet 4.6/4-6 → claude-sonnet-4.6
 /// - 其他 sonnet → claude-sonnet-4.5
 /// - opus 4.5/4-5 → claude-opus-4.5
@@ -108,7 +109,12 @@ pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
     if model_lower.contains("sonnet") {
-        if model_lower.contains("4-6") || model_lower.contains("4.6") {
+        if model_lower.contains("sonnet-5")
+            || model_lower.contains("sonnet-5.0")
+            || model_lower.contains("sonnet 5")
+        {
+            Some("claude-sonnet-5".to_string())
+        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-sonnet-4.6".to_string())
         } else {
             Some("claude-sonnet-4.5".to_string())
@@ -138,11 +144,12 @@ pub fn map_model(model: &str) -> Option<String> {
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// 4.7 / 4.8 同 1M
+/// Sonnet 5 与 Opus 4.7 / 4.8 同 1M。
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
         Some(mapped)
-            if mapped == "claude-sonnet-4.6"
+            if mapped == "claude-sonnet-5"
+                || mapped == "claude-sonnet-4.6"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
                 || mapped == "claude-opus-4.8" =>
@@ -992,6 +999,52 @@ mod tests {
         // thinking 后缀不应影响 sonnet 模型映射
         let result = map_model("claude-sonnet-4-5-20250929-thinking");
         assert_eq!(result, Some("claude-sonnet-4.5".to_string()));
+    }
+
+    #[test]
+    fn test_map_model_sonnet_5() {
+        assert_eq!(
+            map_model("claude-sonnet-5"),
+            Some("claude-sonnet-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-5-thinking"),
+            Some("claude-sonnet-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-5-20260701"),
+            Some("claude-sonnet-5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
+    }
+
+    #[test]
+    fn test_convert_request_uses_sonnet_5_upstream_model_id() {
+        let req = MessagesRequest {
+            model: "claude-sonnet-5-thinking".to_string(),
+            max_tokens: 32,
+            messages: vec![super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .model_id,
+            "claude-sonnet-5"
+        );
     }
 
     #[test]
