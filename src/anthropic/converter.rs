@@ -9,7 +9,8 @@ use uuid::Uuid;
 
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
-    HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
+    HistoryUserMessage, KiroDocument, KiroImage, Message, UserInputMessage,
+    UserInputMessageContext, UserMessage,
 };
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
@@ -292,7 +293,8 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
     let last_message = messages.last().unwrap();
-    let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
+    let (text_content, images, documents, tool_results) =
+        process_message_content(&last_message.content)?;
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
     let mut tool_name_map = HashMap::new();
@@ -330,13 +332,21 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     if !tools.is_empty() {
         context = context.with_tools(tools);
     }
-    if !validated_tool_results.is_empty() {
+    let has_tool_results = !validated_tool_results.is_empty();
+    if has_tool_results {
         context = context.with_tool_results(validated_tool_results);
     }
 
     // 12. 构建当前消息
-    // 保留文本内容，即使有工具结果也不丢弃用户文本
-    let content = text_content;
+    // 保留文本内容，即使有工具结果也不丢弃用户文本。
+    // 但当这一轮只有 tool_result、没有任何文本时，content 会是空串；Kiro 对携带
+    // toolResults 的 userInputMessage 要求 content 非空，否则报 "Invalid tool use format"，
+    // 故用占位空格兜底（与 assistant tool_use 分支的处理一致）。
+    let content = if text_content.trim().is_empty() && has_tool_results {
+        " ".to_string()
+    } else {
+        text_content
+    };
 
     let mut user_input = UserInputMessage::new(content, &model_id)
         .with_context(context)
@@ -344,6 +354,10 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     if !images.is_empty() {
         user_input = user_input.with_images(images);
+    }
+
+    if !documents.is_empty() {
+        user_input = user_input.with_documents(documents);
     }
 
     let current_message = CurrentMessage::new(user_input);
@@ -375,9 +389,10 @@ fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
 /// 处理消息内容，提取文本、图片和工具结果
 fn process_message_content(
     content: &serde_json::Value,
-) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
+) -> Result<(String, Vec<KiroImage>, Vec<KiroDocument>, Vec<ToolResult>), ConversionError> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
+    let mut documents = Vec::new();
     let mut tool_results = Vec::new();
 
     match content {
@@ -422,6 +437,21 @@ fn process_message_content(
                                 tool_results.push(result);
                             }
                         }
+                        "document" => {
+                            if let Some(source) = block.source {
+                                if source.source_type == "base64" {
+                                    if let (Some(media_type), Some(data)) =
+                                        (source.media_type.as_deref(), source.data)
+                                    {
+                                        if let Some(format) = get_document_format(media_type) {
+                                            documents.push(KiroDocument::from_base64(
+                                                format, "document", data,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         "tool_use" => {
                             // tool_use 在 assistant 消息中处理，这里忽略
                         }
@@ -433,7 +463,22 @@ fn process_message_content(
         _ => {}
     }
 
-    Ok((text_parts.join("\n"), images, tool_results))
+    Ok((text_parts.join("\n"), images, documents, tool_results))
+}
+
+/// 从 media_type 获取文档格式(Bedrock document 支持的格式)
+fn get_document_format(media_type: &str) -> Option<String> {
+    let fmt = match media_type {
+        "application/pdf" => "pdf",
+        "text/csv" => "csv",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "docx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
+        "text/html" => "html",
+        "text/plain" => "txt",
+        "text/markdown" => "md",
+        _ => return None,
+    };
+    Some(fmt.to_string())
 }
 
 /// 从 media_type 获取图片格式
@@ -793,23 +838,35 @@ fn merge_user_messages(
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut all_images = Vec::new();
+    let mut all_documents = Vec::new();
     let mut all_tool_results = Vec::new();
 
     for msg in messages {
-        let (text, images, tool_results) = process_message_content(&msg.content)?;
+        let (text, images, documents, tool_results) = process_message_content(&msg.content)?;
         if !text.is_empty() {
             content_parts.push(text);
         }
         all_images.extend(images);
+        all_documents.extend(documents);
         all_tool_results.extend(tool_results);
     }
 
-    let content = content_parts.join("\n");
-    // 保留文本内容，即使有工具结果也不丢弃用户文本
+    let joined = content_parts.join("\n");
+    // 保留文本内容，即使有工具结果也不丢弃用户文本；但仅有 tool_result、无文本时用占位空格兜底
+    // （Kiro 对携带 toolResults 的消息要求 content 非空）。
+    let content = if joined.trim().is_empty() && !all_tool_results.is_empty() {
+        " ".to_string()
+    } else {
+        joined
+    };
     let mut user_msg = UserMessage::new(&content, model_id);
 
     if !all_images.is_empty() {
         user_msg = user_msg.with_images(all_images);
+    }
+
+    if !all_documents.is_empty() {
+        user_msg = user_msg.with_documents(all_documents);
     }
 
     if !all_tool_results.is_empty() {

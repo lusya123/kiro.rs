@@ -281,6 +281,7 @@ fn build_continuation_request_body(
             model_id: current.model_id,
             origin: current.origin,
             images: current.images,
+            documents: current.documents,
             user_input_message_context: current.user_input_message_context,
         },
     };

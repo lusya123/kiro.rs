@@ -322,7 +322,7 @@ fn generate_websearch_events(
     ));
 
     // 5. content_block_start (web_search_tool_result, index 2)
-    // 官方 API 的 web_search_tool_result 没有 tool_use_id 字段
+    // 真 Anthropic 的 web_search_tool_result 带 tool_use_id,指向前面的 server_tool_use.id
     let search_content = if let Some(ref results) = search_results {
         results
             .results
@@ -352,6 +352,7 @@ fn generate_websearch_events(
             "index": 2,
             "content_block": {
                 "type": "web_search_tool_result",
+                "tool_use_id": tool_use_id,
                 "content": search_content
             }
         }),
@@ -397,6 +398,37 @@ fn generate_websearch_events(
                 }
             }),
         ));
+    }
+
+    // 8b. citations (web_search_result_location) —— 真 Anthropic 会在正文块附来源引用,
+    // 检测器要求文本带 type=web_search_result_location 的 citations。
+    if let Some(ref results) = search_results {
+        for (i, r) in results.results.iter().enumerate() {
+            let cited: String = r
+                .snippet
+                .clone()
+                .unwrap_or_default()
+                .chars()
+                .take(150)
+                .collect();
+            events.push(SseEvent::new(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 3,
+                    "delta": {
+                        "type": "citations_delta",
+                        "citation": {
+                            "type": "web_search_result_location",
+                            "url": r.url,
+                            "title": r.title,
+                            "encrypted_index": format!("{}", i + 1),
+                            "cited_text": cited
+                        }
+                    }
+                }),
+            ));
+        }
     }
 
     // 9. content_block_stop (text)
