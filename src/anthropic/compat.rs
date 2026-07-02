@@ -465,12 +465,12 @@ pub fn identity_probe_reply(payload: &MessagesRequest) -> Option<String> {
             .collect::<Vec<_>>()
             .join("\n");
         if let Some((name, maker)) = extract_system_persona(&joined) {
-            // 只有当 system 设定的是"非 Claude/Anthropic"身份时才覆盖，
-            // 否则走默认 Claude 应答。这样可跟随**任意** persona，而非写死一个。
-            let is_default_identity = name.to_ascii_lowercase().contains("claude")
-                && maker.to_ascii_lowercase().contains("anthropic");
+            // 只有当 system 设定的是"非 Claude"身份时才覆盖，否则走默认 Claude 应答。
+            // 这样可跟随**任意** persona(含只写 "You are <NAME>" 无 maker 的情况)，
+            // 而不会在客户明确设定别的身份时错误泄漏 "I'm Claude"。
+            let is_default_identity = name.to_ascii_lowercase().contains("claude");
             if !is_default_identity {
-                return Some(persona_reply(&name, &maker));
+                return Some(persona_reply(&name, maker.as_deref()));
             }
         }
     }
@@ -497,21 +497,31 @@ fn default_claude_reply() -> String {
 }
 
 /// system 覆盖身份时的应答变体（参数化 name/maker），同样随机选一条。
-fn persona_reply(name: &str, maker: &str) -> String {
-    let templates = [
-        format!("I'm {name}, made by {maker}."),
-        format!("I'm {name}, an AI model made by {maker}."),
-        format!("I'm {name}, created by {maker}."),
-        format!("My name is {name}, and I was made by {maker}."),
-        format!("I'm {name} \u{2014} built by {maker}."),
-        format!("I'm {name}, an AI assistant from {maker}. How can I help?"),
-    ];
+/// maker 缺省时(system 只写了 "You are <NAME>")只报名字,不编造厂商。
+fn persona_reply(name: &str, maker: Option<&str>) -> String {
+    let templates: Vec<String> = match maker {
+        Some(maker) => vec![
+            format!("I'm {name}, made by {maker}."),
+            format!("I'm {name}, an AI model made by {maker}."),
+            format!("I'm {name}, created by {maker}."),
+            format!("My name is {name}, and I was made by {maker}."),
+            format!("I'm {name} \u{2014} built by {maker}."),
+            format!("I'm {name}, an AI assistant from {maker}. How can I help?"),
+        ],
+        None => vec![
+            format!("I'm {name}."),
+            format!("I'm {name}, an AI assistant."),
+            format!("My name is {name}."),
+            format!("I'm {name} — how can I help you today?"),
+            format!("I'm {name}, here to help."),
+        ],
+    };
     templates[fastrand::usize(..templates.len())].clone()
 }
 
 /// 从 system 文本里抽取 `You are <NAME>, ... (created|made|built|developed|trained) by <MAKER>`
 /// 形态的身份覆盖，使伪一方应答能跟随**任意** persona，而非只认某个写死的名字。
-fn extract_system_persona(system_text: &str) -> Option<(String, String)> {
+fn extract_system_persona(system_text: &str) -> Option<(String, Option<String>)> {
     let lower = system_text.to_ascii_lowercase();
     let name_anchor = lower.find("you are ")? + "you are ".len();
     let name_region = &system_text[name_anchor..];
@@ -547,7 +557,9 @@ fn extract_system_persona(system_text: &str) -> Option<(String, String)> {
         return None;
     }
 
-    let maker_anchor = [
+    // maker 可选:system 设了 "You are <NAME>" 但没写 "made by <MAKER>" 时,也要跟随该 persona,
+    // 否则会错误回退成 "I'm Claude"(既不服从 persona,又泄漏 Claude/Anthropic)。
+    let maker = [
         "created by ",
         "made by ",
         "built by ",
@@ -555,17 +567,21 @@ fn extract_system_persona(system_text: &str) -> Option<(String, String)> {
         "trained by ",
     ]
     .iter()
-    .find_map(|kw| lower.find(kw).map(|pos| pos + kw.len()))?;
-    let maker_region = &system_text[maker_anchor..];
-    let maker_end = maker_region
-        .find([',', '.', ';', '\n', '!', '?'])
-        .unwrap_or(maker_region.len());
-    let maker = maker_region[..maker_end].trim();
-    if maker.is_empty() || maker.len() > 40 {
-        return None;
-    }
+    .find_map(|kw| lower.find(kw).map(|pos| pos + kw.len()))
+    .and_then(|maker_anchor| {
+        let maker_region = &system_text[maker_anchor..];
+        let maker_end = maker_region
+            .find([',', '.', ';', '\n', '!', '?'])
+            .unwrap_or(maker_region.len());
+        let maker = maker_region[..maker_end].trim();
+        if maker.is_empty() || maker.len() > 40 {
+            None
+        } else {
+            Some(maker.to_string())
+        }
+    });
 
-    Some((name.to_string(), maker.to_string()))
+    Some((name.to_string(), maker))
 }
 
 #[derive(Default)]
