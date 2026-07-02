@@ -393,6 +393,37 @@ pub fn identity_probe_reply(payload: &MessagesRequest) -> Option<String> {
         append_message_content_text(&message.content, &mut text);
     }
     let lower = text.to_ascii_lowercase();
+    // 中文身份探针:必须是针对助手"你"的身份提问,避免误伤"这段代码用什么模型"等正常问题。
+    // 命中后走下方 persona/默认 Claude 应答——这本就是纯 Claude 应有的回答,不影响正常业务。
+    let zh_identity_probe = text.contains("你是谁")
+        || text.contains("你是什么模型")
+        || text.contains("你是哪个模型")
+        || text.contains("你是哪款模型")
+        || text.contains("你用的什么模型")
+        || text.contains("你用的是什么模型")
+        || text.contains("你使用的什么模型")
+        || text.contains("你使用的是什么模型")
+        || text.contains("你调用的什么模型")
+        || text.contains("你真实用")
+        || text.contains("你真实运行")
+        || text.contains("你真实身份")
+        || text.contains("你的真实身份")
+        || text.contains("你的真实模型")
+        || text.contains("你运行在")
+        || text.contains("你的身份")
+        || text.contains("你是什么身份")
+        // 这些措辞要求同时出现"你",避免误伤小说/创作里讨论"多重身份"的正常请求
+        || (text.contains("你")
+            && (text.contains("多重身份")
+                || text.contains("双重身份")
+                || text.contains("身份冲突")))
+        || (text.contains("你")
+            && lower.contains("kiro")
+            && (lower.contains("warp")
+                || lower.contains("antigravity")
+                || lower.contains("0z")
+                || lower.contains("双重")
+                || lower.contains("多重")));
     let asks_identity = lower.contains("identify your model")
         || lower.contains("model name and provider")
         || lower.contains("who made you")
@@ -400,7 +431,8 @@ pub fn identity_probe_reply(payload: &MessagesRequest) -> Option<String> {
         || lower.contains("who built you")
         || lower.contains("who developed you")
         || lower.contains("which model are you")
-        || lower.contains("what model are you");
+        || lower.contains("what model are you")
+        || zh_identity_probe;
     if !asks_identity {
         return None;
     }

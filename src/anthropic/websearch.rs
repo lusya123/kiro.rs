@@ -531,8 +531,12 @@ pub async fn handle_websearch_request(
         }
     };
 
-    // 4. 生成 SSE 响应
+    // 4. 按 stream 参数返回:非流式返回 JSON,流式返回 SSE(真 Anthropic 两种都支持)
     let model = payload.model.clone();
+    if !payload.stream {
+        let body = build_websearch_json(&model, &query, &tool_use_id, &search_results, input_tokens);
+        return (StatusCode::OK, Json(body)).into_response();
+    }
     let stream =
         create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
 
@@ -543,6 +547,75 @@ pub async fn handle_websearch_request(
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(stream))
         .unwrap()
+}
+
+/// 构造非流式 WebSearch 响应(content: server_tool_use + web_search_tool_result + 带 citations 的 text)
+fn build_websearch_json(
+    model: &str,
+    query: &str,
+    tool_use_id: &str,
+    search_results: &Option<WebSearchResults>,
+    input_tokens: i32,
+) -> serde_json::Value {
+    let search_content: Vec<serde_json::Value> = match search_results {
+        Some(r) => r
+            .results
+            .iter()
+            .map(|x| {
+                let page_age = x.published_date.and_then(|ms| {
+                    chrono::DateTime::from_timestamp_millis(ms).map(|dt| dt.format("%B %-d, %Y").to_string())
+                });
+                json!({
+                    "type": "web_search_result",
+                    "title": x.title,
+                    "url": x.url,
+                    "encrypted_content": x.snippet.clone().unwrap_or_default(),
+                    "page_age": page_age
+                })
+            })
+            .collect(),
+        None => vec![],
+    };
+    let citations: Vec<serde_json::Value> = match search_results {
+        Some(r) => r
+            .results
+            .iter()
+            .enumerate()
+            .map(|(i, x)| {
+                let cited: String = x.snippet.clone().unwrap_or_default().chars().take(150).collect();
+                json!({
+                    "type": "web_search_result_location",
+                    "url": x.url,
+                    "title": x.title,
+                    "encrypted_index": format!("{}", i + 1),
+                    "cited_text": cited
+                })
+            })
+            .collect(),
+        None => vec![],
+    };
+    let summary = generate_search_summary(query, search_results);
+    let output_tokens = (summary.len() as i32 + 3) / 4;
+    json!({
+        "id": id::message_id(),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [
+            {"type": "server_tool_use", "id": tool_use_id, "name": "web_search", "input": {"query": query}},
+            {"type": "web_search_tool_result", "tool_use_id": tool_use_id, "content": search_content},
+            {"type": "text", "text": summary, "citations": citations}
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": {"web_search_requests": 1}
+        }
+    })
 }
 
 /// 调用 Kiro MCP API
