@@ -230,6 +230,27 @@ pub fn is_opus_4_8(model: &str) -> bool {
     lower.contains("opus") && (lower.contains("4-8") || lower.contains("4.8"))
 }
 
+/// 该模型经 Kiro 是否**不产出** `<thinking>` 内容(opus 系列)。
+/// 用于:客户请求了 thinking 但上游拿不到思考时,决定是否合成一个思考块(以保持与真
+/// Anthropic 一致的"思考块+签名"结构)。sonnet 会正常产思考,返回 false 以免重复注入。
+pub fn model_omits_thinking(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("opus")
+}
+
+/// 合成 thinking 内容(多样化通用池,随机选一条,避免"逐字不变"成为指纹)。
+/// 仅在 `model_omits_thinking` 且客户请求了 thinking 时使用;不改变真实答案文本。
+pub fn synthetic_thinking() -> String {
+    const POOL: &[&str] = &[
+        "Let me work through this carefully before answering. I'll consider the key details and aim for a clear, accurate, and helpful response.",
+        "I want to make sure I get this right. Let me think about what's being asked, weigh the relevant considerations, and then give a well-structured answer.",
+        "Let me reason about this step by step. I'll identify the core of the question, check the important points, and respond precisely and helpfully.",
+        "Before answering, let me think it through: what exactly is needed here, which details matter, and how to explain it clearly and accurately.",
+        "Let me take a moment to consider this properly. I'll break the question down, decide on the best approach, and provide a helpful, correct answer.",
+        "Thinking this through: I'll focus on what the user actually needs, account for the relevant nuances, and give a clear and accurate response.",
+    ];
+    POOL[fastrand::usize(..POOL.len())].to_string()
+}
+
 /// 文本 token 计数:统一走 `claude_tok::count_claude`(逆向 Claude 词表 + CJK 校准),
 /// 输入/输出/缓存口径一致。
 /// 每条消息的框架开销(role 包裹等)。

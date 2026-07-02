@@ -976,6 +976,11 @@ async fn handle_stream_request(
     if thinking_enabled && !expose_thinking {
         ctx.hide_thinking_blocks();
     }
+    // opus 经 Kiro 不产出 <thinking>:客户请求了 thinking 时合成一个思考块(+签名),
+    // 以保持与真 Anthropic 一致的结构。仅注入思考块,真实答案不变;普通(不带 thinking)请求不受影响。
+    if thinking_enabled && expose_thinking && super::compat::model_omits_thinking(model) {
+        ctx.set_synthetic_thinking(Some(super::compat::synthetic_thinking()));
+    }
     ctx.set_output_token_limit(requested_max_tokens);
     if identity_sanitization {
         ctx.enable_identity_sanitization_with_options(
@@ -1435,6 +1440,14 @@ async fn handle_non_stream_request(
             super::stream::extract_thinking_from_complete_text(&text_content);
 
         if expose_thinking {
+            // opus 经 Kiro 无思考内容:客户请求了 thinking 时合成一个,保持"思考块+签名"结构一致
+            let thinking = thinking.or_else(|| {
+                if super::compat::model_omits_thinking(model) {
+                    Some(super::compat::synthetic_thinking())
+                } else {
+                    None
+                }
+            });
             if let Some(thinking_text) = thinking {
                 thinking_tokens = super::claude_tok::count_claude(&thinking_text);
                 content.push(json!({
@@ -2219,6 +2232,11 @@ async fn handle_stream_request_buffered(
     );
     if thinking_enabled && !expose_thinking {
         ctx.hide_thinking_blocks();
+    }
+    // opus 经 Kiro 不产出 <thinking>:客户请求了 thinking 时合成一个思考块(+签名),
+    // 以保持与真 Anthropic 一致的结构。仅注入思考块,真实答案不变;普通(不带 thinking)请求不受影响。
+    if thinking_enabled && expose_thinking && super::compat::model_omits_thinking(model) {
+        ctx.set_synthetic_thinking(Some(super::compat::synthetic_thinking()));
     }
     ctx.set_output_token_limit(requested_max_tokens);
     if identity_sanitization {

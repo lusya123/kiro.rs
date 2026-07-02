@@ -693,6 +693,10 @@ pub struct StreamContext {
     continuation_merge_tail: Option<String>,
     /// 输出侧规整可见文本中的上游产品自称；规则会跳过代码并保留普通 Kiro 技术提及。
     identity_sanitizer: Option<super::identity::IdentityOutputSanitizer>,
+    /// 待注入的合成 thinking 内容。仅当客户请求了 thinking 但上游(如 Kiro 的 opus)不产出
+    /// 思考内容时设置：在首个助手内容前注入一个 `<thinking>…</thinking>` 前缀，复用既有提取
+    /// 逻辑生成"思考块+签名"。真实答案不受影响(仍是模型原始输出)。
+    pending_synthetic_thinking: Option<String>,
 }
 
 impl StreamContext {
@@ -735,11 +739,17 @@ impl StreamContext {
             complete_sentinel_probe_buffer: String::new(),
             continuation_merge_tail: None,
             identity_sanitizer: None,
+            pending_synthetic_thinking: None,
         }
     }
 
     pub fn hide_thinking_blocks(&mut self) {
         self.expose_thinking = false;
+    }
+
+    /// 设置待注入的合成 thinking(仅上游不产思考但客户请求了 thinking 时使用)。
+    pub fn set_synthetic_thinking(&mut self, thinking: Option<String>) {
+        self.pending_synthetic_thinking = thinking;
     }
 
     #[allow(dead_code)]
@@ -958,6 +968,14 @@ impl StreamContext {
     /// 处理包含thinking块的内容
     fn process_content_with_thinking(&mut self, content: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
+
+        // 上游不产思考但客户请求了 thinking(如 Kiro 的 opus)时,首个内容前注入合成
+        // <thinking> 前缀,复用下方提取逻辑生成"思考块+签名"。仅注入一次,真实答案不受影响。
+        if let Some(synth) = self.pending_synthetic_thinking.take() {
+            self.thinking_buffer.push_str("<thinking>");
+            self.thinking_buffer.push_str(&synth);
+            self.thinking_buffer.push_str("</thinking>\n\n");
+        }
 
         // 将内容添加到缓冲区进行处理
         self.thinking_buffer.push_str(content);
@@ -1630,6 +1648,11 @@ impl BufferedStreamContext {
 
     pub fn hide_thinking_blocks(&mut self) {
         self.inner.hide_thinking_blocks();
+    }
+
+    /// 透传:设置待注入的合成 thinking(见 StreamContext::set_synthetic_thinking)。
+    pub fn set_synthetic_thinking(&mut self, thinking: Option<String>) {
+        self.inner.set_synthetic_thinking(thinking);
     }
 
     /// 处理 Kiro 事件并缓冲结果
