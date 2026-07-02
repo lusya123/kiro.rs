@@ -30,16 +30,8 @@ use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 use subtle::ConstantTimeEq;
 
-/// 签名总字节数的随机范围。真 Anthropic 签名长度随内容浮动（实测见过 ~246–279 字节），
-/// 旧实现恒 246 字节，反而能被"多次采样长度恒定"识别。这里在该范围内随机取整字节数。
-const MIN_BYTES: usize = 240;
-const MAX_BYTES: usize = 288;
-/// HMAC-SHA256 输出长度（始终为签名末尾 32 字节）。
+/// HMAC-SHA256 输出长度。
 const MAC_LEN: usize = 32;
-/// protobuf wire-format 头，保证 base64 以 `EvEBCm` 开头、整体外观像 protobuf。
-const PROTOBUF_HEAD: &[u8] = &[
-    0x12, 0xf1, 0x01, 0x0a, 0x65, 0x08, 0x0f, 0x18, 0x02, 0x2a, 0x40,
-];
 
 /// 默认共享签名密钥。全车队镜像一致 → 零配置也能跨容器互验。
 /// 需要隔离/轮换时用环境变量 `KIRO_SIG_SECRET` 覆盖（**全车队配同一值**）。
@@ -78,39 +70,109 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; MAC_LEN] {
     out
 }
 
-/// 生成一个 thinking signature。
-///
-/// 布局：`[protobuf 头][随机体] || HMAC(密钥, 前面全部)`，总长在 `[MIN_BYTES, MAX_BYTES]` 内随机。
-/// 每次随机体+长度都不同 → 签名永不重复、长度也浮动；客户视角是 protobuf 风格 base64，
-/// 以 `EvEBCm` 开头，与 aws-p/Anthropic 响应外观一致。
-pub fn generate_signature() -> String {
-    let total = MIN_BYTES + fastrand::usize(..=(MAX_BYTES - MIN_BYTES));
-    let signed_len = total - MAC_LEN;
-    let mut buf = vec![0u8; total];
-    buf[..PROTOBUF_HEAD.len()].copy_from_slice(PROTOBUF_HEAD);
-    for chunk in buf[PROTOBUF_HEAD.len()..signed_len].chunks_mut(8) {
+fn rand_bytes(n: usize) -> Vec<u8> {
+    let mut v = vec![0u8; n];
+    for chunk in v.chunks_mut(8) {
         let r = fastrand::u64(..).to_le_bytes();
-        let n = chunk.len();
-        chunk.copy_from_slice(&r[..n]);
+        let k = chunk.len();
+        chunk.copy_from_slice(&r[..k]);
     }
-    let mac = hmac_sha256(signing_secret(), &buf[..signed_len]);
-    buf[signed_len..].copy_from_slice(&mac);
+    v
+}
+
+/// 追加 protobuf 变长整数(varint)。
+fn push_varint(buf: &mut Vec<u8>, mut v: usize) {
+    loop {
+        let mut b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            b |= 0x80;
+        }
+        buf.push(b);
+        if v == 0 {
+            break;
+        }
+    }
+}
+
+/// 追加一个 length-delimited 字段:`tag(field<<3|2)` + `varint(len)` + `content`。
+fn push_len_field(buf: &mut Vec<u8>, field: u8, content: &[u8]) {
+    buf.push((field << 3) | 2);
+    push_varint(buf, content.len());
+    buf.extend_from_slice(content);
+}
+
+/// 生成一个 thinking signature，**在字节结构上复刻真 Anthropic 的 protobuf 布局**:
+///
+/// ```text
+/// field2 (len-delimited) {
+///   field1 (99B): 08 0f 18 02 2a 40 [64B] [随机]   // 与真签名同构的内层头
+///   field2 (12B) field3 (12B) field4 (48B)
+///   field5 (大 blob, 长度浮动)                       // 承载随机体 + 末尾 32B HMAC
+/// }
+/// field3 (varint) = 1                                // 18 01 收尾,真签名恒有此字段
+/// ```
+///
+/// 总长在 ~360–510 字节间随机浮动(真签名实测 364–503)。HMAC 位于整签名末尾 `18 01` 之前的
+/// 32 字节(即 field5 内容尾部),验签时对其之前的全部字节重算比对。这样:客户/检测器解析出的
+/// 结构、字段、长度分布都与真 Anthropic 一致;本服务仍能凭共享密钥无状态验真伪。
+pub fn generate_signature() -> String {
+    // 内层 field1:固定同构头 + 随机填充到 99 字节。
+    let mut f1 = vec![0x08, 0x0f, 0x18, 0x02, 0x2a, 0x40];
+    f1.extend(rand_bytes(64));
+    f1.extend(rand_bytes(99 - f1.len()));
+    f1.truncate(99);
+
+    // field5 大 blob,长度浮动 → 总长浮动。末尾 32 字节稍后被 HMAC 覆盖。
+    let f5_len = 175 + fastrand::usize(..=150);
+    let f5 = rand_bytes(f5_len);
+
+    // 组装 field2 的内容。
+    let mut inner = Vec::new();
+    push_len_field(&mut inner, 1, &f1);
+    push_len_field(&mut inner, 2, &rand_bytes(12));
+    push_len_field(&mut inner, 3, &rand_bytes(12));
+    push_len_field(&mut inner, 4, &rand_bytes(48));
+    push_len_field(&mut inner, 5, &f5);
+
+    // 完整签名:field2 { inner } + field3 = 1。
+    let mut buf = Vec::new();
+    push_len_field(&mut buf, 2, &inner);
+    buf.push(0x18);
+    buf.push(0x01);
+
+    // HMAC 覆盖 "MAC 与尾部 18 01 之前" 的全部;MAC 位于 [len-34, len-2)。
+    let mac_start = buf.len() - 2 - MAC_LEN;
+    let mac = hmac_sha256(signing_secret(), &buf[..mac_start]);
+    buf[mac_start..mac_start + MAC_LEN].copy_from_slice(&mac);
     BASE64.encode(buf)
 }
 
-/// 校验签名是否由本服务（持同一共享密钥的任意容器）签发且未被篡改。
-///
-/// 长度无关：MAC 恒为末尾 32 字节，对前面全部重算比对。因此旧版恒 246 字节的签名也照常验过
-/// （向后兼容）。**无状态**：只依赖共享密钥，与"哪个容器签发/是否重启过"无关 → 跨容器、重启可验。
+/// 校验签名是否由本服务（持同一共享密钥的任意容器）签发且未被篡改。**无状态**、跨容器/重启可验。
+/// 兼容两种布局:新版(MAC 在尾部 `18 01` 之前的 32 字节)与旧版(MAC 恒为末尾 32 字节)。
 pub fn verify_signature(signature: &str) -> bool {
     let Ok(buf) = BASE64.decode(signature) else {
         return false;
     };
-    if buf.len() < PROTOBUF_HEAD.len() + MAC_LEN || buf.len() > 4096 {
+    if buf.len() < MAC_LEN + 4 || buf.len() > 4096 {
         return false;
     }
+    let secret = signing_secret();
+    // 新版:签名以 `18 01`(field3=1)收尾,MAC 在其前 32 字节。
+    if buf.len() >= MAC_LEN + 2 && buf[buf.len() - 2] == 0x18 && buf[buf.len() - 1] == 0x01 {
+        let mac_start = buf.len() - 2 - MAC_LEN;
+        let expected = hmac_sha256(secret, &buf[..mac_start]);
+        if bool::from(
+            expected
+                .as_slice()
+                .ct_eq(&buf[mac_start..mac_start + MAC_LEN]),
+        ) {
+            return true;
+        }
+    }
+    // 旧版(向后兼容在途对话):MAC 恒为末尾 32 字节。
     let signed_len = buf.len() - MAC_LEN;
-    let expected = hmac_sha256(signing_secret(), &buf[..signed_len]);
+    let expected = hmac_sha256(secret, &buf[..signed_len]);
     expected.as_slice().ct_eq(&buf[signed_len..]).into()
 }
 
@@ -118,13 +180,49 @@ pub fn verify_signature(signature: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// 与真 Anthropic thinking 签名同构:顶层 `field2 { … }` + `field3=1`(以 `18 01` 收尾),
+    /// 总长在真签名实测区间(364–503)附近浮动。
+    fn parse_top_level(raw: &[u8]) -> (usize, usize) {
+        // 返回 (field2 内容长度, 已消费到的偏移),仅解析顶层 field2 头。
+        assert_eq!(raw[0], 0x12, "顶层应为 field2 (0x12)");
+        let mut i = 1usize;
+        let (len, adv) = {
+            let mut v = 0usize;
+            let mut sh = 0u32;
+            let mut j = i;
+            loop {
+                let b = raw[j];
+                j += 1;
+                v |= ((b & 0x7f) as usize) << sh;
+                if b & 0x80 == 0 {
+                    break;
+                }
+                sh += 7;
+            }
+            (v, j - i)
+        };
+        i += adv;
+        (len, i)
+    }
+
     #[test]
-    fn signature_prefix_and_length_in_range() {
+    fn signature_matches_anthropic_structure() {
         for _ in 0..100 {
             let s = generate_signature();
-            assert!(s.starts_with("EvEBCm"), "signature should look protobuf-like: {s}");
-            let n = BASE64.decode(&s).expect("must decode").len();
-            assert!((MIN_BYTES..=MAX_BYTES).contains(&n), "byte len out of range: {n}");
+            let raw = BASE64.decode(&s).expect("must decode");
+            let n = raw.len();
+            assert!((340..=520).contains(&n), "byte len out of range: {n}");
+            // 以 field3=1 收尾。
+            assert_eq!(&raw[n - 2..], &[0x18, 0x01], "应以 field3=1 收尾: {s}");
+            // 顶层 field2 头合法,且其长度 + 头 + 2字节尾 == 总长。
+            let (f2len, off) = parse_top_level(&raw);
+            assert_eq!(off + f2len + 2, n, "field2 长度应与总长自洽");
+            // 内层以真签名的 field1 头开始。
+            assert_eq!(
+                &raw[off..off + 8],
+                &[0x0a, 0x63, 0x08, 0x0f, 0x18, 0x02, 0x2a, 0x40],
+                "内层 field1 头应与真签名一致"
+            );
         }
     }
 
@@ -146,12 +244,15 @@ mod tests {
 
     #[test]
     fn legacy_fixed_246_signature_still_verifies() {
-        // 向后兼容：旧版恒 246 字节的签名（升级前在途对话回传）必须仍能验过。
+        // 向后兼容：旧版恒 246 字节、MAC 在末尾 32 字节的签名（升级前在途对话回传）必须仍能验过。
+        const LEGACY_HEAD: &[u8] = &[
+            0x12, 0xf1, 0x01, 0x0a, 0x65, 0x08, 0x0f, 0x18, 0x02, 0x2a, 0x40,
+        ];
         const LEGACY_LEN: usize = 246;
         let signed_len = LEGACY_LEN - MAC_LEN;
         let mut buf = vec![0u8; LEGACY_LEN];
-        buf[..PROTOBUF_HEAD.len()].copy_from_slice(PROTOBUF_HEAD);
-        for (i, b) in buf[PROTOBUF_HEAD.len()..signed_len].iter_mut().enumerate() {
+        buf[..LEGACY_HEAD.len()].copy_from_slice(LEGACY_HEAD);
+        for (i, b) in buf[LEGACY_HEAD.len()..signed_len].iter_mut().enumerate() {
             *b = (i as u8).wrapping_mul(13);
         }
         let mac = hmac_sha256(signing_secret(), &buf[..signed_len]);
@@ -191,11 +292,14 @@ mod tests {
     fn verification_is_stateless_across_holders_of_the_secret() {
         // 模拟"另一个容器"：直接用同一密钥构造签名，**不**经过本进程的 generate_signature
         // （即没有任何"登记"步骤），验签仍应通过——证明无状态、跨容器/重启可验。
+        const HEAD: &[u8] = &[
+            0x12, 0xf1, 0x01, 0x0a, 0x65, 0x08, 0x0f, 0x18, 0x02, 0x2a, 0x40,
+        ];
         let total = 252usize;
         let signed_len = total - MAC_LEN;
         let mut buf = vec![0u8; total];
-        buf[..PROTOBUF_HEAD.len()].copy_from_slice(PROTOBUF_HEAD);
-        for (i, b) in buf[PROTOBUF_HEAD.len()..signed_len].iter_mut().enumerate() {
+        buf[..HEAD.len()].copy_from_slice(HEAD);
+        for (i, b) in buf[HEAD.len()..signed_len].iter_mut().enumerate() {
             *b = (i as u8).wrapping_mul(7);
         }
         let mac = hmac_sha256(signing_secret(), &buf[..signed_len]);
