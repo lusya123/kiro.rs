@@ -924,6 +924,7 @@ pub async fn post_messages(
             payload.max_tokens,
             true,
             identity_sanitization_context,
+            tool_choice_forces_tool(&payload),
         )
         .await
     } else {
@@ -959,6 +960,7 @@ async fn handle_stream_request(
     requested_max_tokens: i32,
     identity_sanitization: bool,
     identity_sanitization_context: IdentitySanitizationRequestContext,
+    force_tool_only: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -974,6 +976,8 @@ async fn handle_stream_request(
         initial_usage_breakdown,
         tool_name_map,
     );
+    // tool_choice 强制工具(any/tool):只发 tool_use,抑制夹带的解释性文本。
+    ctx.set_suppress_text_blocks(force_tool_only);
     if thinking_enabled && !expose_thinking {
         ctx.hide_thinking_blocks();
     }
@@ -1658,6 +1662,18 @@ async fn apply_compat_reply_delay() {
         0
     };
     tokio::time::sleep(std::time::Duration::from_millis(base + tail)).await;
+}
+
+/// tool_choice 是否**强制**使用工具(any / tool)。此时响应应只含 tool_use,
+/// 不含解释性文本(与真 Anthropic 一致)。auto / 不设 时返回 false(正常写代码不受影响)。
+fn tool_choice_forces_tool(payload: &MessagesRequest) -> bool {
+    payload
+        .tool_choice
+        .as_ref()
+        .and_then(|tc| tc.get("type"))
+        .and_then(|t| t.as_str())
+        .map(|t| t == "any" || t == "tool")
+        .unwrap_or(false)
 }
 
 /// 请求是否含"必须真跑模型才能正确处理"的内容(工具 / 图片 / 文档 / 工具结果)。

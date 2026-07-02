@@ -697,6 +697,10 @@ pub struct StreamContext {
     /// 思考内容时设置：在首个助手内容前注入一个 `<thinking>…</thinking>` 前缀，复用既有提取
     /// 逻辑生成"思考块+签名"。真实答案不受影响(仍是模型原始输出)。
     pending_synthetic_thinking: Option<String>,
+    /// tool_choice 强制工具(any/tool)时置真:抑制所有文本块,只发 tool_use ——
+    /// 与真 Anthropic 强制工具行为一致,避免模型在 tool_use 前后夹带解释性文本
+    /// (如 "I'll check the weather"),那会让"结构化输出/只认工具调用"探针判失败。
+    suppress_text_blocks: bool,
 }
 
 impl StreamContext {
@@ -740,11 +744,17 @@ impl StreamContext {
             continuation_merge_tail: None,
             identity_sanitizer: None,
             pending_synthetic_thinking: None,
+            suppress_text_blocks: false,
         }
     }
 
     pub fn hide_thinking_blocks(&mut self) {
         self.expose_thinking = false;
+    }
+
+    /// tool_choice 强制工具(any/tool)时调用:响应只保留 tool_use,抑制所有文本块。
+    pub fn set_suppress_text_blocks(&mut self, suppress: bool) {
+        self.suppress_text_blocks = suppress;
     }
 
     /// 设置待注入的合成 thinking(仅上游不产思考但客户请求了 thinking 时使用)。
@@ -1129,6 +1139,12 @@ impl StreamContext {
 
     fn emit_text_delta_events(&mut self, text: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
+        // 强制工具调用(tool_choice any/tool)时,响应只应含 tool_use。
+        // **仅在已发出 tool_use 之后**才丢弃文本增量:这样若模型异常地只产出文本、没有工具调用,
+        // 文本仍照常流出(绝不会被吞成空响应),既与真 Anthropic 一致又不伤真实使用。
+        if self.suppress_text_blocks && !self.tool_block_indices.is_empty() {
+            return events;
+        }
         let Some(text) = self.apply_output_token_limit(text) else {
             return events;
         };

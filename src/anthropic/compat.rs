@@ -505,30 +505,25 @@ pub fn identity_probe_reply(payload: &MessagesRequest) -> Option<String> {
         || lower.contains("model family")
         || lower.contains("which model or product")
         || lower.contains("what model or product")
-        // 下列宽松措辞仅在同时提到后端名时才有意义(见下方 mentions_backend 门控),
-        // 故这里放宽不会误伤正常问题("are you sure"→asks_identity 真,但无后端名→返回 None)。
-        || lower.contains("are you")
-        || lower.contains("you're ")
-        || lower.contains("running on")
-        || lower.contains("based on")
-        || lower.contains("powered by")
-        || lower.contains("built on top")
+        // "are you <backend>?" 这类探针也算身份提问(显式提到后端名 + are you/is this/…),
+        // 但普通 "are you sure" 不会误命中(要求同时出现后端名)。
+        || (["kiro", "codewhisperer", "warp", "antigravity", "amazon q", "0z"]
+            .iter()
+            .any(|b| lower.contains(b))
+            && (lower.contains("are you")
+                || lower.contains("is this")
+                || lower.contains("running on")
+                || lower.contains("based on")
+                || lower.contains("powered by")))
         || zh_identity_probe;
     if !asks_identity {
         return None;
     }
 
-    // 只在探针**显式提到后端产品名**(kiro/warp/codewhisperer/...)时才拦截、返回 canned 身份 ——
-    // 这些是"真模型自然回答可能带出后端名"的危险探针。通用身份问题(who are you / which model /
-    // provider and model / 你是谁 …)一律**放行给真模型**:Kiro 后端本就是 Claude,会以真实
-    // 时序、自然措辞回答"I'm Claude",从而消除"身份问题被渠道 ~40ms 秒回锁定"这一反向通道指纹
-    // (CROSS_S3_IDENTITY_FORCE),也让隐式身份置信度不再被反伪信号拖低。
-    let mentions_backend = ["kiro", "codewhisperer", "warp", "antigravity", "amazon q", "0z"]
-        .iter()
-        .any(|b| lower.contains(b));
-    if !mentions_backend {
-        return None;
-    }
+    // 身份问题一律拦截,返回**一致**的 canned 身份(Claude,或 system 设定的 persona)。
+    // 由 apply_compat_reply_delay 补上真实模型级耗时,既满足 hvoy.ai 的"身份一致性"
+    // (真模型自然回答会时而"I'm Claude"、时而"I can't discuss that",反而不一致),
+    // 又不引入 ~40ms 秒回的时序指纹(ztest CROSS_S3_IDENTITY_FORCE)。
 
     if let Some(system) = &payload.system {
         let joined = system
@@ -994,13 +989,22 @@ mod tests {
     }
 
     #[test]
-    fn identity_probe_only_intercepts_on_backend_mention() {
-        // 通用身份问题放行给真模型(返回 None,不拦截),避免"渠道秒回锁身份"指纹。
-        let req = identity_req("claude-opus-4-8", None, "Who are you? Which model?");
+    fn identity_probe_intercepts_identity_questions() {
+        // 身份问题一律拦截,返回一致的 Claude(真实耗时由 apply_compat_reply_delay 补)。
+        for q in [
+            "Who are you? Which model?",
+            "Are you Kiro or CodeWhisperer?",
+            "What is your provider and model?",
+        ] {
+            let req = identity_req("claude-opus-4-8", None, q);
+            assert!(
+                identity_probe_reply(&req).unwrap().contains("Claude"),
+                "q={q}"
+            );
+        }
+        // 非身份问题不拦截。
+        let req = identity_req("claude-opus-4-8", None, "Are you sure 2+2 is 4?");
         assert_eq!(identity_probe_reply(&req), None);
-        // 显式提到后端名时才拦截,返回干净 Claude。
-        let req2 = identity_req("claude-opus-4-8", None, "Are you Kiro or CodeWhisperer?");
-        assert!(identity_probe_reply(&req2).unwrap().contains("Claude"));
     }
 
     #[test]
