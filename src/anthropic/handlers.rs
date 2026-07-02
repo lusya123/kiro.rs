@@ -1646,10 +1646,42 @@ fn ctoc_output_tokens(content: &[serde_json::Value]) -> i32 {
     super::claude_tok::count_claude(&buf).max(1)
 }
 
+/// 请求是否含"必须真跑模型才能正确处理"的内容(工具 / 图片 / 文档 / 工具结果)。
+/// 这类请求绝不能走 canned 短路,否则会忽略这些内容 —— 典型:文档识别探针
+/// "reply with exactly the token ... and nothing else" 会被 extract_exact_system_reply
+/// 命中而返回字面串、忽略 PDF,导致文档识别 0 分 / 空响应。
+fn request_needs_model(payload: &MessagesRequest) -> bool {
+    if payload
+        .tools
+        .as_ref()
+        .map(|t| !t.is_empty())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    for message in &payload.messages {
+        if let Some(blocks) = message.content.as_array() {
+            for block in blocks {
+                if matches!(
+                    block.get("type").and_then(|v| v.as_str()),
+                    Some("image") | Some("document") | Some("tool_result") | Some("tool_use")
+                ) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn compat_direct_response(
     payload: &MessagesRequest,
     mut usage_breakdown: super::cache::UsageBreakdown,
 ) -> Option<Response> {
+    // 含工具/图片/文档/工具结果时不短路,交给真模型处理。
+    if request_needs_model(payload) {
+        return None;
+    }
     let (text, output_tokens, forced_input_tokens) =
         if let Some(answer) = super::compat::extract_exact_system_reply(payload) {
             let output_tokens = exact_reply_output_tokens(&payload.model, &answer);
