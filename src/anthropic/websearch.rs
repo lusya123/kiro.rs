@@ -295,9 +295,8 @@ fn generate_websearch_events(
         }),
     ));
 
-    // 3. content_block_start (server_tool_use, index 1)
-    // server_tool_use 是服务端工具，input 在 content_block_start 中一次性完整发送，
-    // 不像客户端 tool_use 需要通过 input_json_delta 增量传输。
+    // 3. content_block_start (server_tool_use, index 1) —— 对齐真 Anthropic:
+    // start 时 input 为空对象,随后用 input_json_delta 增量发送,再 stop。
     events.push(SseEvent::new(
         "content_block_start",
         json!({
@@ -307,7 +306,21 @@ fn generate_websearch_events(
                 "id": tool_use_id,
                 "type": "server_tool_use",
                 "name": "web_search",
-                "input": {"query": query}
+                "input": {}
+            }
+        }),
+    ));
+
+    // 3b. input_json_delta:query 以 JSON 字符串增量发送
+    let query_json = json!({ "query": query }).to_string();
+    events.push(SseEvent::new(
+        "content_block_delta",
+        json!({
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": query_json
             }
         }),
     ));
