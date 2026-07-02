@@ -750,6 +750,25 @@ const INJ_STRONG_MARKERS: &[&str] = &[
     "heads-up: the",
     "the earlier instructions in this",
     "earlier instructions in this conversation",
+    // —— 中文元评论(模型对注入 system 的自我剖白)——
+    "那不是我的真实身份",
+    "不是我的真实身份",
+    "并非我的真实身份",
+    "声称我是",
+    "对话开头有一段",
+    "对话开头有段",
+    "不会因为某条消息",
+    "不会因为某段",
+    "不会因为一条消息",
+    "改变我的身份",
+    "改变身份",
+    "冒充我的",
+    "刚才那条声称",
+    "那段说明并不是",
+    "那条消息声称",
+    "需要说明一下",
+    "需要澄清一下",
+    "关于你提到的",
 ];
 
 fn sentence_is_injection_commentary(low: &str) -> bool {
@@ -783,7 +802,8 @@ fn strip_injection_awareness_commentary(text: &str) -> String {
     };
     for ch in text.chars() {
         cur.push(ch);
-        if matches!(ch, '.' | '!' | '?' | '\n') {
+        // 句末标点含中文全角(。！？)与英文半角,以及换行。
+        if matches!(ch, '.' | '!' | '?' | '\n' | '。' | '！' | '？') {
             flush(&mut cur, &mut out);
         }
     }
