@@ -969,12 +969,11 @@ impl StreamContext {
     fn process_content_with_thinking(&mut self, content: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
-        // 上游不产思考但客户请求了 thinking(如 Kiro 的 opus)时,首个内容前注入合成
-        // <thinking> 前缀,复用下方提取逻辑生成"思考块+签名"。仅注入一次,真实答案不受影响。
+        // 上游不产思考但客户请求了 thinking(如 Kiro 的 opus)时,直接发出一个完整的合成思考块
+        // (content_block_start + thinking_delta + signature_delta + stop),并标记 thinking 已提取,
+        // 之后真实内容一律走文本路径。直接发块可避免 </thinking> 闭合标签在流式分块时被拆坏。
         if let Some(synth) = self.pending_synthetic_thinking.take() {
-            self.thinking_buffer.push_str("<thinking>");
-            self.thinking_buffer.push_str(&synth);
-            self.thinking_buffer.push_str("</thinking>\n\n");
+            events.extend(self.emit_synthetic_thinking_block(&synth));
         }
 
         // 将内容添加到缓冲区进行处理
@@ -1203,6 +1202,36 @@ impl StreamContext {
             events.push(delta_event);
         }
 
+        events
+    }
+
+    /// 直接发出一个完整的合成 thinking 块(用于上游不产思考、但客户请求了 thinking 的情况,如 opus)。
+    /// 发出后置 `thinking_extracted=true`,后续真实内容走文本路径。
+    fn emit_synthetic_thinking_block(&mut self, synth: &str) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        if self.expose_thinking {
+            let idx = self.state_manager.next_block_index();
+            self.thinking_block_index = Some(idx);
+            events.extend(self.state_manager.handle_content_block_start(
+                idx,
+                "thinking",
+                json!({
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {
+                        "type": "thinking",
+                        "thinking": "",
+                        "signature": ""
+                    }
+                }),
+            ));
+            events.push(self.create_thinking_delta_event(idx, synth)); // 内部已累加 thinking_text_acc
+            events.push(self.create_signature_delta_event(idx));
+            if let Some(stop) = self.state_manager.handle_content_block_stop(idx) {
+                events.push(stop);
+            }
+        }
+        self.thinking_extracted = true;
         events
     }
 
