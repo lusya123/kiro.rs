@@ -463,6 +463,11 @@ pub fn identity_probe_reply(payload: &MessagesRequest) -> Option<String> {
         || lower.contains("which ai are you")
         || lower.contains("what ai are you")
         || lower.contains("which llm are you")
+        || lower.contains("provider and model")
+        || lower.contains("your provider and")
+        || lower.contains("model family")
+        || lower.contains("which model or product")
+        || lower.contains("what model or product")
         || zh_identity_probe;
     if !asks_identity {
         return None;
