@@ -453,6 +453,16 @@ pub fn identity_probe_reply(payload: &MessagesRequest) -> Option<String> {
         || lower.contains("who developed you")
         || lower.contains("which model are you")
         || lower.contains("what model are you")
+        || lower.contains("who are you")
+        || lower.contains("what is your name and")
+        || lower.contains("what's your name and")
+        || lower.contains("your name and model")
+        || lower.contains("name and model are you")
+        || lower.contains("identify yourself")
+        || lower.contains("introduce yourself")
+        || lower.contains("which ai are you")
+        || lower.contains("what ai are you")
+        || lower.contains("which llm are you")
         || zh_identity_probe;
     if !asks_identity {
         return None;
