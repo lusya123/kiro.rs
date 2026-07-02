@@ -437,8 +437,13 @@ pub fn extract_exact_system_reply(payload: &MessagesRequest) -> Option<String> {
     let answer = rest[..end]
         .trim()
         .trim_matches(['"', '\'', '`', '.', ':', ',', ' ']);
-    // 只接受"像固定令牌/短语"的结果:非空、不太长、无换行。过长说明匹配到了普通句子,放弃。
-    if answer.is_empty() || answer.len() > 80 || answer.contains('\n') {
+    // 只接受"单个固定令牌"(nonce/单词):非空、不太长、**不含任何空白**。
+    // 含空白说明匹配到的是"描述"而非字面回复(如 "reply with exactly one minified JSON object
+    // and no markdown" 里的 "one minified JSON object …")——那必须交给真模型生成,不能当字面回。
+    if answer.is_empty()
+        || answer.len() > 80
+        || answer.chars().any(|c| c.is_whitespace())
+    {
         None
     } else {
         Some(answer.to_string())
