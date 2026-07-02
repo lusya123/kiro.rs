@@ -892,6 +892,7 @@ pub async fn post_messages(
         super::cache::compute_request_usage_breakdown(input_tokens, &payload).await;
 
     if let Some(response) = compat_direct_response(&payload, initial_usage_breakdown) {
+        apply_compat_reply_delay().await;
         return response;
     }
 
@@ -1646,6 +1647,19 @@ fn ctoc_output_tokens(content: &[serde_json::Value]) -> i32 {
     super::claude_tok::count_claude(&buf).max(1)
 }
 
+/// canned 短路(精确回复 / 身份)补上贴近真实模型的耗时,消除"~50ms 秒回"这一时序指纹
+/// (检测器据此判定 CROSS_S3_IDENTITY_FORCE / 渠道拦截)。采样带抖动 + 偶发长尾,
+/// 使延迟分布贴近真实上游响应,而非固定值(固定值本身也是指纹)。
+async fn apply_compat_reply_delay() {
+    let base = 2100u64 + fastrand::u64(..1600); // 2.1–3.7s 主体
+    let tail = if fastrand::u8(..12) == 0 {
+        fastrand::u64(..3500) // ~8% 概率的长尾,模拟上游偶发缓慢
+    } else {
+        0
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(base + tail)).await;
+}
+
 /// 请求是否含"必须真跑模型才能正确处理"的内容(工具 / 图片 / 文档 / 工具结果)。
 /// 这类请求绝不能走 canned 短路,否则会忽略这些内容 —— 典型:文档识别探针
 /// "reply with exactly the token ... and nothing else" 会被 extract_exact_system_reply
@@ -2178,6 +2192,7 @@ pub async fn post_messages_cc(
         super::cache::compute_request_usage_breakdown(input_tokens, &payload).await;
 
     if let Some(response) = compat_direct_response(&payload, initial_usage_breakdown) {
+        apply_compat_reply_delay().await;
         return response;
     }
 

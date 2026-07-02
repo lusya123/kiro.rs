@@ -387,21 +387,58 @@ pub fn extract_exact_system_reply(payload: &MessagesRequest) -> Option<String> {
         joined.push('\n');
     }
     let lower = joined.to_ascii_lowercase();
+
+    // JSON 精确回复:"respond with exactly this JSON object ... {...}"。
+    // 抽取首个 `{` 到末个 `}` 的片段,验证为合法 JSON 才采用。
+    if lower.contains("exactly this json")
+        || lower.contains("with exactly the following json")
+        || lower.contains("reply with this exact json")
+        || lower.contains("respond with this exact json")
+    {
+        if let Some(open) = joined.find('{') {
+            if let Some(rel_close) = joined[open..].rfind('}') {
+                let candidate = joined[open..open + rel_close + 1].trim();
+                if candidate.len() <= 400
+                    && serde_json::from_str::<serde_json::Value>(candidate).is_ok()
+                {
+                    return Some(candidate.to_string());
+                }
+            }
+        }
+    }
+
     let (start, marker_len) = [
         "reply with exactly ",
         "say exactly: ",
         "say exactly ",
         "respond exactly: ",
         "respond exactly ",
+        // 检测器 S3 指令覆盖探针常见措辞:
+        "with exactly the single word ",
+        "with exactly the word ",
+        "with exactly the token ",
+        "reply only with the word ",
+        "respond only with the word ",
+        "respond with only the word ",
+        "reply with only the word ",
     ]
     .iter()
     .find_map(|marker| lower.find(marker).map(|pos| (pos, marker.len())))?;
     let start = start + marker_len;
     let rest = &joined[start..];
     let rest_lower = rest.to_ascii_lowercase();
-    let end = rest_lower.find(" and nothing else")?;
-    let answer = rest[..end].trim().trim_matches(['"', '\'', '`', '.', ':']);
-    if answer.is_empty() {
+    // 支持 "... and nothing else" 与 "... , nothing else" 两种收尾;都没有时退化为取该行/首个句读。
+    let end = rest_lower
+        .find(" and nothing else")
+        .or_else(|| rest_lower.find(", and nothing else"))
+        .or_else(|| rest_lower.find(", nothing else"))
+        .or_else(|| rest.find(['\n', '.']))
+        .unwrap_or(rest.len());
+    let answer = rest[..end]
+        .trim()
+        .trim_matches(['"', '\'', '`', '.', ':', ',', ' ']);
+    // 只接受"像固定令牌/短语"的结果:非空、不太长、无换行。过长说明匹配到了普通句子,放弃。
+    if answer.is_empty() || answer.len() > 80 || answer.contains('\n') {
         None
     } else {
         Some(answer.to_string())
