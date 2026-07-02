@@ -828,29 +828,13 @@ impl StreamContext {
             events.push(event);
         }
 
-        // 如果启用了 thinking，不在这里创建文本块
-        // thinking 块和文本块会在 process_content_with_thinking 中按正确顺序创建
-        if self.thinking_enabled {
-            return events;
-        }
-
-        // 创建初始文本块（仅在未启用 thinking 时）
-        let text_block_index = self.state_manager.next_block_index();
-        self.text_block_index = Some(text_block_index);
-        let text_block_events = self.state_manager.handle_content_block_start(
-            text_block_index,
-            "text",
-            json!({
-                "type": "content_block_start",
-                "index": text_block_index,
-                "content_block": {
-                    "type": "text",
-                    "text": ""
-                }
-            }),
-        );
-        events.extend(text_block_events);
-
+        // 首块一律惰性创建:不在这里急切发出空文本块。
+        // 首个真实内容到达时才创建对应的首块——
+        //   文本 -> emit_text_delta_events 会创建 text 块;
+        //   工具 -> process_tool_use 创建 tool_use 块;
+        //   思考 -> process_content_with_thinking 创建 thinking 块。
+        // 这样强制工具调用(tool_choice)时会直接以 tool_use 开头,不再多出一个空 text 块
+        // (真 Anthropic 的强制工具响应正是如此)。ping 仍固定跟在"首个 content_block_start"之后。
         events
     }
 
@@ -1950,17 +1934,25 @@ mod tests {
         let mut ctx =
             StreamContext::new_with_thinking("test-model", 1, false, false, HashMap::new());
 
+        // 首块惰性:generate_initial_events 只发 message_start,不再急切建空 text 块。
         let initial_events = ctx.generate_initial_events();
         assert!(
-            initial_events
+            !initial_events
                 .iter()
-                .any(|e| e.event == "content_block_start"
-                    && e.data["content_block"]["type"] == "text")
+                .any(|e| e.event == "content_block_start"),
+            "初始事件不应急切创建任何 content_block"
         );
 
+        // 首个文本 delta 才惰性创建 text 块
+        let first_text = ctx.process_assistant_response("hi");
+        assert!(
+            first_text.iter().any(|e| e.event == "content_block_start"
+                && e.data["content_block"]["type"] == "text"),
+            "首个文本应惰性创建 text 块"
+        );
         let initial_text_index = ctx
             .text_block_index
-            .expect("initial text block index should exist");
+            .expect("text block should exist after first text");
 
         // tool_use 开始会自动关闭现有 text block
         let tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
