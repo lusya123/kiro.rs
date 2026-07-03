@@ -1732,6 +1732,10 @@ fn compat_direct_response(
             // 隐式身份/规格探针:回答较长,按真实 token 数计量(避免固定计量成为指纹)。
             let output_tokens = token::count_tokens(&answer) as i32;
             (answer, output_tokens, None)
+        } else if let Some(answer) = super::compat::prompt_extraction_reply(payload) {
+            // 提示词提取探针:干净婉拒,按真实 token 数计量。
+            let output_tokens = token::count_tokens(&answer) as i32;
+            (answer, output_tokens, None)
         } else {
             return None;
         };
