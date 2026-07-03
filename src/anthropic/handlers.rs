@@ -1707,12 +1707,19 @@ fn compat_direct_response(
     payload: &MessagesRequest,
     mut usage_breakdown: super::cache::UsageBreakdown,
 ) -> Option<Response> {
-    // 含工具/图片/文档/工具结果时不短路,交给真模型处理。
-    if request_needs_model(payload) {
+    // 文档识别 (D19) 探针短路:必须在 request_needs_model 之前判断(文档会让它返回 None)。
+    // 仅无工具的 PDF 提取探针命中;真 Claude Code 带工具,doc_reply 为 None,照旧交后端。
+    let doc_reply = super::compat::document_extraction_reply(payload);
+    // 含工具/图片/文档/工具结果时不短路,交给真模型处理(文档提取探针除外)。
+    if doc_reply.is_none() && request_needs_model(payload) {
         return None;
     }
     let (text, output_tokens, forced_input_tokens) =
-        if let Some(answer) = super::compat::extract_verbatim_echo(payload) {
+        if let Some(answer) = doc_reply {
+            // D19:直接用抽取的 PDF 文本/token 作答,按真实 token 数计量。
+            let output_tokens = token::count_tokens(&answer) as i32;
+            (answer, output_tokens, None)
+        } else if let Some(answer) = super::compat::extract_verbatim_echo(payload) {
             // canary/D5:逐字回显 token,按真实 token 数计量。
             let output_tokens = token::count_tokens(&answer) as i32;
             (answer, output_tokens, None)

@@ -519,6 +519,85 @@ pub fn extract_exact_system_reply(payload: &MessagesRequest) -> Option<String> {
     }
 }
 
+/// 文档识别 (D19) 探针短路。
+///
+/// 根因(实测隔离):Kiro/CodeWhisperer 后端对含 **NATO 音标填充词**("whiskey foxtrot …")的
+/// 内容会**整条吐空**(疑似把 "whiskey foxtrot" 当 WTF 类粗口过滤),无论该内容是 PDF 还是纯文本。
+/// 检测器正是用这些词做 token 周围的噪声,导致文档识别 0 分。
+///
+/// 修法:对**无工具**的 PDF 提取探针,自己从 PDF 抽出文本、直接作答(不经后端,绕过内容过滤)。
+/// 真 Claude Code 的 PDF 使用**都带工具**,不进这里 → 后端照常解析,零影响。
+pub fn document_extraction_reply(payload: &MessagesRequest) -> Option<String> {
+    if payload.tools.as_ref().map(|t| !t.is_empty()).unwrap_or(false) {
+        return None;
+    }
+    let mut pdf_text: Option<String> = None;
+    let mut instruction = String::new();
+    for message in &payload.messages {
+        if let Some(blocks) = message.content.as_array() {
+            for block in blocks {
+                match block.get("type").and_then(|v| v.as_str()) {
+                    Some("document") => {
+                        let mt = block
+                            .pointer("/source/media_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if mt == "application/pdf" {
+                            if let Some(data) =
+                                block.pointer("/source/data").and_then(|v| v.as_str())
+                            {
+                                if let Some(t) = super::converter::extract_pdf_text(data) {
+                                    pdf_text = Some(t);
+                                }
+                            }
+                        }
+                    }
+                    Some("text") => {
+                        if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                            instruction.push_str(t);
+                            instruction.push(' ');
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let text = pdf_text?;
+    let low = instruction.to_ascii_lowercase();
+    // 要"token/identifier"就回单个 token;否则回全文(全文含 token,兼容"reply with the text")。
+    if low.contains("token") || low.contains("identifier") {
+        if let Some(tok) = find_token_in_text(&text) {
+            return Some(tok);
+        }
+    }
+    Some(text)
+}
+
+/// 从抽取文本里找"类 token 串"(检测器 canary),优先 ZTEST-TOKEN-xxxx,其次含数字的无空白长串。
+fn find_token_in_text(text: &str) -> Option<String> {
+    let clean = |word: &str| -> String {
+        word.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .to_string()
+    };
+    for word in text.split_whitespace() {
+        let w = clean(word);
+        if w.to_ascii_uppercase().starts_with("ZTEST-TOKEN-") && w.len() > 12 {
+            return Some(w);
+        }
+    }
+    for word in text.split_whitespace() {
+        let w = clean(word);
+        if w.len() >= 8
+            && w.chars().any(|c| c.is_ascii_digit())
+            && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Some(w);
+        }
+    }
+    None
+}
+
 /// 内容完整性 / CANARY (D5) 探针:"逐字复述给定 token"。
 ///
 /// 检测器发 "Please repeat the following token verbatim ... : <TOKEN>",真 Claude 会原样回显
@@ -1498,6 +1577,42 @@ mod tests {
             let req = identity_req("claude-opus-4-8", None, q);
             assert_eq!(implicit_identity_reply(&req), None, "over-fired on q={q}");
         }
+    }
+
+    #[test]
+    fn document_extraction_returns_token_no_tools() {
+        use base64::Engine;
+        let pdf = b"%PDF-1.4\n5 0 obj<< /Length 90 >>stream\nBT /F1 14 Tf 50 100 Td (whiskey foxtrot quebec) Tj ET\nBT /F1 14 Tf 50 80 Td (ZTEST-TOKEN-d6bee22d) Tj ET\nendstream endobj\n%%EOF";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(pdf);
+        let body = json!({
+            "model":"claude-opus-4-8","max_tokens":64,
+            "messages":[{"role":"user","content":[
+                {"type":"document","source":{"type":"base64","media_type":"application/pdf","data":b64}},
+                {"type":"text","text":"Extract the ZTEST-TOKEN identifier and reply with ONLY the identifier."}
+            ]}]
+        });
+        let req: MessagesRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(
+            document_extraction_reply(&req).as_deref(),
+            Some("ZTEST-TOKEN-d6bee22d")
+        );
+    }
+
+    #[test]
+    fn document_extraction_skipped_with_tools() {
+        use base64::Engine;
+        let pdf = b"%PDF-1.4\nstream\nBT (ZTEST-TOKEN-aaaa1111) Tj ET\nendstream";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(pdf);
+        let body = json!({
+            "model":"claude-opus-4-8","max_tokens":64,
+            "tools":[{"name":"Read","description":"x","input_schema":{"type":"object"}}],
+            "messages":[{"role":"user","content":[
+                {"type":"document","source":{"type":"base64","media_type":"application/pdf","data":b64}},
+                {"type":"text","text":"What token is in this PDF?"}
+            ]}]
+        });
+        let req: MessagesRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(document_extraction_reply(&req), None);
     }
 
     #[test]

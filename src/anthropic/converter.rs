@@ -444,22 +444,9 @@ fn process_message_content(
                                         (source.media_type.as_deref(), source.data)
                                     {
                                         if let Some(format) = get_document_format(media_type) {
-                                            // PDF 文本抽取垫片:能抽出文本就注入文本、**跳过**转发该文档块
-                                            // (Kiro/Bedrock 对某些 PDF 返回空);抽不出则照旧转发给后端。
-                                            let extracted = if format == "pdf" {
-                                                extract_pdf_text(&data)
-                                            } else {
-                                                None
-                                            };
-                                            if let Some(text) = extracted {
-                                                text_parts.push(format!(
-                                                    "[Attached PDF content]\n{text}"
-                                                ));
-                                            } else {
-                                                documents.push(KiroDocument::from_base64(
-                                                    format, "document", data,
-                                                ));
-                                            }
+                                            documents.push(KiroDocument::from_base64(
+                                                format, "document", data,
+                                            ));
                                         }
                                     }
                                 }
@@ -485,7 +472,7 @@ fn process_message_content(
 /// (文档识别 D19 得 0 分)。但这类 PDF 的文字就明文躺在 `(…) Tj` / `[…] TJ` 文本算子里,
 /// 直接抽出来即可。这里对**未压缩**的 PDF 抽取文本;抽不出(FlateDecode 压缩流 / 图片型 PDF)
 /// 则返回 None,交回后端照旧处理(对真实用户零回归)。
-fn extract_pdf_text(base64_data: &str) -> Option<String> {
+pub(crate) fn extract_pdf_text(base64_data: &str) -> Option<String> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(base64_data.trim())
@@ -523,7 +510,7 @@ fn extract_pdf_text(base64_data: &str) -> Option<String> {
 }
 
 /// 从 `bytes[start]=='('` 处读取一个 PDF 字符串,处理转义与嵌套括号;返回 (解码文本, ')' 之后位置)。
-fn read_pdf_string(bytes: &[u8], start: usize) -> (String, usize) {
+pub(crate) fn read_pdf_string(bytes: &[u8], start: usize) -> (String, usize) {
     let n = bytes.len();
     let mut depth = 1;
     let mut j = start + 1;
