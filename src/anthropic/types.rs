@@ -93,12 +93,21 @@ pub struct Thinking {
         deserialize_with = "deserialize_budget_tokens"
     )]
     pub budget_tokens: i32,
+    /// `display`: "summarized" 时返回可读思考摘要;"omitted"(缺省)时思考块文本为空。
+    #[serde(default)]
+    pub display: Option<String>,
 }
 
 impl Thinking {
     /// 是否启用了 thinking（enabled 或 adaptive）
     pub fn is_enabled(&self) -> bool {
         self.thinking_type == "enabled" || self.thinking_type == "adaptive"
+    }
+
+    /// 客户端是否要求**可读的思考摘要**(display=summarized)。
+    /// 真 opus-4-8 仅在此设定下返回非空思考文本;否则(omitted/缺省)思考块文本为空。
+    pub fn wants_summary(&self) -> bool {
+        self.display.as_deref() == Some("summarized")
     }
 }
 

@@ -1757,6 +1757,7 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "enabled".to_string(),
                 budget_tokens: 4096,
+                display: None,
             }),
             output_config: None,
             cache_control: None,

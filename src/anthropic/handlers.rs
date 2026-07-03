@@ -907,6 +907,11 @@ pub async fn post_messages(
         .as_ref()
         .map(|t| t.is_enabled())
         .unwrap_or(false);
+    let thinking_wants_summary = payload
+        .thinking
+        .as_ref()
+        .map(|t| t.wants_summary())
+        .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
 
@@ -920,6 +925,7 @@ pub async fn post_messages(
             initial_usage_breakdown,
             thinking_enabled,
             expose_thinking,
+            thinking_wants_summary,
             tool_name_map,
             payload.max_tokens,
             true,
@@ -938,6 +944,7 @@ pub async fn post_messages(
             initial_usage_breakdown,
             extract_thinking,
             expose_thinking,
+            thinking_wants_summary,
             tool_name_map,
             payload.max_tokens,
             true,
@@ -956,6 +963,7 @@ async fn handle_stream_request(
     initial_usage_breakdown: super::cache::UsageBreakdown,
     thinking_enabled: bool,
     expose_thinking: bool,
+    thinking_wants_summary: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     requested_max_tokens: i32,
     identity_sanitization: bool,
@@ -984,7 +992,14 @@ async fn handle_stream_request(
     // opus 经 Kiro 不产出 <thinking>:客户请求了 thinking 时合成一个思考块(+签名),
     // 以保持与真 Anthropic 一致的结构。仅注入思考块,真实答案不变;普通(不带 thinking)请求不受影响。
     if thinking_enabled && expose_thinking && super::compat::model_omits_thinking(model) {
-        ctx.set_synthetic_thinking(Some(super::compat::synthetic_thinking()));
+        // 真 opus-4-8 仅在 display=summarized 时返回**非空**思考摘要;否则(omitted/缺省)思考块
+        // 文本为空(但仍带签名)。这里对齐:非 summary 时注入空文本思考块,避免"通用套话思考"指纹。
+        let text = if thinking_wants_summary {
+            super::compat::synthetic_thinking()
+        } else {
+            String::new()
+        };
+        ctx.set_synthetic_thinking(Some(text));
     }
     ctx.set_output_token_limit(requested_max_tokens);
     if identity_sanitization {
@@ -1221,6 +1236,7 @@ async fn handle_non_stream_request(
     initial_usage_breakdown: super::cache::UsageBreakdown,
     thinking_enabled: bool,
     expose_thinking: bool,
+    thinking_wants_summary: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     requested_max_tokens: i32,
     identity_sanitization: bool,
@@ -1448,7 +1464,12 @@ async fn handle_non_stream_request(
             // opus 经 Kiro 无思考内容:客户请求了 thinking 时合成一个,保持"思考块+签名"结构一致
             let thinking = thinking.or_else(|| {
                 if super::compat::model_omits_thinking(model) {
-                    Some(super::compat::synthetic_thinking())
+                    // display!=summarized → 空文本思考块(对齐真 opus-4-8 的 omitted 行为)。
+                    Some(if thinking_wants_summary {
+                        super::compat::synthetic_thinking()
+                    } else {
+                        String::new()
+                    })
                 } else {
                     None
                 }
@@ -1755,10 +1776,20 @@ fn compat_direct_response(
         .as_ref()
         .map(|t| t.is_enabled())
         .unwrap_or(false);
+    let thinking_wants_summary = payload
+        .thinking
+        .as_ref()
+        .map(|t| t.wants_summary())
+        .unwrap_or(false);
     let mut content = Vec::new();
     let mut thinking_tokens = 0;
     let thinking_text = if expose_thinking {
-        Some("I should follow the user's exact response constraint.".to_string())
+        // 对齐真 opus-4-8:非 summary 时思考块文本为空(但仍带块+签名)。
+        Some(if thinking_wants_summary {
+            "I should follow the user's exact response constraint.".to_string()
+        } else {
+            String::new()
+        })
     } else {
         None
     };
@@ -2065,9 +2096,11 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         "覆写 thinking 配置（等同于 *-thinking 模型）"
     );
 
+    let preserved_display = payload.thinking.as_ref().and_then(|t| t.display.clone());
     payload.thinking = Some(Thinking {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
+        display: preserved_display,
     });
 
     if is_opus_4_6_or_newer {
@@ -2241,6 +2274,11 @@ pub async fn post_messages_cc(
         .as_ref()
         .map(|t| t.is_enabled())
         .unwrap_or(false);
+    let thinking_wants_summary = payload
+        .thinking
+        .as_ref()
+        .map(|t| t.wants_summary())
+        .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
 
@@ -2254,6 +2292,7 @@ pub async fn post_messages_cc(
             initial_usage_breakdown,
             thinking_enabled,
             expose_thinking,
+            thinking_wants_summary,
             tool_name_map,
             payload.max_tokens,
             true,
@@ -2271,6 +2310,7 @@ pub async fn post_messages_cc(
             initial_usage_breakdown,
             extract_thinking,
             expose_thinking,
+            thinking_wants_summary,
             tool_name_map,
             payload.max_tokens,
             true,
@@ -2292,6 +2332,7 @@ async fn handle_stream_request_buffered(
     initial_usage_breakdown: super::cache::UsageBreakdown,
     thinking_enabled: bool,
     expose_thinking: bool,
+    thinking_wants_summary: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     requested_max_tokens: i32,
     identity_sanitization: bool,
@@ -2317,7 +2358,14 @@ async fn handle_stream_request_buffered(
     // opus 经 Kiro 不产出 <thinking>:客户请求了 thinking 时合成一个思考块(+签名),
     // 以保持与真 Anthropic 一致的结构。仅注入思考块,真实答案不变;普通(不带 thinking)请求不受影响。
     if thinking_enabled && expose_thinking && super::compat::model_omits_thinking(model) {
-        ctx.set_synthetic_thinking(Some(super::compat::synthetic_thinking()));
+        // 真 opus-4-8 仅在 display=summarized 时返回**非空**思考摘要;否则(omitted/缺省)思考块
+        // 文本为空(但仍带签名)。这里对齐:非 summary 时注入空文本思考块,避免"通用套话思考"指纹。
+        let text = if thinking_wants_summary {
+            super::compat::synthetic_thinking()
+        } else {
+            String::new()
+        };
+        ctx.set_synthetic_thinking(Some(text));
     }
     ctx.set_output_token_limit(requested_max_tokens);
     if identity_sanitization {
