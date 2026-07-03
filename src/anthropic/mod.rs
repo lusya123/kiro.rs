@@ -31,6 +31,7 @@ mod handlers;
 mod id;
 mod identity;
 mod middleware;
+mod openai_compat;
 mod router;
 mod signature;
 mod stream;
