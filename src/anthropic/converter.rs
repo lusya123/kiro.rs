@@ -444,9 +444,22 @@ fn process_message_content(
                                         (source.media_type.as_deref(), source.data)
                                     {
                                         if let Some(format) = get_document_format(media_type) {
-                                            documents.push(KiroDocument::from_base64(
-                                                format, "document", data,
-                                            ));
+                                            // PDF 文本抽取垫片:能抽出文本就注入文本、**跳过**转发该文档块
+                                            // (Kiro/Bedrock 对某些 PDF 返回空);抽不出则照旧转发给后端。
+                                            let extracted = if format == "pdf" {
+                                                extract_pdf_text(&data)
+                                            } else {
+                                                None
+                                            };
+                                            if let Some(text) = extracted {
+                                                text_parts.push(format!(
+                                                    "[Attached PDF content]\n{text}"
+                                                ));
+                                            } else {
+                                                documents.push(KiroDocument::from_base64(
+                                                    format, "document", data,
+                                                ));
+                                            }
                                         }
                                     }
                                 }
@@ -464,6 +477,123 @@ fn process_message_content(
     }
 
     Ok((text_parts.join("\n"), images, documents, tool_results))
+}
+
+/// PDF 文本抽取垫片。
+///
+/// Kiro/Bedrock 后端对**部分 PDF**(多行、带二进制头的普通文本 PDF)会直接返回空
+/// (文档识别 D19 得 0 分)。但这类 PDF 的文字就明文躺在 `(…) Tj` / `[…] TJ` 文本算子里,
+/// 直接抽出来即可。这里对**未压缩**的 PDF 抽取文本;抽不出(FlateDecode 压缩流 / 图片型 PDF)
+/// 则返回 None,交回后端照旧处理(对真实用户零回归)。
+fn extract_pdf_text(base64_data: &str) -> Option<String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(base64_data.trim())
+        .ok()?;
+    // 压缩流本垫片抽不出(会是乱码),交回后端。
+    if bytes.windows(11).any(|w| w == b"FlateDecode") {
+        return None;
+    }
+    let n = bytes.len();
+    let mut pieces: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if bytes[i] == b'(' {
+            let (s, next) = read_pdf_string(&bytes, i);
+            // 前瞻窗口内出现 Tj/TJ 才当作"文本显示算子"的字符串(避免抓到结构里的普通括号串)。
+            let end = (next + 12).min(n);
+            let follows_show = bytes[next..end].windows(2).any(|w| w == b"Tj" || w == b"TJ");
+            if follows_show {
+                let t = s.trim();
+                if !t.is_empty() {
+                    pieces.push(t.to_string());
+                }
+            }
+            i = next;
+        } else {
+            i += 1;
+        }
+    }
+    let joined = pieces.join("\n");
+    if joined.trim().is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
+}
+
+/// 从 `bytes[start]=='('` 处读取一个 PDF 字符串,处理转义与嵌套括号;返回 (解码文本, ')' 之后位置)。
+fn read_pdf_string(bytes: &[u8], start: usize) -> (String, usize) {
+    let n = bytes.len();
+    let mut depth = 1;
+    let mut j = start + 1;
+    let mut s: Vec<u8> = Vec::new();
+    while j < n && depth > 0 {
+        match bytes[j] {
+            b'\\' if j + 1 < n => {
+                let c = bytes[j + 1];
+                match c {
+                    b'n' => {
+                        s.push(b'\n');
+                        j += 2;
+                    }
+                    b'r' => {
+                        s.push(b'\r');
+                        j += 2;
+                    }
+                    b't' => {
+                        s.push(b'\t');
+                        j += 2;
+                    }
+                    b'(' => {
+                        s.push(b'(');
+                        j += 2;
+                    }
+                    b')' => {
+                        s.push(b')');
+                        j += 2;
+                    }
+                    b'\\' => {
+                        s.push(b'\\');
+                        j += 2;
+                    }
+                    b'0'..=b'7' => {
+                        let mut k = j + 1;
+                        let mut oct = 0u32;
+                        let mut cnt = 0;
+                        while k < n && cnt < 3 && (b'0'..=b'7').contains(&bytes[k]) {
+                            oct = oct * 8 + (bytes[k] - b'0') as u32;
+                            k += 1;
+                            cnt += 1;
+                        }
+                        s.push((oct & 0xff) as u8);
+                        j = k;
+                    }
+                    _ => {
+                        s.push(c);
+                        j += 2;
+                    }
+                }
+            }
+            b'(' => {
+                depth += 1;
+                s.push(b'(');
+                j += 1;
+            }
+            b')' => {
+                depth -= 1;
+                if depth > 0 {
+                    s.push(b')');
+                }
+                j += 1;
+            }
+            other => {
+                s.push(other);
+                j += 1;
+            }
+        }
+    }
+    (String::from_utf8_lossy(&s).into_owned(), j)
 }
 
 /// 从 media_type 获取文档格式(Bedrock document 支持的格式)
@@ -994,6 +1124,26 @@ fn merge_assistant_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_extract_pdf_text_uncompressed() {
+        use base64::Engine;
+        // 多行文本 PDF(未压缩),含目标 token,模拟检测器 D19 探针。
+        let pdf = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n5 0 obj<< /Length 120 >>stream\nBT /F1 14 Tf 50 192 Td (whiskey foxtrot quebec) Tj ET\nBT /F1 18 Tf 50 162 Td (ZTEST-TOKEN-d6bee22d) Tj ET\nendstream endobj\n%%EOF";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(pdf);
+        let text = extract_pdf_text(&b64).expect("should extract text");
+        assert!(text.contains("ZTEST-TOKEN-d6bee22d"), "got {text:?}");
+        assert!(text.contains("whiskey foxtrot quebec"), "got {text:?}");
+    }
+
+    #[test]
+    fn test_extract_pdf_text_compressed_falls_back() {
+        use base64::Engine;
+        // 含 FlateDecode → 返回 None(交回后端)。
+        let pdf = b"%PDF-1.4\n5 0 obj<< /Filter /FlateDecode /Length 20 >>stream\n\x78\x9c\x00\x00\nendstream endobj";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(pdf);
+        assert_eq!(extract_pdf_text(&b64), None);
+    }
 
     #[test]
     fn test_map_model_sonnet() {
