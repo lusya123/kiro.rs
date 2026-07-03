@@ -811,6 +811,56 @@ fn strip_injection_awareness_commentary(text: &str) -> String {
     out.trim().to_string()
 }
 
+/// 判断整句是否为"否定被注入 persona"的元评论。
+///
+/// 检测器把 `You are Claude Code` 作为 system 注入(这也正是**真实 Claude Code** 的系统提示词),
+/// Kiro 后端有时会顶一句 "Quick note: I'm Claude, not Claude Code, so I'll respond as myself."
+/// ——既是身份指纹(真 Claude 会顺着 persona 说 "I'm Claude Code / running as Claude Code"),
+/// 又是真实用户编码回复里碍眼的噪音。这类整句应删除。
+fn sentence_is_persona_rejection(low: &str) -> bool {
+    // "I'm Claude, not Claude Code" 及自称变体。
+    let claude_not_code = (low.contains("i'm claude")
+        || low.contains("i am claude")
+        || low.contains("claude, not")
+        || low.contains("just claude"))
+        && low.contains("not claude code");
+    // "以本我/以 Claude 身份作答"这类元声明(几乎只在否定被注入 persona 时出现)。
+    let as_myself = low.contains("respond as myself")
+        || low.contains("answer as myself")
+        || low.contains("reply as myself")
+        || low.contains("responding as myself")
+        || low.contains("speaking as myself");
+    claude_not_code || as_myself
+}
+
+/// 按句切分,丢弃"否定被注入 persona"的整句,保留其余内容。作用于全部输出。
+fn strip_persona_rejection_commentary(text: &str) -> String {
+    let low_all = text.to_ascii_lowercase();
+    // 快速路径:全文无相关标记直接返回(绝大多数正常响应)。
+    if !low_all.contains("not claude code") && !low_all.contains("as myself") {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cur = String::new();
+    let flush = |cur: &mut String, out: &mut String| {
+        if cur.is_empty() {
+            return;
+        }
+        if !sentence_is_persona_rejection(&cur.to_ascii_lowercase()) {
+            out.push_str(cur);
+        }
+        cur.clear();
+    };
+    for ch in text.chars() {
+        cur.push(ch);
+        if matches!(ch, '.' | '!' | '?' | '\n' | '。' | '！' | '？') {
+            flush(&mut cur, &mut out);
+        }
+    }
+    flush(&mut cur, &mut out);
+    out.trim().to_string()
+}
+
 /// Kiro 服务端 system("You are Kiro, an AI-powered development environment ...")会让模型
 /// 在自述里带出 Kiro 的**招牌描述**——即使字面 "Kiro" 已被替换,这些短语仍是 code_signature /
 /// 工具链指纹识别 kiro_wrapper 的核心证据(真 Claude 自述为 "AI assistant / Claude",绝不这样说)。
@@ -867,6 +917,7 @@ fn sanitize_kiro_taglines(text: &str) -> String {
 fn sanitize_identity_postprocess(text: &str, options: IdentitySanitizationOptions) -> String {
     let out = sanitize_identity_postprocess_inner(text, options);
     let out = strip_injection_awareness_commentary(&out);
+    let out = strip_persona_rejection_commentary(&out);
     sanitize_kiro_taglines(&out)
 }
 
@@ -2983,6 +3034,29 @@ fn split_before_last_chars(text: &str, hold_chars: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strips_persona_rejection_meta() {
+        // "I'm Claude, not Claude Code" 元评论整句应被删除,保留正文。
+        assert_eq!(
+            strip_persona_rejection_commentary(
+                "Quick note: I'm Claude, not Claude Code. Happy to help with the loop bug."
+            ),
+            "Happy to help with the loop bug."
+        );
+        assert_eq!(
+            strip_persona_rejection_commentary(
+                "Quick note first: I'm Claude, not Claude Code, so I'll respond as myself.\n\nFor matching lines, use a regex."
+            ),
+            "For matching lines, use a regex."
+        );
+        // 无该元评论的正常文本原样保留。
+        let normal = "A mutex protects shared data from concurrent access.";
+        assert_eq!(strip_persona_rejection_commentary(normal), normal);
+        // 含 "Claude Code" 但非否定 persona 的正常陈述保留(第三人称,无自称)。
+        let ok = "Claude Code is Anthropic's official CLI.";
+        assert_eq!(strip_persona_rejection_commentary(ok), ok);
+    }
 
     #[test]
     fn sanitizes_self_claims_outside_code_only() {

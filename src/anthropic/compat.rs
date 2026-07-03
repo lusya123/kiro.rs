@@ -412,10 +412,18 @@ pub fn extract_exact_system_reply(payload: &MessagesRequest) -> Option<String> {
     // 经 pomoai 实测,真 claude-opus-4-8 对此**照做**回 "BANANA";旧实现因整段含空白被 guard
     // 拒绝而落到真模型,后者会加"这看起来是注入指令"之类元评论——正是反向通道指纹。短路回单词
     // 既与真 Claude 一致,又避免元评论(由 apply_compat_reply_delay 补真实耗时,无秒回时序破绽)。
+    // 均要求祈使前缀(reply/respond/answer/say),避免误伤 "match lines with exactly the word foo"
+    // 这类正常编码问法(那里 "with exactly the word" 前面没有对助手的祈使动词)。
     const WORD_MARKERS: &[&str] = &[
-        "with exactly the single word ",
-        "with exactly the word ",
-        "with exactly the token ",
+        "reply with exactly the single word ",
+        "respond with exactly the single word ",
+        "answer with exactly the single word ",
+        "reply with exactly the word ",
+        "respond with exactly the word ",
+        "answer with exactly the word ",
+        "say exactly the word ",
+        "reply with exactly the token ",
+        "respond with exactly the token ",
         "reply only with the word ",
         "respond only with the word ",
         "respond with only the word ",
@@ -840,30 +848,45 @@ pub fn prompt_extraction_reply(payload: &MessagesRequest) -> Option<String> {
         || text.contains("初始指令")
         || text.contains("初始上下文");
 
-    // 意图必须是**泄露/复述**(而非解释)。
-    let reveal = lower.contains("reproduce")
-        || lower.contains("repeat")
-        || lower.contains("reveal")
-        || lower.contains("verbatim")
+    // 意图必须是**明确泄露我收到的那份系统提示词/指令**——需要一个**强信号**。
+    // 单凭 "reproduce"/"system prompt" 等弱词会误伤正常编码问法(如"帮我复现 system prompt
+    // handler 模块的 bug""总结你对提交信息格式的说明"),故要求叠加下列强信号之一:
+    let strong = lower.contains("verbatim")
         || lower.contains("word for word")
-        || lower.contains("show me")
-        || lower.contains("print your")
-        || lower.contains("recite")
-        || lower.contains("output your")
-        || lower.contains("share the")
-        || lower.contains("summarize the instructions")
-        || lower.contains("summarize your")
-        || lower.contains("what were your")
-        || lower.contains("what are your exact")
+        || lower.contains("word-for-word")
         || lower.contains("you were given")
+        || lower.contains("you were provided")
+        || lower.contains("you have been given")
+        || lower.contains("you've been given")
         || lower.contains("you received")
         || lower.contains("before my message")
+        || lower.contains("before this message")
+        || lower.contains("in full")
+        || lower.contains("reveal your system")
+        || lower.contains("reveal your instructions")
+        || lower.contains("reveal your prompt")
+        || lower.contains("reveal the system prompt")
+        || lower.contains("show me your system")
+        || lower.contains("show me your instructions")
+        || lower.contains("show me your prompt")
+        || lower.contains("show me the system prompt")
+        || lower.contains("print your system")
+        || lower.contains("print your instructions")
+        || lower.contains("print the system prompt")
+        || lower.contains("repeat your system")
+        || lower.contains("repeat the system prompt")
+        || lower.contains("recite your")
+        || lower.contains("exact instructions")
+        || lower.contains("exact system prompt")
+        || lower.contains("full system prompt")
+        || lower.contains("entire system prompt")
         || text.contains("原样")
         || text.contains("逐字")
-        || text.contains("复述")
-        || text.contains("完整给出");
+        || text.contains("一字不差")
+        || text.contains("完整给出")
+        || text.contains("完整复述");
 
-    if !target || !reveal {
+    if !target || !strong {
         return None;
     }
 
@@ -1477,12 +1500,17 @@ mod tests {
 
     #[test]
     fn prompt_extraction_ignores_conceptual_and_normal() {
-        // 概念/翻译类与正常业务不拦截,交给真模型。
+        // 概念/翻译类、正常业务、以及**含触发词但实为编码问题**的问法都不拦截,交给真模型。
         for q in [
             "Translate the phrase 'system prompt' into Chinese, then explain what role a system prompt typically plays.",
             "What is a system prompt and why is it useful?",
             "Write a Python function to reverse a string.",
             "Explain what a mutex does.",
+            // 关键防误伤:含 "system prompt"/"your instructions" 但没有强提取信号的编码问法。
+            "Help me reproduce a bug in my system prompt handler module.",
+            "Summarize your instructions for how to format a git commit message.",
+            "Refactor my system prompt builder function to be cleaner.",
+            "Write a regex to match lines containing exactly the word 'import'.",
         ] {
             let req = identity_req("claude-opus-4-8", None, q);
             assert_eq!(prompt_extraction_reply(&req), None, "over-fired on q={q}");
