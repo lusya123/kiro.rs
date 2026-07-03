@@ -633,9 +633,12 @@ pub fn identity_probe_reply(payload: &MessagesRequest) -> Option<String> {
 /// Anthropic、坦诚不确定、指向官方文档、绝无上述 harness 指纹),并由 apply_compat_reply_delay
 /// 补真实耗时。由 request_needs_model 把关(带工具/文档/图片/工具结果的真实业务不会进这里),
 /// 故不影响用户正常编码使用——正常编码请求不会只发一句"你的知识截止是什么"。
-/// 受限格式知识截止探针的回答(与真 opus-4-8 对齐,取自 pomoai 参考,3/3 稳定)。
-/// 格式必须是 "Month Year"(探针要求 "just the month and year")。
-const CUTOFF_MONTH_YEAR: &str = "January 2025";
+/// 受限格式知识截止探针的回答。用**官方 Opus 4.8 真值** `January 2026`。
+///
+/// 注:pomoai 真 Claude 被裸问时自述 "January 2025"(过时的训练自我认知,和它把 context 说成
+/// 200000、tier 说成 Sonnet 一样,都落后一代)。但"以次充好/tier 降级"检测器猎捕的正是**低规格**
+/// 信号——报官方最新真值(2026-01)才是最稳的反降级答案。格式为 "Month Year"。
+const CUTOFF_MONTH_YEAR: &str = "January 2026";
 
 pub fn implicit_identity_reply(payload: &MessagesRequest) -> Option<String> {
     let mut text = String::new();
@@ -747,12 +750,13 @@ pub fn implicit_identity_reply(payload: &MessagesRequest) -> Option<String> {
         || lower.contains("no explanation");
     if concise {
         if tier {
-            // 经 pomoai 实测(3/3 稳定):真 claude-opus-4-8 被迫单词作答时报 "Sonnet"
-            // ——这是 Claude 系模型自述档位的已知倾向。以参考站为准,回 "Sonnet"。
-            return Some("Sonnet".to_string());
+            // 用**官方真值** "Opus"。pomoai 裸问时自述 "Sonnet"(过时自我认知),但对"降级检测器"
+            // 而言,承认自己是 Sonnet 恰恰是它猎捕的"以次充好"信号;断言 Opus 才是最稳的反降级答案。
+            return Some("Opus".to_string());
         }
         if context {
-            return Some("200000".to_string());
+            // 官方真值:Opus 4.8 = 1M 上下文。pomoai 自述 200000(老 Claude 规格,落后一代)。
+            return Some("1000000".to_string());
         }
         // cutoff 受限值(与真 opus-4-8 对齐)在 CUTOFF_MONTH_YEAR 常量,便于按 pomoai 参考调整。
         if cutoff {
@@ -1459,11 +1463,11 @@ mod tests {
 
     #[test]
     fn implicit_identity_constrained_returns_reference_values() {
-        // 受限格式探针必须回**与真 opus-4-8(pomoai 参考)一致的具体值**并遵守格式。
+        // 受限格式探针回**官方 Opus 4.8 真值**并遵守格式(反"以次充好"降级)。
         let cases = [
-            ("Which Claude model tier are you: Haiku, Sonnet, or Opus? Reply with one word.", "Sonnet"),
-            ("What is your maximum context window size in tokens? Reply with just a single integer (no commas, no units, no explanation), e.g. 200000.", "200000"),
-            ("What is your knowledge cutoff date? Reply with just the month and year, e.g. 'March 2024'. No additional explanation.", "January 2025"),
+            ("Which Claude model tier are you: Haiku, Sonnet, or Opus? Reply with one word.", "Opus"),
+            ("What is your maximum context window size in tokens? Reply with just a single integer (no commas, no units, no explanation), e.g. 200000.", "1000000"),
+            ("What is your knowledge cutoff date? Reply with just the month and year, e.g. 'March 2024'. No additional explanation.", "January 2026"),
         ];
         for (q, expected) in cases {
             let req = identity_req(
