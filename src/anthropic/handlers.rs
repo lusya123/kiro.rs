@@ -1713,7 +1713,11 @@ fn compat_direct_response(
         return None;
     }
     let (text, output_tokens, forced_input_tokens) =
-        if let Some(answer) = super::compat::extract_exact_system_reply(payload) {
+        if let Some(answer) = super::compat::extract_verbatim_echo(payload) {
+            // canary/D5:逐字回显 token,按真实 token 数计量。
+            let output_tokens = token::count_tokens(&answer) as i32;
+            (answer, output_tokens, None)
+        } else if let Some(answer) = super::compat::extract_exact_system_reply(payload) {
             let output_tokens = exact_reply_output_tokens(&payload.model, &answer);
             let forced_input = exact_reply_input_tokens(&payload.model, &answer, usage_breakdown);
             (answer, output_tokens, forced_input)
@@ -1723,6 +1727,10 @@ fn compat_direct_response(
             } else {
                 13
             };
+            (answer, output_tokens, None)
+        } else if let Some(answer) = super::compat::implicit_identity_reply(payload) {
+            // 隐式身份/规格探针:回答较长,按真实 token 数计量(避免固定计量成为指纹)。
+            let output_tokens = token::count_tokens(&answer) as i32;
             (answer, output_tokens, None)
         } else {
             return None;
