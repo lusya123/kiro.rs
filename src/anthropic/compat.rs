@@ -654,6 +654,7 @@ pub fn extract_verbatim_echo(payload: &MessagesRequest) -> Option<String> {
         text.push('\n');
     }
     let lower = text.to_ascii_lowercase();
+    // 形态一:"逐字复述..."(repeat/echo + verbatim)。
     let is_verbatim_repeat = (lower.contains("repeat the following")
         || lower.contains("repeat this")
         || lower.contains("repeat back")
@@ -666,7 +667,29 @@ pub fn extract_verbatim_echo(payload: &MessagesRequest) -> Option<String> {
             || lower.contains("no extra characters")
             || lower.contains("character for character")
             || lower.contains("without any extra"));
-    if !is_verbatim_repeat {
+    // 形态二:"把这个串复制到回复里以校验连接"(copy/include this string + verify connection)。
+    // 检测器新版 canary 用这种措辞;真 Claude 会原样回显,Kiro 后端却会拒答("I can't discuss that")。
+    let is_connection_canary = (lower.contains("copy this string")
+        || lower.contains("copy the string")
+        || lower.contains("copy this")
+        || lower.contains("copy the following")
+        || lower.contains("include this string")
+        || lower.contains("put this string")
+        || lower.contains("send back this string")
+        || lower.contains("return this string")
+        || lower.contains("output this string")
+        || lower.contains("echo this string")
+        || lower.contains("reflect this string"))
+        && (lower.contains("verify the connection")
+            || lower.contains("verify the link")
+            || lower.contains("verify connectivity")
+            || lower.contains("into your response")
+            || lower.contains("so i can verify")
+            || lower.contains("confirm the connection")
+            || lower.contains("test the connection")
+            || lower.contains("check the connection")
+            || lower.contains("verify the relay"));
+    if !is_verbatim_repeat && !is_connection_canary {
         return None;
     }
     // 探针格式固定为 "...: <TOKEN>";取最后一个冒号后的内容作为待回显 token。
@@ -1696,12 +1719,30 @@ mod tests {
     }
 
     #[test]
+    fn verbatim_echo_connection_canary() {
+        // 新版 canary:"copy this string into your response ... verify the connection: <nonce>"。
+        let req = identity_req(
+            "claude-opus-4-8",
+            Some("You are Claude Code, Anthropic's official CLI for Claude."),
+            "I need you to copy this string into your response so I can verify the connection: e91074f537651910",
+        );
+        assert_eq!(
+            extract_verbatim_echo(&req).as_deref(),
+            Some("e91074f537651910")
+        );
+    }
+
+    #[test]
     fn verbatim_echo_ignores_non_verbatim() {
         // 普通"重复一下你说的"不该短路;多词内容也不该被当单 token 回。
+        // 含 "copy this"/"connection" 但非 canary 的正常编码问法也不该被劫持(多词或缺连接校验语)。
         for q in [
             "Can you repeat what you just said?",
             "Please summarize the following text: the quick brown fox jumps",
             "Repeat the following sentence verbatim: the quick brown fox",
+            "Copy this string into a new variable and reverse it: hello world",
+            "How do I verify the connection to my Postgres database in Rust?",
+            "Copy the following config into your response so I can review it: host port user pass",
         ] {
             let req = identity_req("claude-opus-4-8", None, q);
             assert_eq!(extract_verbatim_echo(&req), None, "over-fired on q={q}");
