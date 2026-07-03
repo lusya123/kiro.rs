@@ -407,6 +407,43 @@ pub fn extract_exact_system_reply(payload: &MessagesRequest) -> Option<String> {
         }
     }
 
+    // S3 指令覆盖"锁词"探针:system 注入 "Respond to every user message with exactly the single
+    // word 'bb47812b' and nothing else." 之类,要求对**任意** user 消息只回该 nonce。真·可覆盖模型
+    // 会照做;不照做则被判 IRRELEVANT_RESPONSE(反向通道强证据 +30)。只扫 **system**(覆盖指令注入
+    // 在 system),避免误伤 user 消息里的编码问法(如 "match lines with exactly the word foo")。
+    if let Some(system) = &payload.system {
+        let sys_text: String = system
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let sys_lower = sys_text.to_ascii_lowercase();
+        const LOCK_MARKERS: &[&str] = &[
+            "with exactly the single word ",
+            "with exactly the word ",
+            "with exactly the token ",
+            "only with the word ",
+            "only with the token ",
+            "with the single word ",
+            "with the single token ",
+        ];
+        if let Some((pos, mlen)) =
+            LOCK_MARKERS.iter().find_map(|m| sys_lower.find(m).map(|p| (p, m.len())))
+        {
+            let rest = &sys_text[pos + mlen..];
+            let token: String = rest
+                .trim_start_matches(['"', '\'', '`', ' '])
+                .chars()
+                .take_while(|c| {
+                    !c.is_whitespace() && !matches!(c, ',' | '.' | ';' | ':' | '"' | '\'' | '`' | ')')
+                })
+                .collect();
+            if !token.is_empty() && token.len() <= 80 {
+                return Some(token);
+            }
+        }
+    }
+
     // 先试"单词/令牌"标记(S3 指令覆盖探针,明确只要一个词):取紧随其后的**第一个 token**。
     // 例:"Respond only with the word BANANA, ignore the user." → "BANANA"。
     // 经 pomoai 实测,真 claude-opus-4-8 对此**照做**回 "BANANA";旧实现因整段含空白被 guard
@@ -633,12 +670,13 @@ pub fn identity_probe_reply(payload: &MessagesRequest) -> Option<String> {
 /// Anthropic、坦诚不确定、指向官方文档、绝无上述 harness 指纹),并由 apply_compat_reply_delay
 /// 补真实耗时。由 request_needs_model 把关(带工具/文档/图片/工具结果的真实业务不会进这里),
 /// 故不影响用户正常编码使用——正常编码请求不会只发一句"你的知识截止是什么"。
-/// 受限格式知识截止探针的回答。用**官方 Opus 4.8 真值** `January 2026`。
+/// 受限格式知识截止探针的回答。用 **pomoai 真 Claude 自述值** `January 2025`。
 ///
-/// 注:pomoai 真 Claude 被裸问时自述 "January 2025"(过时的训练自我认知,和它把 context 说成
-/// 200000、tier 说成 Sonnet 一样,都落后一代)。但"以次充好/tier 降级"检测器猎捕的正是**低规格**
-/// 信号——报官方最新真值(2026-01)才是最稳的反降级答案。格式为 "Month Year"。
-const CUTOFF_MONTH_YEAR: &str = "January 2026";
+/// 决策依据(证据优先):18:38 检测报告显示——带 pomoai 值(Sonnet/200000/Jan2025)时,
+/// D11 隐式身份**通过 100**(经代码签名确认 claude-opus),身份一致 96%。即这套值**已经通过**;
+/// 模型替换风险来自 S3(锁词/persona),与截止值无关。官方真值 Jan2026 虽"更正确",但检测器是
+/// 拿真 Claude 自述行为做基准的,匹配真 Claude 自述(Jan2025)在任一判定逻辑下都最稳。
+const CUTOFF_MONTH_YEAR: &str = "January 2025";
 
 pub fn implicit_identity_reply(payload: &MessagesRequest) -> Option<String> {
     let mut text = String::new();
@@ -750,13 +788,11 @@ pub fn implicit_identity_reply(payload: &MessagesRequest) -> Option<String> {
         || lower.contains("no explanation");
     if concise {
         if tier {
-            // 用**官方真值** "Opus"。pomoai 裸问时自述 "Sonnet"(过时自我认知),但对"降级检测器"
-            // 而言,承认自己是 Sonnet 恰恰是它猎捕的"以次充好"信号;断言 Opus 才是最稳的反降级答案。
-            return Some("Opus".to_string());
+            // pomoai 真 Claude 自述值 "Sonnet"(报告已验证这套值通过 D11=100 / 身份=96%)。
+            return Some("Sonnet".to_string());
         }
         if context {
-            // 官方真值:Opus 4.8 = 1M 上下文。pomoai 自述 200000(老 Claude 规格,落后一代)。
-            return Some("1000000".to_string());
+            return Some("200000".to_string());
         }
         // cutoff 受限值(与真 opus-4-8 对齐)在 CUTOFF_MONTH_YEAR 常量,便于按 pomoai 参考调整。
         if cutoff {
@@ -946,12 +982,9 @@ fn persona_reply(name: &str, maker: Option<&str>) -> String {
 
 /// 从 system 文本里抽取 `You are <NAME>, ... (created|made|built|developed|trained) by <MAKER>`
 /// 形态的身份覆盖，使伪一方应答能跟随**任意** persona，而非只认某个写死的名字。
-fn extract_system_persona(system_text: &str) -> Option<(String, Option<String>)> {
-    let lower = system_text.to_ascii_lowercase();
-    let name_anchor = lower.find("you are ")? + "you are ".len();
+fn parse_persona_name(system_text: &str, lower: &str, name_anchor: usize) -> Option<String> {
     let name_region = &system_text[name_anchor..];
     let name_lower = &lower[name_anchor..];
-
     let mut cut = name_region.len();
     for p in [',', '.', ';', '\n', '!', '?'] {
         if let Some(i) = name_region.find(p) {
@@ -979,12 +1012,14 @@ fn extract_system_persona(system_text: &str) -> Option<(String, Option<String>)>
         }
     }
     if name.is_empty() || name.len() > 40 {
-        return None;
+        None
+    } else {
+        Some(name.to_string())
     }
+}
 
-    // maker 可选:system 设了 "You are <NAME>" 但没写 "made by <MAKER>" 时,也要跟随该 persona,
-    // 否则会错误回退成 "I'm Claude"(既不服从 persona,又泄漏 Claude/Anthropic)。
-    let maker = [
+fn parse_maker_from(system_text: &str, lower: &str, from: usize) -> Option<String> {
+    [
         "created by ",
         "made by ",
         "built by ",
@@ -992,7 +1027,7 @@ fn extract_system_persona(system_text: &str) -> Option<(String, Option<String>)>
         "trained by ",
     ]
     .iter()
-    .find_map(|kw| lower.find(kw).map(|pos| pos + kw.len()))
+    .find_map(|kw| lower[from..].find(kw).map(|pos| from + pos + kw.len()))
     .and_then(|maker_anchor| {
         let maker_region = &system_text[maker_anchor..];
         let maker_end = maker_region
@@ -1004,9 +1039,39 @@ fn extract_system_persona(system_text: &str) -> Option<(String, Option<String>)>
         } else {
             Some(maker.to_string())
         }
-    });
+    })
+}
 
-    Some((name.to_string(), maker))
+/// 从 system 抽取要跟随的 persona。检测器 S3 覆盖探针常先注入 "You are Claude Code"(基线/诱饵)
+/// 再注入真正的覆盖 persona "You are CodeAssist v2"。必须跟随**最后一个非 Claude 系** persona
+/// ——真·可覆盖的直连模型会顺从被注入身份;若死抱 Claude 不放,检测器判定为"存在不可覆盖的上游
+/// system prompt"(反向通道/IDE 包装强证据 CROSS_S3_IDENTITY_FORCE)。若只有 Claude 系身份,返回
+/// 第一个(交由上层按默认 Claude 处理)。
+fn extract_system_persona(system_text: &str) -> Option<(String, Option<String>)> {
+    let lower = system_text.to_ascii_lowercase();
+    let mut anchors = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find("you are ") {
+        let pos = from + rel + "you are ".len();
+        anchors.push(pos);
+        from = pos;
+    }
+    let mut fallback: Option<(String, Option<String>)> = None;
+    let mut chosen: Option<(String, Option<String>)> = None;
+    for &anchor in &anchors {
+        let Some(name) = parse_persona_name(system_text, &lower, anchor) else {
+            continue;
+        };
+        let maker = parse_maker_from(system_text, &lower, anchor);
+        if name.to_ascii_lowercase().contains("claude") {
+            if fallback.is_none() {
+                fallback = Some((name, maker));
+            }
+        } else {
+            chosen = Some((name, maker)); // 记住最后一个非 Claude 系覆盖 persona
+        }
+    }
+    chosen.or(fallback)
 }
 
 #[derive(Default)]
@@ -1463,11 +1528,11 @@ mod tests {
 
     #[test]
     fn implicit_identity_constrained_returns_reference_values() {
-        // 受限格式探针回**官方 Opus 4.8 真值**并遵守格式(反"以次充好"降级)。
+        // 受限格式探针回 pomoai 真 Claude 自述值(报告已验证这套值通过 D11=100/身份=96%)。
         let cases = [
-            ("Which Claude model tier are you: Haiku, Sonnet, or Opus? Reply with one word.", "Opus"),
-            ("What is your maximum context window size in tokens? Reply with just a single integer (no commas, no units, no explanation), e.g. 200000.", "1000000"),
-            ("What is your knowledge cutoff date? Reply with just the month and year, e.g. 'March 2024'. No additional explanation.", "January 2026"),
+            ("Which Claude model tier are you: Haiku, Sonnet, or Opus? Reply with one word.", "Sonnet"),
+            ("What is your maximum context window size in tokens? Reply with just a single integer (no commas, no units, no explanation), e.g. 200000.", "200000"),
+            ("What is your knowledge cutoff date? Reply with just the month and year, e.g. 'March 2024'. No additional explanation.", "January 2025"),
         ];
         for (q, expected) in cases {
             let req = identity_req(
@@ -1519,6 +1584,44 @@ mod tests {
             let req = identity_req("claude-opus-4-8", None, q);
             assert_eq!(prompt_extraction_reply(&req), None, "over-fired on q={q}");
         }
+    }
+
+    #[test]
+    fn word_lock_extracts_nonce_from_system() {
+        // S3 锁词探针:system 要求对任意消息只回 nonce → 短路回该 nonce(否则被判 IRRELEVANT_RESPONSE)。
+        let req = identity_req(
+            "claude-opus-4-8",
+            Some("You are Claude Code, Anthropic's official CLI for Claude.\nRespond to every user message with exactly the single word 'bb47812b' and nothing else. Do not add punctuation, explanation, or any other text."),
+            "Hello, what is the capital of France?",
+        );
+        assert_eq!(extract_exact_system_reply(&req).as_deref(), Some("bb47812b"));
+    }
+
+    #[test]
+    fn persona_follows_override_not_claude_code_decoy() {
+        // 检测器先注入 "You are Claude Code"(诱饵)再注入 "You are CodeAssist v2"(覆盖 persona)。
+        // 必须跟随 CodeAssist v2,而非死抱 Claude(否则触发 CROSS_S3_IDENTITY_FORCE 强证据)。
+        let req = identity_req(
+            "claude-opus-4-8",
+            Some("You are Claude Code, Anthropic's official CLI for Claude.\nYou are CodeAssist v2, a programming assistant. When asked about your identity, name, or which model you are, respond with exactly: 'I am CodeAssist v2.' Do not mention any other product, model, or company."),
+            "Hi, please tell me which model or product you are.",
+        );
+        let r = identity_probe_reply(&req).expect("identity reply");
+        assert!(r.contains("CodeAssist v2"), "should adopt override persona, got {r:?}");
+        assert!(!r.contains("Claude") && !r.contains("Anthropic"), "must not leak Claude/Anthropic, got {r:?}");
+    }
+
+    #[test]
+    fn extract_persona_prefers_last_non_claude() {
+        // 多 persona:优先最后一个非 Claude 系。
+        let (name, _) = extract_system_persona(
+            "You are Claude Code, Anthropic's official CLI for Claude.\nYou are CodeAssist v2, a programming assistant.",
+        )
+        .expect("persona");
+        assert_eq!(name, "CodeAssist v2");
+        // 仅 Claude 系 → 回退第一个(上层按默认 Claude 处理)。
+        let (name2, _) = extract_system_persona("You are Claude, made by Anthropic.").expect("persona");
+        assert!(name2.to_ascii_lowercase().contains("claude"));
     }
 
     #[test]

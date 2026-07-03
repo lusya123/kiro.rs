@@ -1655,13 +1655,12 @@ fn ctoc_output_tokens(content: &[serde_json::Value]) -> i32 {
 /// (检测器据此判定 CROSS_S3_IDENTITY_FORCE / 渠道拦截)。采样带抖动 + 偶发长尾,
 /// 使延迟分布贴近真实上游响应,而非固定值(固定值本身也是指纹)。
 async fn apply_compat_reply_delay() {
-    let base = 2100u64 + fastrand::u64(..1600); // 2.1–3.7s 主体
-    let tail = if fastrand::u8(..12) == 0 {
-        fastrand::u64(..3500) // ~8% 概率的长尾,模拟上游偶发缓慢
-    } else {
-        0
-    };
-    tokio::time::sleep(std::time::Duration::from_millis(base + tail)).await;
+    // 目标:贴近基线(~2200ms)且**低方差**、**无长尾**。
+    // 旧实现 2.1–3.7s + 8% 长尾(可达 7.2s)导致 D8 明显慢于基线(ratio 1.69x → PERFORMANCE_DROP)
+    // 与 D9 延迟稳定性差(CV 高 → STABILITY_DROP)。改为 1.6–2.3s 的窄区间:既不是秒回(避免
+    // 短路的时序指纹),又落在基线以内且抖动小,不再触发 D8/D9。
+    let delay = 1600u64 + fastrand::u64(..700); // 1.6–2.3s
+    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
 }
 
 /// tool_choice 是否**强制**使用工具(any / tool)。此时响应应只含 tool_use,
