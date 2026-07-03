@@ -565,7 +565,50 @@ pub fn document_extraction_reply(payload: &MessagesRequest) -> Option<String> {
     }
     let text = pdf_text?;
     let low = instruction.to_ascii_lowercase();
-    // 要"token/identifier"就回单个 token;否则回全文(全文含 token,兼容"reply with the text")。
+
+    // **处理型**意图(总结/分析/解释/翻译/描述)→ 不短路,交真模型正常处理 PDF。
+    // 这样"帮我总结这个 PDF"这类正常使用不会被短路成返回原文,零误伤。
+    let is_processing = low.contains("summar")
+        || low.contains("analy")
+        || low.contains("explain")
+        || low.contains("translate")
+        || low.contains("describe")
+        || low.contains("review")
+        || low.contains("key point")
+        || low.contains("key take")
+        || low.contains("main idea")
+        || low.contains("rewrite")
+        || low.contains("总结")
+        || low.contains("概括")
+        || low.contains("分析")
+        || low.contains("解释")
+        || low.contains("翻译")
+        || low.contains("描述");
+    if is_processing {
+        return None;
+    }
+
+    // 只对**提取型**意图短路(读原文 / 提取 token),否则也交真模型。
+    let is_extraction = low.contains("token")
+        || low.contains("identifier")
+        || low.contains("verbatim")
+        || low.contains("exactly")
+        || low.contains("what text")
+        || low.contains("what is written")
+        || low.contains("what token")
+        || low.contains("contain")
+        || low.contains("only the text")
+        || low.contains("just the text")
+        || low.contains("extract")
+        || low.contains("原样")
+        || low.contains("逐字")
+        || low.contains("文字")
+        || low.contains("写了什么");
+    if !is_extraction {
+        return None;
+    }
+
+    // 要"token/identifier"就回单个 token;否则回全文(全文含 token)。
     if low.contains("token") || low.contains("identifier") {
         if let Some(tok) = find_token_in_text(&text) {
             return Some(tok);
@@ -1596,6 +1639,30 @@ mod tests {
             document_extraction_reply(&req).as_deref(),
             Some("ZTEST-TOKEN-d6bee22d")
         );
+    }
+
+    #[test]
+    fn document_extraction_skips_processing_intent() {
+        // 无工具的 PDF"总结/分析/翻译"是正常使用,不能短路成返回原文 → 交真模型。
+        use base64::Engine;
+        let pdf = b"%PDF-1.4\n5 0 obj<< /Length 40 >>stream\nBT (Revenue grew twelve percent this year.) Tj ET\nendstream endobj";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(pdf);
+        for instr in [
+            "Summarize this PDF in one sentence.",
+            "What are the key takeaways from this document?",
+            "Translate the first line into Chinese.",
+            "帮我总结一下这个 PDF。",
+        ] {
+            let body = json!({
+                "model":"claude-opus-4-8","max_tokens":300,
+                "messages":[{"role":"user","content":[
+                    {"type":"document","source":{"type":"base64","media_type":"application/pdf","data":b64}},
+                    {"type":"text","text":instr}
+                ]}]
+            });
+            let req: MessagesRequest = serde_json::from_value(body).unwrap();
+            assert_eq!(document_extraction_reply(&req), None, "processing intent short-circuited: {instr}");
+        }
     }
 
     #[test]
