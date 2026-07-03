@@ -814,6 +814,9 @@ pub async fn post_messages(
         return response;
     }
 
+    // opus-4-8:合法的 type:enabled 归一化为 adaptive(匹配真 Claude 的 200 行为),再做校验。
+    normalize_opus_thinking(&mut payload);
+
     if let Some(response) = reject_invalid_thinking_request(&payload) {
         return response;
     }
@@ -1580,6 +1583,26 @@ async fn handle_non_stream_request(
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
+/// 把 opus-4-8 上**合法的** `thinking:{type:enabled}` 归一化为 `adaptive`。
+///
+/// 真 Claude(经 pomoai/Bedrock 实测):opus-4-8 对 `type:enabled` 只在 `max_tokens<=budget_tokens`
+/// 或 `budget<1024` 时才 400,其余情况返回 **200**(正常应答)。此前本服务对所有 opus+enabled 一律 400,
+/// 反而把检测器的 thinking / thinking+tool 探针变成了 400 错误,拉低 Claude真伪 / native signal。
+/// 归一化为 adaptive 后:合法 enabled → 200,并产出 thinking 块(+签名),与真 Claude 的 200 行为一致。
+/// 非法 enabled(max<=budget / budget<1024)保持原样,交由 `reject_invalid_thinking_request` 按 Bedrock 400。
+/// 真实用户在 opus 上本就用 adaptive,不受影响。
+fn normalize_opus_thinking(payload: &mut MessagesRequest) {
+    if !super::compat::is_opus_4_8(&payload.model) {
+        return;
+    }
+    let max_tokens = payload.max_tokens;
+    if let Some(t) = payload.thinking.as_mut() {
+        if t.thinking_type == "enabled" && t.budget_tokens >= 1024 && max_tokens > t.budget_tokens {
+            t.thinking_type = "adaptive".to_string();
+        }
+    }
+}
+
 fn reject_invalid_thinking_request(payload: &MessagesRequest) -> Option<Response> {
     let thinking_type = payload.thinking.as_ref()?.thinking_type.as_str();
     if thinking_type == "enabled" && payload.thinking.as_ref()?.budget_tokens < 1024 {
@@ -1591,10 +1614,9 @@ fn reject_invalid_thinking_request(payload: &MessagesRequest) -> Option<Response
         return Some(thinking_error_response(payload.stream, message));
     }
 
-    if super::compat::is_opus_4_8(&payload.model) && thinking_type == "enabled" {
-        let message = "\"***.***.enabled\" is not supported for this model. Use \"***.***.adaptive\" and \"output_config.effort\" to control thinking behavior.";
-        return Some(thinking_error_response(payload.stream, message));
-    }
+    // 注意:opus-4-8 对**合法的** type:enabled(budget>=1024 且 max_tokens>budget)会返回 200
+    // (经 pomoai/Bedrock 实测),不再 400。合法 enabled 已由 normalize_opus_thinking 归一化为
+    // adaptive;这里只保留对**非法** enabled 的 Bedrock 口径校验(budget<1024 / max<=budget)。
 
     // 一方契约：thinking.enabled 时 max_tokens 必须大于 budget_tokens，否则 400。
     // 仅对 enabled 生效（adaptive 的 budget_tokens 被覆写为标准值，不构成约束）。
@@ -2182,6 +2204,9 @@ pub async fn post_messages_cc(
     if let Some(response) = reject_invalid_thinking_signatures(&payload) {
         return response;
     }
+
+    // opus-4-8:合法的 type:enabled 归一化为 adaptive(匹配真 Claude 的 200 行为),再做校验。
+    normalize_opus_thinking(&mut payload);
 
     if let Some(response) = reject_invalid_thinking_request(&payload) {
         return response;
