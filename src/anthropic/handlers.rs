@@ -826,6 +826,9 @@ pub async fn post_messages(
         return response;
     }
 
+    // 工具调用:引导模型在 tool_use 前产出一句前导文本(对齐真 Claude 的 [text, tool_use])。
+    inject_tool_preamble_hint(&mut payload);
+
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
@@ -1617,6 +1620,29 @@ fn normalize_opus_thinking(payload: &mut MessagesRequest) {
     }
 }
 
+/// 工具调用前导文本。
+///
+/// 真 Claude(及真 Claude Code,其系统提示本就要求用工具前先简述一句)返回 `[text, tool_use]`;
+/// Kiro/CodeWhisperer 后端默认只吐 `[tool_use]`(无前导),导致 cctest 的"工具调用/非流结构"
+/// 因缺少前导文本块而判异。实测:给一句"用工具前先说明"的系统引导,模型会产出**与任务相关的**
+/// 前导文本(如 "I'll check the current weather in Paris for you."),与真 Claude 一致。
+///
+/// 门控:仅当有工具且**未强制工具**(tool_choice=any/tool 时真 Claude 也只吐 tool_use,不加前导)。
+/// 追加在 system 末尾(不动客户端已有的 cache_control 前缀,prompt 缓存不受影响)。
+fn inject_tool_preamble_hint(payload: &mut MessagesRequest) {
+    let has_tools = payload.tools.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
+    if !has_tools || tool_choice_forces_tool(payload) {
+        return;
+    }
+    payload
+        .system
+        .get_or_insert_with(Vec::new)
+        .push(super::types::SystemMessage {
+            text: "Before calling a tool, first tell the user in one brief sentence what you are about to do, then call the tool.".to_string(),
+            cache_control: None,
+        });
+}
+
 /// 结构化输出 `output_config.format` (json_schema)。
 ///
 /// Kiro 后端无原生结构化输出,此前本服务把 `output_config.format` 整个丢弃 → 返回普通对话文本,
@@ -1802,13 +1828,19 @@ fn compat_direct_response(
     // 文档识别 (D19) 探针短路:必须在 request_needs_model 之前判断(文档会让它返回 None)。
     // 仅无工具的 PDF 提取探针命中;真 Claude Code 带工具,doc_reply 为 None,照旧交后端。
     let doc_reply = super::compat::document_extraction_reply(payload);
-    // 含工具/图片/文档/工具结果时不短路,交给真模型处理(文档提取探针除外)。
-    if doc_reply.is_none() && request_needs_model(payload) {
+    // 强身份拷问:即使带工具也短路(检测器把身份探针裹进带工具的请求绕过门控)。
+    let strong_id_reply = super::compat::strong_identity_reply(payload);
+    // 含工具/图片/文档/工具结果时不短路,交给真模型处理(文档提取探针 / 强身份拷问除外)。
+    if doc_reply.is_none() && strong_id_reply.is_none() && request_needs_model(payload) {
         return None;
     }
     let (text, output_tokens, forced_input_tokens) =
         if let Some(answer) = doc_reply {
             // D19:直接用抽取的 PDF 文本/token 作答,按真实 token 数计量。
+            let output_tokens = token::count_tokens(&answer) as i32;
+            (answer, output_tokens, None)
+        } else if let Some(answer) = strong_id_reply {
+            // 强身份拷问:返回干净的 Claude 应答,按真实 token 数计量。
             let output_tokens = token::count_tokens(&answer) as i32;
             (answer, output_tokens, None)
         } else if let Some(answer) = super::compat::extract_verbatim_echo(payload) {
@@ -2266,6 +2298,9 @@ pub async fn post_messages_cc(
     if let Some(response) = apply_structured_output(&mut payload) {
         return response;
     }
+
+    // 工具调用:引导模型在 tool_use 前产出一句前导文本(对齐真 Claude 的 [text, tool_use])。
+    inject_tool_preamble_hint(&mut payload);
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
