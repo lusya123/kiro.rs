@@ -33,6 +33,13 @@ pub fn server_tool_use_id() -> String {
     anthropic_id("srvtoolu")
 }
 
+/// 客户端可见的 tool_use ID(Anthropic 形态 `toolu_01…`)。
+/// 后端返回的是 `toolu_bdrk_…`(Bedrock),会与我们已重写的 `msg_01…` 冲突暴露异源;
+/// 统一重写成本函数生成的形态,与真 Anthropic / 参考渠道一致。
+pub fn tool_use_id() -> String {
+    anthropic_id("toolu")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{message_id, server_tool_use_id};

@@ -664,6 +664,9 @@ pub struct StreamContext {
     pub assistant_raw_content: String,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
+    /// 后端 tool_use_id(`toolu_bdrk_…`)→ 对客户端暴露的 Anthropic 形态 id(`toolu_01…`)。
+    /// 同一后端 id 复用同一输出 id,保证同一响应内的块相关性;跨轮由客户端回传该 id 自洽。
+    pub tool_output_ids: HashMap<String, String>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
     pub tool_name_map: HashMap<String, String>,
     /// thinking 是否启用
@@ -729,6 +732,7 @@ impl StreamContext {
             output_token_limit_reached: false,
             assistant_raw_content: String::new(),
             tool_block_indices: HashMap::new(),
+            tool_output_ids: HashMap::new(),
             tool_name_map,
             thinking_enabled,
             expose_thinking: thinking_enabled,
@@ -1345,6 +1349,13 @@ impl StreamContext {
             idx
         };
 
+        // 把后端 `toolu_bdrk_…` 重写为 Anthropic 形态 `toolu_01…`(与 msg_01 一致,消除异源指纹)。
+        let output_id = self
+            .tool_output_ids
+            .entry(tool_use.tool_use_id.clone())
+            .or_insert_with(super::id::tool_use_id)
+            .clone();
+
         // 还原工具名称（如果有映射）
         let original_name = self
             .tool_name_map
@@ -1352,7 +1363,7 @@ impl StreamContext {
             .cloned()
             .unwrap_or_else(|| tool_use.name.clone());
 
-        // 发送 content_block_start
+        // 发送 content_block_start(带 caller,对齐真 Anthropic / 参考渠道的 tool_use 块)
         let start_events = self.state_manager.handle_content_block_start(
             block_index,
             "tool_use",
@@ -1361,9 +1372,10 @@ impl StreamContext {
                 "index": block_index,
                 "content_block": {
                     "type": "tool_use",
-                    "id": tool_use.tool_use_id,
+                    "id": output_id,
                     "name": original_name,
-                    "input": {}
+                    "input": {},
+                    "caller": { "type": "direct" }
                 }
             }),
         );

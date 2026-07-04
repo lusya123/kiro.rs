@@ -1254,6 +1254,9 @@ async fn handle_non_stream_request(
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    // 后端 toolu_bdrk_… → 对客户端暴露的 toolu_01…(与流式路径一致,消除异源指纹)。
+    let mut tool_output_ids: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     let mut current_request_body = request_body.to_string();
     let mut continuation_round = 0usize;
@@ -1347,11 +1350,17 @@ async fn handle_non_stream_request(
                                         .cloned()
                                         .unwrap_or_else(|| tool_use.name.clone());
 
+                                    let output_id = tool_output_ids
+                                        .entry(tool_use.tool_use_id.clone())
+                                        .or_insert_with(super::id::tool_use_id)
+                                        .clone();
+
                                     tool_uses.push(json!({
                                         "type": "tool_use",
-                                        "id": tool_use.tool_use_id,
+                                        "id": output_id,
                                         "name": original_name,
-                                        "input": input
+                                        "input": input,
+                                        "caller": { "type": "direct" }
                                     }));
                                 }
                             }
