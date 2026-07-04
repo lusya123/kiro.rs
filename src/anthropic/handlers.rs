@@ -737,6 +737,8 @@ pub async fn get_models() -> impl IntoResponse {
     // 且只列 Claude 模型（glm-5/minimax 等非 Claude 模型不出现在列表里，但仍可按名直接调用）。
     // 源数据用 (id, display_name, created_unix) 表示，序列化时把 unix 转成 RFC3339 字符串。
     const CATALOG: &[(&str, &str, i64)] = &[
+        ("claude-sonnet-5", "Claude Sonnet 5", 1782835200),
+        ("claude-sonnet-5-thinking", "Claude Sonnet 5 (Thinking)", 1782835200),
         ("claude-opus-4-8", "Claude Opus 4.8", 1779897600),
         ("claude-opus-4-8-thinking", "Claude Opus 4.8 (Thinking)", 1779897600),
         ("claude-opus-4-7", "Claude Opus 4.7", 1776276000),
