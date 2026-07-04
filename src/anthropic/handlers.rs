@@ -1481,15 +1481,13 @@ async fn handle_non_stream_request(
             super::stream::extract_thinking_from_complete_text(&text_content);
 
         if expose_thinking {
-            // opus 经 Kiro 无思考内容:客户请求了 thinking 时合成一个,保持"思考块+签名"结构一致
+            // opus 经 Kiro 无思考内容:仅 display=summarized 时合成思考摘要块。
+            // **非流式**下真 Claude(pomoai/Bedrock)对 omitted 请求**不返回 thinking 块**(只 [text]),
+            // 所以 omitted 时这里返回 None、不注入空思考块——否则 cctest 非流结构校验会因多一个块而判异。
+            // (流式路径不变:流式 omitted 仍发空文本 thinking 块,与 pomoai 流式一致,流结构校验通过。)
             let thinking = thinking.or_else(|| {
-                if super::compat::model_omits_thinking(model) {
-                    // display!=summarized → 空文本思考块(对齐真 opus-4-8 的 omitted 行为)。
-                    Some(if thinking_wants_summary {
-                        super::compat::synthetic_thinking()
-                    } else {
-                        String::new()
-                    })
+                if super::compat::model_omits_thinking(model) && thinking_wants_summary {
+                    Some(super::compat::synthetic_thinking())
                 } else {
                     None
                 }

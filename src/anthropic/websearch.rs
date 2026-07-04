@@ -261,47 +261,14 @@ fn generate_websearch_events(
         }),
     ));
 
-    // 2. content_block_start (text - 搜索决策说明, index 0)
-    let decision_text = format!("I'll search for \"{}\".", query);
-    events.push(SseEvent::new(
-        "content_block_start",
-        json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {
-                "type": "text",
-                "text": ""
-            }
-        }),
-    ));
-
-    events.push(SseEvent::new(
-        "content_block_delta",
-        json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {
-                "type": "text_delta",
-                "text": decision_text
-            }
-        }),
-    ));
-
-    events.push(SseEvent::new(
-        "content_block_stop",
-        json!({
-            "type": "content_block_stop",
-            "index": 0
-        }),
-    ));
-
-    // 3. content_block_start (server_tool_use, index 1) —— 对齐真 Anthropic:
+    // 2. content_block_start (server_tool_use, index 0) —— 对齐真 Claude(pomoai/Bedrock):
+    // web search 直接以 server_tool_use 开头,**不带**前导"I'll search…"文本块(否则块数比真 Claude 多 1)。
     // start 时 input 为空对象,随后用 input_json_delta 增量发送,再 stop。
     events.push(SseEvent::new(
         "content_block_start",
         json!({
             "type": "content_block_start",
-            "index": 1,
+            "index": 0,
             "content_block": {
                 "id": tool_use_id,
                 "type": "server_tool_use",
@@ -311,13 +278,13 @@ fn generate_websearch_events(
         }),
     ));
 
-    // 3b. input_json_delta:query 以 JSON 字符串增量发送
+    // 2b. input_json_delta:query 以 JSON 字符串增量发送
     let query_json = json!({ "query": query }).to_string();
     events.push(SseEvent::new(
         "content_block_delta",
         json!({
             "type": "content_block_delta",
-            "index": 1,
+            "index": 0,
             "delta": {
                 "type": "input_json_delta",
                 "partial_json": query_json
@@ -325,12 +292,12 @@ fn generate_websearch_events(
         }),
     ));
 
-    // 4. content_block_stop (server_tool_use)
+    // 3. content_block_stop (server_tool_use)
     events.push(SseEvent::new(
         "content_block_stop",
         json!({
             "type": "content_block_stop",
-            "index": 1
+            "index": 0
         }),
     ));
 
@@ -362,7 +329,7 @@ fn generate_websearch_events(
         "content_block_start",
         json!({
             "type": "content_block_start",
-            "index": 2,
+            "index": 1,
             "content_block": {
                 "type": "web_search_tool_result",
                 "tool_use_id": tool_use_id,
@@ -376,7 +343,7 @@ fn generate_websearch_events(
         "content_block_stop",
         json!({
             "type": "content_block_stop",
-            "index": 2
+            "index": 1
         }),
     ));
 
@@ -385,7 +352,7 @@ fn generate_websearch_events(
         "content_block_start",
         json!({
             "type": "content_block_start",
-            "index": 3,
+            "index": 2,
             "content_block": {
                 "type": "text",
                 "text": ""
@@ -404,7 +371,7 @@ fn generate_websearch_events(
             "content_block_delta",
             json!({
                 "type": "content_block_delta",
-                "index": 3,
+                "index": 2,
                 "delta": {
                     "type": "text_delta",
                     "text": text
@@ -428,7 +395,7 @@ fn generate_websearch_events(
                 "content_block_delta",
                 json!({
                     "type": "content_block_delta",
-                    "index": 3,
+                    "index": 2,
                     "delta": {
                         "type": "citations_delta",
                         "citation": {
@@ -449,7 +416,7 @@ fn generate_websearch_events(
         "content_block_stop",
         json!({
             "type": "content_block_stop",
-            "index": 3
+            "index": 2
         }),
     ));
 
