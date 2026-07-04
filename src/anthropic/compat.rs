@@ -1200,10 +1200,28 @@ fn parse_persona_name(system_text: &str, lower: &str, name_anchor: usize) -> Opt
         }
     }
     if name.is_empty() || name.len() > 40 {
-        None
-    } else {
-        Some(name.to_string())
+        return None;
     }
+    // 拒绝**非 persona** 的 "you are X":模型规格 / 动词短语 / 状态描述。
+    // 否则会把 "You are powered by the model named Sonnet 4.6" 当成身份 → 泄漏模型名;
+    // 或把 "...what you are about to do..." 当成 persona → 产出 "I'm about to do" 乱码。
+    let low = name.to_ascii_lowercase();
+    const REJECT_PREFIX: &[&str] = &[
+        "powered by", "about to", "going to", "supposed to", "here to", "designed to",
+        "able to", "responsible", "being ", "running", "using ", "now ", "currently",
+        "not ", "no longer", "still ", "only ", "just ", "meant to", "expected to",
+        "required to", "free to", "welcome to", "encouraged to", "allowed to", "in a ",
+        "part of", "one of", "interacting", "talking", "chatting", "helping", "assisting",
+    ];
+    // 只拒"规格陈述"措辞 + **真实后端**模型名(sonnet),不拒 Gemini/MaxBot 等可跟随的注入 persona
+    // (那是 S3 指令覆盖要顺从的),否则会破坏"可覆盖性"判定。
+    const REJECT_CONTAINS: &[&str] = &["model named", "powered by", "the model", "sonnet"];
+    if REJECT_PREFIX.iter().any(|p| low.starts_with(p))
+        || REJECT_CONTAINS.iter().any(|c| low.contains(c))
+    {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 fn parse_maker_from(system_text: &str, lower: &str, from: usize) -> Option<String> {
@@ -1888,6 +1906,26 @@ mod tests {
         // 仅 Claude 系 → 回退第一个(上层按默认 Claude 处理)。
         let (name2, _) = extract_system_persona("You are Claude, made by Anthropic.").expect("persona");
         assert!(name2.to_ascii_lowercase().contains("claude"));
+    }
+
+    #[test]
+    fn extract_persona_rejects_model_spec_and_fragments() {
+        // "You are powered by the model named Sonnet 4.6" 不是 persona → 不能跟随(否则泄漏模型名)。
+        let r = extract_system_persona(
+            "You are Claude Code, Anthropic's official CLI for Claude. You are powered by the model named Sonnet 4.6.",
+        );
+        // 只应回退到 Claude 系(或 None),绝不能是 "powered by ... Sonnet"。
+        if let Some((name, _)) = r {
+            let low = name.to_ascii_lowercase();
+            assert!(low.contains("claude"), "must not adopt model-spec persona: {name:?}");
+            assert!(!low.contains("sonnet") && !low.contains("powered"), "leaked: {name:?}");
+        }
+        // 动词短语片段不算 persona。
+        let r2 = extract_system_persona("Before calling a tool, tell the user what you are about to do.");
+        assert!(r2.is_none(), "verb fragment should not be a persona: {r2:?}");
+        // 真正的覆盖 persona 仍要跟随。
+        let (name, _) = extract_system_persona("You are Zephyr, a helpful bot.").expect("persona");
+        assert_eq!(name, "Zephyr");
     }
 
     #[test]

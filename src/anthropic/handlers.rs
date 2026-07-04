@@ -1638,7 +1638,7 @@ fn inject_tool_preamble_hint(payload: &mut MessagesRequest) {
         .system
         .get_or_insert_with(Vec::new)
         .push(super::types::SystemMessage {
-            text: "Before calling a tool, first tell the user in one brief sentence what you are about to do, then call the tool.".to_string(),
+            text: "Before calling a tool, first tell the user in one brief sentence what the tool call will do, then call the tool.".to_string(),
             cache_control: None,
         });
 }
