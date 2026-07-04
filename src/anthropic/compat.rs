@@ -714,26 +714,32 @@ pub fn strong_identity_reply(payload: &MessagesRequest) -> Option<String> {
         append_message_content_text(&message.content, &mut text);
     }
     let low = text.to_ascii_lowercase();
-    let strong = text.contains("多重身份")
-        || text.contains("双重身份")
-        || text.contains("身份冲突")
+    // 组1:拷问"真实"身份/模型/平台(检测器特征;真实编码任务几乎不会这么问助手)。
+    let probes_real = text.contains("真实用")
         || text.contains("真实运行")
-        || text.contains("真实用")
         || text.contains("真实的模型")
         || text.contains("真实模型")
+        || text.contains("真实身份")
+        || text.contains("真实平台")
+        || text.contains("真实是什么")
+        || low.contains("really running on")
+        || low.contains("what platform are you really")
+        || low.contains("what model are you really");
+    // 组2:多重身份/身份冲突/点名 kiro/warp 等平台。
+    let multi = text.contains("多重身份")
+        || text.contains("双重身份")
+        || text.contains("身份冲突")
         || low.contains("multiple identit")
         || low.contains("dual identit")
         || low.contains("identity conflict")
-        || low.contains("really running on")
-        || low.contains("what platform are you")
         || (low.contains("kiro")
             && (low.contains("warp")
                 || low.contains("antigravity")
                 || low.contains("0z")
-                || low.contains("sn")
                 || low.contains("双重")
                 || low.contains("多重")));
-    if !strong {
+    // 必须**同时**命中两组(检测器的组合特征),避免误伤只提到"多重身份"的正常编码任务。
+    if !(probes_real && multi) {
         return None;
     }
     // 仍要求确实是在拷问助手身份(复用既有身份探针判定 + 干净应答)。
