@@ -127,6 +127,9 @@ where
 pub struct OutputConfig {
     #[serde(default = "default_effort")]
     pub effort: String,
+    /// 结构化输出:`output_config.format`(json_schema)。仅入站捕获,不转发给 Kiro。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<serde_json::Value>,
 }
 
 fn default_effort() -> String {

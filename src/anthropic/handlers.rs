@@ -821,6 +821,11 @@ pub async fn post_messages(
         return response;
     }
 
+    // 结构化输出:校验 output_config.format 并注入 schema 指令(非法 schema 直接 400)。
+    if let Some(response) = apply_structured_output(&mut payload) {
+        return response;
+    }
+
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
@@ -1612,6 +1617,41 @@ fn normalize_opus_thinking(payload: &mut MessagesRequest) {
     }
 }
 
+/// 结构化输出 `output_config.format` (json_schema)。
+///
+/// Kiro 后端无原生结构化输出,此前本服务把 `output_config.format` 整个丢弃 → 返回普通对话文本,
+/// 与真 Claude(返回严格匹配 schema 的 JSON,或对非法 schema 返回 400)不一致 → cctest 结构化输出失败。
+/// 这里:①校验 schema(object 顶层须显式 additionalProperties:false,对齐 Bedrock/参考渠道,否则 400);
+/// ②注入系统指令让模型只吐匹配 schema 的裸 JSON。真实用户此前该功能本就不可用,现变为可用,不构成回退。
+fn apply_structured_output(payload: &mut MessagesRequest) -> Option<Response> {
+    let format = payload.output_config.as_ref().and_then(|oc| oc.format.clone())?;
+    if format.get("type").and_then(|v| v.as_str()) != Some("json_schema") {
+        return None;
+    }
+    let schema = format.get("schema")?.clone();
+    if schema.get("type").and_then(|v| v.as_str()) == Some("object")
+        && schema.get("additionalProperties") != Some(&serde_json::Value::Bool(false))
+    {
+        let message = format!(
+            "output_config.***.schema: For 'object' type, 'additionalProperties' must be explicitly set to false (request id: {})",
+            super::compat::oneapi_request_id()
+        );
+        return Some(thinking_error_response(payload.stream, message));
+    }
+    let schema_str = serde_json::to_string(&schema).unwrap_or_default();
+    let instruction = format!(
+        "You must respond with ONLY a single valid JSON value that strictly conforms to the following JSON Schema. Output the raw JSON only — no explanations, no markdown code fences, no surrounding text.\n\nJSON Schema:\n{schema_str}"
+    );
+    payload
+        .system
+        .get_or_insert_with(Vec::new)
+        .push(super::types::SystemMessage {
+            text: instruction,
+            cache_control: None,
+        });
+    None
+}
+
 fn reject_invalid_thinking_request(payload: &MessagesRequest) -> Option<Response> {
     let thinking_type = payload.thinking.as_ref()?.thinking_type.as_str();
     if thinking_type == "enabled" && payload.thinking.as_ref()?.budget_tokens < 1024 {
@@ -2137,6 +2177,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     if is_opus_4_6_or_newer {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
+            format: None,
         });
     }
 }
@@ -2218,6 +2259,11 @@ pub async fn post_messages_cc(
     normalize_opus_thinking(&mut payload);
 
     if let Some(response) = reject_invalid_thinking_request(&payload) {
+        return response;
+    }
+
+    // 结构化输出:校验 output_config.format 并注入 schema 指令(非法 schema 直接 400)。
+    if let Some(response) = apply_structured_output(&mut payload) {
         return response;
     }
 
