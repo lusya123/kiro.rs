@@ -102,47 +102,87 @@ impl ClusterCache {
     }
 
     /// 自举:连得上就当 client;连不上就抢占端口起内嵌服务当 owner;都不行退本地。
+    ///
+    /// `addr` 支持**逗号分隔的多个候选**,用于 owner 故障转移(多容器集群无单点):
+    /// - 任一候选可连 → 当 client(连上谁用谁);
+    /// - 都连不上 → 按顺序尝试 `bind`。关键点:`bind("<容器名>:46379")` 只有当该名字
+    ///   解析到**本机 IP** 时才成功,所以每个容器只能"抢占"与自己同名的候选 —— 天然
+    ///   避免脑裂(别的容器名解析成远端 IP,bind 直接失败),同时允许列表里靠后的容器
+    ///   在靠前的 owner 挂掉后接管。单地址(如默认 127.0.0.1:46379)= 只有一个候选,行为不变。
     async fn bootstrap(addr: &str) -> Self {
-        // 1) 先尝试连接已有的服务
-        if let Some(conn) = try_connect(addr).await {
-            tracing::info!("集群缓存:连接到已有共享服务 {}", addr);
-            return ClusterCache::shared(conn, "client");
+        let candidates: Vec<String> = addr
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if candidates.is_empty() {
+            tracing::warn!("集群缓存:地址为空,退回本地");
+            return ClusterCache::local();
         }
-        // 2) 抢占绑定端口,起内嵌服务
-        if !is_loopback_addr(addr) {
-            tracing::warn!(
-                "集群缓存:即将在非回环地址 {} 启动内嵌服务(无鉴权的键值服务)。\
-                 请确保该地址仅在可信内网可达,勿暴露到公网。",
-                addr
-            );
-        }
-        match TcpListener::bind(addr).await {
-            Ok(listener) => {
-                spawn_embedded_server(listener);
-                // 连接自己
-                for _ in 0..20 {
-                    if let Some(conn) = try_connect(addr).await {
-                        tracing::info!("集群缓存:本容器成为 owner,内嵌共享服务已启动于 {}", addr);
-                        return ClusterCache::shared(conn, "owner");
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                tracing::warn!("集群缓存:内嵌服务已起但自连失败,退回本地");
-                ClusterCache::local()
+
+        // 尝试成为 `cand` 的 owner:bind 成功(该名字解析到本机 IP,或 loopback)才算。
+        async fn try_own(cand: &str) -> Option<ClusterCache> {
+            if !is_loopback_addr(cand) {
+                tracing::warn!(
+                    "集群缓存:即将在非回环地址 {} 启动内嵌服务(无鉴权的键值服务)。\
+                     请确保该地址仅在可信内网可达,勿暴露到公网。",
+                    cand
+                );
             }
-            Err(_) => {
-                // 3) 竞态:别的容器刚抢到,重试连接
-                for _ in 0..20 {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    if let Some(conn) = try_connect(addr).await {
-                        tracing::info!("集群缓存:连接到并发抢占的 owner {}", addr);
-                        return ClusterCache::shared(conn, "client");
-                    }
+            let listener = TcpListener::bind(cand).await.ok()?;
+            spawn_embedded_server(listener);
+            for _ in 0..20 {
+                if let Some(conn) = try_connect(cand).await {
+                    tracing::info!("集群缓存:本容器成为 owner,内嵌共享服务已启动于 {}", cand);
+                    return Some(ClusterCache::shared(conn, "owner"));
                 }
-                tracing::warn!("集群缓存:无法连接共享服务 {},退回本地", addr);
-                ClusterCache::local()
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            tracing::warn!("集群缓存:{} 内嵌服务已起但自连失败", cand);
+            None
+        }
+
+        // 1) 任一候选连得上 → client(primary owner 已在)
+        for cand in &candidates {
+            if let Some(conn) = try_connect(cand).await {
+                tracing::info!("集群缓存:连接到已有共享服务 {}", cand);
+                return ClusterCache::shared(conn, "client");
             }
         }
+
+        // 2) primary 抢占:只 bind **第一个**候选。名字==本机的容器立即成为 primary owner;
+        //    其他容器 bind 远端名字会失败,落到下面的等待逻辑——**不会**在此各自称王(防脑裂)。
+        if let Some(owner) = try_own(&candidates[0]).await {
+            return owner;
+        }
+
+        // 3) 本容器不是 primary(或 primary 尚在启动)。**先给 primary 充足时间**(~6s)重试连接
+        //    所有候选;这段等待是防脑裂的关键:failover 容器绝不在 primary 还可能上线时自立门户。
+        for _ in 0..60 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            for cand in &candidates {
+                if let Some(conn) = try_connect(cand).await {
+                    tracing::info!("集群缓存:连接到 owner {}", cand);
+                    return ClusterCache::shared(conn, "client");
+                }
+            }
+        }
+
+        // 4) primary 确实持续不可达 → 由后续候选里"与自己同名"的容器接管成为 failover owner。
+        for cand in candidates.iter().skip(1) {
+            if let Some(owner) = try_own(cand).await {
+                return owner;
+            }
+        }
+
+        // 5) 收尾:再试一轮连接(可能刚有人接管),否则退回本地。
+        for cand in &candidates {
+            if let Some(conn) = try_connect(cand).await {
+                return ClusterCache::shared(conn, "client");
+            }
+        }
+        tracing::warn!("集群缓存:无法连接任何候选 {:?},退回本地", candidates);
+        ClusterCache::local()
     }
 
     fn cooling(breaker: &AtomicI64) -> bool {
@@ -527,6 +567,27 @@ mod tests {
         assert!(!c2.exists("prefixB").await);
         c2.register("prefixB", ttl).await;
         assert!(c1.exists("prefixB").await, "跨容器应共享登记");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_multi_candidate_failover_to_reachable() {
+        // 多候选:第一个不可达、第二个有服务 → 应跳过第一个,连上第二个当 client。
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = listener.local_addr().unwrap().to_string();
+        spawn_embedded_server(listener);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // 占一个端口再立即释放,作为"不可达"候选(连接会被拒)。
+        let dead_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = dead_listener.local_addr().unwrap().to_string();
+        drop(dead_listener);
+
+        let cache = ClusterCache::bootstrap(&format!("{dead},{live}")).await;
+        assert_eq!(
+            cache.role(),
+            "client",
+            "应跳过不可达候选、连上可达候选当 client"
+        );
     }
 
     #[tokio::test]
