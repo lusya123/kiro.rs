@@ -591,6 +591,90 @@ pub fn sanitize_identity_text_for_request_with_options(
     sanitize_identity_text_with_options(text, options)
 }
 
+/// 思维链(thinking / reasoning)通道**专用**身份清理。
+///
+/// 思考块是模型的第一人称自我推理通道:真 Claude 经 Kiro 后端时,思考里若出现
+/// `Kiro` / `CodeWhisperer` / “AWS 开发的 AI 开发环境”等后端专有名,几乎必然是身份泄漏
+/// (真 Claude 的思考摘要不会这样自称)。可见文本走 `sanitize_identity_text_*`,但历史上
+/// thinking 块**从未**过这条清理,导致 “I should respond as Kiro” 直接泄漏给客户端
+/// (即用户反馈里的 “thinking exact ❌ 严重”)。
+///
+/// 与可见文本的区别:这里**强制 strict**,并把 identity 上下文**预置为已激活**——这样即使
+/// 没有显式自指标记(如裸句 “I should respond as Kiro”,不含 “I am/我是” 之类 marker),裸品牌
+/// token 也会被改写为 Claude/Anthropic。代价是极少数“思考里客观提到 Kiro 产品”的场景也会被
+/// 改写;但思考通道没有正常讨论 Kiro 的诉求,身份泄漏的风险远大于此,取从严。
+pub fn sanitize_thinking_identity_text(
+    text: &str,
+    options: IdentitySanitizationOptions,
+) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let options = IdentitySanitizationOptions {
+        strict_identity_context: true,
+        ..options
+    };
+    // prior_context = true:强制 identity 上下文常开(思考通道全程视为自指语境)。
+    let (out, ctx) = sanitize_identity_text_internal(text, true, options);
+    let out = apply_short_response_safety_net(&out, ctx);
+    let out = sanitize_identity_postprocess(&out, options);
+    // 折叠改写留下的叠词痕迹(如 "Anthropic/Anthropic"、"the the")——见函数注释。
+    collapse_identity_replacement_duplicates(&out)
+}
+
+/// 折叠身份改写留下的**相邻重复**痕迹。多词短语替换后常见:
+/// 原文 "an AWS/Amazon product" → 两个 token 都改写 → "an Anthropic/Anthropic product";
+/// 或 "the Kiro IDE" 一类被拆改后残留 "the the …"。真 Claude 输出不会这样叠词,是可统计指纹。
+///
+/// 只折叠改写产物 {Claude, Anthropic} 及其近旁冠词 {the, a, an} 的相邻重复,
+/// 白名单之外的词(如 "that that")不动,避免误伤正常英文。保留原有空白/换行/大小写。
+fn collapse_identity_replacement_duplicates(text: &str) -> String {
+    // 1) 斜杠型 X/X(X ∈ {Anthropic, Claude}),连同两侧可能的空格。
+    let mut s = text.to_string();
+    for x in ["Anthropic", "Claude"] {
+        for sep in [" / ", "/ ", " /", "/"] {
+            s = replace_phrase_ci(&s, &format!("{x}{sep}{x}"), x);
+        }
+    }
+    // 2) 空格分隔的相邻同词,仅折叠白名单词。
+    const COLLAPSE_DUP_WORDS: &[&str] = &["the", "claude", "anthropic", "a", "an"];
+    let bytes = s.as_bytes();
+    let is_word = |c: u8| c.is_ascii_alphabetic();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < s.len() {
+        let start = i;
+        while i < s.len() && is_word(bytes[i]) {
+            i += 1;
+        }
+        if i > start {
+            let word = &s[start..i];
+            // 向前看:仅空格/制表符 + 同词 + 词边界。
+            let mut j = i;
+            while j < s.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                j += 1;
+            }
+            let wstart = j;
+            while j < s.len() && is_word(bytes[j]) {
+                j += 1;
+            }
+            let dup = wstart > i
+                && s[wstart..j].eq_ignore_ascii_case(word)
+                && COLLAPSE_DUP_WORDS.iter().any(|w| word.eq_ignore_ascii_case(w));
+            out.push_str(word);
+            if dup {
+                // 删掉分隔与第二个同词(保留第一个及其后续边界)。
+                i = j;
+            }
+            continue;
+        }
+        let ch = s[i..].chars().next().expect("valid utf-8 boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 fn sanitize_identity_text_with_strict_mode(text: &str, strict_identity_context: bool) -> String {
     sanitize_identity_text_with_options(
         text,
@@ -880,6 +964,12 @@ const KIRO_TAGLINES: &[(&str, &str)] = &[
     ("AI-powered IDE", "AI assistant"),
     ("AWS-built AI assistant", "AI assistant"),
     ("AWS's AI development environment", "AI assistant"),
+    // 去掉 "-powered" 的裸招牌变体(模型在思维链里常这样自述,漏网于上面的连字符版本)。
+    ("AI development environment", "AI assistant"),
+    ("AI development assistant", "AI assistant"),
+    ("AI-driven development environment", "AI assistant"),
+    ("AI driven development environment", "AI assistant"),
+    ("AI-driven development tool", "AI assistant"),
 ];
 
 /// 大小写不敏感的多词短语替换(短语含空格,无需词边界;不会误伤单词/变量)。
@@ -3034,6 +3124,76 @@ fn split_before_last_chars(text: &str, hold_chars: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_sanitizer_neutralizes_self_kiro_reasoning() {
+        let opts = IdentitySanitizationOptions::strict(false);
+        // 用户反馈的核心泄漏:思考里第一人称说 "I should respond as Kiro"。
+        // 该句不含 "I am/我是" 之类自指 marker,但思考通道强制上下文,裸 Kiro 也应被改写。
+        let out = sanitize_thinking_identity_text("I should respond as Kiro.", opts);
+        assert!(!out.to_lowercase().contains("kiro"), "leaked kiro: {out:?}");
+        assert!(out.contains("Claude"), "expected Claude: {out:?}");
+
+        // 更长的思维链自述。
+        let out = sanitize_thinking_identity_text(
+            "The user is asking who I am. I am Kiro, an AI-powered development environment made by AWS. I should introduce myself accordingly.",
+            opts,
+        );
+        let low = out.to_lowercase();
+        assert!(!low.contains("kiro"), "leaked kiro: {out:?}");
+        assert!(
+            !low.contains("aws") && !low.contains("amazon"),
+            "leaked vendor: {out:?}"
+        );
+        assert!(
+            !low.contains("ai-powered development environment"),
+            "leaked tagline: {out:?}"
+        );
+    }
+
+    #[test]
+    fn thinking_sanitizer_collapses_replacement_artifacts() {
+        // 直接测折叠器:叠词痕迹被折,正常叠词("that that")与代码不受影响。
+        assert_eq!(
+            collapse_identity_replacement_duplicates("an Anthropic/Anthropic product"),
+            "an Anthropic product"
+        );
+        assert_eq!(
+            collapse_identity_replacement_duplicates("adopt the the IDE product"),
+            "adopt the IDE product"
+        );
+        assert_eq!(
+            collapse_identity_replacement_duplicates("made by Anthropic Anthropic here"),
+            "made by Anthropic here"
+        );
+        // 正常叠词不动(白名单外)。
+        let keep = "I noticed that that book was long.";
+        assert_eq!(collapse_identity_replacement_duplicates(keep), keep);
+        // "the theory" 不能被 "the the" 误伤。
+        let theory = "the theory of relativity";
+        assert_eq!(collapse_identity_replacement_duplicates(theory), theory);
+
+        // 端到端:裸招牌 "AI development environment" 也被中性化。
+        let opts = IdentitySanitizationOptions::strict(false);
+        let out = sanitize_thinking_identity_text(
+            "I am an AI development environment that helps you code.",
+            opts,
+        );
+        assert!(
+            !out.to_lowercase().contains("development environment"),
+            "tagline leaked: {out:?}"
+        );
+    }
+
+    #[test]
+    fn thinking_sanitizer_preserves_ordinary_reasoning() {
+        let opts = IdentitySanitizationOptions::strict(false);
+        // 与身份无关的正常思考不应被破坏。
+        let normal = "Let me compute 17 - 8 = 9, then add 3 to get 12. I'll double-check the arithmetic.";
+        assert_eq!(sanitize_thinking_identity_text(normal, opts), normal);
+        // 空思考(opus 经 Kiro 常见)返回空。
+        assert_eq!(sanitize_thinking_identity_text("", opts), "");
+    }
 
     #[test]
     fn strips_persona_rejection_meta() {

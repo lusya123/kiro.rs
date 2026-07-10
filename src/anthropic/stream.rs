@@ -696,6 +696,13 @@ pub struct StreamContext {
     continuation_merge_tail: Option<String>,
     /// 输出侧规整可见文本中的上游产品自称；规则会跳过代码并保留普通 Kiro 技术提及。
     identity_sanitizer: Option<super::identity::IdentityOutputSanitizer>,
+    /// thinking(思维链)通道身份清理选项。Some 时:思考块内容在**块结束**时统一
+    /// 过一遍 `sanitize_thinking_identity_text`(强制 strict + 预置 identity 上下文)再发出,
+    /// 堵住 “thinking 里直接说 I should respond as Kiro” 这类身份泄漏。
+    thinking_sanitize_options: Option<super::identity::IdentitySanitizationOptions>,
+    /// 待清理的原始 thinking 文本累积区。为了让跨 chunk 的身份短语能被整体识别,
+    /// thinking 内容先累积在这里,到 thinking 块结束时一次性清理并作为 thinking_delta 发出。
+    thinking_pending_raw: String,
     /// 待注入的合成 thinking 内容。仅当客户请求了 thinking 但上游(如 Kiro 的 opus)不产出
     /// 思考内容时设置：在首个助手内容前注入一个 `<thinking>…</thinking>` 前缀，复用既有提取
     /// 逻辑生成"思考块+签名"。真实答案不受影响(仍是模型原始输出)。
@@ -747,6 +754,8 @@ impl StreamContext {
             complete_sentinel_probe_buffer: String::new(),
             continuation_merge_tail: None,
             identity_sanitizer: None,
+            thinking_sanitize_options: None,
+            thinking_pending_raw: String::new(),
             pending_synthetic_thinking: None,
             suppress_text_blocks: false,
         }
@@ -772,9 +781,12 @@ impl StreamContext {
     }
 
     pub fn enable_identity_sanitization_with_strict_mode(&mut self, strict_identity_context: bool) {
+        let options =
+            super::identity::IdentitySanitizationOptions::strict(strict_identity_context);
         self.identity_sanitizer = Some(
-            super::identity::IdentityOutputSanitizer::new_with_strict_mode(strict_identity_context),
+            super::identity::IdentityOutputSanitizer::new_with_options(options),
         );
+        self.thinking_sanitize_options = Some(options);
     }
 
     pub fn enable_identity_sanitization_with_options(
@@ -785,15 +797,16 @@ impl StreamContext {
         vendor_lineage_probe: bool,
         third_party_kiro_discussion: bool,
     ) {
-        self.identity_sanitizer = Some(super::identity::IdentityOutputSanitizer::new_with_options(
-            super::identity::IdentitySanitizationOptions {
-                strict_identity_context,
-                agentic_ide_probe,
-                codewhisperer_relationship_probe,
-                vendor_lineage_probe,
-                third_party_kiro_discussion,
-            },
-        ));
+        let options = super::identity::IdentitySanitizationOptions {
+            strict_identity_context,
+            agentic_ide_probe,
+            codewhisperer_relationship_probe,
+            vendor_lineage_probe,
+            third_party_kiro_discussion,
+        };
+        self.identity_sanitizer =
+            Some(super::identity::IdentityOutputSanitizer::new_with_options(options));
+        self.thinking_sanitize_options = Some(options);
     }
 
     pub fn set_output_token_limit(&mut self, max_tokens: i32) {
@@ -1051,23 +1064,20 @@ impl StreamContext {
 
                 // 在 thinking 块内，查找 </thinking> 结束标签（跳过被反引号包裹的）
                 if let Some(end_pos) = find_real_thinking_end_tag(&self.thinking_buffer) {
-                    // 提取 thinking 内容
+                    // 累积 thinking 内容(延迟到块结束时统一清理后再发出)
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                    if self.expose_thinking && !thinking_content.is_empty() {
-                        if let Some(thinking_index) = self.thinking_block_index {
-                            events.push(
-                                self.create_thinking_delta_event(thinking_index, &thinking_content),
-                            );
-                        }
-                    }
+                    self.accumulate_thinking(&thinking_content);
 
                     // 结束 thinking 块
                     self.in_thinking_block = false;
                     self.thinking_extracted = true;
 
-                    // 发送空的 thinking_delta、signature_delta、然后 content_block_stop
+                    // 先 flush(清理后)累积的 thinking,再发空的 thinking_delta、signature_delta、content_block_stop
                     if self.expose_thinking {
                         if let Some(thinking_index) = self.thinking_block_index {
+                            if let Some(ev) = self.flush_thinking_delta(thinking_index) {
+                                events.push(ev);
+                            }
                             events.push(self.create_thinking_delta_event(thinking_index, ""));
                             events.push(self.create_signature_delta_event(thinking_index));
                             if let Some(stop_event) =
@@ -1094,17 +1104,9 @@ impl StreamContext {
                         .saturating_sub("</thinking>\n\n".len());
                     let safe_len = find_char_boundary(&self.thinking_buffer, target_len);
                     if safe_len > 0 {
-                        if self.expose_thinking {
-                            let safe_content = self.thinking_buffer[..safe_len].to_string();
-                            if !safe_content.is_empty() {
-                                if let Some(thinking_index) = self.thinking_block_index {
-                                    events.push(self.create_thinking_delta_event(
-                                        thinking_index,
-                                        &safe_content,
-                                    ));
-                                }
-                            }
-                        }
+                        // 累积安全内容(延迟到块结束时统一清理);缓冲区照常推进。
+                        let safe_content = self.thinking_buffer[..safe_len].to_string();
+                        self.accumulate_thinking(&safe_content);
                         self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
                     }
                     break;
@@ -1239,6 +1241,31 @@ impl StreamContext {
         events
     }
 
+    /// 累积一段**原始**(未清理)thinking 文本,延迟到 thinking 块结束时统一清理后再发出。
+    /// 只在 `expose_thinking` 时累积(与旧逻辑的发出门控一致);非空判断留给 flush。
+    fn accumulate_thinking(&mut self, content: &str) {
+        if self.expose_thinking && !content.is_empty() {
+            self.thinking_pending_raw.push_str(content);
+        }
+    }
+
+    /// thinking 块结束时调用:对累积的原始 thinking 做身份清理,并作为单个 thinking_delta 发出。
+    /// 未开启身份清理(`thinking_sanitize_options` 为 None)时原样发出,保持既有行为。
+    fn flush_thinking_delta(&mut self, index: i32) -> Option<SseEvent> {
+        if self.thinking_pending_raw.is_empty() {
+            return None;
+        }
+        let raw = std::mem::take(&mut self.thinking_pending_raw);
+        let out = match self.thinking_sanitize_options {
+            Some(options) => super::identity::sanitize_thinking_identity_text(&raw, options),
+            None => raw,
+        };
+        if out.is_empty() {
+            return None;
+        }
+        Some(self.create_thinking_delta_event(index, &out))
+    }
+
     /// 创建 thinking_delta 事件
     fn create_thinking_delta_event(&mut self, index: i32, thinking: &str) -> SseEvent {
         if !thinking.is_empty() {
@@ -1293,13 +1320,7 @@ impl StreamContext {
         if self.thinking_enabled && self.in_thinking_block {
             if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer) {
                 let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                if self.expose_thinking && !thinking_content.is_empty() {
-                    if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(
-                            self.create_thinking_delta_event(thinking_index, &thinking_content),
-                        );
-                    }
-                }
+                self.accumulate_thinking(&thinking_content);
 
                 // 结束 thinking 块
                 self.in_thinking_block = false;
@@ -1307,6 +1328,9 @@ impl StreamContext {
 
                 if self.expose_thinking {
                     if let Some(thinking_index) = self.thinking_block_index {
+                        if let Some(ev) = self.flush_thinking_delta(thinking_index) {
+                            events.push(ev);
+                        }
                         events.push(self.create_thinking_delta_event(thinking_index, ""));
                         events.push(self.create_signature_delta_event(thinking_index));
                         if let Some(stop_event) =
@@ -1415,25 +1439,27 @@ impl StreamContext {
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
-        // Flush thinking_buffer 中的剩余内容
-        if self.thinking_enabled && !self.thinking_buffer.is_empty() {
+        // Flush thinking_buffer 中的剩余内容。
+        // 注意:thinking 内容现在累积在 thinking_pending_raw(延迟到块结束统一清理),
+        // 因此即使 thinking_buffer 已被抽空,只要仍在 thinking 块内(需要清理累积内容并关闭块),
+        // 也必须进入此分支——否则累积的 thinking 会丢失、块也不会闭合。
+        if self.thinking_enabled
+            && (!self.thinking_buffer.is_empty() || self.in_thinking_block)
+        {
             if self.in_thinking_block {
                 // 末尾可能残留 `</thinking>`（例如紧跟 tool_use 或流结束），需要在 flush 时过滤掉结束标签。
                 if let Some(end_pos) =
                     find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer)
                 {
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                    if self.expose_thinking && !thinking_content.is_empty() {
-                        if let Some(thinking_index) = self.thinking_block_index {
-                            events.push(
-                                self.create_thinking_delta_event(thinking_index, &thinking_content),
-                            );
-                        }
-                    }
+                    self.accumulate_thinking(&thinking_content);
 
-                    // 关闭 thinking 块：thinking_delta 空 + signature_delta + content_block_stop
+                    // 关闭 thinking 块：先 flush(清理后)累积内容,再 thinking_delta 空 + signature + stop
                     if self.expose_thinking {
                         if let Some(thinking_index) = self.thinking_block_index {
+                            if let Some(ev) = self.flush_thinking_delta(thinking_index) {
+                                events.push(ev);
+                            }
                             events.push(self.create_thinking_delta_event(thinking_index, ""));
                             events.push(self.create_signature_delta_event(thinking_index));
                             if let Some(stop_event) =
@@ -1454,18 +1480,14 @@ impl StreamContext {
                         events.extend(self.create_text_delta_events(&remaining));
                     }
                 } else {
-                    // 如果还在 thinking 块内，发送剩余内容作为 thinking_delta
+                    // 仍在 thinking 块内:把剩余缓冲区累积后统一清理,再关闭 thinking 块
+                    let thinking_buffer = self.thinking_buffer.clone();
+                    self.accumulate_thinking(&thinking_buffer);
                     if self.expose_thinking {
                         if let Some(thinking_index) = self.thinking_block_index {
-                            let thinking_buffer = self.thinking_buffer.clone();
-                            events.push(
-                                self.create_thinking_delta_event(thinking_index, &thinking_buffer),
-                            );
-                        }
-                    }
-                    // 关闭 thinking 块：thinking_delta 空 + signature_delta + content_block_stop
-                    if self.expose_thinking {
-                        if let Some(thinking_index) = self.thinking_block_index {
+                            if let Some(ev) = self.flush_thinking_delta(thinking_index) {
+                                events.push(ev);
+                            }
                             events.push(self.create_thinking_delta_event(thinking_index, ""));
                             events.push(self.create_signature_delta_event(thinking_index));
                             if let Some(stop_event) =
@@ -1475,6 +1497,8 @@ impl StreamContext {
                             }
                         }
                     }
+                    self.in_thinking_block = false;
+                    self.thinking_extracted = true;
                 }
             } else {
                 // 否则发送剩余内容作为 text_delta

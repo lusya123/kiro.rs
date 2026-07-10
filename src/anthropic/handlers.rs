@@ -1495,6 +1495,16 @@ async fn handle_non_stream_request(
                 }
             });
             if let Some(thinking_text) = thinking {
+                // 思考块历史上**不过**身份清理,导致 "I should respond as Kiro" 之类直接泄漏。
+                // 与可见文本一样清理,但走 thinking 专用(强制 strict + 预置 identity 上下文)。
+                let thinking_text = if identity_sanitization {
+                    super::identity::sanitize_thinking_identity_text(
+                        &thinking_text,
+                        identity_sanitization_options(identity_sanitization_context),
+                    )
+                } else {
+                    thinking_text
+                };
                 thinking_tokens = super::claude_tok::count_claude(&thinking_text);
                 content.push(json!({
                     "type": "thinking",
