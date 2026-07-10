@@ -12,6 +12,11 @@ use super::types::{CountTokensRequest, Message, MessagesRequest, SystemMessage, 
 const EXPOSE_HEADERS: &str =
     "date,request-id,retry-after,retry-after-ms,x-should-retry,anthropic-organization-id";
 const ORG_ID: &str = "089a9559-f257-4a40-845e-2f716aaeb7f6";
+// new-api 网关公开头。对齐参照实例（pomoai/awsp 组）以消除自建构建串指纹：
+// 旧值 `official01-rc25-redis-release-cleanup-...` 是显眼的自建标识，会被指纹识别。
+const NEW_API_VERSION: &str = "20260501R2";
+const APP_REVISION: &str = "1e5cd49d8dc8df51";
+const GROUP_USED: &str = "awsp";
 const INPUT_LIMIT: &str = "500000";
 const OUTPUT_LIMIT: &str = "80000";
 const REQUEST_LIMIT: &str = "1000";
@@ -33,10 +38,14 @@ pub fn aws_request_id() -> String {
 }
 
 pub fn oneapi_request_id() -> String {
+    // new-api 真实格式：`yyyymmddHHMMSS` + 纳秒级数字段 + 随机 base62。
+    // 参照实例观测为 ts(14) + 9 位数字 + 8 位 base62（旧实现 ts+base62(24)，
+    // 字母紧贴时间戳、长度也对不上，是可指纹点）。
     format!(
-        "{}{}",
+        "{}{}{}",
         chrono::Utc::now().format("%Y%m%d%H%M%S"),
-        base62(24)
+        digits(9),
+        base62(8)
     )
 }
 
@@ -46,11 +55,7 @@ pub fn add_response_headers(
     is_stream: bool,
     include_official_headers: bool,
 ) {
-    set(
-        headers,
-        "x-new-api-version",
-        "official01-rc25-redis-release-cleanup-20260627-203800-5e86644649",
-    );
+    set(headers, "x-new-api-version", NEW_API_VERSION);
     set(headers, "x-oneapi-request-id", &oneapi_request_id());
 
     if is_stream || !status.is_success() || !include_official_headers {
@@ -69,6 +74,9 @@ pub fn add_response_headers(
     set(headers, "anthropic-organization-id", ORG_ID);
     set(headers, "x-amzn-requestid", &aws_id);
     set(headers, "x-request-id", &aws_id);
+    // 参照实例(pomoai/awsp)在 /messages 成功响应上还带这两个 new-api 头。
+    set(headers, "x-app-revision", APP_REVISION);
+    set(headers, "x-group-used", GROUP_USED);
 
     set(
         headers,
@@ -144,7 +152,10 @@ pub fn usage(
     }
 
     usage.insert("service_tier".to_string(), json!("standard"));
-    usage.insert("inference_geo".to_string(), json!("global"));
+    usage.insert(
+        "inference_geo".to_string(),
+        json!(inference_geo_for(model)),
+    );
     Value::Object(usage)
 }
 
@@ -152,7 +163,7 @@ pub fn usage(
 /// `output_tokens_details`——真 Anthropic 仅在流末的 message_delta 给出
 /// thinking_tokens，message_start 阶段不带该字段。签名与 `usage()` 一致以便直接替换。
 pub fn stream_start_usage(
-    _model: &str,
+    model: &str,
     input_tokens: i32,
     output_tokens: i32,
     _thinking_tokens: i32,
@@ -181,7 +192,10 @@ pub fn stream_start_usage(
     );
     usage.insert("output_tokens".to_string(), json!(output_tokens));
     usage.insert("service_tier".to_string(), json!("standard"));
-    usage.insert("inference_geo".to_string(), json!("global"));
+    usage.insert(
+        "inference_geo".to_string(),
+        json!(inference_geo_for(model)),
+    );
     Value::Object(usage)
 }
 
@@ -1531,6 +1545,23 @@ fn base62(len: usize) -> String {
     (0..len)
         .map(|_| ALPHABET[fastrand::usize(..ALPHABET.len())] as char)
         .collect()
+}
+
+fn digits(len: usize) -> String {
+    (0..len)
+        .map(|_| (b'0' + fastrand::u8(..10)) as char)
+        .collect()
+}
+
+/// `inference_geo` 随模型而定：参照实例(pomoai/awsp)上 haiku 返回
+/// `not_available`，opus/sonnet 返回 `global`。旧实现对所有模型硬编码
+/// `global`，与参照在 haiku 上不一致，是一个可区分点。
+fn inference_geo_for(model: &str) -> &'static str {
+    if model.contains("haiku") {
+        "not_available"
+    } else {
+        "global"
+    }
 }
 
 fn lower_base62(len: usize) -> String {
