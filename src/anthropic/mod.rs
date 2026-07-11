@@ -22,13 +22,17 @@
 //! axum::serve(listener, app).await?;
 //! ```
 
+mod bedrock;
 mod billing;
 mod cache;
+mod claude_tok;
+mod compat;
 mod converter;
 mod handlers;
 mod id;
 mod identity;
 mod middleware;
+mod openai_compat;
 mod router;
 mod signature;
 mod stream;

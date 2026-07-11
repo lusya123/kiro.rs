@@ -17,6 +17,8 @@ pub struct ErrorDetail {
     #[serde(rename = "type")]
     pub error_type: String,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
 
 impl ErrorResponse {
@@ -26,6 +28,21 @@ impl ErrorResponse {
             error: ErrorDetail {
                 error_type: error_type.into(),
                 message: message.into(),
+                code: None,
+            },
+        }
+    }
+
+    pub fn new_with_code(
+        error_type: impl Into<String>,
+        message: impl Into<String>,
+        code: impl Into<String>,
+    ) -> Self {
+        Self {
+            error: ErrorDetail {
+                error_type: error_type.into(),
+                message: message.into(),
+                code: Some(code.into()),
             },
         }
     }
@@ -38,24 +55,27 @@ impl ErrorResponse {
 
 // === Models 端点类型 ===
 
-/// 模型信息
+/// 模型信息（Anthropic 原生 `/v1/models` schema）
+///
+/// 真 Anthropic 返回 `{"type":"model","id":...,"display_name":...,"created_at":...}`，
+/// 字段仅此四个、`created_at` 为 RFC3339 字符串。不含 OpenAI 风格的
+/// `object`/`created`(unix)/`owned_by`/`max_tokens`。
 #[derive(Debug, Serialize)]
 pub struct Model {
-    pub id: String,
-    pub object: String,
-    pub created: i64,
-    pub owned_by: String,
+    pub created_at: String,
     pub display_name: String,
+    pub id: String,
     #[serde(rename = "type")]
     pub model_type: String,
-    pub max_tokens: i32,
 }
 
 /// 模型列表响应
 #[derive(Debug, Serialize)]
 pub struct ModelsResponse {
-    pub object: String,
     pub data: Vec<Model>,
+    pub first_id: String,
+    pub has_more: bool,
+    pub last_id: String,
 }
 
 // === Messages 端点类型 ===
@@ -64,7 +84,7 @@ pub struct ModelsResponse {
 const MAX_BUDGET_TOKENS: i32 = 24576;
 
 /// Thinking 配置
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Thinking {
     #[serde(rename = "type")]
     pub thinking_type: String,
@@ -73,12 +93,21 @@ pub struct Thinking {
         deserialize_with = "deserialize_budget_tokens"
     )]
     pub budget_tokens: i32,
+    /// `display`: "summarized" 时返回可读思考摘要;"omitted"(缺省)时思考块文本为空。
+    #[serde(default)]
+    pub display: Option<String>,
 }
 
 impl Thinking {
     /// 是否启用了 thinking（enabled 或 adaptive）
     pub fn is_enabled(&self) -> bool {
         self.thinking_type == "enabled" || self.thinking_type == "adaptive"
+    }
+
+    /// 客户端是否要求**可读的思考摘要**(display=summarized)。
+    /// 真 opus-4-8 仅在此设定下返回非空思考文本;否则(omitted/缺省)思考块文本为空。
+    pub fn wants_summary(&self) -> bool {
+        self.display.as_deref() == Some("summarized")
     }
 }
 
@@ -98,6 +127,9 @@ where
 pub struct OutputConfig {
     #[serde(default = "default_effort")]
     pub effort: String,
+    /// 结构化输出:`output_config.format`(json_schema)。仅入站捕获,不转发给 Kiro。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<serde_json::Value>,
 }
 
 fn default_effort() -> String {
@@ -116,6 +148,7 @@ pub struct Metadata {
 #[allow(dead_code)]
 pub struct MessagesRequest {
     pub model: String,
+    #[serde(default = "default_max_tokens")]
     pub max_tokens: i32,
     pub messages: Vec<Message>,
     #[serde(default)]
@@ -126,8 +159,14 @@ pub struct MessagesRequest {
     pub tool_choice: Option<serde_json::Value>,
     pub thinking: Option<Thinking>,
     pub output_config: Option<OutputConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<serde_json::Value>,
     /// Claude Code 请求中的 metadata，包含 session 信息
     pub metadata: Option<Metadata>,
+}
+
+fn default_max_tokens() -> i32 {
+    1024
 }
 
 /// 反序列化 system 字段，支持字符串或数组格式
@@ -293,6 +332,8 @@ pub struct CountTokensRequest {
     pub system: Option<Vec<SystemMessage>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Tool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<Thinking>,
 }
 
 /// Token 计数响应

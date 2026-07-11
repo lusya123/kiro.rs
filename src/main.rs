@@ -1,6 +1,7 @@
 mod admin;
 mod admin_ui;
 mod anthropic;
+mod cluster_cache;
 mod common;
 mod http_client;
 mod kiro;
@@ -40,6 +41,25 @@ async fn main() {
         tracing::error!("加载配置失败: {}", e);
         std::process::exit(1);
     });
+
+    // 集群共享缓存(虚拟 prompt-cache 登记表跨容器共享,让一批容器对外像"一个统一号池")。
+    // 约定用冷门端口 46379,可用环境变量 KIRO_CLUSTER_CACHE_ADDR 覆盖;设为 off/local/disabled 则纯本地。
+    // 自举:连得上就当 client;连不上就抢占该端口起内嵌服务当 owner;都不行退本地(不影响请求)。
+    let cluster_addr = std::env::var("KIRO_CLUSTER_CACHE_ADDR")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "127.0.0.1:46379".to_string());
+    if matches!(cluster_addr.as_str(), "off" | "local" | "disabled") {
+        tracing::info!("集群共享缓存: 已禁用(纯本地登记表)");
+    } else {
+        cluster_cache::init(&cluster_addr).await;
+        tracing::info!(
+            "集群共享缓存: {} (本容器角色={})",
+            cluster_addr,
+            cluster_cache::global().role()
+        );
+    }
 
     // 加载凭证（支持单对象或数组格式）
     let credentials_path = args
@@ -204,15 +224,6 @@ async fn main() {
         endpoints,
         config.default_endpoint.clone(),
     );
-
-    // 初始化 count_tokens 配置
-    token::init_config(token::CountTokensConfig {
-        api_url: config.count_tokens_api_url.clone(),
-        api_key: config.count_tokens_api_key.clone(),
-        auth_type: config.count_tokens_auth_type.clone(),
-        proxy: proxy_config,
-        tls_backend: config.tls_backend,
-    });
 
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(

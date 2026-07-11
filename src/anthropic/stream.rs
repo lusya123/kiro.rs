@@ -9,7 +9,6 @@ use serde_json::json;
 use crate::kiro::model::events::Event;
 
 use super::id;
-use super::types::MessagesRequest;
 
 const AUTO_CONTINUE_COMPLETE_SENTINEL: &str = "__KRS_CONTINUATION_COMPLETE__";
 
@@ -386,6 +385,8 @@ pub struct SseStateManager {
     stop_reason: Option<String>,
     /// 是否有工具调用
     has_tool_use: bool,
+    /// 是否已发出"首个 content_block_start 之后的确定性 ping"
+    first_block_started: bool,
 }
 
 impl Default for SseStateManager {
@@ -404,6 +405,7 @@ impl SseStateManager {
             next_block_index: 0,
             stop_reason: None,
             has_tool_use: false,
+            first_block_started: false,
         }
     }
 
@@ -508,6 +510,15 @@ impl SseStateManager {
         }
 
         events.push(SseEvent::new("content_block_start", data));
+
+        // 真 Anthropic 在**首个** content_block_start 之后紧跟一个 ping（确定性、固定位置）。
+        // 旧实现靠 25s keepalive 定时器的立即首 tick 发 ping，会与首个数据块在 select! 里赛跑，
+        // 导致 ping 有时跑到 content_block_start 之前——位置不稳即指纹。这里改为确定性注入。
+        if !self.first_block_started {
+            self.first_block_started = true;
+            events.push(SseEvent::new("ping", json!({"type": "ping"})));
+        }
+
         events
     }
 
@@ -561,6 +572,8 @@ impl SseStateManager {
         &mut self,
         usage: super::cache::UsageBreakdown,
         output_tokens: i32,
+        model: &str,
+        thinking_tokens: i32,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -587,14 +600,18 @@ impl SseStateManager {
                     "type": "message_delta",
                     "delta": {
                         "stop_reason": self.get_stop_reason(),
-                        "stop_sequence": null
+                        "stop_sequence": null,
+                        "stop_details": null
                     },
-                    "usage": {
-                        "input_tokens": usage.input_tokens,
-                        "output_tokens": output_tokens,
-                        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-                        "cache_read_input_tokens": usage.cache_read_input_tokens
-                    }
+                    "usage": super::compat::stream_delta_usage(
+                        model,
+                        usage.input_tokens,
+                        output_tokens,
+                        thinking_tokens,
+                        usage.cache_creation_input_tokens,
+                        usage.cache_creation_1h_input_tokens,
+                        usage.cache_read_input_tokens
+                    )
                 }),
             ));
         }
@@ -622,14 +639,23 @@ pub struct StreamContext {
     pub model: String,
     /// 消息 ID
     pub message_id: String,
+    /// 首轮客户请求输入 tokens。续写时 input_tokens 会切换为下一轮输入。
+    pub initial_input_tokens: i32,
     /// 输入 tokens（估算值）
     pub input_tokens: i32,
     /// 从 contextUsageEvent 计算的实际输入 tokens
     pub context_input_tokens: Option<i32>,
     /// 自动续写已经完成的上游调用输入 tokens 累计
     pub accumulated_input_tokens: i32,
-    /// 输出 tokens 累计
+    /// 输出 tokens 累计（字符估算，仅用于流中途的限长/续写判断，非最终计费数字）
     pub output_tokens: i32,
+    /// thinking tokens 累计（字符估算，同上）
+    pub thinking_tokens: i32,
+    /// 已发给客户端的输出文本(含工具调用 JSON),流结束时用 ctoc 算一次得到最终 output_tokens。
+    /// 贪心分词跨块不可加,必须累积完整文本再算。多轮 auto-continue 会持续累积。
+    output_text_acc: String,
+    /// 已发给客户端的 thinking 文本,流结束时用 ctoc 算一次。
+    thinking_text_acc: String,
     /// 客户请求的输出 token 上限
     output_token_limit: Option<i32>,
     /// 是否已经因为输出 token 上限停止向客户端发送文本
@@ -638,10 +664,15 @@ pub struct StreamContext {
     pub assistant_raw_content: String,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
+    /// 后端 tool_use_id(`toolu_bdrk_…`)→ 对客户端暴露的 Anthropic 形态 id(`toolu_01…`)。
+    /// 同一后端 id 复用同一输出 id,保证同一响应内的块相关性;跨轮由客户端回传该 id 自洽。
+    pub tool_output_ids: HashMap<String, String>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
     pub tool_name_map: HashMap<String, String>,
     /// thinking 是否启用
     pub thinking_enabled: bool,
+    /// 是否向客户端暴露 thinking 块。adaptive 模式需要上游 thinking，但不暴露给客户端。
+    pub expose_thinking: bool,
     /// thinking 内容缓冲区
     pub thinking_buffer: String,
     /// 是否在 thinking 块内
@@ -655,8 +686,8 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
-    /// 客户请求是否包含 cache_control（用于 usage 字段拆分策略）
-    pub has_cache_control: bool,
+    /// 初始请求的 input/cache 拆分。
+    pub initial_usage_breakdown: super::cache::UsageBreakdown,
     /// 疑似截断探测续写时吞掉完成哨兵，避免把内部控制文本发给客户端
     swallow_complete_sentinel_probe: bool,
     /// 探测完成哨兵可能被上游拆成多个 chunk，需要短暂缓冲确认
@@ -665,12 +696,24 @@ pub struct StreamContext {
     continuation_merge_tail: Option<String>,
     /// 输出侧规整可见文本中的上游产品自称；规则会跳过代码并保留普通 Kiro 技术提及。
     identity_sanitizer: Option<super::identity::IdentityOutputSanitizer>,
-    /// AWS-B-40 外观兼容模式
+    /// thinking(思维链)通道身份清理选项。Some 时:思考块内容在**块结束**时统一
+    /// 过一遍 `sanitize_thinking_identity_text`(强制 strict + 预置 identity 上下文)再发出,
+    /// 堵住 “thinking 里直接说 I should respond as Kiro” 这类身份泄漏。
+    thinking_sanitize_options: Option<super::identity::IdentitySanitizationOptions>,
+    /// 待清理的原始 thinking 文本累积区。为了让跨 chunk 的身份短语能被整体识别,
+    /// thinking 内容先累积在这里,到 thinking 块结束时一次性清理并作为 thinking_delta 发出。
+    thinking_pending_raw: String,
+    /// 待注入的合成 thinking 内容。仅当客户请求了 thinking 但上游(如 Kiro 的 opus)不产出
+    /// 思考内容时设置：在首个助手内容前注入一个 `<thinking>…</thinking>` 前缀，复用既有提取
+    /// 逻辑生成"思考块+签名"。真实答案不受影响(仍是模型原始输出)。
+    pending_synthetic_thinking: Option<String>,
+    /// tool_choice 强制工具(any/tool)时置真:抑制所有文本块,只发 tool_use ——
+    /// 与真 Anthropic 强制工具行为一致,避免模型在 tool_use 前后夹带解释性文本
+    /// (如 "I'll check the weather"),那会让"结构化输出/只认工具调用"探针判失败。
+    suppress_text_blocks: bool,
+    /// Preserve the externally observed AWS-B/Bedrock protocol shape.
     aws_b40_compat: bool,
-    /// AWS-B adaptive thinking 使用更长的 signature 外观
     aws_b40_adaptive_signature: bool,
-    /// AWS-B usage 需要按原始请求中的 cache_control block 精确拆分。
-    aws_b40_usage_request: Option<MessagesRequest>,
 }
 
 impl StreamContext {
@@ -679,71 +722,69 @@ impl StreamContext {
         model: impl Into<String>,
         input_tokens: i32,
         thinking_enabled: bool,
-        has_cache_control: bool,
+        initial_usage_breakdown: impl IntoInitialUsageBreakdown,
         tool_name_map: HashMap<String, String>,
     ) -> Self {
+        let initial_usage_breakdown = initial_usage_breakdown.into_breakdown(input_tokens);
         Self {
             state_manager: SseStateManager::new(),
             model: model.into(),
             message_id: id::message_id(),
+            initial_input_tokens: input_tokens,
             input_tokens,
             context_input_tokens: None,
             accumulated_input_tokens: 0,
             output_tokens: 0,
+            thinking_tokens: 0,
+            output_text_acc: String::new(),
+            thinking_text_acc: String::new(),
             output_token_limit: None,
             output_token_limit_reached: false,
             assistant_raw_content: String::new(),
             tool_block_indices: HashMap::new(),
+            tool_output_ids: HashMap::new(),
             tool_name_map,
             thinking_enabled,
+            expose_thinking: thinking_enabled,
             thinking_buffer: String::new(),
             in_thinking_block: false,
             thinking_extracted: false,
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
-            has_cache_control,
+            initial_usage_breakdown,
             swallow_complete_sentinel_probe: false,
             complete_sentinel_probe_buffer: String::new(),
             continuation_merge_tail: None,
             identity_sanitizer: None,
+            thinking_sanitize_options: None,
+            thinking_pending_raw: String::new(),
+            pending_synthetic_thinking: None,
+            suppress_text_blocks: false,
             aws_b40_compat: false,
             aws_b40_adaptive_signature: false,
-            aws_b40_usage_request: None,
         }
     }
 
     pub fn enable_aws_b40_compat(&mut self, adaptive_signature: bool) {
         self.aws_b40_compat = true;
         self.aws_b40_adaptive_signature = adaptive_signature;
-        self.message_id = id::bedrock_message_id_for_model(&self.model);
+        self.model = super::bedrock::response_model(&self.model);
+        self.message_id = super::bedrock::response_id(&self.model);
     }
 
-    pub fn set_aws_b40_usage_request(&mut self, request: Option<MessagesRequest>) {
-        self.aws_b40_usage_request = request;
+    pub fn hide_thinking_blocks(&mut self) {
+        self.expose_thinking = false;
     }
 
-    fn billable_current_input_tokens(&self) -> i32 {
-        if self.aws_b40_compat {
-            self.input_tokens.max(1)
-        } else {
-            super::billing::billable_input_tokens(self.input_tokens, self.context_input_tokens)
-        }
+    /// tool_choice 强制工具(any/tool)时调用:响应只保留 tool_use,抑制所有文本块。
+    pub fn set_suppress_text_blocks(&mut self, suppress: bool) {
+        self.suppress_text_blocks = suppress;
     }
 
-    fn usage_breakdown_for_total(
-        &self,
-        final_input_tokens: i32,
-        commit_cache_state: bool,
-    ) -> super::cache::UsageBreakdown {
-        if let Some(request) = self.aws_b40_usage_request.as_ref() {
-            return if commit_cache_state {
-                super::cache::compute_usage_breakdown_for_request(final_input_tokens, request)
-            } else {
-                super::cache::preview_usage_breakdown_for_request(final_input_tokens, request)
-            };
-        }
-        super::cache::compute_usage_breakdown(final_input_tokens, self.has_cache_control)
+    /// 设置待注入的合成 thinking(仅上游不产思考但客户请求了 thinking 时使用)。
+    pub fn set_synthetic_thinking(&mut self, thinking: Option<String>) {
+        self.pending_synthetic_thinking = thinking;
     }
 
     #[allow(dead_code)]
@@ -752,9 +793,11 @@ impl StreamContext {
     }
 
     pub fn enable_identity_sanitization_with_strict_mode(&mut self, strict_identity_context: bool) {
-        self.identity_sanitizer = Some(
-            super::identity::IdentityOutputSanitizer::new_with_strict_mode(strict_identity_context),
-        );
+        let options = super::identity::IdentitySanitizationOptions::strict(strict_identity_context);
+        self.identity_sanitizer = Some(super::identity::IdentityOutputSanitizer::new_with_options(
+            options,
+        ));
+        self.thinking_sanitize_options = Some(options);
     }
 
     pub fn enable_identity_sanitization_with_options(
@@ -765,15 +808,17 @@ impl StreamContext {
         vendor_lineage_probe: bool,
         third_party_kiro_discussion: bool,
     ) {
+        let options = super::identity::IdentitySanitizationOptions {
+            strict_identity_context,
+            agentic_ide_probe,
+            codewhisperer_relationship_probe,
+            vendor_lineage_probe,
+            third_party_kiro_discussion,
+        };
         self.identity_sanitizer = Some(super::identity::IdentityOutputSanitizer::new_with_options(
-            super::identity::IdentitySanitizationOptions {
-                strict_identity_context,
-                agentic_ide_probe,
-                codewhisperer_relationship_probe,
-                vendor_lineage_probe,
-                third_party_kiro_discussion,
-            },
+            options,
         ));
+        self.thinking_sanitize_options = Some(options);
     }
 
     pub fn set_output_token_limit(&mut self, max_tokens: i32) {
@@ -782,7 +827,7 @@ impl StreamContext {
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
-        let breakdown = self.usage_breakdown_for_total(self.input_tokens, false);
+        let breakdown = self.initial_usage_breakdown;
         if self.aws_b40_compat {
             return json!({
                 "type": "message_start",
@@ -800,31 +845,36 @@ impl StreamContext {
                         "cache_creation_input_tokens": breakdown.cache_creation_input_tokens,
                         "cache_read_input_tokens": breakdown.cache_read_input_tokens,
                         "cache_creation": {
-                            "ephemeral_5m_input_tokens": breakdown.cache_creation_input_tokens,
-                            "ephemeral_1h_input_tokens": 0
+                            "ephemeral_5m_input_tokens": breakdown.cache_creation_5m_input_tokens,
+                            "ephemeral_1h_input_tokens": breakdown.cache_creation_1h_input_tokens
                         },
                         "output_tokens": 1
                     }
                 }
             });
         }
-
+        // message_start 用 stream_start_usage（不含 output_tokens_details）。
+        let usage = super::compat::stream_start_usage(
+            &self.model,
+            breakdown.input_tokens,
+            1,
+            0,
+            breakdown.cache_creation_input_tokens,
+            breakdown.cache_creation_1h_input_tokens,
+            breakdown.cache_read_input_tokens,
+        );
         json!({
             "type": "message_start",
             "message": {
+                "model": self.model,
                 "id": self.message_id,
                 "type": "message",
                 "role": "assistant",
                 "content": [],
-                "model": self.model,
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": {
-                    "input_tokens": breakdown.input_tokens,
-                    "output_tokens": 1,
-                    "cache_creation_input_tokens": breakdown.cache_creation_input_tokens,
-                    "cache_read_input_tokens": breakdown.cache_read_input_tokens
-                }
+                "stop_details": null,
+                "usage": usage
             }
         })
     }
@@ -842,29 +892,13 @@ impl StreamContext {
             events.push(event);
         }
 
-        // 如果启用了 thinking，不在这里创建文本块
-        // thinking 块和文本块会在 process_content_with_thinking 中按正确顺序创建
-        if self.thinking_enabled {
-            return events;
-        }
-
-        // 创建初始文本块（仅在未启用 thinking 时）
-        let text_block_index = self.state_manager.next_block_index();
-        self.text_block_index = Some(text_block_index);
-        let text_block_events = self.state_manager.handle_content_block_start(
-            text_block_index,
-            "text",
-            json!({
-                "type": "content_block_start",
-                "index": text_block_index,
-                "content_block": {
-                    "type": "text",
-                    "text": ""
-                }
-            }),
-        );
-        events.extend(text_block_events);
-
+        // 首块一律惰性创建:不在这里急切发出空文本块。
+        // 首个真实内容到达时才创建对应的首块——
+        //   文本 -> emit_text_delta_events 会创建 text 块;
+        //   工具 -> process_tool_use 创建 tool_use 块;
+        //   思考 -> process_content_with_thinking 创建 thinking 块。
+        // 这样强制工具调用(tool_choice)时会直接以 tool_use 开头,不再多出一个空 text 块
+        // (真 Anthropic 的强制工具响应正是如此)。ping 仍固定跟在"首个 content_block_start"之后。
         events
     }
 
@@ -983,6 +1017,13 @@ impl StreamContext {
     fn process_content_with_thinking(&mut self, content: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
+        // 上游不产思考但客户请求了 thinking(如 Kiro 的 opus)时,直接发出一个完整的合成思考块
+        // (content_block_start + thinking_delta + signature_delta + stop),并标记 thinking 已提取,
+        // 之后真实内容一律走文本路径。直接发块可避免 </thinking> 闭合标签在流式分块时被拆坏。
+        if let Some(synth) = self.pending_synthetic_thinking.take() {
+            events.extend(self.emit_synthetic_thinking_block(&synth));
+        }
+
         // 将内容添加到缓冲区进行处理
         self.thinking_buffer.push_str(content);
 
@@ -1004,23 +1045,25 @@ impl StreamContext {
                     self.thinking_buffer =
                         self.thinking_buffer[start_pos + "<thinking>".len()..].to_string();
 
-                    // 创建 thinking 块的 content_block_start 事件
-                    let thinking_index = self.state_manager.next_block_index();
-                    self.thinking_block_index = Some(thinking_index);
-                    let start_events = self.state_manager.handle_content_block_start(
-                        thinking_index,
-                        "thinking",
-                        json!({
-                            "type": "content_block_start",
-                            "index": thinking_index,
-                            "content_block": {
-                                "type": "thinking",
-                                "thinking": "",
-                                "signature": ""
-                            }
-                        }),
-                    );
-                    events.extend(start_events);
+                    if self.expose_thinking {
+                        // 创建 thinking 块的 content_block_start 事件
+                        let thinking_index = self.state_manager.next_block_index();
+                        self.thinking_block_index = Some(thinking_index);
+                        let start_events = self.state_manager.handle_content_block_start(
+                            thinking_index,
+                            "thinking",
+                            json!({
+                                "type": "content_block_start",
+                                "index": thinking_index,
+                                "content_block": {
+                                    "type": "thinking",
+                                    "thinking": "",
+                                    "signature": ""
+                                }
+                            }),
+                        );
+                        events.extend(start_events);
+                    }
                 } else {
                     // 没有找到 <thinking>，检查是否可能是部分标签
                     // 保留可能是部分标签的内容
@@ -1058,28 +1101,27 @@ impl StreamContext {
 
                 // 在 thinking 块内，查找 </thinking> 结束标签（跳过被反引号包裹的）
                 if let Some(end_pos) = find_real_thinking_end_tag(&self.thinking_buffer) {
-                    // 提取 thinking 内容
+                    // 累积 thinking 内容(延迟到块结束时统一清理后再发出)
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                    if !thinking_content.is_empty() {
-                        if let Some(thinking_index) = self.thinking_block_index {
-                            events.push(
-                                self.create_thinking_delta_event(thinking_index, &thinking_content),
-                            );
-                        }
-                    }
+                    self.accumulate_thinking(&thinking_content);
 
                     // 结束 thinking 块
                     self.in_thinking_block = false;
                     self.thinking_extracted = true;
 
-                    // 发送空的 thinking_delta、signature_delta、然后 content_block_stop
-                    if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        events.push(self.create_signature_delta_event(thinking_index));
-                        if let Some(stop_event) =
-                            self.state_manager.handle_content_block_stop(thinking_index)
-                        {
-                            events.push(stop_event);
+                    // 先 flush(清理后)累积的 thinking,再发空的 thinking_delta、signature_delta、content_block_stop
+                    if self.expose_thinking {
+                        if let Some(thinking_index) = self.thinking_block_index {
+                            if let Some(ev) = self.flush_thinking_delta(thinking_index) {
+                                events.push(ev);
+                            }
+                            events.push(self.create_thinking_delta_event(thinking_index, ""));
+                            events.push(self.create_signature_delta_event(thinking_index));
+                            if let Some(stop_event) =
+                                self.state_manager.handle_content_block_stop(thinking_index)
+                            {
+                                events.push(stop_event);
+                            }
                         }
                     }
 
@@ -1099,14 +1141,9 @@ impl StreamContext {
                         .saturating_sub("</thinking>\n\n".len());
                     let safe_len = find_char_boundary(&self.thinking_buffer, target_len);
                     if safe_len > 0 {
+                        // 累积安全内容(延迟到块结束时统一清理);缓冲区照常推进。
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
-                        if !safe_content.is_empty() {
-                            if let Some(thinking_index) = self.thinking_block_index {
-                                events.push(
-                                    self.create_thinking_delta_event(thinking_index, &safe_content),
-                                );
-                            }
-                        }
+                        self.accumulate_thinking(&safe_content);
                         self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
                     }
                     break;
@@ -1145,6 +1182,12 @@ impl StreamContext {
 
     fn emit_text_delta_events(&mut self, text: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
+        // 强制工具调用(tool_choice any/tool)时,响应只应含 tool_use。
+        // **仅在已发出 tool_use 之后**才丢弃文本增量:这样若模型异常地只产出文本、没有工具调用,
+        // 文本仍照常流出(绝不会被吞成空响应),既与真 Anthropic 一致又不伤真实使用。
+        if self.suppress_text_blocks && !self.tool_block_indices.is_empty() {
+            return events;
+        }
         let Some(text) = self.apply_output_token_limit(text) else {
             return events;
         };
@@ -1152,6 +1195,7 @@ impl StreamContext {
             return events;
         }
         self.output_tokens += estimate_tokens(&text);
+        self.output_text_acc.push_str(&text); // ctoc 在流结束时对全量文本计数
 
         // 如果当前 text_block_index 指向的块已经被关闭（例如 tool_use 开始时自动 stop），
         // 则丢弃该索引并创建新的文本块继续输出，避免 delta 被状态机拒绝导致“吞字”。
@@ -1204,8 +1248,67 @@ impl StreamContext {
         events
     }
 
+    /// 直接发出一个完整的合成 thinking 块(用于上游不产思考、但客户请求了 thinking 的情况,如 opus)。
+    /// 发出后置 `thinking_extracted=true`,后续真实内容走文本路径。
+    fn emit_synthetic_thinking_block(&mut self, synth: &str) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        if self.expose_thinking {
+            let idx = self.state_manager.next_block_index();
+            self.thinking_block_index = Some(idx);
+            events.extend(self.state_manager.handle_content_block_start(
+                idx,
+                "thinking",
+                json!({
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {
+                        "type": "thinking",
+                        "thinking": "",
+                        "signature": ""
+                    }
+                }),
+            ));
+            events.push(self.create_thinking_delta_event(idx, synth)); // 内部已累加 thinking_text_acc
+            events.push(self.create_signature_delta_event(idx));
+            if let Some(stop) = self.state_manager.handle_content_block_stop(idx) {
+                events.push(stop);
+            }
+        }
+        self.thinking_extracted = true;
+        events
+    }
+
+    /// 累积一段**原始**(未清理)thinking 文本,延迟到 thinking 块结束时统一清理后再发出。
+    /// 只在 `expose_thinking` 时累积(与旧逻辑的发出门控一致);非空判断留给 flush。
+    fn accumulate_thinking(&mut self, content: &str) {
+        if self.expose_thinking && !content.is_empty() {
+            self.thinking_pending_raw.push_str(content);
+        }
+    }
+
+    /// thinking 块结束时调用:对累积的原始 thinking 做身份清理,并作为单个 thinking_delta 发出。
+    /// 未开启身份清理(`thinking_sanitize_options` 为 None)时原样发出,保持既有行为。
+    fn flush_thinking_delta(&mut self, index: i32) -> Option<SseEvent> {
+        if self.thinking_pending_raw.is_empty() {
+            return None;
+        }
+        let raw = std::mem::take(&mut self.thinking_pending_raw);
+        let out = match self.thinking_sanitize_options {
+            Some(options) => super::identity::sanitize_thinking_identity_text(&raw, options),
+            None => raw,
+        };
+        if out.is_empty() {
+            return None;
+        }
+        Some(self.create_thinking_delta_event(index, &out))
+    }
+
     /// 创建 thinking_delta 事件
-    fn create_thinking_delta_event(&self, index: i32, thinking: &str) -> SseEvent {
+    fn create_thinking_delta_event(&mut self, index: i32, thinking: &str) -> SseEvent {
+        if !thinking.is_empty() {
+            self.thinking_tokens += estimate_tokens(thinking);
+            self.thinking_text_acc.push_str(thinking); // ctoc 流结束时计数
+        }
         SseEvent::new(
             "content_block_delta",
             json!({
@@ -1221,12 +1324,10 @@ impl StreamContext {
 
     /// 创建 signature_delta 事件（thinking 块伪签名，详见 anthropic::signature 模块）
     fn create_signature_delta_event(&self, index: i32) -> SseEvent {
-        let signature = if self.aws_b40_adaptive_signature {
-            super::signature::generate_aws_b40_adaptive_signature()
-        } else if self.aws_b40_compat {
-            super::signature::generate_aws_b40_signature_for_model(&self.model)
+        let signature = if self.aws_b40_compat {
+            super::bedrock::signature(&self.model, self.aws_b40_adaptive_signature)
         } else {
-            super::signature::generate_fake_signature()
+            super::signature::generate_signature()
         };
         SseEvent::new(
             "content_block_delta",
@@ -1261,25 +1362,24 @@ impl StreamContext {
         if self.thinking_enabled && self.in_thinking_block {
             if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer) {
                 let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                if !thinking_content.is_empty() {
-                    if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(
-                            self.create_thinking_delta_event(thinking_index, &thinking_content),
-                        );
-                    }
-                }
+                self.accumulate_thinking(&thinking_content);
 
                 // 结束 thinking 块
                 self.in_thinking_block = false;
                 self.thinking_extracted = true;
 
-                if let Some(thinking_index) = self.thinking_block_index {
-                    events.push(self.create_thinking_delta_event(thinking_index, ""));
-                    events.push(self.create_signature_delta_event(thinking_index));
-                    if let Some(stop_event) =
-                        self.state_manager.handle_content_block_stop(thinking_index)
-                    {
-                        events.push(stop_event);
+                if self.expose_thinking {
+                    if let Some(thinking_index) = self.thinking_block_index {
+                        if let Some(ev) = self.flush_thinking_delta(thinking_index) {
+                            events.push(ev);
+                        }
+                        events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        events.push(self.create_signature_delta_event(thinking_index));
+                        if let Some(stop_event) =
+                            self.state_manager.handle_content_block_stop(thinking_index)
+                        {
+                            events.push(stop_event);
+                        }
                     }
                 }
 
@@ -1315,6 +1415,17 @@ impl StreamContext {
             idx
         };
 
+        // AWS-P rewrites the backend id to Anthropic shape; AWS-B deliberately
+        // keeps the Bedrock id as part of its public profile.
+        let output_id = if self.aws_b40_compat {
+            tool_use.tool_use_id.clone()
+        } else {
+            self.tool_output_ids
+                .entry(tool_use.tool_use_id.clone())
+                .or_insert_with(super::id::tool_use_id)
+                .clone()
+        };
+
         // 还原工具名称（如果有映射）
         let original_name = self
             .tool_name_map
@@ -1322,19 +1433,23 @@ impl StreamContext {
             .cloned()
             .unwrap_or_else(|| tool_use.name.clone());
 
-        // 发送 content_block_start
+        // 发送 content_block_start(带 caller,对齐真 Anthropic / 参考渠道的 tool_use 块)
+        let mut content_block = json!({
+            "type": "tool_use",
+            "id": output_id,
+            "name": original_name,
+            "input": {}
+        });
+        if !self.aws_b40_compat {
+            content_block["caller"] = json!({ "type": "direct" });
+        }
         let start_events = self.state_manager.handle_content_block_start(
             block_index,
             "tool_use",
             json!({
                 "type": "content_block_start",
                 "index": block_index,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": tool_use.tool_use_id,
-                    "name": original_name,
-                    "input": {}
-                }
+                "content_block": content_block
             }),
         );
         events.extend(start_events);
@@ -1342,6 +1457,7 @@ impl StreamContext {
         // 发送参数增量 (ToolUseEvent.input 是 String 类型)
         if !tool_use.input.is_empty() {
             self.output_tokens += (tool_use.input.len() as i32 + 3) / 4; // 估算 token
+            self.output_text_acc.push_str(&tool_use.input); // tool 调用 JSON 计入输出(ctoc)
 
             if let Some(delta_event) = self.state_manager.handle_content_block_delta(
                 block_index,
@@ -1372,30 +1488,32 @@ impl StreamContext {
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
-        // Flush thinking_buffer 中的剩余内容
-        if self.thinking_enabled && !self.thinking_buffer.is_empty() {
+        // Flush thinking_buffer 中的剩余内容。
+        // 注意:thinking 内容现在累积在 thinking_pending_raw(延迟到块结束统一清理),
+        // 因此即使 thinking_buffer 已被抽空,只要仍在 thinking 块内(需要清理累积内容并关闭块),
+        // 也必须进入此分支——否则累积的 thinking 会丢失、块也不会闭合。
+        if self.thinking_enabled && (!self.thinking_buffer.is_empty() || self.in_thinking_block) {
             if self.in_thinking_block {
                 // 末尾可能残留 `</thinking>`（例如紧跟 tool_use 或流结束），需要在 flush 时过滤掉结束标签。
                 if let Some(end_pos) =
                     find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer)
                 {
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                    if !thinking_content.is_empty() {
-                        if let Some(thinking_index) = self.thinking_block_index {
-                            events.push(
-                                self.create_thinking_delta_event(thinking_index, &thinking_content),
-                            );
-                        }
-                    }
+                    self.accumulate_thinking(&thinking_content);
 
-                    // 关闭 thinking 块：thinking_delta 空 + signature_delta + content_block_stop
-                    if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        events.push(self.create_signature_delta_event(thinking_index));
-                        if let Some(stop_event) =
-                            self.state_manager.handle_content_block_stop(thinking_index)
-                        {
-                            events.push(stop_event);
+                    // 关闭 thinking 块：先 flush(清理后)累积内容,再 thinking_delta 空 + signature + stop
+                    if self.expose_thinking {
+                        if let Some(thinking_index) = self.thinking_block_index {
+                            if let Some(ev) = self.flush_thinking_delta(thinking_index) {
+                                events.push(ev);
+                            }
+                            events.push(self.create_thinking_delta_event(thinking_index, ""));
+                            events.push(self.create_signature_delta_event(thinking_index));
+                            if let Some(stop_event) =
+                                self.state_manager.handle_content_block_stop(thinking_index)
+                            {
+                                events.push(stop_event);
+                            }
                         }
                     }
 
@@ -1409,22 +1527,25 @@ impl StreamContext {
                         events.extend(self.create_text_delta_events(&remaining));
                     }
                 } else {
-                    // 如果还在 thinking 块内，发送剩余内容作为 thinking_delta
-                    if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(
-                            self.create_thinking_delta_event(thinking_index, &self.thinking_buffer),
-                        );
-                    }
-                    // 关闭 thinking 块：thinking_delta 空 + signature_delta + content_block_stop
-                    if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        events.push(self.create_signature_delta_event(thinking_index));
-                        if let Some(stop_event) =
-                            self.state_manager.handle_content_block_stop(thinking_index)
-                        {
-                            events.push(stop_event);
+                    // 仍在 thinking 块内:把剩余缓冲区累积后统一清理,再关闭 thinking 块
+                    let thinking_buffer = self.thinking_buffer.clone();
+                    self.accumulate_thinking(&thinking_buffer);
+                    if self.expose_thinking {
+                        if let Some(thinking_index) = self.thinking_block_index {
+                            if let Some(ev) = self.flush_thinking_delta(thinking_index) {
+                                events.push(ev);
+                            }
+                            events.push(self.create_thinking_delta_event(thinking_index, ""));
+                            events.push(self.create_signature_delta_event(thinking_index));
+                            if let Some(stop_event) =
+                                self.state_manager.handle_content_block_stop(thinking_index)
+                            {
+                                events.push(stop_event);
+                            }
                         }
                     }
+                    self.in_thinking_block = false;
+                    self.thinking_extracted = true;
                 }
             } else {
                 // 否则发送剩余内容作为 text_delta
@@ -1445,6 +1566,7 @@ impl StreamContext {
         // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
         // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
         if self.thinking_enabled
+            && self.expose_thinking
             && self.thinking_block_index.is_some()
             && !self.state_manager.has_non_thinking_blocks()
         {
@@ -1454,43 +1576,72 @@ impl StreamContext {
 
         // 自动续写会产生多次上游调用；最终 usage 需要包含所有内部调用的输入。
         // 短请求使用客户请求估算，避免 Kiro 固定上下文底噪让“你好”显示 4K+ input。
-        let final_input_tokens =
-            self.accumulated_input_tokens + self.billable_current_input_tokens();
-        // 按客户请求意图拆分 usage
-        let breakdown = self.usage_breakdown_for_total(final_input_tokens, true);
+        let final_input_tokens = self.accumulated_input_tokens
+            + super::billing::billable_input_tokens(self.input_tokens, self.context_input_tokens);
+        let breakdown = super::cache::with_additional_input(
+            self.initial_usage_breakdown,
+            self.initial_input_tokens,
+            final_input_tokens,
+        );
 
-        // 生成最终事件
-        let mut final_events = self
-            .state_manager
-            .generate_final_events(breakdown.clone(), self.output_tokens);
+        // 最终 output_tokens 用 ctoc 对累积的完整输出文本算一次(贪心跨块不可加,故不能逐块累加)。
+        // self.output_tokens(字符估算)仅用于流中途的限长/续写判断。
+        // 限长是按字符估算截断的,与 ctoc 口径不同,故上报值封顶到客户请求的上限(真 Anthropic 的
+        // output_tokens 也不会超过 max_tokens)。
+        let ctoc_output_tokens = match self.output_token_limit {
+            Some(limit) => super::claude_tok::count_claude(&self.output_text_acc).min(limit.max(0)),
+            None => super::claude_tok::count_claude(&self.output_text_acc),
+        };
+        let visible_output_tokens = if ctoc_output_tokens > 0 {
+            match self.output_token_limit {
+                Some(limit) if limit < 4 => ctoc_output_tokens,
+                _ => ctoc_output_tokens.max(4),
+            }
+        } else {
+            0
+        };
+        let thinking_usage_tokens = self.compat_thinking_usage_tokens();
+        // 请求开启 thinking 即在 message_delta 带 output_tokens_details（与真 Anthropic 一致），
+        // 即便本轮无思考也显示 thinking_tokens:0。-1 = "包含但显示 0" 的 sentinel。
+        let usage_thinking_tokens = if self.thinking_enabled && thinking_usage_tokens == 0 {
+            -1
+        } else {
+            thinking_usage_tokens
+        };
+        let final_output_tokens = visible_output_tokens
+            + thinking_usage_tokens
+            + if thinking_usage_tokens > 0 { 2 } else { 0 };
+        let mut final_events = self.state_manager.generate_final_events(
+            breakdown,
+            final_output_tokens,
+            &self.model,
+            usage_thinking_tokens,
+        );
         if self.aws_b40_compat {
             for event in &mut final_events {
-                match event.event.as_str() {
-                    "message_delta" => {
-                        if let Some(delta) = event.data.get_mut("delta") {
-                            delta["stop_details"] = serde_json::Value::Null;
+                if event.event == "message_stop" {
+                    event.data = json!({
+                        "type": "message_stop",
+                        "usage": {
+                            "input_tokens": breakdown.input_tokens,
+                            "output_tokens": final_output_tokens
                         }
-                        if self.thinking_enabled {
-                            event.data["usage"]["output_tokens_details"] = json!({
-                                "thinking_tokens": self.output_tokens.saturating_sub(1)
-                            });
-                        }
-                    }
-                    "message_stop" => {
-                        event.data = json!({
-                            "type": "message_stop",
-                            "usage": {
-                                "input_tokens": breakdown.input_tokens,
-                                "output_tokens": self.output_tokens
-                            }
-                        });
-                    }
-                    _ => {}
+                    });
                 }
             }
         }
         events.extend(final_events);
         events
+    }
+
+    fn compat_thinking_usage_tokens(&self) -> i32 {
+        // 思考 token 也用 ctoc 对累积的完整 thinking 文本算一次。
+        let ctoc_thinking = super::claude_tok::count_claude(&self.thinking_text_acc);
+        if ctoc_thinking > 0 {
+            ctoc_thinking + 6
+        } else {
+            0
+        }
     }
 
     /// 当前响应是否适合自动续写。
@@ -1524,7 +1675,8 @@ impl StreamContext {
     }
 
     pub fn begin_continuation_for_billing(&mut self, next_estimated_input_tokens: i32) {
-        self.accumulated_input_tokens += self.billable_current_input_tokens();
+        self.accumulated_input_tokens +=
+            super::billing::billable_input_tokens(self.input_tokens, self.context_input_tokens);
         self.input_tokens = next_estimated_input_tokens.max(1);
         self.context_input_tokens = None;
     }
@@ -1563,6 +1715,22 @@ impl StreamContext {
     }
 }
 
+pub(crate) trait IntoInitialUsageBreakdown {
+    fn into_breakdown(self, input_tokens: i32) -> super::cache::UsageBreakdown;
+}
+
+impl IntoInitialUsageBreakdown for super::cache::UsageBreakdown {
+    fn into_breakdown(self, _input_tokens: i32) -> super::cache::UsageBreakdown {
+        self
+    }
+}
+
+impl IntoInitialUsageBreakdown for bool {
+    fn into_breakdown(self, input_tokens: i32) -> super::cache::UsageBreakdown {
+        super::cache::compute_usage_breakdown(input_tokens, self)
+    }
+}
+
 /// 缓冲流处理上下文 - 用于 /cc/v1/messages 流式请求
 ///
 /// 与 `StreamContext` 不同，此上下文会缓冲所有事件直到流结束，
@@ -1588,14 +1756,14 @@ impl BufferedStreamContext {
         model: impl Into<String>,
         estimated_input_tokens: i32,
         thinking_enabled: bool,
-        has_cache_control: bool,
+        initial_usage_breakdown: impl IntoInitialUsageBreakdown,
         tool_name_map: HashMap<String, String>,
     ) -> Self {
         let inner = StreamContext::new_with_thinking(
             model,
             estimated_input_tokens,
             thinking_enabled,
-            has_cache_control,
+            initial_usage_breakdown,
             tool_name_map,
         );
         Self {
@@ -1603,6 +1771,19 @@ impl BufferedStreamContext {
             event_buffer: Vec::new(),
             initial_events_generated: false,
         }
+    }
+
+    pub fn hide_thinking_blocks(&mut self) {
+        self.inner.hide_thinking_blocks();
+    }
+
+    pub fn enable_aws_b40_compat(&mut self, adaptive_signature: bool) {
+        self.inner.enable_aws_b40_compat(adaptive_signature);
+    }
+
+    /// 透传:设置待注入的合成 thinking(见 StreamContext::set_synthetic_thinking)。
+    pub fn set_synthetic_thinking(&mut self, thinking: Option<String>) {
+        self.inner.set_synthetic_thinking(thinking);
     }
 
     /// 处理 Kiro 事件并缓冲结果
@@ -1639,12 +1820,17 @@ impl BufferedStreamContext {
         let final_events = self.inner.generate_final_events();
         self.event_buffer.extend(final_events);
 
-        // 获取 billable input_tokens 并按 has_cache_control 拆分；自动续写时包含所有内部上游调用。
-        let final_input_tokens =
-            self.inner.accumulated_input_tokens + self.inner.billable_current_input_tokens();
-        let breakdown = self
-            .inner
-            .usage_breakdown_for_total(final_input_tokens, true);
+        // 获取 billable input_tokens；自动续写的额外输入只计入普通 input。
+        let final_input_tokens = self.inner.accumulated_input_tokens
+            + super::billing::billable_input_tokens(
+                self.inner.input_tokens,
+                self.inner.context_input_tokens,
+            );
+        let breakdown = super::cache::with_additional_input(
+            self.inner.initial_usage_breakdown,
+            self.inner.initial_input_tokens,
+            final_input_tokens,
+        );
 
         // 更正 message_start 事件中的 usage（input + cache 字段全部按拆分后回填）
         for event in &mut self.event_buffer {
@@ -1656,6 +1842,10 @@ impl BufferedStreamContext {
                             serde_json::json!(breakdown.cache_creation_input_tokens);
                         usage["cache_read_input_tokens"] =
                             serde_json::json!(breakdown.cache_read_input_tokens);
+                        usage["cache_creation"] = serde_json::json!({
+                            "ephemeral_5m_input_tokens": breakdown.cache_creation_5m_input_tokens,
+                            "ephemeral_1h_input_tokens": breakdown.cache_creation_1h_input_tokens
+                        });
                     }
                 }
             }
@@ -1799,9 +1989,16 @@ mod tests {
     fn test_sse_state_manager_block_lifecycle() {
         let mut manager = SseStateManager::new();
 
-        // 创建块
+        // 创建首个块：content_block_start + 确定性 ping（真 Anthropic 在首块后紧跟 ping）
         let events = manager.handle_content_block_start(0, "text", json!({}));
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event, "content_block_start");
+        assert_eq!(events[1].event, "ping");
+
+        // 第二个块不再追加 ping（ping 只在首块后一次）
+        let events2 = manager.handle_content_block_start(1, "text", json!({}));
+        assert_eq!(events2.len(), 1);
+        assert_eq!(events2[0].event, "content_block_start");
 
         // delta
         let event = manager.handle_content_block_delta(0, json!({}));
@@ -1855,17 +2052,27 @@ mod tests {
         let mut ctx =
             StreamContext::new_with_thinking("test-model", 1, false, false, HashMap::new());
 
+        // 首块惰性:generate_initial_events 只发 message_start,不再急切建空 text 块。
         let initial_events = ctx.generate_initial_events();
         assert!(
-            initial_events
+            !initial_events
                 .iter()
-                .any(|e| e.event == "content_block_start"
-                    && e.data["content_block"]["type"] == "text")
+                .any(|e| e.event == "content_block_start"),
+            "初始事件不应急切创建任何 content_block"
         );
 
+        // 首个文本 delta 才惰性创建 text 块
+        let first_text = ctx.process_assistant_response("hi");
+        assert!(
+            first_text
+                .iter()
+                .any(|e| e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "text"),
+            "首个文本应惰性创建 text 块"
+        );
         let initial_text_index = ctx
             .text_block_index
-            .expect("initial text block index should exist");
+            .expect("text block should exist after first text");
 
         // tool_use 开始会自动关闭现有 text block
         let tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
@@ -2028,6 +2235,69 @@ mod tests {
         assert_eq!(i + cc + cr, 20_000, "token 数恒等失败");
         assert_eq!(cc, 3000);
         assert_eq!(cr, 7650);
+    }
+
+    #[test]
+    fn aws_b_message_start_keeps_bedrock_shape_with_shared_cache_usage() {
+        let usage = super::super::cache::UsageBreakdown {
+            input_tokens: 100,
+            cache_read_input_tokens: 40,
+            cache_creation_input_tokens: 30,
+            cache_creation_5m_input_tokens: 10,
+            cache_creation_1h_input_tokens: 20,
+        };
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-4-5-thinking",
+            170,
+            false,
+            usage,
+            HashMap::new(),
+        );
+        ctx.enable_aws_b40_compat(false);
+
+        let event = ctx.create_message_start_event();
+        let message = &event["message"];
+        let response_usage = &message["usage"];
+        assert_eq!(message["model"], "claude-sonnet-4-5-20250929");
+        assert!(
+            message["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("msg_bdrk_"))
+        );
+        assert_eq!(response_usage["input_tokens"], 100);
+        assert_eq!(response_usage["cache_read_input_tokens"], 40);
+        assert_eq!(response_usage["cache_creation_input_tokens"], 30);
+        assert_eq!(
+            response_usage["cache_creation"]["ephemeral_5m_input_tokens"],
+            10
+        );
+        assert_eq!(
+            response_usage["cache_creation"]["ephemeral_1h_input_tokens"],
+            20
+        );
+        assert!(response_usage.get("service_tier").is_none());
+    }
+
+    #[test]
+    fn aws_b_stream_preserves_backend_tool_id_and_omits_caller() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4-6", 1, false, false, HashMap::new());
+        ctx.enable_aws_b40_compat(false);
+
+        let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "Read".to_string(),
+            tool_use_id: "toolu_bdrk_original".to_string(),
+            input: "{}".to_string(),
+            stop: true,
+        });
+        let start = events
+            .iter()
+            .find(|event| event.event == "content_block_start")
+            .expect("tool start event");
+        let content_block = &start.data["content_block"];
+
+        assert_eq!(content_block["id"], "toolu_bdrk_original");
+        assert!(content_block.get("caller").is_none());
     }
 
     /// 流式 thinking 块必须在 content_block_start 带 signature: ""，

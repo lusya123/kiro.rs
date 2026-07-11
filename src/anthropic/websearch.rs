@@ -211,6 +211,7 @@ pub fn parse_search_results(mcp_response: &McpResponse) -> Option<WebSearchResul
 }
 
 /// 生成 WebSearch SSE 响应流
+#[allow(dead_code)]
 pub fn create_websearch_sse_stream(
     model: String,
     query: String,
@@ -218,8 +219,32 @@ pub fn create_websearch_sse_stream(
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let events =
-        generate_websearch_events(&model, &query, &tool_use_id, search_results, input_tokens);
+    create_websearch_sse_stream_with_profile(
+        model,
+        query,
+        tool_use_id,
+        search_results,
+        input_tokens,
+        false,
+    )
+}
+
+fn create_websearch_sse_stream_with_profile(
+    model: String,
+    query: String,
+    tool_use_id: String,
+    search_results: Option<WebSearchResults>,
+    input_tokens: i32,
+    aws_b40_compat: bool,
+) -> impl Stream<Item = Result<Bytes, Infallible>> {
+    let events = generate_websearch_events(
+        &model,
+        &query,
+        &tool_use_id,
+        search_results,
+        input_tokens,
+        aws_b40_compat,
+    );
 
     stream::iter(
         events
@@ -235,9 +260,19 @@ fn generate_websearch_events(
     tool_use_id: &str,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    aws_b40_compat: bool,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
-    let message_id = id::message_id();
+    let message_id = if aws_b40_compat {
+        super::bedrock::response_id(model)
+    } else {
+        id::message_id()
+    };
+    let public_model = if aws_b40_compat {
+        super::bedrock::response_model(model)
+    } else {
+        model.to_string()
+    };
 
     // 1. message_start
     events.push(SseEvent::new(
@@ -248,7 +283,7 @@ fn generate_websearch_events(
                 "id": message_id,
                 "type": "message",
                 "role": "assistant",
-                "model": model,
+                "model": public_model,
                 "content": [],
                 "stop_reason": null,
                 "usage": {
@@ -261,32 +296,38 @@ fn generate_websearch_events(
         }),
     ));
 
-    // 2. content_block_start (text - 搜索决策说明, index 0)
-    let decision_text = format!("I'll search for \"{}\".", query);
+    // 2. content_block_start (server_tool_use, index 0) —— 对齐真 Claude(pomoai/Bedrock):
+    // web search 直接以 server_tool_use 开头,**不带**前导"I'll search…"文本块(否则块数比真 Claude 多 1)。
+    // start 时 input 为空对象,随后用 input_json_delta 增量发送,再 stop。
     events.push(SseEvent::new(
         "content_block_start",
         json!({
             "type": "content_block_start",
             "index": 0,
             "content_block": {
-                "type": "text",
-                "text": ""
+                "id": tool_use_id,
+                "type": "server_tool_use",
+                "name": "web_search",
+                "input": {}
             }
         }),
     ));
 
+    // 2b. input_json_delta:query 以 JSON 字符串增量发送
+    let query_json = json!({ "query": query }).to_string();
     events.push(SseEvent::new(
         "content_block_delta",
         json!({
             "type": "content_block_delta",
             "index": 0,
             "delta": {
-                "type": "text_delta",
-                "text": decision_text
+                "type": "input_json_delta",
+                "partial_json": query_json
             }
         }),
     ));
 
+    // 3. content_block_stop (server_tool_use)
     events.push(SseEvent::new(
         "content_block_stop",
         json!({
@@ -295,34 +336,8 @@ fn generate_websearch_events(
         }),
     ));
 
-    // 3. content_block_start (server_tool_use, index 1)
-    // server_tool_use 是服务端工具，input 在 content_block_start 中一次性完整发送，
-    // 不像客户端 tool_use 需要通过 input_json_delta 增量传输。
-    events.push(SseEvent::new(
-        "content_block_start",
-        json!({
-            "type": "content_block_start",
-            "index": 1,
-            "content_block": {
-                "id": tool_use_id,
-                "type": "server_tool_use",
-                "name": "web_search",
-                "input": {"query": query}
-            }
-        }),
-    ));
-
-    // 4. content_block_stop (server_tool_use)
-    events.push(SseEvent::new(
-        "content_block_stop",
-        json!({
-            "type": "content_block_stop",
-            "index": 1
-        }),
-    ));
-
     // 5. content_block_start (web_search_tool_result, index 2)
-    // 官方 API 的 web_search_tool_result 没有 tool_use_id 字段
+    // 真 Anthropic 的 web_search_tool_result 带 tool_use_id,指向前面的 server_tool_use.id
     let search_content = if let Some(ref results) = search_results {
         results
             .results
@@ -349,9 +364,10 @@ fn generate_websearch_events(
         "content_block_start",
         json!({
             "type": "content_block_start",
-            "index": 2,
+            "index": 1,
             "content_block": {
                 "type": "web_search_tool_result",
+                "tool_use_id": tool_use_id,
                 "content": search_content
             }
         }),
@@ -362,7 +378,7 @@ fn generate_websearch_events(
         "content_block_stop",
         json!({
             "type": "content_block_stop",
-            "index": 2
+            "index": 1
         }),
     ));
 
@@ -371,7 +387,7 @@ fn generate_websearch_events(
         "content_block_start",
         json!({
             "type": "content_block_start",
-            "index": 3,
+            "index": 2,
             "content_block": {
                 "type": "text",
                 "text": ""
@@ -390,7 +406,7 @@ fn generate_websearch_events(
             "content_block_delta",
             json!({
                 "type": "content_block_delta",
-                "index": 3,
+                "index": 2,
                 "delta": {
                     "type": "text_delta",
                     "text": text
@@ -399,12 +415,43 @@ fn generate_websearch_events(
         ));
     }
 
+    // 8b. citations (web_search_result_location) —— 真 Anthropic 会在正文块附来源引用,
+    // 检测器要求文本带 type=web_search_result_location 的 citations。
+    if let Some(ref results) = search_results {
+        for (i, r) in results.results.iter().enumerate() {
+            let cited: String = r
+                .snippet
+                .clone()
+                .unwrap_or_default()
+                .chars()
+                .take(150)
+                .collect();
+            events.push(SseEvent::new(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 2,
+                    "delta": {
+                        "type": "citations_delta",
+                        "citation": {
+                            "type": "web_search_result_location",
+                            "url": r.url,
+                            "title": r.title,
+                            "encrypted_index": format!("{}", i + 1),
+                            "cited_text": cited
+                        }
+                    }
+                }),
+            ));
+        }
+    }
+
     // 9. content_block_stop (text)
     events.push(SseEvent::new(
         "content_block_stop",
         json!({
             "type": "content_block_stop",
-            "index": 3
+            "index": 2
         }),
     ));
 
@@ -430,9 +477,14 @@ fn generate_websearch_events(
     // 11. message_stop
     events.push(SseEvent::new(
         "message_stop",
-        json!({
-            "type": "message_stop"
-        }),
+        if aws_b40_compat {
+            json!({
+                "type": "message_stop",
+                "usage": { "input_tokens": input_tokens, "output_tokens": output_tokens }
+            })
+        } else {
+            json!({ "type": "message_stop" })
+        },
     ));
 
     events
@@ -469,6 +521,7 @@ pub async fn handle_websearch_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
+    aws_b40_compat: bool,
 ) -> Response {
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
@@ -499,10 +552,27 @@ pub async fn handle_websearch_request(
         }
     };
 
-    // 4. 生成 SSE 响应
+    // 4. 按 stream 参数返回:非流式返回 JSON,流式返回 SSE(真 Anthropic 两种都支持)
     let model = payload.model.clone();
-    let stream =
-        create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
+    if !payload.stream {
+        let body = build_websearch_json(
+            &model,
+            &query,
+            &tool_use_id,
+            &search_results,
+            input_tokens,
+            aws_b40_compat,
+        );
+        return (StatusCode::OK, Json(body)).into_response();
+    }
+    let stream = create_websearch_sse_stream_with_profile(
+        model,
+        query,
+        tool_use_id,
+        search_results,
+        input_tokens,
+        aws_b40_compat,
+    );
 
     Response::builder()
         .status(StatusCode::OK)
@@ -511,6 +581,93 @@ pub async fn handle_websearch_request(
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(stream))
         .unwrap()
+}
+
+/// 构造非流式 WebSearch 响应(content: server_tool_use + web_search_tool_result + 带 citations 的 text)
+fn build_websearch_json(
+    model: &str,
+    query: &str,
+    tool_use_id: &str,
+    search_results: &Option<WebSearchResults>,
+    input_tokens: i32,
+    aws_b40_compat: bool,
+) -> serde_json::Value {
+    let search_content: Vec<serde_json::Value> = match search_results {
+        Some(r) => r
+            .results
+            .iter()
+            .map(|x| {
+                let page_age = x.published_date.and_then(|ms| {
+                    chrono::DateTime::from_timestamp_millis(ms)
+                        .map(|dt| dt.format("%B %-d, %Y").to_string())
+                });
+                json!({
+                    "type": "web_search_result",
+                    "title": x.title,
+                    "url": x.url,
+                    "encrypted_content": x.snippet.clone().unwrap_or_default(),
+                    "page_age": page_age
+                })
+            })
+            .collect(),
+        None => vec![],
+    };
+    let citations: Vec<serde_json::Value> = match search_results {
+        Some(r) => r
+            .results
+            .iter()
+            .enumerate()
+            .map(|(i, x)| {
+                let cited: String = x
+                    .snippet
+                    .clone()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(150)
+                    .collect();
+                json!({
+                    "type": "web_search_result_location",
+                    "url": x.url,
+                    "title": x.title,
+                    "encrypted_index": format!("{}", i + 1),
+                    "cited_text": cited
+                })
+            })
+            .collect(),
+        None => vec![],
+    };
+    let summary = generate_search_summary(query, search_results);
+    let output_tokens = (summary.len() as i32 + 3) / 4;
+    let message_id = if aws_b40_compat {
+        super::bedrock::response_id(model)
+    } else {
+        id::message_id()
+    };
+    let public_model = if aws_b40_compat {
+        super::bedrock::response_model(model)
+    } else {
+        model.to_string()
+    };
+    json!({
+        "id": message_id,
+        "type": "message",
+        "role": "assistant",
+        "model": public_model,
+        "content": [
+            {"type": "server_tool_use", "id": tool_use_id, "name": "web_search", "input": {"query": query}},
+            {"type": "web_search_tool_result", "tool_use_id": tool_use_id, "content": search_content},
+            {"type": "text", "text": summary, "citations": citations}
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": {"web_search_requests": 1}
+        }
+    })
 }
 
 /// 调用 Kiro MCP API
@@ -568,6 +725,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            cache_control: None,
             metadata: None,
         };
 
@@ -608,6 +766,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            cache_control: None,
             metadata: None,
         };
 
@@ -635,6 +794,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            cache_control: None,
             metadata: None,
         };
 
@@ -660,6 +820,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            cache_control: None,
             metadata: None,
         };
 

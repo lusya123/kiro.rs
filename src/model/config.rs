@@ -120,7 +120,7 @@ pub struct Config {
     ///
     /// 仅调整本服务对外协议形状（headers、模型列表、错误格式、SSE 细节等），
     /// 不改变真实 Kiro 上游模型。
-    #[serde(default)]
+    #[serde(default = "default_aws_b40_compat")]
     pub aws_b40_compat: bool,
 
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
@@ -188,6 +188,10 @@ fn default_extract_thinking() -> bool {
     true
 }
 
+fn default_aws_b40_compat() -> bool {
+    true
+}
+
 fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
@@ -219,7 +223,7 @@ impl Default for Config {
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
-            aws_b40_compat: false,
+            aws_b40_compat: default_aws_b40_compat(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             config_path: None,
@@ -277,5 +281,25 @@ impl Config {
         fs::write(path, content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aws_b_profile_is_enabled_by_default() {
+        assert!(Config::default().aws_b40_compat);
+
+        let from_empty_json: Config = serde_json::from_str("{}").expect("default config JSON");
+        assert!(from_empty_json.aws_b40_compat);
+    }
+
+    #[test]
+    fn aws_b_profile_can_be_explicitly_disabled() {
+        let config: Config =
+            serde_json::from_str(r#"{"awsB40Compat":false}"#).expect("explicit profile config");
+        assert!(!config.aws_b40_compat);
     }
 }

@@ -159,6 +159,16 @@ pub async fn aws_b40_headers_middleware(
                 HeaderValue::from_static("h3=\":443\"; ma=2592000"),
             );
         }
+    } else {
+        let include_official_headers = path.ends_with("/messages");
+        let is_stream = is_stream_response(&response);
+        let status = response.status();
+        super::compat::add_response_headers(
+            response.headers_mut(),
+            status,
+            is_stream,
+            include_official_headers,
+        );
     }
     response
 }
@@ -270,4 +280,48 @@ pub fn cors_layer() -> tower_http::cors::CorsLayer {
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response(status: StatusCode, content_type: &str) -> Response {
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn aws_b_versions_distinguish_messages_and_streams() {
+        let non_stream = response(StatusCode::OK, "application/json");
+        assert_eq!(
+            aws_b40_version_for_response(&Method::POST, "/v1/messages", &non_stream),
+            "20260501R2"
+        );
+
+        let stream = response(StatusCode::OK, "text/event-stream");
+        assert_eq!(
+            aws_b40_version_for_response(&Method::POST, "/v1/messages", &stream),
+            "0b8be5cf"
+        );
+
+        let models = response(StatusCode::OK, "application/json");
+        assert_eq!(
+            aws_b40_version_for_response(&Method::GET, "/v1/models", &models),
+            "83c64fa5"
+        );
+    }
+
+    #[test]
+    fn aws_b_headers_keep_bedrock_gateway_identity() {
+        let mut headers = header::HeaderMap::new();
+        apply_aws_b40_headers(&mut headers, "request-123");
+
+        assert_eq!(headers["server"], "lyywafcdn");
+        assert_eq!(headers["x-oneapi-request-id"], "request-123");
+        assert_eq!(headers["x-new-api-version"], "83c64fa5");
+    }
 }
