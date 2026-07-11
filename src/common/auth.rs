@@ -6,6 +6,11 @@ use axum::{
 };
 use subtle::ConstantTimeEq;
 
+/// API key 最终会进入 HTTP header，因此只接受非空的可见 ASCII 字符。
+pub fn is_valid_header_secret(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+}
+
 /// 从请求中提取 API Key
 ///
 /// 支持两种认证方式：
@@ -38,4 +43,18 @@ pub fn extract_api_key(request: &Request<Body>) -> Option<String> {
 /// 使用经过安全审计的 `subtle` crate 实现
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_secret_must_be_non_empty_visible_ascii() {
+        assert!(is_valid_header_secret("sk-local_123-ABC"));
+        assert!(!is_valid_header_secret(""));
+        assert!(!is_valid_header_secret(" \t"));
+        assert!(!is_valid_header_secret("a key"));
+        assert!(!is_valid_header_secret("a密钥"));
+    }
 }

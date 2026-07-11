@@ -4,6 +4,7 @@ import { CheckCircle2, XCircle, AlertCircle, Loader2 } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
   DialogFooter,
@@ -410,6 +411,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       <DialogContent className="sm:max-w-2xl max-h-[80vh] flex flex-col">
         <DialogHeader>
           <DialogTitle>KAM 账号导入（自动验活）</DialogTitle>
+          <DialogDescription className="sr-only">从 Kiro Account Manager 导入并验证账号</DialogDescription>
         </DialogHeader>
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">

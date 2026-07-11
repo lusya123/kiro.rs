@@ -282,6 +282,26 @@ const SELF_IDENTITY_REPLACEMENTS: &[(&str, &str)] = &[
 ];
 
 const CONTEXTUAL_IDENTITY_REPLACEMENTS: &[(&str, &str)] = &[
+    (
+        "an amazon aws codewhisperer assistant",
+        "an AI assistant created by Anthropic",
+    ),
+    (
+        "an aws codewhisperer assistant",
+        "an AI assistant created by Anthropic",
+    ),
+    (
+        "an amazon codewhisperer assistant",
+        "an AI assistant created by Anthropic",
+    ),
+    ("a codewhisperer assistant", "an AI assistant created by Anthropic"),
+    ("codewhisperer assistant", "AI assistant"),
+    ("https://kiro.dev", "https://www.anthropic.com"),
+    ("http://kiro.dev", "https://www.anthropic.com"),
+    ("kiro.dev", "anthropic.com"),
+    ("https://claude.dev", "https://www.anthropic.com"),
+    ("http://claude.dev", "https://www.anthropic.com"),
+    ("claude.dev", "anthropic.com"),
     ("您的 kiro ai 助手", " Claude"),
     ("您的kiro ai 助手", " Claude"),
     ("您的 kiro ai助手", " Claude"),
@@ -2791,7 +2811,7 @@ fn replace_identity_terms(text: &str, prior_context: bool) -> (String, bool) {
     let mut identity_context_seen = prior_context;
 
     for (index, ch) in text.char_indices() {
-        if is_sentence_boundary(ch) {
+        if is_sentence_boundary_at(text, index, ch) {
             let sentence_end = index + ch.len_utf8();
             let (sentence, has_identity_context) = replace_identity_terms_in_sentence(
                 &text[sentence_start..sentence_end],
@@ -2878,6 +2898,19 @@ fn replace_identity_terms_with(
 
 fn is_sentence_boundary(ch: char) -> bool {
     matches!(ch, '。' | '！' | '？' | '.' | '!' | '?' | '\n' | '\r')
+}
+
+fn is_sentence_boundary_at(text: &str, index: usize, ch: char) -> bool {
+    if !is_sentence_boundary(ch) {
+        return false;
+    }
+    if ch != '.' {
+        return true;
+    }
+
+    let previous = text[..index].chars().next_back();
+    let next = text[index + ch.len_utf8()..].chars().next();
+    !(is_identifier_char(previous) && is_identifier_char(next))
 }
 
 fn contains_self_reference_marker(text: &str) -> bool {
@@ -3109,7 +3142,9 @@ impl Default for IdentityOutputSanitizer {
 fn last_sentence_boundary_at_or_before(text: &str, limit: usize) -> Option<usize> {
     text.char_indices()
         .take_while(|(index, _)| *index < limit)
-        .filter_map(|(index, ch)| is_sentence_boundary(ch).then_some(index + ch.len_utf8()))
+        .filter_map(|(index, ch)| {
+            is_sentence_boundary_at(text, index, ch).then_some(index + ch.len_utf8())
+        })
         .last()
 }
 
@@ -3809,6 +3844,30 @@ mod tests {
         }
         output.push_str(&sanitizer.finish());
         assert_eq!(output, "我是一个由 Anthropic 创建的 AI 助手，帮助写代码。");
+    }
+
+    #[test]
+    fn conservative_sanitizer_cleans_complete_codewhisperer_self_identity() {
+        let input = "I am Kiro, an Amazon AWS CodeWhisperer assistant. Visit kiro.dev for official support.";
+        assert_eq!(
+            sanitize_identity_text_conservative(input),
+            "I am Claude, an AI assistant created by Anthropic. Visit anthropic.com for official support."
+        );
+
+        let mut sanitizer = IdentityOutputSanitizer::new_with_strict_mode(false);
+        let mut output = String::new();
+        for chunk in [
+            "I am Kiro, ",
+            "an Amazon AWS CodeWhisperer assistant. ",
+            "Visit kiro.dev for official support.",
+        ] {
+            output.push_str(&sanitizer.push(chunk));
+        }
+        output.push_str(&sanitizer.finish());
+        assert_eq!(
+            output,
+            "I am Claude, an AI assistant created by Anthropic. Visit anthropic.com for official support."
+        );
     }
 
     #[test]

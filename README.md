@@ -173,7 +173,7 @@ docker-compose up
 |------|------|--------|------|
 | `host` | string | `127.0.0.1` | 服务监听地址 |
 | `port` | number | `8080` | 服务监听端口 |
-| `apiKey` | string | - | 自定义 API Key（用于客户端认证，必配） |
+| `apiKey` | string | - | 自定义 API Key（用于客户端认证，必配；须为非空可见 ASCII） |
 | `region` | string | `us-east-1` | AWS 区域 |
 | `authRegion` | string | - | Auth Region（用于 Token 刷新），未配置时回退到 region |
 | `apiRegion` | string | - | API Region（用于 API 请求），未配置时回退到 region |
@@ -188,7 +188,7 @@ docker-compose up
 | `proxyUrl` | string | - | HTTP/SOCKS5 代理地址 |
 | `proxyUsername` | string | - | 代理用户名 |
 | `proxyPassword` | string | - | 代理密码 |
-| `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
+| `adminApiKey` | string | - | Admin API 密钥（须为非空可见 ASCII），配置后启用凭据管理 API 和 Web 管理界面 |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `awsB40Compat` | boolean | `true` | 保留 AWS-B/Bedrock 的模型目录、响应头、错误、ID、签名和 SSE 外形；设为 `false` 时使用 AWS-P 外观 |
@@ -388,7 +388,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 | `/v1/models` | GET | 获取可用模型列表 |
 | `/v1/messages` | POST | 创建消息（对话） |
 | `/v1/messages/count_tokens` | POST | 估算 Token 数量 |
-| `/v1/chat/completions` | POST | OpenAI Chat Completions 兼容端点 |
+| `/v1/chat/completions` | POST | OpenAI Chat Completions 兼容端点，支持流式响应与函数工具调用 |
 
 ### Claude Code 兼容端点 (/cc/v1)
 

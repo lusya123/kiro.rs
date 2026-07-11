@@ -4,6 +4,7 @@ import { CheckCircle2, XCircle, AlertCircle, Loader2 } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
   DialogFooter,
@@ -414,6 +415,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       <DialogContent className="sm:max-w-2xl max-h-[80vh] flex flex-col">
         <DialogHeader>
           <DialogTitle>批量导入凭据（自动验活）</DialogTitle>
+          <DialogDescription className="sr-only">批量导入并验证 Kiro 凭据</DialogDescription>
         </DialogHeader>
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">

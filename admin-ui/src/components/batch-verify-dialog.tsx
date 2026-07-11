@@ -1,6 +1,7 @@
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
@@ -40,6 +41,7 @@ export function BatchVerifyDialog({
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>批量验活</DialogTitle>
+          <DialogDescription className="sr-only">查看批量凭据验证的进度和结果</DialogDescription>
         </DialogHeader>
 
         <div className="space-y-4 py-4">

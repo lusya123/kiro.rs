@@ -1,6 +1,7 @@
 //! Anthropic API Handler 函数
 
 use std::convert::Infallible;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::conversation::{
@@ -22,7 +23,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
-use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use serde_json::json;
 use std::time::Duration;
 use tokio::time::{Instant, interval_at};
@@ -39,6 +40,7 @@ use super::websearch;
 
 const MAX_REMOTE_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const REMOTE_IMAGE_FETCH_TIMEOUT_SECS: u64 = 30;
+const MAX_REMOTE_IMAGE_REDIRECTS: usize = 5;
 const AUTO_CONTINUE_BASE_CHUNK_TOKENS: i32 = 8192;
 const AUTO_CONTINUE_ESTIMATED_CHUNK_TOKENS: i32 = 4096;
 const AUTO_CONTINUE_MAX_ROUNDS: usize = 8;
@@ -343,17 +345,132 @@ fn map_provider_error(err: Error) -> Response {
 }
 
 async fn normalize_remote_image_sources(payload: &mut MessagesRequest) -> Result<(), String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(REMOTE_IMAGE_FETCH_TIMEOUT_SECS))
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
-        .map_err(|e| format!("Failed to create image fetch client: {}", e))?;
-
     for message in &mut payload.messages {
-        normalize_content_remote_images(&client, &mut message.content).await?;
+        normalize_content_remote_images(&mut message.content).await?;
     }
 
     Ok(())
+}
+
+fn is_disallowed_remote_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_disallowed_remote_ipv4(ip),
+        IpAddr::V6(ip) => is_disallowed_remote_ipv6(ip),
+    }
+}
+
+fn is_disallowed_remote_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, _, _] = ip.octets();
+    a == 0
+        || a == 10
+        || a == 127
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 0)
+        || (a == 192 && b == 168)
+        || (a == 198 && (b == 18 || b == 19))
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_multicast()
+        || a >= 240
+}
+
+fn is_disallowed_remote_ipv6(ip: Ipv6Addr) -> bool {
+    if let Some(mapped) = ip.to_ipv4_mapped() {
+        return is_disallowed_remote_ipv4(mapped);
+    }
+    let segments = ip.segments();
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || (segments[0] & 0xfe00) == 0xfc00
+        || (segments[0] & 0xffc0) == 0xfe80
+        || (segments[0] & 0xffc0) == 0xfec0
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        || (segments[0] & 0xe000) != 0x2000
+}
+
+async fn remote_image_client(url: &reqwest::Url) -> Result<reqwest::Client, String> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("Image URL must use http or https".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("Image URL must not contain credentials".to_string());
+    }
+
+    let host = url
+        .host_str()
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| "Image URL is missing host".to_string())?;
+    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
+        return Err("Image URL resolves to a private or reserved address".to_string());
+    }
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "Image URL is missing port".to_string())?;
+
+    let mut addresses: Vec<SocketAddr> = if let Ok(ip) = host.parse::<IpAddr>() {
+        vec![SocketAddr::new(ip, port)]
+    } else {
+        tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| format!("Failed to resolve image URL host: {}", e))?
+            .collect()
+    };
+    addresses.sort_unstable();
+    addresses.dedup();
+    if addresses.is_empty() {
+        return Err("Image URL host did not resolve".to_string());
+    }
+    if addresses
+        .iter()
+        .any(|address| is_disallowed_remote_ip(address.ip()))
+    {
+        return Err("Image URL resolves to a private or reserved address".to_string());
+    }
+
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(REMOTE_IMAGE_FETCH_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy();
+    if host.parse::<IpAddr>().is_err() {
+        // Pin the validated DNS answers so the actual request cannot be redirected by DNS rebinding.
+        builder = builder.resolve_to_addrs(host, &addresses);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("Failed to create image fetch client: {}", e))
+}
+
+async fn fetch_remote_image(
+    initial_url: reqwest::Url,
+) -> Result<(reqwest::Response, reqwest::Url), String> {
+    let mut current_url = initial_url;
+    for redirect_count in 0..=MAX_REMOTE_IMAGE_REDIRECTS {
+        let client = remote_image_client(&current_url).await?;
+        let response = client
+            .get(current_url.clone())
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch image URL: {}", e))?;
+
+        if !response.status().is_redirection() {
+            return Ok((response, current_url));
+        }
+        if redirect_count == MAX_REMOTE_IMAGE_REDIRECTS {
+            return Err("Image URL exceeded redirect limit".to_string());
+        }
+        let location = response
+            .headers()
+            .get(LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| "Image URL redirect is missing Location".to_string())?;
+        current_url = current_url
+            .join(location)
+            .map_err(|e| format!("Invalid image redirect URL: {}", e))?;
+    }
+    Err("Image URL exceeded redirect limit".to_string())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -606,10 +723,7 @@ fn append_message_content_text(value: &serde_json::Value, out: &mut String) {
     }
 }
 
-async fn normalize_content_remote_images(
-    client: &reqwest::Client,
-    content: &mut serde_json::Value,
-) -> Result<(), String> {
+async fn normalize_content_remote_images(content: &mut serde_json::Value) -> Result<(), String> {
     let Some(blocks) = content.as_array_mut() else {
         return Ok(());
     };
@@ -643,11 +757,7 @@ async fn normalize_content_remote_images(
             _ => return Err("Image URL must use http or https".to_string()),
         }
 
-        let resp = client
-            .get(parsed_url.clone())
-            .send()
-            .await
-            .map_err(|e| format!("Failed to fetch image URL: {}", e))?;
+        let (resp, final_url) = fetch_remote_image(parsed_url).await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -659,13 +769,12 @@ async fn normalize_content_remote_images(
             .get(CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<usize>().ok())
+            && content_length > MAX_REMOTE_IMAGE_BYTES
         {
-            if content_length > MAX_REMOTE_IMAGE_BYTES {
-                return Err(format!(
-                    "Remote image is too large: {} bytes, max {} bytes",
-                    content_length, MAX_REMOTE_IMAGE_BYTES
-                ));
-            }
+            return Err(format!(
+                "Remote image is too large: {} bytes, max {} bytes",
+                content_length, MAX_REMOTE_IMAGE_BYTES
+            ));
         }
 
         let media_type = match resp.headers().get(CONTENT_TYPE) {
@@ -673,22 +782,28 @@ async fn normalize_content_remote_images(
                 .to_str()
                 .ok()
                 .and_then(normalize_supported_image_media_type),
-            None => infer_supported_image_media_type(parsed_url.path()),
+            None => infer_supported_image_media_type(final_url.path()),
         };
 
         let media_type =
             media_type.ok_or_else(|| "Remote image must be JPEG, PNG, GIF, or WebP".to_string())?;
 
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| format!("Failed to read image URL response: {}", e))?;
-        if bytes.len() > MAX_REMOTE_IMAGE_BYTES {
-            return Err(format!(
-                "Remote image is too large: {} bytes, max {} bytes",
-                bytes.len(),
-                MAX_REMOTE_IMAGE_BYTES
-            ));
+        let mut bytes = Vec::with_capacity(
+            resp.content_length()
+                .and_then(|length| usize::try_from(length).ok())
+                .unwrap_or(0)
+                .min(MAX_REMOTE_IMAGE_BYTES),
+        );
+        let mut body = resp.bytes_stream();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|e| format!("Failed to read image URL response: {}", e))?;
+            if bytes.len().saturating_add(chunk.len()) > MAX_REMOTE_IMAGE_BYTES {
+                return Err(format!(
+                    "Remote image is too large: more than {} bytes",
+                    MAX_REMOTE_IMAGE_BYTES
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
         }
 
         source.insert(
@@ -701,12 +816,126 @@ async fn normalize_content_remote_images(
         );
         source.insert(
             "data".to_string(),
-            serde_json::Value::String(BASE64.encode(bytes)),
+            serde_json::Value::String(BASE64.encode(&bytes)),
         );
         source.remove("url");
     }
 
     Ok(())
+}
+
+fn validate_base64_media_sources(payload: &MessagesRequest) -> Result<(), String> {
+    for message in &payload.messages {
+        let Some(blocks) = message.content.as_array() else {
+            continue;
+        };
+        for block in blocks {
+            let Some(kind) = block.get("type").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            if !matches!(kind, "image" | "document") {
+                continue;
+            }
+            let Some(source) = block.get("source").and_then(|value| value.as_object()) else {
+                return Err(format!("{} source is missing", title_case_media_kind(kind)));
+            };
+            if source.get("type").and_then(|value| value.as_str()) != Some("base64") {
+                continue;
+            }
+            let media_type = source
+                .get("media_type")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    format!(
+                        "{} base64 source is missing media_type",
+                        title_case_media_kind(kind)
+                    )
+                })?;
+            let data = source
+                .get("data")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    format!(
+                        "{} base64 source is missing data",
+                        title_case_media_kind(kind)
+                    )
+                })?;
+            let encoded = data.trim();
+            if encoded.is_empty() {
+                return Err(format!(
+                    "{} base64 data is empty",
+                    title_case_media_kind(kind)
+                ));
+            }
+            let max_encoded = MAX_REMOTE_IMAGE_BYTES.saturating_mul(4) / 3 + 8;
+            if encoded.len() > max_encoded {
+                return Err(format!(
+                    "{} is too large: max {} decoded bytes",
+                    title_case_media_kind(kind),
+                    MAX_REMOTE_IMAGE_BYTES
+                ));
+            }
+            let bytes = BASE64
+                .decode(encoded)
+                .map_err(|_| format!("{} data is not valid base64", title_case_media_kind(kind)))?;
+            if bytes.is_empty() || bytes.len() > MAX_REMOTE_IMAGE_BYTES {
+                return Err(format!(
+                    "{} is empty or exceeds {} decoded bytes",
+                    title_case_media_kind(kind),
+                    MAX_REMOTE_IMAGE_BYTES
+                ));
+            }
+
+            if kind == "image" {
+                validate_image_bytes(media_type, &bytes)?;
+            } else {
+                validate_document_bytes(media_type, &bytes)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn title_case_media_kind(kind: &str) -> &'static str {
+    if kind == "image" { "Image" } else { "Document" }
+}
+
+fn validate_image_bytes(media_type: &str, bytes: &[u8]) -> Result<(), String> {
+    let valid = match media_type {
+        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "image/webp" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP",
+        _ => return Err("Image media_type must be JPEG, PNG, GIF, or WebP".to_string()),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "Image bytes do not match media_type {}",
+            media_type
+        ))
+    }
+}
+
+fn validate_document_bytes(media_type: &str, bytes: &[u8]) -> Result<(), String> {
+    let valid = match media_type {
+        "application/pdf" => bytes.starts_with(b"%PDF-"),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => {
+            bytes.starts_with(b"PK\x03\x04")
+        }
+        "text/csv" | "text/html" | "text/plain" | "text/markdown" => true,
+        _ => return Err(format!("Unsupported document media_type {}", media_type)),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "Document bytes do not match media_type {}",
+            media_type
+        ))
+    }
 }
 
 fn normalize_supported_image_media_type(raw: &str) -> Option<String> {
@@ -911,6 +1140,14 @@ pub async fn post_messages(
 
     if let Err(e) = normalize_remote_image_sources(&mut payload).await {
         tracing::warn!("远程图片处理失败: {}", e);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invalid_request_error", e)),
+        )
+            .into_response();
+    }
+    if let Err(e) = validate_base64_media_sources(&payload) {
+        tracing::warn!("媒体内容校验失败: {}", e);
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new("invalid_request_error", e)),
@@ -2608,6 +2845,14 @@ pub async fn post_messages_cc(
         )
             .into_response();
     }
+    if let Err(e) = validate_base64_media_sources(&payload) {
+        tracing::warn!("媒体内容校验失败: {}", e);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invalid_request_error", e)),
+        )
+            .into_response();
+    }
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -3726,5 +3971,94 @@ mod tests {
             &request_body,
             "正文\nKRS_REALISTIC_DOC_END but extra text"
         ));
+    }
+
+    #[test]
+    fn remote_image_ip_policy_blocks_private_and_reserved_ranges() {
+        for ip in [
+            "0.0.0.0",
+            "10.0.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.169.254",
+            "172.16.0.1",
+            "192.168.1.1",
+            "198.18.0.1",
+            "224.0.0.1",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "2001:db8::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(
+                is_disallowed_remote_ip(ip.parse().unwrap()),
+                "{ip} must be blocked"
+            );
+        }
+        assert!(!is_disallowed_remote_ip("8.8.8.8".parse().unwrap()));
+        assert!(!is_disallowed_remote_ip(
+            "2606:4700:4700::1111".parse().unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_image_client_rejects_loopback_before_connecting() {
+        let url = reqwest::Url::parse("http://127.0.0.1:19090/image.png").unwrap();
+        let error = remote_image_client(&url).await.unwrap_err();
+        assert!(error.contains("private or reserved"));
+    }
+
+    #[test]
+    fn base64_media_validation_accepts_real_signatures() {
+        let png = BASE64.encode(b"\x89PNG\r\n\x1a\nrest");
+        let pdf = BASE64.encode(b"%PDF-1.4\n%%EOF");
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": png}},
+                    {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": pdf}}
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(validate_base64_media_sources(&request).is_ok());
+    }
+
+    #[test]
+    fn base64_media_validation_rejects_invalid_or_mismatched_data() {
+        let invalid: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": [{
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "%%%bad%%%"}
+            }]}]
+        }))
+        .unwrap();
+        assert!(
+            validate_base64_media_sources(&invalid)
+                .unwrap_err()
+                .contains("valid base64")
+        );
+
+        let mismatched: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": [{
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": BASE64.encode(b"not a png")
+                }
+            }]}]
+        }))
+        .unwrap();
+        assert!(
+            validate_base64_media_sources(&mismatched)
+                .unwrap_err()
+                .contains("do not match")
+        );
     }
 }

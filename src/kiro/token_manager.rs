@@ -598,19 +598,18 @@ impl MultiTokenManager {
             })
             .collect();
 
-        // 校验 API Key 凭据配置完整性：authMethod=api_key 时必须提供 kiroApiKey
+        // 校验 API Key 凭据配置完整性：API Key 凭据必须提供非空 kiroApiKey。
         let mut entries = entries;
         for entry in &mut entries {
-            if entry.credentials.kiro_api_key.is_none()
+            if entry.credentials.is_api_key_credential()
                 && entry
                     .credentials
-                    .auth_method
+                    .kiro_api_key
                     .as_deref()
-                    .map(|m| m.eq_ignore_ascii_case("api_key") || m.eq_ignore_ascii_case("apikey"))
-                    .unwrap_or(false)
+                    .is_none_or(|key| !crate::common::auth::is_valid_header_secret(key))
             {
                 tracing::warn!(
-                    "凭据 #{} 配置了 authMethod=api_key 但缺少 kiroApiKey 字段，已自动禁用",
+                    "凭据 #{} 配置为 API Key 认证但缺少非空 kiroApiKey，已自动禁用",
                     entry.id
                 );
                 entry.disabled = true;
@@ -886,6 +885,9 @@ impl MultiTokenManager {
                 .kiro_api_key
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?;
+            if !crate::common::auth::is_valid_header_secret(&token) {
+                anyhow::bail!("API Key 凭据的 kiroApiKey 不是非空的可见 ASCII");
+            }
             return Ok(CallContext {
                 id,
                 credentials: credentials.clone(),
@@ -1653,8 +1655,8 @@ impl MultiTokenManager {
                 .kiro_api_key
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?;
-            if api_key.is_empty() {
-                anyhow::bail!("kiroApiKey 为空");
+            if !crate::common::auth::is_valid_header_secret(api_key) {
+                anyhow::bail!("kiroApiKey 不是非空的可见 ASCII");
             }
         } else {
             validate_refresh_token(&new_cred)?;
@@ -2076,23 +2078,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_add_credential_api_key_empty_rejected() {
+    async fn test_add_credential_api_key_blank_rejected() {
         let config = Config::default();
         let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
 
-        let mut cred = KiroCredentials::default();
-        cred.kiro_api_key = Some(String::new());
-        cred.auth_method = Some("api_key".to_string());
+        let cred = KiroCredentials {
+            kiro_api_key: Some("  \t".to_string()),
+            auth_method: Some("api_key".to_string()),
+            ..Default::default()
+        };
 
         let result = manager.add_credential(cred).await;
         assert!(result.is_err());
-        assert!(
-            result
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("kiroApiKey 为空")
-        );
+        assert!(result.err().unwrap().to_string().contains("可见 ASCII"));
     }
 
     #[tokio::test]
@@ -2195,6 +2193,20 @@ mod tests {
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
         assert_eq!(manager.total_count(), 2);
         assert_eq!(manager.available_count(), 1); // bad_cred 被禁用，只剩 1 个可用
+    }
+
+    #[test]
+    fn test_multi_token_manager_blank_kiro_api_key_auto_disabled() {
+        let config = Config::default();
+        let bad_cred = KiroCredentials {
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some(" \t".to_string()),
+            ..Default::default()
+        };
+
+        let manager = MultiTokenManager::new(config, vec![bad_cred], None, None, false).unwrap();
+        assert_eq!(manager.total_count(), 1);
+        assert_eq!(manager.available_count(), 0);
     }
 
     #[test]

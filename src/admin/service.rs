@@ -636,17 +636,7 @@ impl AdminService {
         let msg = e.to_string();
 
         // 凭据验证失败（refreshToken 无效、格式错误等）
-        let is_invalid_credential = msg.contains("缺少 refreshToken")
-            || msg.contains("refreshToken 为空")
-            || msg.contains("refreshToken 已被截断")
-            || msg.contains("凭据已存在")
-            || msg.contains("refreshToken 重复")
-            || msg.contains("kiroApiKey 重复")
-            || msg.contains("缺少 kiroApiKey")
-            || msg.contains("kiroApiKey 为空")
-            || msg.contains("凭证已过期或无效")
-            || msg.contains("权限不足")
-            || msg.contains("已被限流");
+        let is_invalid_credential = is_invalid_add_credential_error(&msg);
 
         if is_invalid_credential {
             AdminServiceError::InvalidCredential(msg)
@@ -671,5 +661,35 @@ impl AdminService {
         } else {
             AdminServiceError::InternalError(msg)
         }
+    }
+}
+
+fn is_invalid_add_credential_error(message: &str) -> bool {
+    message.contains("缺少 refreshToken")
+        || message.contains("refreshToken 为空")
+        || message.contains("refreshToken 已被截断")
+        || message.contains("凭据已存在")
+        || message.contains("refreshToken 重复")
+        || message.contains("kiroApiKey 重复")
+        || message.contains("缺少 kiroApiKey")
+        || message.contains("kiroApiKey 为空")
+        || message.contains("kiroApiKey 不是非空的可见 ASCII")
+        || message.contains("凭证已过期或无效")
+        || message.contains("权限不足")
+        || message.contains("已被限流")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_invalid_add_credential_error;
+
+    #[test]
+    fn invalid_header_api_key_is_a_client_error() {
+        assert!(is_invalid_add_credential_error(
+            "kiroApiKey 不是非空的可见 ASCII"
+        ));
+        assert!(!is_invalid_add_credential_error(
+            "failed to persist credentials"
+        ));
     }
 }

@@ -3,6 +3,7 @@ import { toast } from 'sonner'
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
   DialogFooter,
@@ -109,6 +110,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       <DialogContent className="sm:max-w-lg max-h-[85vh] flex flex-col">
         <DialogHeader>
           <DialogTitle>添加凭据</DialogTitle>
+          <DialogDescription className="sr-only">添加并配置一项 Kiro 凭据</DialogDescription>
         </DialogHeader>
 
         <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">

@@ -20,6 +20,14 @@ use kiro::token_manager::MultiTokenManager;
 use model::arg::Args;
 use model::config::Config;
 
+fn configured_api_key(config: &Config) -> anyhow::Result<String> {
+    config
+        .api_key
+        .clone()
+        .filter(|key| common::auth::is_valid_header_secret(key))
+        .ok_or_else(|| anyhow::anyhow!("配置文件中的 apiKey 必须是非空的可见 ASCII 字符"))
+}
+
 #[tokio::main]
 async fn main() {
     // 解析命令行参数
@@ -78,8 +86,8 @@ async fn main() {
 
     // 检查 KIRO_API_KEY 环境变量，自动创建 API Key 凭据
     if let Ok(kiro_api_key) = std::env::var("KIRO_API_KEY") {
-        if kiro_api_key.is_empty() {
-            tracing::warn!("KIRO_API_KEY 环境变量已设置但为空，视为未配置");
+        if !common::auth::is_valid_header_secret(&kiro_api_key) {
+            tracing::warn!("KIRO_API_KEY 环境变量不是非空的可见 ASCII，视为未配置");
         } else {
             tracing::info!("检测到 KIRO_API_KEY 环境变量，添加 API Key 凭据（最高优先级）");
             let api_key_cred = KiroCredentials {
@@ -94,13 +102,24 @@ async fn main() {
 
     tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
 
-    // 获取第一个凭据用于日志显示
-    let first_credentials = credentials_list.first().cloned().unwrap_or_default();
-    tracing::debug!("主凭证: {:?}", first_credentials);
+    // 仅记录不含 token/key/secret 的凭据概览。
+    if let Some(first_credentials) = credentials_list.first() {
+        tracing::debug!(
+            id = ?first_credentials.id,
+            auth_method = ?first_credentials.auth_method,
+            priority = first_credentials.priority,
+            endpoint = ?first_credentials.endpoint,
+            has_access_token = first_credentials.access_token.is_some(),
+            has_refresh_token = first_credentials.refresh_token.is_some(),
+            has_api_key = first_credentials.kiro_api_key.is_some(),
+            has_profile_arn = first_credentials.profile_arn.is_some(),
+            "主凭证概览"
+        );
+    }
 
     // 获取 API Key
-    let api_key = config.api_key.clone().unwrap_or_else(|| {
-        tracing::error!("配置文件中未设置 apiKey");
+    let api_key = configured_api_key(&config).unwrap_or_else(|e| {
+        tracing::error!("{}", e);
         std::process::exit(1);
     });
 
@@ -238,12 +257,12 @@ async fn main() {
     let admin_key_valid = config
         .admin_api_key
         .as_ref()
-        .map(|k| !k.trim().is_empty())
+        .map(|key| common::auth::is_valid_header_secret(key))
         .unwrap_or(false);
 
     let app = if let Some(admin_key) = &config.admin_api_key {
-        if admin_key.trim().is_empty() {
-            tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
+        if !common::auth::is_valid_header_secret(admin_key) {
+            tracing::warn!("adminApiKey 不是非空的可见 ASCII，Admin API 未启用");
             anthropic_app
         } else {
             let admin_service = admin::AdminService::new(
@@ -275,7 +294,7 @@ async fn main() {
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("启动 Anthropic API 端点: {}", addr);
-    tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2)]);
+    tracing::info!("API Key: 已配置");
     tracing::info!("可用 API:");
     tracing::info!("  GET  /v1/models");
     tracing::info!("  POST /v1/messages");
@@ -293,4 +312,25 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn configured_api_key_rejects_missing_or_blank_values() {
+        let mut config = Config::default();
+        assert!(configured_api_key(&config).is_err());
+
+        config.api_key = Some(" \t\n".to_string());
+        assert!(configured_api_key(&config).is_err());
+    }
+
+    #[test]
+    fn configured_api_key_rejects_non_header_safe_unicode() {
+        let mut config = Config::default();
+        config.api_key = Some("a密钥".to_string());
+        assert!(configured_api_key(&config).is_err());
+    }
 }

@@ -276,6 +276,36 @@ fn calibrated_text(text: &str) -> i32 {
     super::claude_tok::count_claude(text)
 }
 
+fn canonical_json_value(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+
+            let mut canonical = serde_json::Map::new();
+            for key in keys {
+                canonical.insert(key.clone(), canonical_json_value(&object[key]));
+            }
+            Value::Object(canonical)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonical_json_value).collect()),
+        _ => value.clone(),
+    }
+}
+
+fn canonical_tool_schema_json(
+    schema: &std::collections::HashMap<String, serde_json::Value>,
+) -> String {
+    let mut keys = schema.keys().collect::<Vec<_>>();
+    keys.sort_unstable();
+
+    let mut canonical = serde_json::Map::new();
+    for key in keys {
+        canonical.insert(key.clone(), canonical_json_value(&schema[key]));
+    }
+    serde_json::to_string(&Value::Object(canonical)).unwrap_or_default()
+}
+
 pub fn estimate_input_tokens(payload: &MessagesRequest) -> i32 {
     estimate_input_tokens_parts(
         &payload.model,
@@ -319,7 +349,7 @@ pub fn estimate_prefix_tokens(
     for tool in tools {
         features.add_text(&tool.name);
         features.add_text(&tool.description);
-        features.add_text(&serde_json::to_string(&tool.input_schema).unwrap_or_default());
+        features.add_text(&canonical_tool_schema_json(&tool.input_schema));
     }
 
     let is_opus = model.to_ascii_lowercase().contains("opus");
@@ -362,7 +392,7 @@ fn estimate_input_tokens_parts(
         for tool in tools {
             features.add_text(&tool.name);
             features.add_text(&tool.description);
-            features.add_text(&serde_json::to_string(&tool.input_schema).unwrap_or_default());
+            features.add_text(&canonical_tool_schema_json(&tool.input_schema));
         }
     }
 
@@ -1615,6 +1645,42 @@ mod tests {
         // sonnet（无 thinking）不带
         let s = stream_delta_usage("claude-sonnet-4-6", 10, 9, 0, 0, 0, 0);
         assert!(!s.as_object().unwrap().contains_key("output_tokens_details"));
+    }
+
+    #[test]
+    fn tool_schema_token_count_is_deterministic_across_deserializations() {
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "system": [{"type": "text", "text": "system"}],
+            "tools": [{
+                "name": "configure",
+                "description": "Configure nested values",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "cache_control": {"type": "string"},
+                        "nested": {
+                            "type": "object",
+                            "properties": {
+                                "enabled": {"type": "boolean"},
+                                "count": {"type": "integer"}
+                            }
+                        }
+                    },
+                    "required": ["nested"]
+                }
+            }],
+            "messages": [{"role": "user", "content": "count this"}]
+        });
+
+        let counts = (0..128)
+            .map(|_| {
+                let request: CountTokensRequest = serde_json::from_value(body.clone()).unwrap();
+                estimate_count_tokens_request(&request)
+            })
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(counts.len(), 1, "token estimate varied: {counts:?}");
     }
 
     fn identity_req(model: &str, system: Option<&str>, question: &str) -> MessagesRequest {
