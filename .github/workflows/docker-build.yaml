@@ -7,6 +7,7 @@ on:
       - custom
       - codex/high-cache-container
       - aws-p
+      - aws-b
     tags:
       - 'v*'
   workflow_dispatch:
@@ -69,6 +70,7 @@ jobs:
         run: |
           HIGH_CACHE_BRANCH="codex/high-cache-container"
           AWS_P_BRANCH="aws-p"
+          AWS_B_BRANCH="aws-b"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             if [ "${{ github.ref_name }}" = "${HIGH_CACHE_BRANCH}" ]; then
               echo "version=high-cache-${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
@@ -76,6 +78,9 @@ jobs:
             elif [ "${{ github.ref_name }}" = "${AWS_P_BRANCH}" ]; then
               echo "version=aws-p-${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
               echo "alias_tag=aws-p" >> $GITHUB_OUTPUT
+            elif [ "${{ github.ref_name }}" = "${AWS_B_BRANCH}" ]; then
+              echo "version=aws-b-${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+              echo "alias_tag=aws-b" >> $GITHUB_OUTPUT
             else
               echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
               echo "alias_tag=latest" >> $GITHUB_OUTPUT
@@ -93,6 +98,9 @@ jobs:
             elif [ "${{ github.ref_name }}" = "${AWS_P_BRANCH}" ]; then
               echo "version=aws-p-beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
               echo "alias_tag=aws-p" >> $GITHUB_OUTPUT
+            elif [ "${{ github.ref_name }}" = "${AWS_B_BRANCH}" ]; then
+              echo "version=aws-b-beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
+              echo "alias_tag=aws-b" >> $GITHUB_OUTPUT
             else
               echo "version=beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
               echo "alias_tag=beta" >> $GITHUB_OUTPUT

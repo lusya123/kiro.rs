@@ -171,10 +171,8 @@ pub fn request_cache_control_count(req: &MessagesRequest) -> usize {
         .map(|items| {
             items
                 .iter()
-                .map(|item| {
-                    cache_control_count_in_value(&serde_json::to_value(item).unwrap_or(Value::Null))
-                })
-                .sum::<usize>()
+                .filter(|item| item.cache_control.is_some())
+                .count()
         })
         .unwrap_or(0);
     let messages = req
@@ -188,10 +186,8 @@ pub fn request_cache_control_count(req: &MessagesRequest) -> usize {
         .map(|items| {
             items
                 .iter()
-                .map(|item| {
-                    cache_control_count_in_value(&serde_json::to_value(item).unwrap_or(Value::Null))
-                })
-                .sum::<usize>()
+                .filter(|item| item.cache_control.is_some())
+                .count()
         })
         .unwrap_or(0);
     system + messages + tools
@@ -200,23 +196,17 @@ pub fn request_cache_control_count(req: &MessagesRequest) -> usize {
 fn message_cache_control_count(msg: &Message) -> usize {
     match &msg.content {
         Value::String(_) => 0,
-        Value::Array(arr) => arr.iter().map(cache_control_count_in_value).sum(),
-        value => cache_control_count_in_value(value),
+        Value::Array(items) => items.iter().map(direct_cache_control_count).sum(),
+        value => direct_cache_control_count(value),
     }
 }
 
-fn cache_control_count_in_value(value: &Value) -> usize {
-    match value {
-        Value::Object(map) => {
-            usize::from(map.contains_key("cache_control"))
-                + map
-                    .values()
-                    .map(cache_control_count_in_value)
-                    .sum::<usize>()
-        }
-        Value::Array(items) => items.iter().map(cache_control_count_in_value).sum(),
-        _ => 0,
-    }
+fn direct_cache_control_count(value: &Value) -> usize {
+    usize::from(
+        value
+            .as_object()
+            .is_some_and(|map| map.contains_key("cache_control")),
+    )
 }
 
 /// 根据请求意图决定 usage 字段的最终形态。
@@ -256,14 +246,9 @@ pub fn with_additional_input(
     initial_total_input_tokens: i32,
     final_total_input_tokens: i32,
 ) -> UsageBreakdown {
-    // 有缓存拆分时，(input, cache_read, cache_creation) 已按"全量 − 缓存"拆好并满足
-    // input + cr + cc = 总量，绝不能再叠加差额（否则缓存量被重复计进 input → 双重计数）。
-    if initial.cache_creation_input_tokens > 0 || initial.cache_read_input_tokens > 0 {
-        return initial;
-    }
-    // 无缓存：把多轮 auto-continue 累计的额外 input 叠加进来（成本回收）。
-    // 注意 final 现在来自本地估算累加（见 billing::billable_input_tokens），不再是 Kiro 虚高计数，
-    // 因此既保留多轮累加、又能与 pomoai 口径拟合。
+    // 初始拆分已经覆盖首轮总量；自动续写产生的后续轮次没有 cache breakpoint，
+    // 因此只把新增 input 累加到普通 input，已有 cache_read/cache_creation 保持不变。
+    // final 来自本地估算累加（见 billing::billable_input_tokens），不会混入 Kiro 的固定底噪。
     let extra = (final_total_input_tokens - initial_total_input_tokens).max(0);
     UsageBreakdown {
         input_tokens: initial.input_tokens + extra,
@@ -607,7 +592,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn with_additional_input_does_not_double_count_cached_tokens() {
+    fn with_additional_input_preserves_cache_and_bills_continuation_rounds() {
         // 缓存命中：input=100, cache_read=3954, total=4054。
         let cached = UsageBreakdown {
             input_tokens: 100,
@@ -616,11 +601,11 @@ mod tests {
             cache_creation_5m_input_tokens: 0,
             cache_creation_1h_input_tokens: 0,
         };
-        // 即使上游 billable 虚高到 8000，也不能把差额加到 input（否则 input 与 cache_read 双重计数）。
+        // final=8000 表示本地估算累计了后续轮次；新增的 3946 只进入普通 input。
         let out = with_additional_input(cached, 4054, 8000);
-        assert_eq!(out.input_tokens, 100, "缓存命中时 input 必须保持非缓存部分");
+        assert_eq!(out.input_tokens, 4046);
         assert_eq!(out.cache_read_input_tokens, 3954);
-        assert_eq!(out.total(), 4054, "input+cr+cc 恒等必须保持");
+        assert_eq!(out.total(), 8000, "input+cr+cc 必须覆盖所有上游轮次");
     }
 
     #[test]
@@ -853,5 +838,104 @@ mod tests {
 
         assert!(request_has_cache_control(&req));
         assert_eq!(request_cache_control_count(&req), 4);
+    }
+
+    #[test]
+    fn nested_schema_fields_do_not_count_as_cache_breakpoints() {
+        let req = parse_request(serde_json::json!({
+            "tools": [{
+                "name": "configure",
+                "description": "configuration",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "cache_control": {"type": "string"},
+                        "nested": {
+                            "type": "object",
+                            "properties": {
+                                "cache_control": {"type": "boolean"}
+                            }
+                        }
+                    }
+                }
+            }],
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": {"cache_control": "ordinary payload data"}
+                }]
+            }]
+        }));
+
+        assert_eq!(request_cache_control_count(&req), 0);
+    }
+
+    #[tokio::test]
+    async fn system_breakpoint_transitions_from_creation_to_read() {
+        let text = "stateful-system-cache-unique ".repeat(2_000);
+        let req = parse_request(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "system": [{
+                "type": "text",
+                "text": text,
+                "cache_control": {"type": "ephemeral"}
+            }]
+        }));
+
+        let first = compute_request_usage_breakdown(20_000, &req).await;
+        assert!(first.cache_creation_input_tokens > 0);
+        assert_eq!(first.cache_read_input_tokens, 0);
+        assert_eq!(first.total(), 20_000);
+
+        let second = compute_request_usage_breakdown(20_000, &req).await;
+        assert_eq!(second.cache_creation_input_tokens, 0);
+        assert!(second.cache_read_input_tokens > 0);
+        assert_eq!(second.total(), 20_000);
+    }
+
+    #[tokio::test]
+    async fn one_hour_breakpoint_uses_the_one_hour_creation_bucket() {
+        let text = "stateful-one-hour-cache-unique ".repeat(2_000);
+        let req = parse_request(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "system": [{
+                "type": "text",
+                "text": text,
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }]
+        }));
+
+        let first = compute_request_usage_breakdown(20_000, &req).await;
+        assert_eq!(first.cache_creation_5m_input_tokens, 0);
+        assert!(first.cache_creation_1h_input_tokens > 0);
+        assert_eq!(
+            first.cache_creation_input_tokens,
+            first.cache_creation_1h_input_tokens
+        );
+    }
+
+    #[tokio::test]
+    async fn message_breakpoints_create_but_do_not_report_read_hits() {
+        let text = "stateful-message-cache-unique ".repeat(2_000);
+        let req = parse_request(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": text,
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }]
+        }));
+
+        let first = compute_request_usage_breakdown(20_000, &req).await;
+        let second = compute_request_usage_breakdown(20_000, &req).await;
+        assert!(first.cache_creation_input_tokens > 0);
+        assert!(second.cache_creation_input_tokens > 0);
+        assert_eq!(first.cache_read_input_tokens, 0);
+        assert_eq!(second.cache_read_input_tokens, 0);
     }
 }

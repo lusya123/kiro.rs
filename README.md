@@ -191,6 +191,7 @@ docker-compose up
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
+| `awsB40Compat` | boolean | `true` | 保留 AWS-B/Bedrock 的模型目录、响应头、错误、ID、签名和 SSE 外形；设为 `false` 时使用 AWS-P 外观 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
 
 完整配置示例：
@@ -216,9 +217,13 @@ docker-compose up
    "proxyPassword": "pass",
    "adminApiKey": "sk-admin-your-secret-key",
    "loadBalancingMode": "priority",
-   "extractThinking": true
+   "extractThinking": true,
+   "awsB40Compat": true
 }
 ```
+
+AWS-B 与 AWS-P 共用 tokenizer、计费、缓存、身份清洗、流式处理和工具链。`awsB40Compat`
+只控制对外协议外观，不切换上游模型或内部质量引擎。
 
 ### credentials.json
 
@@ -370,6 +375,10 @@ docker-compose up
 RUST_LOG=debug ./target/release/kiro-rs
 ```
 
+集群 prompt cache 默认连接或自举在 `127.0.0.1:46379`。可用
+`KIRO_CLUSTER_CACHE_ADDR=host1:46379,host2:46379` 配置共享候选地址，或设为
+`off`、`local`、`disabled` 关闭集群共享并退回进程内缓存。
+
 ## API 端点
 
 ### 标准端点 (/v1)
@@ -379,6 +388,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 | `/v1/models` | GET | 获取可用模型列表 |
 | `/v1/messages` | POST | 创建消息（对话） |
 | `/v1/messages/count_tokens` | POST | 估算 Token 数量 |
+| `/v1/chat/completions` | POST | OpenAI Chat Completions 兼容端点 |
 
 ### Claude Code 兼容端点 (/cc/v1)
 

@@ -827,7 +827,9 @@ pub async fn head_models(State(state): State<AppState>) -> Response {
     if state.aws_b40_compat {
         super::bedrock::head_models_response()
     } else {
-        StatusCode::OK.into_response()
+        let mut response = get_models(State(state)).await;
+        *response.body_mut() = Body::empty();
+        response
     }
 }
 

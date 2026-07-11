@@ -302,4 +302,11 @@ mod tests {
             serde_json::from_str(r#"{"awsB40Compat":false}"#).expect("explicit profile config");
         assert!(!config.aws_b40_compat);
     }
+
+    #[test]
+    fn checked_in_example_enables_aws_b_profile() {
+        let config: Config = serde_json::from_str(include_str!("../../config.example.json"))
+            .expect("config.example.json must deserialize");
+        assert!(config.aws_b40_compat);
+    }
 }

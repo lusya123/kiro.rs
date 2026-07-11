@@ -2300,6 +2300,57 @@ mod tests {
         assert!(content_block.get("caller").is_none());
     }
 
+    #[test]
+    fn aws_b_final_usage_does_not_leak_aws_p_fields() {
+        let mut aws_b = StreamContext::new_with_thinking(
+            "claude-sonnet-4-6",
+            42,
+            false,
+            super::super::cache::UsageBreakdown::flat(42),
+            HashMap::new(),
+        );
+        aws_b.enable_aws_b40_compat(false);
+        let _ = aws_b.generate_initial_events();
+        let _ = aws_b.process_assistant_response("hello");
+        let events = aws_b.generate_final_events();
+
+        let delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("AWS-B message_delta");
+        let usage = &delta.data["usage"];
+        assert_eq!(usage["input_tokens"], 42);
+        assert!(
+            usage["output_tokens"]
+                .as_i64()
+                .is_some_and(|value| value > 0)
+        );
+        assert_eq!(usage["cache_creation_input_tokens"], 0);
+        assert_eq!(usage["cache_read_input_tokens"], 0);
+        assert!(usage.get("service_tier").is_none());
+        assert!(usage.get("inference_geo").is_none());
+        assert!(usage.get("cache_creation").is_none());
+
+        let mut aws_p = StreamContext::new_with_thinking(
+            "claude-sonnet-4-6",
+            42,
+            false,
+            super::super::cache::UsageBreakdown::flat(42),
+            HashMap::new(),
+        );
+        let _ = aws_p.generate_initial_events();
+        let _ = aws_p.process_assistant_response("hello");
+        let events = aws_p.generate_final_events();
+        let p_usage = &events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("AWS-P message_delta")
+            .data["usage"];
+        assert!(p_usage.get("service_tier").is_none());
+        assert!(p_usage.get("inference_geo").is_none());
+        assert_eq!(usage, p_usage);
+    }
+
     /// 流式 thinking 块必须在 content_block_start 带 signature: ""，
     /// 并在 content_block_stop 之前发出 signature_delta 事件。
     #[test]
@@ -2920,6 +2971,36 @@ mod tests {
                 .unwrap()
                 > 0
         );
+    }
+
+    #[test]
+    fn cached_continuation_billing_keeps_cache_split_and_adds_later_input() {
+        let initial = super::super::cache::UsageBreakdown {
+            input_tokens: 100,
+            cache_read_input_tokens: 3954,
+            cache_creation_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-4-6",
+            4054,
+            false,
+            initial,
+            HashMap::new(),
+        );
+        ctx.begin_continuation_for_billing(3946);
+        ctx.process_assistant_response("continued text");
+
+        let final_events = ctx.generate_final_events();
+        let usage = &final_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta")
+            .data["usage"];
+        assert_eq!(usage["input_tokens"], 4046);
+        assert_eq!(usage["cache_read_input_tokens"], 3954);
+        assert_eq!(usage["cache_creation_input_tokens"], 0);
     }
 
     #[test]

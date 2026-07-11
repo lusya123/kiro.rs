@@ -140,10 +140,10 @@ fn no_bedrock_distributor(model: &str) -> Response {
 
 fn no_relay_channel(model: &str) -> Response {
     let request_id = super::middleware::aws_b40_oneapi_request_id();
-    let body = format!(
-        "{{\"error\":\"no relay channel available: model={} (request id: {})\"}}",
-        model, request_id
-    );
+    let body = json!({
+        "error": format!("no relay channel available: model={model} (request id: {request_id})")
+    })
+    .to_string();
     let mut response = Response::builder()
         .status(StatusCode::FORBIDDEN)
         .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
@@ -451,5 +451,54 @@ mod tests {
         ));
         assert!(body.contains("\"last_id\":\"claude-sonnet-4-6-thinking\""));
         assert!(!body.contains("claude-sonnet-5"));
+    }
+
+    #[tokio::test]
+    async fn relay_error_escapes_untrusted_model_names() {
+        let response = no_relay_channel("claude-sonnet-4-5-thinking\"quoted");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("relay error body");
+        let body: Value = serde_json::from_slice(&bytes).expect("valid JSON error body");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("thinking\"quoted"))
+        );
+    }
+
+    #[tokio::test]
+    async fn non_stream_response_keeps_bedrock_order_and_shared_cache_breakdown() {
+        let response = non_stream_response(
+            "claude-sonnet-4-5-thinking",
+            &[json!({"type": "text", "text": "done"})],
+            "end_turn",
+            UsageBreakdown {
+                input_tokens: 100,
+                cache_read_input_tokens: 40,
+                cache_creation_input_tokens: 30,
+                cache_creation_5m_input_tokens: 10,
+                cache_creation_1h_input_tokens: 20,
+            },
+            7,
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("non-stream body");
+        let raw = String::from_utf8(bytes.to_vec()).expect("UTF-8 non-stream body");
+        assert!(raw.starts_with("{\"model\":\"claude-sonnet-4-5-20250929\",\"id\":\"msg_bdrk_"));
+
+        let body: Value = serde_json::from_str(&raw).expect("valid non-stream JSON");
+        assert_eq!(body["usage"]["input_tokens"], 100);
+        assert_eq!(body["usage"]["cache_read_input_tokens"], 40);
+        assert_eq!(
+            body["usage"]["cache_creation"]["ephemeral_5m_input_tokens"],
+            10
+        );
+        assert_eq!(
+            body["usage"]["cache_creation"]["ephemeral_1h_input_tokens"],
+            20
+        );
+        assert!(body["usage"].get("service_tier").is_none());
     }
 }
