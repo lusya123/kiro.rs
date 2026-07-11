@@ -9,6 +9,7 @@ use serde_json::json;
 use crate::kiro::model::events::Event;
 
 use super::id;
+use super::types::MessagesRequest;
 
 const AUTO_CONTINUE_COMPLETE_SENTINEL: &str = "__KRS_CONTINUATION_COMPLETE__";
 
@@ -664,6 +665,12 @@ pub struct StreamContext {
     continuation_merge_tail: Option<String>,
     /// 输出侧规整可见文本中的上游产品自称；规则会跳过代码并保留普通 Kiro 技术提及。
     identity_sanitizer: Option<super::identity::IdentityOutputSanitizer>,
+    /// AWS-B-40 外观兼容模式
+    aws_b40_compat: bool,
+    /// AWS-B adaptive thinking 使用更长的 signature 外观
+    aws_b40_adaptive_signature: bool,
+    /// AWS-B usage 需要按原始请求中的 cache_control block 精确拆分。
+    aws_b40_usage_request: Option<MessagesRequest>,
 }
 
 impl StreamContext {
@@ -700,7 +707,43 @@ impl StreamContext {
             complete_sentinel_probe_buffer: String::new(),
             continuation_merge_tail: None,
             identity_sanitizer: None,
+            aws_b40_compat: false,
+            aws_b40_adaptive_signature: false,
+            aws_b40_usage_request: None,
         }
+    }
+
+    pub fn enable_aws_b40_compat(&mut self, adaptive_signature: bool) {
+        self.aws_b40_compat = true;
+        self.aws_b40_adaptive_signature = adaptive_signature;
+        self.message_id = id::bedrock_message_id_for_model(&self.model);
+    }
+
+    pub fn set_aws_b40_usage_request(&mut self, request: Option<MessagesRequest>) {
+        self.aws_b40_usage_request = request;
+    }
+
+    fn billable_current_input_tokens(&self) -> i32 {
+        if self.aws_b40_compat {
+            self.input_tokens.max(1)
+        } else {
+            super::billing::billable_input_tokens(self.input_tokens, self.context_input_tokens)
+        }
+    }
+
+    fn usage_breakdown_for_total(
+        &self,
+        final_input_tokens: i32,
+        commit_cache_state: bool,
+    ) -> super::cache::UsageBreakdown {
+        if let Some(request) = self.aws_b40_usage_request.as_ref() {
+            return if commit_cache_state {
+                super::cache::compute_usage_breakdown_for_request(final_input_tokens, request)
+            } else {
+                super::cache::preview_usage_breakdown_for_request(final_input_tokens, request)
+            };
+        }
+        super::cache::compute_usage_breakdown(final_input_tokens, self.has_cache_control)
     }
 
     #[allow(dead_code)]
@@ -739,8 +782,33 @@ impl StreamContext {
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
-        let breakdown =
-            super::cache::compute_usage_breakdown(self.input_tokens, self.has_cache_control);
+        let breakdown = self.usage_breakdown_for_total(self.input_tokens, false);
+        if self.aws_b40_compat {
+            return json!({
+                "type": "message_start",
+                "message": {
+                    "model": self.model,
+                    "id": self.message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "stop_details": null,
+                    "usage": {
+                        "input_tokens": breakdown.input_tokens,
+                        "cache_creation_input_tokens": breakdown.cache_creation_input_tokens,
+                        "cache_read_input_tokens": breakdown.cache_read_input_tokens,
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": breakdown.cache_creation_input_tokens,
+                            "ephemeral_1h_input_tokens": 0
+                        },
+                        "output_tokens": 1
+                    }
+                }
+            });
+        }
+
         json!({
             "type": "message_start",
             "message": {
@@ -1153,6 +1221,13 @@ impl StreamContext {
 
     /// 创建 signature_delta 事件（thinking 块伪签名，详见 anthropic::signature 模块）
     fn create_signature_delta_event(&self, index: i32) -> SseEvent {
+        let signature = if self.aws_b40_adaptive_signature {
+            super::signature::generate_aws_b40_adaptive_signature()
+        } else if self.aws_b40_compat {
+            super::signature::generate_aws_b40_signature_for_model(&self.model)
+        } else {
+            super::signature::generate_fake_signature()
+        };
         SseEvent::new(
             "content_block_delta",
             json!({
@@ -1160,7 +1235,7 @@ impl StreamContext {
                 "index": index,
                 "delta": {
                     "type": "signature_delta",
-                    "signature": super::signature::generate_fake_signature()
+                    "signature": signature
                 }
             }),
         )
@@ -1379,17 +1454,42 @@ impl StreamContext {
 
         // 自动续写会产生多次上游调用；最终 usage 需要包含所有内部调用的输入。
         // 短请求使用客户请求估算，避免 Kiro 固定上下文底噪让“你好”显示 4K+ input。
-        let final_input_tokens = self.accumulated_input_tokens
-            + super::billing::billable_input_tokens(self.input_tokens, self.context_input_tokens);
+        let final_input_tokens =
+            self.accumulated_input_tokens + self.billable_current_input_tokens();
         // 按客户请求意图拆分 usage
-        let breakdown =
-            super::cache::compute_usage_breakdown(final_input_tokens, self.has_cache_control);
+        let breakdown = self.usage_breakdown_for_total(final_input_tokens, true);
 
         // 生成最终事件
-        events.extend(
-            self.state_manager
-                .generate_final_events(breakdown, self.output_tokens),
-        );
+        let mut final_events = self
+            .state_manager
+            .generate_final_events(breakdown.clone(), self.output_tokens);
+        if self.aws_b40_compat {
+            for event in &mut final_events {
+                match event.event.as_str() {
+                    "message_delta" => {
+                        if let Some(delta) = event.data.get_mut("delta") {
+                            delta["stop_details"] = serde_json::Value::Null;
+                        }
+                        if self.thinking_enabled {
+                            event.data["usage"]["output_tokens_details"] = json!({
+                                "thinking_tokens": self.output_tokens.saturating_sub(1)
+                            });
+                        }
+                    }
+                    "message_stop" => {
+                        event.data = json!({
+                            "type": "message_stop",
+                            "usage": {
+                                "input_tokens": breakdown.input_tokens,
+                                "output_tokens": self.output_tokens
+                            }
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        events.extend(final_events);
         events
     }
 
@@ -1424,8 +1524,7 @@ impl StreamContext {
     }
 
     pub fn begin_continuation_for_billing(&mut self, next_estimated_input_tokens: i32) {
-        self.accumulated_input_tokens +=
-            super::billing::billable_input_tokens(self.input_tokens, self.context_input_tokens);
+        self.accumulated_input_tokens += self.billable_current_input_tokens();
         self.input_tokens = next_estimated_input_tokens.max(1);
         self.context_input_tokens = None;
     }
@@ -1541,13 +1640,11 @@ impl BufferedStreamContext {
         self.event_buffer.extend(final_events);
 
         // 获取 billable input_tokens 并按 has_cache_control 拆分；自动续写时包含所有内部上游调用。
-        let final_input_tokens = self.inner.accumulated_input_tokens
-            + super::billing::billable_input_tokens(
-                self.inner.input_tokens,
-                self.inner.context_input_tokens,
-            );
-        let breakdown =
-            super::cache::compute_usage_breakdown(final_input_tokens, self.inner.has_cache_control);
+        let final_input_tokens =
+            self.inner.accumulated_input_tokens + self.inner.billable_current_input_tokens();
+        let breakdown = self
+            .inner
+            .usage_breakdown_for_total(final_input_tokens, true);
 
         // 更正 message_start 事件中的 usage（input + cache 字段全部按拆分后回填）
         for event in &mut self.event_buffer {

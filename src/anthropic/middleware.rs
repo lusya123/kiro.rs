@@ -5,10 +5,11 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, StatusCode},
+    http::{HeaderValue, Method, Request, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
+use serde_json::json;
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
@@ -25,15 +26,18 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// 是否启用 AWS-B-40 外观兼容模式
+    pub aws_b40_compat: bool,
 }
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(api_key: impl Into<String>, extract_thinking: bool) -> Self {
+    pub fn new(api_key: impl Into<String>, extract_thinking: bool, aws_b40_compat: bool) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
+            aws_b40_compat,
         }
     }
 
@@ -50,13 +54,204 @@ pub async fn auth_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    let path = request.uri().path().to_string();
     match auth::extract_api_key(&request) {
         Some(key) if auth::constant_time_eq(&key, &state.api_key) => next.run(request).await,
         _ => {
+            if state.aws_b40_compat {
+                let request_id = aws_b40_oneapi_request_id();
+                if is_messages_path(&path) {
+                    let body = format!(
+                        "{{\"error\":\"missing token (request id: {})\"}}",
+                        request_id
+                    );
+                    let mut response = Response::builder()
+                        .status(StatusCode::UNAUTHORIZED)
+                        .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+                        .body(Body::from(body))
+                        .unwrap();
+                    apply_aws_b40_headers(response.headers_mut(), &request_id);
+                    return response;
+                }
+
+                let body = json!({
+                    "error": {
+                        "code": "",
+                        "message": format!("未提供令牌 (request id: {request_id})"),
+                        "type": "new_api_error"
+                    }
+                });
+                let mut response = (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+                apply_aws_b40_headers(response.headers_mut(), &request_id);
+                return response;
+            }
+
             let error = ErrorResponse::authentication_error();
             (StatusCode::UNAUTHORIZED, Json(error)).into_response()
         }
     }
+}
+
+/// AWS-B-40 响应头兼容层。
+pub async fn aws_b40_headers_middleware(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+
+    if state.aws_b40_compat && request.method() == Method::OPTIONS {
+        let request_id = aws_b40_oneapi_request_id();
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        apply_aws_b40_headers_with_version(response.headers_mut(), &request_id, "0b8be5cf");
+        response.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        );
+        response.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("*"),
+        );
+        response.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static("*"),
+        );
+        return response;
+    }
+
+    let mut response = next.run(request).await;
+    if state.aws_b40_compat {
+        let messages_success = is_messages_path(&path) && response.status().is_success();
+        let messages_stream_success = messages_success && is_stream_response(&response);
+        let request_id = response
+            .headers()
+            .get("x-oneapi-request-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                if messages_success && !messages_stream_success {
+                    aws_b40_messages_success_request_id()
+                } else {
+                    aws_b40_oneapi_request_id()
+                }
+            });
+        let version = aws_b40_version_for_response(&method, &path, &response);
+        apply_aws_b40_headers_with_version(response.headers_mut(), &request_id, version);
+
+        if messages_success && !messages_stream_success {
+            let x_request_id = aws_b40_messages_success_request_id();
+            if let Ok(value) = HeaderValue::from_str(&x_request_id) {
+                response.headers_mut().insert("x-request-id", value);
+            }
+            response
+                .headers_mut()
+                .insert("x-group-used", HeaderValue::from_static("claude-aws-self"));
+            response.headers_mut().insert(
+                "x-app-revision",
+                HeaderValue::from_static("3e4de959a905257d"),
+            );
+            response
+                .headers_mut()
+                .insert(header::VIA, HeaderValue::from_static("1.1 Caddy"));
+            response.headers_mut().insert(
+                header::ALT_SVC,
+                HeaderValue::from_static("h3=\":443\"; ma=2592000"),
+            );
+        }
+    }
+    response
+}
+
+pub fn aws_b40_oneapi_request_id() -> String {
+    let now = chrono::Utc::now().format("%Y%m%d%H%M%S");
+    format!("{now}{}{}", random_digits(9), random_base62(8))
+}
+
+fn aws_b40_messages_success_request_id() -> String {
+    let now = chrono::Utc::now().format("%Y%m%d%H%M%S");
+    format!(
+        "{now}{}{}{}",
+        random_digits(13),
+        random_hex(4),
+        random_base62(8)
+    )
+}
+
+fn random_base62(len: usize) -> String {
+    const BASE62: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    (0..len)
+        .map(|_| BASE62[fastrand::usize(..BASE62.len())] as char)
+        .collect()
+}
+
+fn random_digits(len: usize) -> String {
+    (0..len)
+        .map(|i| {
+            let start = if i == 0 { 1 } else { 0 };
+            char::from(b'0' + fastrand::u8(start..=9))
+        })
+        .collect()
+}
+
+fn random_hex(len: usize) -> String {
+    const HEX: &[u8] = b"0123456789abcdef";
+    (0..len)
+        .map(|_| HEX[fastrand::usize(..HEX.len())] as char)
+        .collect()
+}
+
+pub(crate) fn apply_aws_b40_headers(headers: &mut header::HeaderMap, request_id: &str) {
+    apply_aws_b40_headers_with_version(headers, request_id, "83c64fa5");
+}
+
+pub(crate) fn apply_aws_b40_headers_with_version(
+    headers: &mut header::HeaderMap,
+    request_id: &str,
+    version: &'static str,
+) {
+    headers.insert("x-new-api-version", HeaderValue::from_static(version));
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        headers.insert("x-oneapi-request-id", value);
+    }
+    headers.insert(
+        header::STRICT_TRANSPORT_SECURITY,
+        HeaderValue::from_static("max-age=31536000"),
+    );
+    headers.insert(header::SERVER, HeaderValue::from_static("lyywafcdn"));
+    headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
+}
+
+fn aws_b40_version_for_response(method: &Method, path: &str, response: &Response) -> &'static str {
+    if *method == Method::OPTIONS || *method == Method::HEAD {
+        return "0b8be5cf";
+    }
+
+    if is_messages_path(path) {
+        if response.status().is_success() {
+            if is_stream_response(response) {
+                "0b8be5cf"
+            } else {
+                "20260501R2"
+            }
+        } else {
+            "0b8be5cf"
+        }
+    } else {
+        "83c64fa5"
+    }
+}
+
+fn is_messages_path(path: &str) -> bool {
+    path == "/messages" || path == "/v1/messages" || path == "/cc/v1/messages"
+}
+
+fn is_stream_response(response: &Response) -> bool {
+    response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"))
 }
 
 /// CORS 中间件层

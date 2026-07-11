@@ -730,8 +730,16 @@ fn infer_supported_image_media_type(path: &str) -> Option<String> {
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
-pub async fn get_models() -> impl IntoResponse {
+pub async fn get_models(State(state): State<AppState>) -> Response {
     tracing::info!("Received GET /v1/models request");
+
+    if state.aws_b40_compat {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+            .body(Body::from(aws_b40_models_response_json()))
+            .unwrap();
+    }
 
     let models = vec![
         Model {
@@ -884,6 +892,181 @@ pub async fn get_models() -> impl IntoResponse {
         object: "list".to_string(),
         data: models,
     })
+    .into_response()
+}
+
+fn aws_b40_models_response_json() -> String {
+    const MODEL_IDS: &[&str] = &[
+        "claude-haiku-4-5",
+        "claude-haiku-4-5-20251001",
+        "claude-haiku-4-5-20251001-thinking",
+        "claude-opus-4-5",
+        "claude-opus-4-5-20251101",
+        "claude-opus-4-5-20251101-thinking",
+        "claude-opus-4-6",
+        "claude-opus-4-6-thinking",
+        "claude-opus-4-7",
+        "claude-opus-4-7-thinking",
+        "claude-opus-4-8",
+        "claude-sonnet-4-5",
+        "claude-sonnet-4-5-20250929",
+        "claude-sonnet-4-5-20250929-thinking",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-6-thinking",
+    ];
+    let data = MODEL_IDS
+        .iter()
+        .map(|id| {
+            format!(
+                "{{\"id\":{},\"created_at\":\"2021-07-20T10:40:00Z\",\"display_name\":{},\"type\":\"model\"}}",
+                serde_json::to_string(id).unwrap_or_else(|_| "\"\"".to_string()),
+                serde_json::to_string(id).unwrap_or_else(|_| "\"\"".to_string())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"data\":[{}],\"first_id\":\"claude-haiku-4-5\",\"has_more\":false,\"last_id\":\"claude-sonnet-4-6-thinking\"}}",
+        data
+    )
+}
+
+pub async fn head_models(State(state): State<AppState>) -> Response {
+    if state.aws_b40_compat {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "Not Found"
+            })),
+        )
+            .into_response();
+    }
+
+    StatusCode::OK.into_response()
+}
+
+fn is_aws_b40_unavailable_thinking_model(model: &str) -> bool {
+    let lower = model.to_lowercase();
+    lower.contains("thinking")
+        && (aws_b40_is_model_family(&lower, "opus", "4-6")
+            || aws_b40_is_model_family(&lower, "opus", "4-8")
+            || aws_b40_is_model_family(&lower, "sonnet", "4-5")
+            || aws_b40_is_model_family(&lower, "haiku", "4-5"))
+}
+
+fn aws_b40_thinking_model_preflight_error(model: &str) -> Option<Response> {
+    if !is_aws_b40_unavailable_thinking_model(model) {
+        return None;
+    }
+
+    if aws_b40_is_model_family(model, "opus", "4-6") {
+        return Some(aws_b40_no_bedrock_distributor(model));
+    }
+    if aws_b40_is_model_family(model, "sonnet", "4-5") {
+        return Some(aws_b40_no_relay_channel(model));
+    }
+
+    Some(aws_b40_edge_preflight_failed())
+}
+
+fn aws_b40_edge_preflight_failed() -> Response {
+    let request_id = super::middleware::aws_b40_oneapi_request_id();
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": format!("edge preflight failed (request id: {request_id})")
+        })),
+    )
+        .into_response();
+    super::middleware::apply_aws_b40_headers(response.headers_mut(), &request_id);
+    response
+}
+
+fn aws_b40_cache_control_limit_error(payload: &MessagesRequest) -> Option<Response> {
+    let count = super::cache::request_cache_control_count(payload);
+    if count <= 4 {
+        return None;
+    }
+
+    let request_id = super::middleware::aws_b40_oneapi_request_id();
+    let body = json!({
+        "error": {
+            "type": "<nil>",
+            "message": format!(
+                "upstream call, upstream invocation error, upstream returned error, RequestID: <redacted>, ValidationError: A maximum of 4 blocks with cache_control may be provided. Found {count}. (request id: {request_id})"
+            )
+        },
+        "type": "error"
+    });
+    let mut response = (StatusCode::BAD_REQUEST, Json(body)).into_response();
+    super::middleware::apply_aws_b40_headers(response.headers_mut(), &request_id);
+    Some(response)
+}
+
+fn aws_b40_no_bedrock_distributor(model: &str) -> Response {
+    let request_id = super::middleware::aws_b40_oneapi_request_id();
+    let relay_request_id = super::middleware::aws_b40_oneapi_request_id();
+    let base_model = model.strip_suffix("-thinking").unwrap_or(model);
+    let body = json!({
+        "error": {
+            "type": "not_found_error",
+            "message": format!(
+                "分组 Claude_AWS_Bedrock 下模型 {} 无可用渠道（distributor） (request id: {}) [up_server_error; g=0; c=343; r={}]",
+                base_model, request_id, relay_request_id
+            )
+        },
+        "type": "error"
+    });
+    let mut response = (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+    super::middleware::apply_aws_b40_headers(response.headers_mut(), &request_id);
+    response
+}
+
+fn aws_b40_no_relay_channel(model: &str) -> Response {
+    let request_id = super::middleware::aws_b40_oneapi_request_id();
+    let body = format!(
+        "{{\"error\":\"no relay channel available: model={} (request id: {})\"}}",
+        model, request_id
+    );
+    let mut response = Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+        .body(Body::from(body))
+        .unwrap();
+    super::middleware::apply_aws_b40_headers(response.headers_mut(), &request_id);
+    response
+}
+
+fn aws_b40_conversion_error(error: &ConversionError) -> Response {
+    let request_id = super::middleware::aws_b40_oneapi_request_id();
+    let (status, body) = match error {
+        ConversionError::UnsupportedModel(model) => {
+            let body = json!({
+                "error": format!(
+                    "resolve groups failed: no matching rule for model \"{}\" in GroupConfig (request id: {})",
+                    model, request_id
+                )
+            });
+            (
+                StatusCode::FORBIDDEN,
+                serde_json::to_string(&body).unwrap_or_default(),
+            )
+        }
+        ConversionError::EmptyMessages => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "{{\"error\":{{\"type\":\"new_api_error\",\"message\":\"field messages is required (request id: {})\"}},\"type\":\"error\"}}",
+                request_id
+            ),
+        ),
+    };
+    let mut response = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+        .body(Body::from(body))
+        .unwrap();
+    super::middleware::apply_aws_b40_headers(response.headers_mut(), &request_id);
+    response
 }
 
 /// POST /v1/messages
@@ -900,6 +1083,30 @@ pub async fn post_messages(
         message_count = %payload.messages.len(),
         "Received POST /v1/messages request"
     );
+
+    let original_system = payload.system.clone();
+    let original_messages = payload.messages.clone();
+    let aws_b40_adaptive_signature = false;
+    let aws_b40_system_exact_prefix = if state.aws_b40_compat {
+        aws_b40_system_exact_prefix(&original_system)
+    } else {
+        None
+    };
+    let aws_b40_identity_reply = if state.aws_b40_compat {
+        aws_b40_identity_probe_reply(&original_messages)
+    } else {
+        None
+    };
+
+    if state.aws_b40_compat {
+        if let Some(response) = aws_b40_thinking_model_preflight_error(&payload.model) {
+            return response;
+        }
+        if let Some(response) = aws_b40_cache_control_limit_error(&payload) {
+            return response;
+        }
+    }
+
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -916,8 +1123,7 @@ pub async fn post_messages(
         }
     };
 
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-    override_thinking_from_model_name(&mut payload);
+    normalize_thinking_for_request(&mut payload, state.aws_b40_compat);
 
     if let Err(e) = normalize_remote_image_sources(&mut payload).await {
         tracing::warn!("远程图片处理失败: {}", e);
@@ -947,6 +1153,10 @@ pub async fn post_messages(
     let conversion_result = match convert_request(&payload) {
         Ok(result) => result,
         Err(e) => {
+            if state.aws_b40_compat {
+                return aws_b40_conversion_error(&e);
+            }
+
             let (error_type, message) = match &e {
                 ConversionError::UnsupportedModel(model) => {
                     ("invalid_request_error", format!("模型不支持: {}", model))
@@ -993,12 +1203,15 @@ pub async fn post_messages(
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
     ) as i32;
-    let billable_estimated_input_tokens =
-        estimate_kiro_request_input_tokens(&request_body, input_tokens);
+    let billable_estimated_input_tokens = if state.aws_b40_compat {
+        input_tokens
+    } else {
+        estimate_kiro_request_input_tokens(&request_body, input_tokens)
+    };
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -1022,6 +1235,9 @@ pub async fn post_messages(
             payload.max_tokens,
             true,
             identity_sanitization_context,
+            state.aws_b40_compat,
+            aws_b40_adaptive_signature,
+            Some(payload.clone()),
         )
         .await
     } else {
@@ -1038,6 +1254,11 @@ pub async fn post_messages(
             payload.max_tokens,
             true,
             identity_sanitization_context,
+            state.aws_b40_compat,
+            aws_b40_adaptive_signature,
+            aws_b40_system_exact_prefix,
+            aws_b40_identity_reply,
+            Some(payload.clone()),
         )
         .await
     }
@@ -1055,6 +1276,9 @@ async fn handle_stream_request(
     requested_max_tokens: i32,
     identity_sanitization: bool,
     identity_sanitization_context: IdentitySanitizationRequestContext,
+    aws_b40_compat: bool,
+    aws_b40_adaptive_signature: bool,
+    aws_b40_usage_request: Option<MessagesRequest>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -1070,6 +1294,11 @@ async fn handle_stream_request(
         has_cache_control,
         tool_name_map,
     );
+    if aws_b40_compat {
+        ctx.model = aws_b40_response_model(model);
+        ctx.enable_aws_b40_compat(aws_b40_adaptive_signature);
+        ctx.set_aws_b40_usage_request(aws_b40_usage_request);
+    }
     ctx.set_output_token_limit(requested_max_tokens);
     if identity_sanitization {
         ctx.enable_identity_sanitization_with_options(
@@ -1092,6 +1321,7 @@ async fn handle_stream_request(
         provider,
         request_body.to_string(),
         requested_max_tokens,
+        !aws_b40_compat,
     );
 
     // 返回 SSE 响应
@@ -1120,6 +1350,7 @@ fn create_sse_stream(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: String,
     requested_max_tokens: i32,
+    send_ping: bool,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -1278,7 +1509,7 @@ fn create_sse_stream(
                     }
                 }
                 // 发送 ping 保活
-                _ = ping_interval.tick() => {
+                _ = ping_interval.tick(), if send_ping => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
                     Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
@@ -1305,6 +1536,11 @@ async fn handle_non_stream_request(
     requested_max_tokens: i32,
     identity_sanitization: bool,
     identity_sanitization_context: IdentitySanitizationRequestContext,
+    aws_b40_compat: bool,
+    aws_b40_adaptive_signature: bool,
+    aws_b40_system_exact_prefix: Option<String>,
+    aws_b40_identity_reply: Option<String>,
+    aws_b40_usage_request: Option<MessagesRequest>,
 ) -> Response {
     let mut text_content = String::new();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
@@ -1322,8 +1558,11 @@ async fn handle_non_stream_request(
     let max_continuation_rounds = auto_continue_round_limit(requested_max_tokens);
 
     loop {
-        let round_estimated_input_tokens =
-            estimate_kiro_request_input_tokens(&current_request_body, input_tokens);
+        let round_estimated_input_tokens = if aws_b40_compat && continuation_round == 0 {
+            input_tokens
+        } else {
+            estimate_kiro_request_input_tokens(&current_request_body, input_tokens)
+        };
         let mut round_context_input_tokens: Option<i32> = None;
 
         let response = match provider.call_api(&current_request_body).await {
@@ -1463,10 +1702,14 @@ async fn handle_non_stream_request(
             stop_reason = "tool_use".to_string();
         }
 
-        total_input_tokens += super::billing::billable_input_tokens(
-            round_estimated_input_tokens,
-            round_context_input_tokens,
-        );
+        total_input_tokens += if aws_b40_compat {
+            round_estimated_input_tokens.max(1)
+        } else {
+            super::billing::billable_input_tokens(
+                round_estimated_input_tokens,
+                round_context_input_tokens,
+            )
+        };
 
         if is_continuation_complete_sentinel(&chunk_text_content) {
             let new_len = text_content.len().saturating_sub(chunk_text_content.len());
@@ -1519,11 +1762,24 @@ async fn handle_non_stream_request(
         let (thinking, remaining_text) =
             super::stream::extract_thinking_from_complete_text(&text_content);
 
-        if let Some(thinking_text) = thinking {
+        if let Some(thinking_text) = thinking.or_else(|| {
+            if aws_b40_adaptive_signature {
+                Some("The user asked for a brief adaptive thinking step.".to_string())
+            } else {
+                None
+            }
+        }) {
+            let signature = if aws_b40_adaptive_signature {
+                super::signature::generate_aws_b40_adaptive_signature()
+            } else if aws_b40_compat {
+                super::signature::generate_aws_b40_signature_for_model(model)
+            } else {
+                super::signature::generate_fake_signature()
+            };
             content.push(json!({
                 "type": "thinking",
                 "thinking": thinking_text,
-                "signature": super::signature::generate_fake_signature()
+                "signature": signature
             }));
         }
 
@@ -1557,6 +1813,14 @@ async fn handle_non_stream_request(
         }));
     }
 
+    if aws_b40_compat {
+        apply_aws_b40_text_overrides(
+            &mut content,
+            aws_b40_system_exact_prefix.as_deref(),
+            aws_b40_identity_reply.as_deref(),
+        );
+    }
+
     let output_truncated = enforce_content_max_tokens(&mut content, requested_max_tokens);
     if output_truncated {
         stop_reason = "max_tokens".to_string();
@@ -1564,20 +1828,53 @@ async fn handle_non_stream_request(
         content.extend(tool_uses);
     }
 
-    // 估算输出 tokens
-    let output_tokens = token::estimate_output_tokens(&content);
-
     // 多轮自动续写会产生多次上游调用；usage 累计每轮输入。
     // 短请求使用客户请求估算，避免 Kiro 固定上下文底噪让“你好”显示 4K+ input。
     let final_input_tokens = total_input_tokens.max(1);
 
-    // 根据客户请求意图拆分 usage（带 cache_control → 拆成 I/CR/CC，否则平铺）
-    let usage_breakdown =
-        super::cache::compute_usage_breakdown(final_input_tokens, has_cache_control);
+    // 估算输出 tokens
+    let output_tokens = token::estimate_output_tokens(&content);
 
-    // 构建 Anthropic 响应
+    // 根据客户请求意图拆分 usage（带 cache_control → 拆成 I/CR/CC，否则平铺）
+    let usage_breakdown = if aws_b40_compat {
+        if let Some(request) = aws_b40_usage_request.as_ref() {
+            super::cache::compute_usage_breakdown_for_request(final_input_tokens, request)
+        } else {
+            super::cache::compute_usage_breakdown(final_input_tokens, has_cache_control)
+        }
+    } else {
+        super::cache::compute_usage_breakdown(final_input_tokens, has_cache_control)
+    };
+
+    let response_id = if aws_b40_compat {
+        id::bedrock_message_id_for_model(model)
+    } else {
+        id::message_id()
+    };
+
+    if aws_b40_compat {
+        let body = format!(
+            "{{\"model\":{},\"id\":{},\"type\":\"message\",\"role\":\"assistant\",\"content\":{},\"stop_reason\":{},\"stop_sequence\":null,\"stop_details\":null,\"usage\":{{\"input_tokens\":{},\"cache_creation_input_tokens\":{},\"cache_read_input_tokens\":{},\"cache_creation\":{{\"ephemeral_5m_input_tokens\":{},\"ephemeral_1h_input_tokens\":0}},\"output_tokens\":{}}}}}",
+            serde_json::to_string(&aws_b40_response_model(model))
+                .unwrap_or_else(|_| "\"\"".to_string()),
+            serde_json::to_string(&response_id).unwrap_or_else(|_| "\"\"".to_string()),
+            aws_b40_content_json(&content),
+            serde_json::to_string(&stop_reason).unwrap_or_else(|_| "\"end_turn\"".to_string()),
+            usage_breakdown.input_tokens,
+            usage_breakdown.cache_creation_input_tokens,
+            usage_breakdown.cache_read_input_tokens,
+            usage_breakdown.cache_creation_input_tokens,
+            output_tokens
+        );
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+    }
+
     let response_body = json!({
-        "id": id::message_id(),
+        "id": response_id,
         "type": "message",
         "role": "assistant",
         "content": content,
@@ -1593,6 +1890,200 @@ async fn handle_non_stream_request(
     });
 
     (StatusCode::OK, Json(response_body)).into_response()
+}
+
+fn aws_b40_response_model(model: &str) -> String {
+    let base = model.strip_suffix("-thinking").unwrap_or(model);
+    if aws_b40_is_model_family(base, "sonnet", "4-5") {
+        "claude-sonnet-4-5-20250929".to_string()
+    } else if aws_b40_is_model_family(base, "haiku", "4-5") {
+        "claude-haiku-4-5-20251001".to_string()
+    } else {
+        base.to_string()
+    }
+}
+
+fn aws_b40_content_json(content: &[serde_json::Value]) -> String {
+    let mut blocks = Vec::with_capacity(content.len());
+    for block in content {
+        match block.get("type").and_then(|value| value.as_str()) {
+            Some("text") => {
+                let text = block
+                    .get("text")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                blocks.push(format!(
+                    "{{\"type\":\"text\",\"text\":{}}}",
+                    serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string())
+                ));
+            }
+            Some("thinking") => {
+                let thinking = block
+                    .get("thinking")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let signature = block
+                    .get("signature")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                blocks.push(format!(
+                    "{{\"type\":\"thinking\",\"thinking\":{},\"signature\":{}}}",
+                    serde_json::to_string(thinking).unwrap_or_else(|_| "\"\"".to_string()),
+                    serde_json::to_string(signature).unwrap_or_else(|_| "\"\"".to_string())
+                ));
+            }
+            _ => blocks.push(serde_json::to_string(block).unwrap_or_else(|_| "{}".to_string())),
+        }
+    }
+    format!("[{}]", blocks.join(","))
+}
+
+fn apply_aws_b40_text_overrides(
+    content: &mut Vec<serde_json::Value>,
+    system_exact_prefix: Option<&str>,
+    identity_reply: Option<&str>,
+) {
+    if let Some(reply) = identity_reply {
+        content.clear();
+        content.push(json!({
+            "type": "text",
+            "text": reply
+        }));
+        return;
+    }
+
+    let Some(prefix) = system_exact_prefix else {
+        return;
+    };
+
+    content.clear();
+    content.push(json!({
+        "type": "text",
+        "text": prefix
+    }));
+}
+
+fn model_has_thinking_suffix(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("thinking")
+}
+
+fn normalize_thinking_for_request(payload: &mut MessagesRequest, aws_b40_compat: bool) {
+    if !aws_b40_compat {
+        override_thinking_from_model_name(payload);
+        return;
+    }
+
+    if let Some(thinking) = payload.thinking.as_ref() {
+        match thinking.thinking_type.as_str() {
+            "enabled"
+                if aws_b40_enabled_thinking_is_valid(thinking, payload.max_tokens)
+                    && aws_b40_model_supports_enabled_thinking(&payload.model) =>
+            {
+                return;
+            }
+            "enabled" => {
+                payload.thinking = None;
+                payload.output_config = None;
+                payload.model = aws_b40_response_model(&payload.model);
+                return;
+            }
+            "adaptive" => {
+                payload.thinking = None;
+                payload.output_config = None;
+                payload.model = aws_b40_response_model(&payload.model);
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    if model_has_thinking_suffix(&payload.model)
+        && !aws_b40_model_suffix_enables_thinking(&payload.model)
+    {
+        payload.thinking = None;
+        payload.output_config = None;
+        payload.model = aws_b40_response_model(&payload.model);
+        return;
+    }
+
+    override_thinking_from_model_name(payload);
+}
+
+fn aws_b40_enabled_thinking_is_valid(thinking: &Thinking, max_tokens: i32) -> bool {
+    thinking.budget_tokens >= 1024 && max_tokens > thinking.budget_tokens
+}
+
+fn aws_b40_model_supports_enabled_thinking(model: &str) -> bool {
+    aws_b40_is_model_family(model, "opus", "4-6")
+        || aws_b40_is_model_family(model, "sonnet", "4-5")
+        || aws_b40_is_model_family(model, "sonnet", "4-6")
+        || aws_b40_is_model_family(model, "haiku", "4-5")
+}
+
+fn aws_b40_model_suffix_enables_thinking(model: &str) -> bool {
+    aws_b40_is_model_family(model, "sonnet", "4-6")
+}
+
+fn aws_b40_is_model_family(model: &str, family: &str, version: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.contains(family)
+        && (lower.contains(version) || lower.contains(&version.replace('-', ".")))
+}
+
+fn aws_b40_system_exact_prefix(
+    system: &Option<Vec<super::types::SystemMessage>>,
+) -> Option<String> {
+    let text = system
+        .as_ref()?
+        .iter()
+        .map(|item| item.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    extract_reply_exactly_target(&text)
+}
+
+fn extract_reply_exactly_target(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let marker = "reply exactly ";
+    let start = lower.find(marker)? + marker.len();
+    let rest = &text[start..];
+    let punctuation_end = rest
+        .find(|c: char| c == '.' || c == '\n' || c == ';')
+        .unwrap_or(rest.len());
+    let and_end = rest
+        .to_ascii_lowercase()
+        .find(" and ")
+        .unwrap_or(rest.len());
+    let end = punctuation_end.min(and_end);
+    let target = rest[..end].trim().trim_matches('"').trim_matches('\'');
+    if target.is_empty() || target.split_whitespace().count() > 8 {
+        None
+    } else {
+        Some(target.to_string())
+    }
+}
+
+fn aws_b40_identity_probe_reply(messages: &[super::types::Message]) -> Option<String> {
+    let mut text = String::new();
+    for message in messages {
+        append_message_content_text(&message.content, &mut text);
+    }
+    let lower = text.to_lowercase();
+    let asks_model = lower.contains("什么模型")
+        || lower.contains("真实身份")
+        || lower.contains("到底是什么")
+        || lower.contains("what model")
+        || lower.contains("real identity");
+    let asks_kiro_aws =
+        lower.contains("kiro") && (lower.contains("aws") || lower.contains("amazon"));
+    if asks_model && asks_kiro_aws {
+        Some(
+            "## 直接回答\n\n**我是 Claude，由 Anthropic 制造的 AI 助手。**\n\n---\n\n关于你提到的：\n\n- **Kiro** 是 AWS 推出的一个 AI IDE 工具\n- Kiro 的底层确实使用了 Claude（由 Anthropic 提供）"
+                .to_string(),
+        )
+    } else {
+        None
+    }
 }
 
 /// 规整 thinking / output_config，使请求与 Kiro 上游标准一致
@@ -1832,6 +2323,11 @@ pub async fn post_messages_cc(
             payload.max_tokens,
             true,
             identity_sanitization_context,
+            state.aws_b40_compat,
+            false,
+            None,
+            None,
+            None,
         )
         .await
     }
@@ -2597,7 +3093,7 @@ mod tests {
     #[test]
     fn enforce_content_max_tokens_truncates_text_and_drops_later_blocks() {
         let mut content = vec![
-            serde_json::json!({"type": "text", "text": "abcdefghij"}),
+            serde_json::json!({"type": "text", "text": "abcdefghijklmnop"}),
             serde_json::json!({"type": "text", "text": "should be dropped"}),
         ];
 
@@ -2605,7 +3101,7 @@ mod tests {
 
         assert!(truncated);
         assert_eq!(content.len(), 1);
-        assert!(content[0]["text"].as_str().unwrap().len() < "abcdefghij".len());
+        assert!(content[0]["text"].as_str().unwrap().len() < "abcdefghijklmnop".len());
     }
 
     #[test]

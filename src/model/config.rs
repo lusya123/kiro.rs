@@ -116,6 +116,13 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
+    /// 启用 AWS-B-40 外观兼容模式。
+    ///
+    /// 仅调整本服务对外协议形状（headers、模型列表、错误格式、SSE 细节等），
+    /// 不改变真实 Kiro 上游模型。
+    #[serde(default)]
+    pub aws_b40_compat: bool,
+
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
@@ -212,6 +219,7 @@ impl Default for Config {
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
+            aws_b40_compat: false,
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             config_path: None,

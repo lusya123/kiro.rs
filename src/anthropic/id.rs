@@ -29,6 +29,26 @@ pub fn message_id() -> String {
     anthropic_id("msg")
 }
 
+pub fn bedrock_message_id() -> String {
+    let suffix = ensure_not_hex_suffix(format!("01{}", random_base62(22)));
+    format!("msg_bdrk_{suffix}")
+}
+
+pub fn bedrock_message_id_for_model(model: &str) -> String {
+    if model.to_ascii_lowercase().contains("opus") {
+        format!("msg_bdrk_{}", random_lower_alnum(52))
+    } else {
+        bedrock_message_id()
+    }
+}
+
+fn random_lower_alnum(len: usize) -> String {
+    const LOWER_ALNUM: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    (0..len)
+        .map(|_| LOWER_ALNUM[fastrand::usize(..LOWER_ALNUM.len())] as char)
+        .collect()
+}
+
 pub fn server_tool_use_id() -> String {
     anthropic_id("srvtoolu")
 }

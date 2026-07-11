@@ -10,8 +10,8 @@ use axum::{
 use crate::kiro::provider::KiroProvider;
 
 use super::{
-    handlers::{count_tokens, get_models, post_messages, post_messages_cc},
-    middleware::{AppState, auth_middleware, cors_layer},
+    handlers::{count_tokens, get_models, head_models, post_messages, post_messages_cc},
+    middleware::{AppState, auth_middleware, aws_b40_headers_middleware, cors_layer},
 };
 
 /// 请求体最大大小限制 (50MB)
@@ -38,15 +38,16 @@ pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
+    aws_b40_compat: bool,
 ) -> Router {
-    let mut state = AppState::new(api_key, extract_thinking);
+    let mut state = AppState::new(api_key, extract_thinking, aws_b40_compat);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()
-        .route("/models", get(get_models))
+        .route("/models", get(get_models).head(head_models))
         .route("/messages", post(post_messages))
         .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(
@@ -68,6 +69,10 @@ pub fn create_router_with_provider(
         .nest("/v1", v1_routes)
         .nest("/cc/v1", cc_v1_routes)
         .layer(cors_layer())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            aws_b40_headers_middleware,
+        ))
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
         .with_state(state)
 }

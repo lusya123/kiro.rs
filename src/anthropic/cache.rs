@@ -1,30 +1,15 @@
 //! Cache usage 显示策略
 //!
-//! Kiro 上游不支持 prompt caching，但客户端可能用 Anthropic prompt caching SDK
-//! 并期待响应里看到 cache 字段反馈。本模块提供两种显示策略：
+//! AWS-P 口径不维护本地 prompt-cache 命中状态，而是在客户请求包含
+//! `cache_control` 时，把真实 input_tokens 按 Anthropic cache 字段做虚拟拆分。
+//! 没有 `cache_control` 的请求始终平铺为普通 input。
 //!
-//! 1. **客户传了 cache_control** → 把上游真实 input_tokens 按 Anthropic 官方
-//!    cache 字段拆分成 (input, cache_read, cache_creation)。高缓存分支按
-//!    输入规模渐进展示 cache：短请求不造缓存，中等上下文少量 read，大上下文
-//!    才展示较高 read。
-//!
-//! 2. **客户没传 cache_control** → 老实返回 `input=T, cache_read=0,
-//!    cache_creation=0`，避免"凭空冒出 cache"的客户投诉。
-//!
-//! ## 渐进式高缓存拆分
-//!
-//! - `T < 4k`：全部显示为普通 input，避免短请求凭空出现 cache。
+//! 渐进式拆分规则：
+//! - `T < 4k`：全部显示为普通 input。
 //! - `4k <= T < 20k`：保留 15% creation，read 从 10% 平滑涨到 45%。
 //! - `20k <= T < 50k`：creation 从 15% 平滑降到 13%，read 从 45% 平滑涨到 80%。
 //! - `T >= 50k`：creation 从 13% 平滑降到 10%，read 从 80% 平滑涨到 90%。
 //! - 始终满足 `input + cache_read + cache_creation = T`。
-//!
-//! ## 取代 sub2api virtual_cache 的理由
-//!
-//! sub2api 的 `applyVirtualCacheToUsageJSON` 在所有上游空 cache 时都注入，
-//! 客户没传 cache_control 也会看到莫名 cache 数字。把策略移到 kiro-rs 后，
-//! 由 kiro-rs 根据客户请求意图主动决定显示，sub2api 把对应账号
-//! `virtual_cache_enabled` 关掉即可全程透传。
 
 use crate::anthropic::types::{Message, MessagesRequest};
 use serde_json::Value;
@@ -71,7 +56,7 @@ pub struct UsageBreakdown {
 }
 
 impl UsageBreakdown {
-    /// 平凡情况：所有 token 算作普通 input，cache 字段为 0
+    /// 平凡情况：所有 token 算作普通 input，cache 字段为 0。
     pub fn flat(input_tokens: i32) -> Self {
         Self {
             input_tokens,
@@ -88,8 +73,6 @@ impl UsageBreakdown {
 }
 
 /// 把真实总 token `total_input_tokens` 拆分成高缓存展示口径 (I, CR, CC)。
-///
-/// `total_input_tokens <= 0` 直接返回全 0。
 pub fn split_virtual_cache(total_input_tokens: i32) -> UsageBreakdown {
     if total_input_tokens <= 0 || total_input_tokens < CACHE_DISPLAY_MIN_TOKENS {
         return UsageBreakdown::flat(total_input_tokens.max(0));
@@ -100,10 +83,10 @@ pub fn split_virtual_cache(total_input_tokens: i32) -> UsageBreakdown {
     let cc = ((total_input_tokens as f64) * creation_ratio).floor() as i32;
     let remaining = total_input_tokens - cc;
     let cr = ((remaining as f64) * read_hit_ratio).floor() as i32;
-    let i = total_input_tokens - cr - cc;
+    let input = total_input_tokens - cr - cc;
 
     UsageBreakdown {
-        input_tokens: i,
+        input_tokens: input,
         cache_read_input_tokens: cr,
         cache_creation_input_tokens: cc,
     }
@@ -154,73 +137,82 @@ fn progress_between(value: i32, start: i32, end: i32) -> f64 {
 }
 
 /// 检查请求里有没有 `cache_control` 字段。
-///
-/// Anthropic 协议中 `cache_control` 可以出现在：
-/// - `system[*].cache_control`
-/// - `messages[*].content[*].cache_control`（content 是数组形态）
-/// - `tools[*].cache_control`
-///
-/// 任何一处出现都视为"客户开启了 prompt caching"。
 pub fn request_has_cache_control(req: &MessagesRequest) -> bool {
-    // system blocks
+    request_cache_control_count(req) > 0
+}
+
+/// 统计请求里出现的 `cache_control` 个数。
+///
+/// 当前 handlers 仍用这个函数保留 Anthropic 最多 4 个 cache breakpoint 的校验。
+pub fn request_cache_control_count(req: &MessagesRequest) -> usize {
+    let mut count = 0;
+
     if let Some(system) = &req.system {
         for s in system {
-            if has_cache_control_in_value(&serde_json::to_value(s).unwrap_or(Value::Null)) {
-                return true;
-            }
+            count += cache_control_count_in_value(&serde_json::to_value(s).unwrap_or(Value::Null));
         }
     }
 
-    // messages
     for msg in &req.messages {
-        if message_has_cache_control(msg) {
-            return true;
-        }
+        count += message_cache_control_count(msg);
     }
 
-    // tools
     if let Some(tools) = &req.tools {
         for tool in tools {
-            if has_cache_control_in_value(&serde_json::to_value(tool).unwrap_or(Value::Null)) {
-                return true;
-            }
+            count +=
+                cache_control_count_in_value(&serde_json::to_value(tool).unwrap_or(Value::Null));
         }
     }
 
-    false
+    count
 }
 
-fn message_has_cache_control(msg: &Message) -> bool {
+fn message_cache_control_count(msg: &Message) -> usize {
     match &msg.content {
-        Value::String(_) => false,
-        Value::Array(arr) => arr.iter().any(has_cache_control_in_value),
-        v => has_cache_control_in_value(v),
+        Value::String(_) => 0,
+        Value::Array(arr) => arr.iter().map(cache_control_count_in_value).sum(),
+        v => cache_control_count_in_value(v),
     }
 }
 
-fn has_cache_control_in_value(v: &Value) -> bool {
+fn cache_control_count_in_value(v: &Value) -> usize {
     match v {
         Value::Object(map) => {
-            if map.contains_key("cache_control") {
-                return true;
-            }
-            map.values().any(has_cache_control_in_value)
+            let current = usize::from(map.contains_key("cache_control"));
+            current
+                + map
+                    .values()
+                    .map(cache_control_count_in_value)
+                    .sum::<usize>()
         }
-        Value::Array(arr) => arr.iter().any(has_cache_control_in_value),
-        _ => false,
+        Value::Array(arr) => arr.iter().map(cache_control_count_in_value).sum(),
+        _ => 0,
     }
 }
 
 /// 根据请求意图决定 usage 字段的最终形态。
-///
-/// - `has_cache_control = true` → 拆分成 (I, CR, CC) 让客户感受 cache 命中
-/// - `has_cache_control = false` → 老实返回 (T, 0, 0)
 pub fn compute_usage_breakdown(total_input_tokens: i32, has_cache_control: bool) -> UsageBreakdown {
     if has_cache_control {
         split_virtual_cache(total_input_tokens)
     } else {
         UsageBreakdown::flat(total_input_tokens)
     }
+}
+
+/// 当前分支保留的请求级入口；AWS-P 口径不提交/读取状态，只看请求是否含 cache_control。
+pub fn compute_usage_breakdown_for_request(
+    total_input_tokens: i32,
+    req: &MessagesRequest,
+) -> UsageBreakdown {
+    compute_usage_breakdown(total_input_tokens, request_has_cache_control(req))
+}
+
+/// 当前分支保留的预览入口；AWS-P 口径没有状态副作用，因此与正式计算一致。
+pub fn preview_usage_breakdown_for_request(
+    total_input_tokens: i32,
+    req: &MessagesRequest,
+) -> UsageBreakdown {
+    compute_usage_breakdown_for_request(total_input_tokens, req)
 }
 
 #[cfg(test)]
@@ -258,10 +250,6 @@ mod tests {
     #[test]
     fn medium_context_shows_limited_cache_read() {
         let b = compute_usage_breakdown(12_000, true);
-        // progress = (12000 - 4000) / (20000 - 4000) = 0.5
-        // read hit ratio = 10% + (45% - 10%) * 0.5 = 27.5%
-        // CC = floor(12000 * 0.15) = 1800
-        // CR = floor((12000 - 1800) * 0.275) = 2805
         assert_eq!(b.cache_creation_input_tokens, 1800);
         assert_eq!(b.cache_read_input_tokens, 2805);
         assert_eq!(b.input_tokens, 7395);
@@ -270,7 +258,6 @@ mod tests {
     #[test]
     fn large_context_starts_high_cache_read() {
         let b = compute_usage_breakdown(20_000, true);
-        // 20k 是高缓存平滑过渡起点：15% creation，剩余部分 45% read。
         assert_eq!(b.cache_creation_input_tokens, 3000);
         assert_eq!(b.cache_read_input_tokens, 7650);
         assert_eq!(b.input_tokens, 9350);
@@ -279,7 +266,6 @@ mod tests {
     #[test]
     fn strong_context_reaches_high_cache_read() {
         let b = compute_usage_breakdown(50_000, true);
-        // 50k 达到强缓存起点：13% creation，剩余部分 80% read。
         assert_eq!(b.cache_creation_input_tokens, 6500);
         assert_eq!(b.cache_read_input_tokens, 34800);
         assert_eq!(b.input_tokens, 8700);
@@ -288,7 +274,6 @@ mod tests {
     #[test]
     fn very_large_context_caps_cache_read_and_reduces_creation() {
         let b = compute_usage_breakdown(100_000, true);
-        // 100k 后达到上限：10% creation，剩余部分 90% read。
         assert_eq!(b.cache_creation_input_tokens, 10_000);
         assert_eq!(b.cache_read_input_tokens, 81_000);
         assert_eq!(b.input_tokens, 9000);
@@ -303,13 +288,21 @@ mod tests {
     }
 
     #[test]
-    fn split_uses_progressive_read_hit_rates() {
-        assert_eq!(read_hit_rate(split_virtual_cache(3999)), 0.0);
-        assert!((read_hit_rate(split_virtual_cache(4000)) - 0.10).abs() <= 0.01);
-        assert!((read_hit_rate(split_virtual_cache(12_000)) - 0.275).abs() <= 0.01);
-        assert!((read_hit_rate(split_virtual_cache(20_000)) - 0.45).abs() <= 0.01);
-        assert!((read_hit_rate(split_virtual_cache(50_000)) - 0.80).abs() <= 0.01);
-        assert!((read_hit_rate(split_virtual_cache(100_000)) - 0.90).abs() <= 0.01);
+    fn request_level_entry_uses_virtual_cache_without_state() {
+        let req = parse_request(serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "long context", "cache_control": {"type": "ephemeral"}}
+                ]
+            }]
+        }));
+
+        let first = compute_usage_breakdown_for_request(12_000, &req);
+        let second = compute_usage_breakdown_for_request(12_000, &req);
+
+        assert_eq!(first, compute_usage_breakdown(12_000, true));
+        assert_eq!(second, first);
     }
 
     #[test]
@@ -319,27 +312,53 @@ mod tests {
     }
 
     #[test]
-    fn split_reduces_creation_for_very_large_context() {
-        assert_eq!(
-            split_virtual_cache(20_000).cache_creation_input_tokens,
-            3000
-        );
-        assert_eq!(
-            split_virtual_cache(50_000).cache_creation_input_tokens,
-            6500
-        );
-        assert_eq!(
-            split_virtual_cache(100_000).cache_creation_input_tokens,
-            10_000
-        );
+    fn detects_cache_control_in_system() {
+        let req = parse_request(serde_json::json!({
+            "system": [{
+                "type": "text",
+                "text": "...",
+                "cache_control": {"type": "ephemeral"}
+            }]
+        }));
+        assert!(request_has_cache_control(&req));
+        assert_eq!(request_cache_control_count(&req), 1);
     }
 
-    fn read_hit_rate(b: UsageBreakdown) -> f64 {
-        let read_or_input = b.cache_read_input_tokens + b.input_tokens;
-        if read_or_input == 0 {
-            return 0.0;
-        }
-        b.cache_read_input_tokens as f64 / read_or_input as f64
+    #[test]
+    fn detects_cache_control_in_message_content() {
+        let req = parse_request(serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "long context", "cache_control": {"type": "ephemeral"}}
+                ]
+            }]
+        }));
+        assert!(request_has_cache_control(&req));
+        assert_eq!(request_cache_control_count(&req), 1);
+    }
+
+    #[test]
+    fn detects_cache_control_in_tools() {
+        let req = parse_request(serde_json::json!({
+            "tools": [{
+                "name": "calculator",
+                "description": "math",
+                "input_schema": {"type": "object"},
+                "cache_control": {"type": "ephemeral"}
+            }]
+        }));
+        assert!(request_has_cache_control(&req));
+        assert_eq!(request_cache_control_count(&req), 1);
+    }
+
+    #[test]
+    fn no_cache_control_returns_false() {
+        let req = parse_request(serde_json::json!({
+            "messages": [{"role": "user", "content": "plain question"}]
+        }));
+        assert!(!request_has_cache_control(&req));
+        assert_eq!(request_cache_control_count(&req), 0);
     }
 
     fn parse_request(extra: serde_json::Value) -> MessagesRequest {
@@ -354,70 +373,5 @@ mod tests {
             }
         }
         serde_json::from_value(body).expect("valid")
-    }
-
-    #[test]
-    fn detects_cache_control_in_system() {
-        let req = parse_request(serde_json::json!({
-            "system": [{
-                "type": "text",
-                "text": "...",
-                "cache_control": {"type": "ephemeral"}
-            }]
-        }));
-        assert!(request_has_cache_control(&req));
-    }
-
-    #[test]
-    fn detects_cache_control_in_message_content() {
-        let req = parse_request(serde_json::json!({
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "long context", "cache_control": {"type": "ephemeral"}}
-                ]
-            }]
-        }));
-        assert!(request_has_cache_control(&req));
-    }
-
-    #[test]
-    fn detects_cache_control_in_tools() {
-        let req = parse_request(serde_json::json!({
-            "tools": [{
-                "name": "calculator",
-                "description": "math",
-                "input_schema": {"type": "object"},
-                "cache_control": {"type": "ephemeral"}
-            }]
-        }));
-        assert!(request_has_cache_control(&req));
-    }
-
-    #[test]
-    fn no_cache_control_returns_false() {
-        let req = parse_request(serde_json::json!({
-            "messages": [{"role": "user", "content": "plain question"}]
-        }));
-        assert!(!request_has_cache_control(&req));
-    }
-
-    #[test]
-    fn customer_xueding_request_has_cache_control() {
-        // 客户 sk-cde0... 的真实请求含 system.cache_control={"type":"ephemeral"}
-        let req = parse_request(serde_json::json!({
-            "thinking": {"type": "adaptive", "display": "summarized"},
-            "output_config": {"effort": "max"},
-            "system": [{
-                "type": "text",
-                "text": "You are OpenCode",
-                "cache_control": {"type": "ephemeral"}
-            }],
-            "messages": [{"role": "user", "content": "hi"}]
-        }));
-        assert!(
-            request_has_cache_control(&req),
-            "客户原始请求 system 含 cache_control 必须被识别"
-        );
     }
 }
