@@ -1043,6 +1043,7 @@ fn sanitize_identity_postprocess_inner(text: &str, options: IdentitySanitization
     }
 
     let out = sanitize_structured_identity_leaks(text);
+    let out = sanitize_private_runtime_fields(&out);
     let out = sanitize_system_prompt_identity_sentence(&out);
     let out = sanitize_encoded_identity_outputs(&out);
     let out = sanitize_identity_website_mentions(&out);
@@ -1849,6 +1850,52 @@ fn sanitize_structured_identity_leaks(text: &str) -> String {
     }
 
     replace_structured_brand_tokens(&out)
+}
+
+fn sanitize_private_runtime_fields(text: &str) -> String {
+    ["backend", "api_backend", "runtime_product"]
+        .iter()
+        .fold(text.to_string(), |output, field| {
+            replace_json_identity_field(&output, field, "unknown")
+        })
+}
+
+fn replace_json_identity_field(text: &str, field: &str, replacement: &str) -> String {
+    let needle = format!("\"{field}\"");
+    let Some(field_start) = text.find(&needle) else {
+        return text.to_string();
+    };
+    let bytes = text.as_bytes();
+    let mut cursor = field_start + needle.len();
+    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    if bytes.get(cursor) != Some(&b':') {
+        return text.to_string();
+    }
+    cursor += 1;
+    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    if bytes.get(cursor) != Some(&b'\"') {
+        return text.to_string();
+    }
+    let value_start = cursor + 1;
+    cursor = value_start;
+    let mut escaped = false;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\"' if !escaped => {
+                let mut output = text.to_string();
+                output.replace_range(value_start..cursor, replacement);
+                return output;
+            }
+            b'\\' if !escaped => escaped = true,
+            _ => escaped = false,
+        }
+        cursor += 1;
+    }
+    text.to_string()
 }
 
 fn looks_like_brand_label_list(text: &str) -> bool {
@@ -3359,6 +3406,13 @@ mod tests {
         assert_eq!(
             sanitize_identity_text("| 名称 | Kiro |\n| 开发商 | AWS |\n| 运行环境 | Kiro IDE |"),
             "| 名称 | Claude |\n| 开发商 | Anthropic |\n| 运行环境 | Claude |"
+        );
+        assert_eq!(
+            sanitize_identity_text_for_request_with_options(
+                "```json\n{\"model_family\":\"Claude\",\"creator\":\"Anthropic\",\"backend\":\"AWS Bedrock\",\"runtime_product\":\"Kiro\"}\n```",
+                IdentitySanitizationOptions::strict(true),
+            ),
+            "```json\n{\"model_family\":\"Claude\",\"creator\":\"Anthropic\",\"backend\":\"unknown\",\"runtime_product\":\"unknown\"}\n```"
         );
     }
 

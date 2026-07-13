@@ -221,12 +221,23 @@ pub fn compute_usage_breakdown(total_input_tokens: i32, has_cache_control: bool)
     }
 }
 
+#[cfg(test)]
 pub async fn compute_request_usage_breakdown(
     total_input_tokens: i32,
     req: &MessagesRequest,
 ) -> UsageBreakdown {
+    compute_request_usage_breakdown_with_profile(total_input_tokens, req, false).await
+}
+
+pub async fn compute_request_usage_breakdown_with_profile(
+    total_input_tokens: i32,
+    req: &MessagesRequest,
+    aws_b40_compat: bool,
+) -> UsageBreakdown {
     let total_input_tokens = total_input_tokens.max(0);
-    let Some(cache_plan) = cache_plan_for_request(total_input_tokens, req).await else {
+    let Some(cache_plan) =
+        cache_plan_for_request(total_input_tokens, req, aws_b40_compat).await
+    else {
         return UsageBreakdown::flat(total_input_tokens);
     };
 
@@ -256,6 +267,48 @@ pub fn with_additional_input(
     }
 }
 
+/// Reconcile the first-round cache split after a profile obtains a more
+/// accurate total from the upstream context-usage event. Continuation rounds
+/// are handled separately by `with_additional_input` and remain ordinary input.
+pub fn reconcile_initial_input(
+    initial: UsageBreakdown,
+    calibrated_total_input_tokens: i32,
+    ordinary_input_adjustment: i32,
+) -> UsageBreakdown {
+    let calibrated_total_input_tokens = calibrated_total_input_tokens.max(1);
+    let initial_cached = initial
+        .cache_read_input_tokens
+        .saturating_add(initial.cache_creation_input_tokens);
+    if initial_cached <= 0 {
+        return UsageBreakdown::flat(calibrated_total_input_tokens);
+    }
+
+    let ordinary_input = initial
+        .input_tokens
+        .saturating_add(ordinary_input_adjustment)
+        .clamp(1, calibrated_total_input_tokens);
+    let calibrated_cached = calibrated_total_input_tokens.saturating_sub(ordinary_input);
+    let cache_read = ((calibrated_cached as i64 * initial.cache_read_input_tokens as i64)
+        / initial_cached as i64) as i32;
+    let cache_creation = calibrated_cached.saturating_sub(cache_read);
+    let initial_creation = initial.cache_creation_input_tokens;
+    let cache_creation_1h = if initial_creation > 0 {
+        ((cache_creation as i64 * initial.cache_creation_1h_input_tokens as i64)
+            / initial_creation as i64) as i32
+    } else {
+        0
+    };
+    let cache_creation_5m = cache_creation.saturating_sub(cache_creation_1h);
+
+    UsageBreakdown {
+        input_tokens: ordinary_input,
+        cache_read_input_tokens: cache_read,
+        cache_creation_input_tokens: cache_creation,
+        cache_creation_5m_input_tokens: cache_creation_5m,
+        cache_creation_1h_input_tokens: cache_creation_1h,
+    }
+}
+
 struct CachePlan {
     cache_tokens: i32,
     cache_read_tokens: i32,
@@ -266,8 +319,10 @@ struct CachePlan {
 async fn cache_plan_for_request(
     total_input_tokens: i32,
     req: &MessagesRequest,
+    aws_b40_compat: bool,
 ) -> Option<CachePlan> {
-    let mut breakpoints = build_cache_breakpoints(req, total_input_tokens);
+    let mut breakpoints =
+        build_cache_breakpoints(req, total_input_tokens, aws_b40_compat);
     breakpoints.retain(|b| b.tokens >= cache_min_tokens(&req.model));
     if breakpoints.is_empty() {
         return None;
@@ -337,7 +392,11 @@ struct CacheBreakpoint {
     readable: bool,
 }
 
-fn build_cache_breakpoints(req: &MessagesRequest, total_input_tokens: i32) -> Vec<CacheBreakpoint> {
+fn build_cache_breakpoints(
+    req: &MessagesRequest,
+    total_input_tokens: i32,
+    aws_b40_compat: bool,
+) -> Vec<CacheBreakpoint> {
     let mut state = PrefixState::default();
     let mut breakpoints = Vec::new();
 
@@ -356,6 +415,7 @@ fn build_cache_breakpoints(req: &MessagesRequest, total_input_tokens: i32) -> Ve
                     &mut breakpoints,
                     cache_ttl(tool.cache_control.as_ref()),
                     true,
+                    aws_b40_compat,
                 );
             }
         }
@@ -372,18 +432,32 @@ fn build_cache_breakpoints(req: &MessagesRequest, total_input_tokens: i32) -> Ve
                     &mut breakpoints,
                     cache_ttl(item.cache_control.as_ref()),
                     true,
+                    aws_b40_compat,
                 );
             }
         }
     }
 
     for message in &req.messages {
-        collect_message_prefix(req, message, &mut state, &mut breakpoints);
+        collect_message_prefix(
+            req,
+            message,
+            &mut state,
+            &mut breakpoints,
+            aws_b40_compat,
+        );
     }
 
     if req.cache_control.is_some() && breakpoints.is_empty() && state.has_cacheable_content() {
         let ttl = cache_ttl(req.cache_control.as_ref());
-        push_breakpoint(req, &state, &mut breakpoints, ttl, true);
+        push_breakpoint(
+            req,
+            &state,
+            &mut breakpoints,
+            ttl,
+            true,
+            aws_b40_compat,
+        );
     }
 
     for breakpoint in &mut breakpoints {
@@ -413,6 +487,7 @@ fn collect_message_prefix(
     message: &Message,
     state: &mut PrefixState,
     breakpoints: &mut Vec<CacheBreakpoint>,
+    aws_b40_compat: bool,
 ) {
     match &message.content {
         Value::String(text) => {
@@ -436,7 +511,14 @@ fn collect_message_prefix(
                     .content_segments
                     .push(Value::Array(vec![item_without_cache]));
                 if has_direct_cache_control(item) {
-                    push_breakpoint(req, state, breakpoints, ttl, false);
+                    push_breakpoint(
+                        req,
+                        state,
+                        breakpoints,
+                        ttl,
+                        false,
+                        aws_b40_compat,
+                    );
                 }
             }
         }
@@ -502,13 +584,24 @@ fn push_breakpoint(
     breakpoints: &mut Vec<CacheBreakpoint>,
     ttl: CacheTtl,
     readable: bool,
+    aws_b40_compat: bool,
 ) {
-    let tokens = super::compat::estimate_prefix_tokens(
+    let base_tokens = super::compat::estimate_prefix_tokens(
         &req.model,
         &state.system_segments,
         &state.content_segments,
         &state.tools,
     );
+    let tokens = if aws_b40_compat {
+        super::bedrock::calibrated_cache_prefix_tokens(
+            base_tokens,
+            &state.system_segments,
+            &state.content_segments,
+            !state.tools.is_empty(),
+        )
+    } else {
+        base_tokens
+    };
     breakpoints.push(CacheBreakpoint {
         tokens,
         ttl,
@@ -616,6 +709,42 @@ mod tests {
         assert_eq!(out.input_tokens, 9000);
         assert_eq!(out.cache_read_input_tokens, 0);
         assert_eq!(out.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn reconciles_profile_delta_into_cached_prefix() {
+        let initial = UsageBreakdown {
+            input_tokens: 230,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 8272,
+            cache_creation_5m_input_tokens: 8272,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let out = reconcile_initial_input(initial, 15_499, -17);
+
+        assert_eq!(out.input_tokens, 213);
+        assert_eq!(out.cache_creation_input_tokens, 15_286);
+        assert_eq!(out.cache_creation_5m_input_tokens, 15_286);
+        assert_eq!(out.total(), 15_499);
+    }
+
+    #[test]
+    fn reconciliation_preserves_cache_kind_and_ttl_ratios() {
+        let initial = UsageBreakdown {
+            input_tokens: 100,
+            cache_read_input_tokens: 300,
+            cache_creation_input_tokens: 600,
+            cache_creation_5m_input_tokens: 400,
+            cache_creation_1h_input_tokens: 200,
+        };
+        let out = reconcile_initial_input(initial, 1900, 0);
+
+        assert_eq!(out.input_tokens, 100);
+        assert_eq!(out.cache_read_input_tokens, 600);
+        assert_eq!(out.cache_creation_input_tokens, 1200);
+        assert_eq!(out.cache_creation_5m_input_tokens, 800);
+        assert_eq!(out.cache_creation_1h_input_tokens, 400);
+        assert_eq!(out.total(), 1900);
     }
 
     #[test]
@@ -937,5 +1066,33 @@ mod tests {
         assert!(second.cache_creation_input_tokens > 0);
         assert_eq!(first.cache_read_input_tokens, 0);
         assert_eq!(second.cache_read_input_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn bedrock_cache_profile_calibrates_total_and_prefix_usage() {
+        let anchor = (0..900)
+            .map(|index| format!("stable cache anchor segment {index}: protocol parity datum."))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let req = parse_request(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "system": [{
+                "type": "text",
+                "text": anchor,
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": [{"role": "user", "content": "Reply exactly CACHE_OK."}]
+        }));
+        let base = super::super::compat::estimate_input_tokens(&req);
+        let total = super::super::bedrock::calibrated_input_tokens(&req, base);
+        let usage = compute_request_usage_breakdown_with_profile(total, &req, true).await;
+
+        assert_eq!(total, 18_021);
+        assert_eq!(usage.input_tokens, 18);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, 18_003);
+        assert_eq!(usage.cache_creation_5m_input_tokens, 18_003);
+        assert_eq!(usage.cache_creation_1h_input_tokens, 0);
+        assert_eq!(usage.total(), total);
     }
 }

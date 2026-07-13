@@ -103,20 +103,12 @@ pub async fn aws_b40_headers_middleware(
 
     if state.aws_b40_compat && request.method() == Method::OPTIONS {
         let request_id = aws_b40_oneapi_request_id();
-        let mut response = StatusCode::NO_CONTENT.into_response();
-        apply_aws_b40_headers_with_version(response.headers_mut(), &request_id, "0b8be5cf");
-        response.headers_mut().insert(
-            header::ACCESS_CONTROL_ALLOW_ORIGIN,
-            HeaderValue::from_static("*"),
-        );
-        response.headers_mut().insert(
-            header::ACCESS_CONTROL_ALLOW_METHODS,
-            HeaderValue::from_static("*"),
-        );
-        response.headers_mut().insert(
-            header::ACCESS_CONTROL_ALLOW_HEADERS,
-            HeaderValue::from_static("*"),
-        );
+        let mut response = (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Not Found" })),
+        )
+            .into_response();
+        apply_aws_b40_headers_with_version(response.headers_mut(), &request_id, "78bb6d21");
         return response;
     }
 
@@ -140,24 +132,7 @@ pub async fn aws_b40_headers_middleware(
         apply_aws_b40_headers_with_version(response.headers_mut(), &request_id, version);
 
         if messages_success && !messages_stream_success {
-            let x_request_id = aws_b40_messages_success_request_id();
-            if let Ok(value) = HeaderValue::from_str(&x_request_id) {
-                response.headers_mut().insert("x-request-id", value);
-            }
-            response
-                .headers_mut()
-                .insert("x-group-used", HeaderValue::from_static("claude-aws-self"));
-            response.headers_mut().insert(
-                "x-app-revision",
-                HeaderValue::from_static("3e4de959a905257d"),
-            );
-            response
-                .headers_mut()
-                .insert(header::VIA, HeaderValue::from_static("1.1 Caddy"));
-            response.headers_mut().insert(
-                header::ALT_SVC,
-                HeaderValue::from_static("h3=\":443\"; ma=2592000"),
-            );
+            apply_aws_b40_non_stream_success_headers(response.headers_mut());
         }
     } else {
         let include_official_headers = path.ends_with("/messages");
@@ -180,12 +155,7 @@ pub fn aws_b40_oneapi_request_id() -> String {
 
 fn aws_b40_messages_success_request_id() -> String {
     let now = chrono::Utc::now().format("%Y%m%d%H%M%S");
-    format!(
-        "{now}{}{}{}",
-        random_digits(13),
-        random_hex(4),
-        random_base62(8)
-    )
+    format!("{now}{}8268d9d6{}", random_digits(9), random_base62(8))
 }
 
 fn random_base62(len: usize) -> String {
@@ -204,15 +174,8 @@ fn random_digits(len: usize) -> String {
         .collect()
 }
 
-fn random_hex(len: usize) -> String {
-    const HEX: &[u8] = b"0123456789abcdef";
-    (0..len)
-        .map(|_| HEX[fastrand::usize(..HEX.len())] as char)
-        .collect()
-}
-
 pub(crate) fn apply_aws_b40_headers(headers: &mut header::HeaderMap, request_id: &str) {
-    apply_aws_b40_headers_with_version(headers, request_id, "83c64fa5");
+    apply_aws_b40_headers_with_version(headers, request_id, "78bb6d21");
 }
 
 pub(crate) fn apply_aws_b40_headers_with_version(
@@ -232,23 +195,41 @@ pub(crate) fn apply_aws_b40_headers_with_version(
     headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
 }
 
+fn apply_aws_b40_non_stream_success_headers(headers: &mut header::HeaderMap) {
+    headers.insert(header::VIA, HeaderValue::from_static("1.1 Caddy"));
+    headers.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+    headers.insert(
+        header::ALT_SVC,
+        HeaderValue::from_static("h3=\":443\"; ma=2592000"),
+    );
+    headers.insert(
+        "referrer-policy",
+        HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert("x-frame-options", HeaderValue::from_static("SAMEORIGIN"));
+}
+
 fn aws_b40_version_for_response(method: &Method, path: &str, response: &Response) -> &'static str {
     if *method == Method::OPTIONS || *method == Method::HEAD {
-        return "0b8be5cf";
+        return "78bb6d21";
     }
 
     if is_messages_path(path) {
         if response.status().is_success() {
             if is_stream_response(response) {
-                "0b8be5cf"
+                "78bb6d21"
             } else {
                 "20260501R2"
             }
         } else {
-            "0b8be5cf"
+            "78bb6d21"
         }
     } else {
-        "83c64fa5"
+        "78bb6d21"
     }
 }
 
@@ -305,13 +286,13 @@ mod tests {
         let stream = response(StatusCode::OK, "text/event-stream");
         assert_eq!(
             aws_b40_version_for_response(&Method::POST, "/v1/messages", &stream),
-            "0b8be5cf"
+            "78bb6d21"
         );
 
         let models = response(StatusCode::OK, "application/json");
         assert_eq!(
             aws_b40_version_for_response(&Method::GET, "/v1/models", &models),
-            "83c64fa5"
+            "78bb6d21"
         );
     }
 
@@ -322,6 +303,29 @@ mod tests {
 
         assert_eq!(headers["server"], "lyywafcdn");
         assert_eq!(headers["x-oneapi-request-id"], "request-123");
-        assert_eq!(headers["x-new-api-version"], "83c64fa5");
+        assert_eq!(headers["x-new-api-version"], "78bb6d21");
+    }
+
+    #[test]
+    fn aws_b_non_stream_success_id_and_headers_match_gateway_shape() {
+        let request_id = aws_b40_messages_success_request_id();
+        assert_eq!(request_id.len(), 39);
+        assert!(request_id[..23].chars().all(|character| character.is_ascii_digit()));
+        assert_eq!(&request_id[23..31], "8268d9d6");
+        assert!(request_id[31..]
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric()));
+
+        let mut headers = header::HeaderMap::new();
+        apply_aws_b40_non_stream_success_headers(&mut headers);
+        assert_eq!(headers["via"], "1.1 Caddy");
+        assert_eq!(headers["vary"], "Accept-Encoding");
+        assert_eq!(headers["alt-svc"], "h3=\":443\"; ma=2592000");
+        assert_eq!(
+            headers["referrer-policy"],
+            "strict-origin-when-cross-origin"
+        );
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        assert_eq!(headers["x-frame-options"], "SAMEORIGIN");
     }
 }

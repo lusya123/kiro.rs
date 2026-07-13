@@ -23,7 +23,7 @@ use bytes::Bytes;
 use futures::{StreamExt, stream};
 use serde_json::{Value, json};
 
-use super::handlers::post_messages;
+use super::handlers::{ApiJson, post_messages};
 use super::middleware::AppState;
 use super::types::{Message, MessagesRequest, SystemMessage, Tool};
 
@@ -660,7 +660,7 @@ pub async fn post_chat_completions(
     };
 
     // 复用 /v1/messages 全套生成逻辑(短路/后端/计量)。
-    let resp = post_messages(State(state), Json(mr)).await;
+    let resp = post_messages(State(state), ApiJson(mr)).await;
     let status = resp.status();
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

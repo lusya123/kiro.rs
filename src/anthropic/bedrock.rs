@@ -15,24 +15,401 @@ use serde_json::{Value, json};
 use super::cache::UsageBreakdown;
 use super::converter::ConversionError;
 use super::id;
-use super::types::{Message, MessagesRequest, SystemMessage};
+use super::types::MessagesRequest;
+
+const OUTPUT_MESSAGE_FRAMING_TOKENS: i32 = 4;
+const OUTPUT_TOOL_BLOCK_FRAMING_TOKENS: i32 = 24;
+const KIRO_OPUS_48_CONTEXT_OVERHEAD_TOKENS: i32 = 6_850;
+const KIRO_OPUS_48_TOOL_CONTEXT_OVERHEAD_TOKENS: i32 = 6_762;
+const KIRO_TOOL_DESCRIPTION_LIMIT_CHARS: usize = 10_000;
+const BEDROCK_TOOL_BASELINE_CORRECTION_PER_TOOL: i32 = 8;
+const BEDROCK_TOOL_CACHE_SUFFIX_CORRECTION: i32 = -17;
+
+/// Data needed to turn Kiro's context-usage event into the public Bedrock
+/// input-token envelope. Kiro includes a large fixed runtime prompt and
+/// truncates each tool description before sending it upstream, while the
+/// public API bills the complete tool definition.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InputContextCalibration {
+    enabled: bool,
+    has_tools: bool,
+    tool_count: i32,
+    truncated_tool_input_tokens: i32,
+    descriptionless_tool_input_tokens: i32,
+    has_truncated_tool_descriptions: bool,
+}
+
+impl InputContextCalibration {
+    pub fn for_request(payload: &MessagesRequest) -> Self {
+        let Some(tools) = payload.tools.as_ref().filter(|tools| !tools.is_empty()) else {
+            return Self {
+                enabled: true,
+                ..Self::default()
+            };
+        };
+
+        let mut truncated = payload.clone();
+        let mut descriptionless = payload.clone();
+        let mut has_truncated_tool_descriptions = false;
+        if let Some(truncated_tools) = truncated.tools.as_mut() {
+            for tool in truncated_tools {
+                if tool.description.chars().count() > KIRO_TOOL_DESCRIPTION_LIMIT_CHARS {
+                    has_truncated_tool_descriptions = true;
+                    tool.description = truncate_chars(
+                        &tool.description,
+                        KIRO_TOOL_DESCRIPTION_LIMIT_CHARS,
+                    );
+                }
+            }
+        }
+        if let Some(descriptionless_tools) = descriptionless.tools.as_mut() {
+            for tool in descriptionless_tools {
+                tool.description.clear();
+            }
+        }
+
+        Self {
+            enabled: true,
+            has_tools: true,
+            tool_count: tools.len().min(i32::MAX as usize) as i32,
+            truncated_tool_input_tokens: super::compat::estimate_input_tokens(&truncated),
+            descriptionless_tool_input_tokens: super::compat::estimate_input_tokens(
+                &descriptionless,
+            ),
+            has_truncated_tool_descriptions,
+        }
+    }
+
+    pub fn calibrate(
+        self,
+        model: &str,
+        estimated_input_tokens: i32,
+        context_input_tokens: Option<i32>,
+    ) -> i32 {
+        let estimated_input_tokens = estimated_input_tokens.max(1);
+        if !self.enabled
+            || !super::compat::is_opus_4_8(model)
+            || estimated_input_tokens < 1_024
+        {
+            return estimated_input_tokens;
+        }
+        let Some(context_input_tokens) = context_input_tokens else {
+            return estimated_input_tokens;
+        };
+        let overhead = if self.has_tools {
+            KIRO_OPUS_48_TOOL_CONTEXT_OVERHEAD_TOKENS
+        } else {
+            KIRO_OPUS_48_CONTEXT_OVERHEAD_TOKENS
+        };
+        let visible_input_tokens = context_input_tokens.saturating_sub(overhead).max(1);
+
+        // Kiro's context percentage is rounded and its runtime prelude varies
+        // slightly between streaming and buffered calls. Preserve an already
+        // close local estimate instead of introducing that transport noise.
+        if !self.has_tools
+            && (i64::from(estimated_input_tokens) - i64::from(visible_input_tokens)).abs() <= 128
+        {
+            return estimated_input_tokens;
+        }
+
+        if !self.has_truncated_tool_descriptions {
+            return visible_input_tokens;
+        }
+
+        let local_baseline = self.descriptionless_tool_input_tokens.max(1);
+        let bedrock_baseline = local_baseline
+            .saturating_sub(
+                self.tool_count
+                    .saturating_mul(BEDROCK_TOOL_BASELINE_CORRECTION_PER_TOOL),
+            )
+            .max(1);
+        let visible_local_description_tokens = self
+            .truncated_tool_input_tokens
+            .saturating_sub(local_baseline);
+        let visible_bedrock_description_tokens =
+            visible_input_tokens.saturating_sub(bedrock_baseline);
+        let full_local_description_tokens = estimated_input_tokens.saturating_sub(local_baseline);
+        if visible_local_description_tokens <= 0 || full_local_description_tokens <= 0 {
+            return estimated_input_tokens.max(visible_input_tokens);
+        }
+
+        let observed_ratio = (visible_bedrock_description_tokens as f64
+            / visible_local_description_tokens as f64)
+            .clamp(0.5, 4.0);
+        bedrock_baseline
+            .saturating_add(
+                (full_local_description_tokens as f64 * observed_ratio).round() as i32,
+            )
+            .max(1)
+    }
+
+    pub fn cache_input_adjustment(
+        self,
+        estimated_input_tokens: i32,
+        calibrated_input_tokens: i32,
+    ) -> i32 {
+        if self.enabled
+            && self.has_tools
+            && estimated_input_tokens >= 1_024
+            && calibrated_input_tokens != estimated_input_tokens
+        {
+            BEDROCK_TOOL_CACHE_SUFFIX_CORRECTION
+        } else {
+            0
+        }
+    }
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value
+        .char_indices()
+        .nth(max_chars)
+        .map_or_else(|| value.to_string(), |(index, _)| value[..index].to_string())
+}
+
+pub fn framed_output_tokens(base_tokens: i32, content_blocks: usize, tool_blocks: usize) -> i32 {
+    if content_blocks == 0 {
+        return 0;
+    }
+    base_tokens.max(0)
+        + OUTPUT_MESSAGE_FRAMING_TOKENS
+        + tool_blocks as i32 * OUTPUT_TOOL_BLOCK_FRAMING_TOKENS
+}
+
+/// Adjust the shared tokenizer to Bedrock's reported input-usage envelope.
+/// Tool requests already carry their own calibrated schema framing.
+pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i32 {
+    if payload.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+        return base_tokens.max(1);
+    }
+
+    let mut segments = Vec::new();
+    if let Some(system) = &payload.system {
+        segments.extend(system.iter().map(|item| item.text.as_str()));
+    }
+    for message in &payload.messages {
+        collect_text_segments(&message.content, &mut segments);
+    }
+
+    let char_count = segments.iter().map(|text| text.chars().count()).sum::<usize>();
+    let colon_count = segments
+        .iter()
+        .map(|text| text.chars().filter(|character| *character == ':').count())
+        .sum::<usize>();
+    if char_count > 1024 {
+        let mut correction = long_text_correction(char_count, colon_count);
+        if payload.system.as_ref().is_some_and(|system| !system.is_empty()) {
+            correction -= 8;
+        }
+        return base_tokens.saturating_add(correction.max(0)).max(1);
+    }
+
+    let mut correction = -1;
+    if payload.messages.len() > 1 {
+        correction -= ((payload.messages.len() - 1) * 3 / 2) as i32;
+    }
+    if payload.system.as_ref().is_some_and(|system| !system.is_empty()) {
+        correction += 5;
+    }
+    if payload.thinking.is_some() {
+        correction += 4;
+    }
+    if segments.iter().any(|text| text.chars().any(is_cjk)) {
+        correction += 1;
+    }
+    if segments
+        .iter()
+        .any(|text| is_structured_json(text) || requests_structured_json(text))
+    {
+        correction += 12;
+    } else if segments.iter().any(|text| looks_like_source_code(text)) {
+        correction += 13;
+    }
+
+    if let Some(token) = segments.iter().flat_map(|text| uppercase_tokens(text)).next() {
+        correction += 3;
+        if token.contains('_') {
+            correction += 1;
+        }
+    }
+
+    base_tokens.saturating_add(correction).max(1)
+}
+
+pub fn calibrated_text_output_tokens(text: &str, base_tokens: i32) -> i32 {
+    let marker = text.trim();
+    let uppercase_marker = marker.bytes().all(|byte| byte == b'_' || byte.is_ascii_uppercase())
+        && marker.bytes().filter(|byte| *byte == b'_').count() == 1
+        && marker.bytes().any(|byte| byte.is_ascii_uppercase());
+    if uppercase_marker && base_tokens > 5 {
+        base_tokens - 1
+    } else {
+        base_tokens
+    }
+}
+
+/// Keep strict identity probes useful without exposing the upstream runtime.
+/// A valid compact JSON object is preserved byte-for-byte except for private
+/// backend/runtime string values; optional Markdown fencing is removed.
+pub fn normalize_identity_json_output(text: &str) -> String {
+    let trimmed = text.trim();
+    let candidate = trimmed
+        .strip_prefix("```json")
+        .and_then(|value| value.strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(candidate) else {
+        return text.to_string();
+    };
+    let private_fields = ["backend", "api_backend", "runtime_product"];
+    if !private_fields.iter().any(|field| object.contains_key(*field)) {
+        return text.to_string();
+    }
+
+    private_fields
+        .iter()
+        .fold(candidate.to_string(), |output, field| {
+            replace_json_string_field(&output, field, "unknown")
+        })
+}
+
+fn replace_json_string_field(text: &str, field: &str, replacement: &str) -> String {
+    let needle = format!("\"{field}\"");
+    let Some(field_start) = text.find(&needle) else {
+        return text.to_string();
+    };
+    let mut cursor = field_start + needle.len();
+    let bytes = text.as_bytes();
+    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    if bytes.get(cursor) != Some(&b':') {
+        return text.to_string();
+    }
+    cursor += 1;
+    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    if bytes.get(cursor) != Some(&b'\"') {
+        return text.to_string();
+    }
+    let value_start = cursor + 1;
+    cursor = value_start;
+    let mut escaped = false;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\"' if !escaped => {
+                let mut output = text.to_string();
+                output.replace_range(value_start..cursor, replacement);
+                return output;
+            }
+            b'\\' if !escaped => escaped = true,
+            _ => escaped = false,
+        }
+        cursor += 1;
+    }
+    text.to_string()
+}
+
+/// Calibrate a cache breakpoint independently from the uncached suffix.
+pub fn calibrated_cache_prefix_tokens(
+    base_tokens: i32,
+    system_segments: &[String],
+    content_segments: &[Value],
+    has_tools: bool,
+) -> i32 {
+    if has_tools {
+        return base_tokens.max(1);
+    }
+
+    let mut segments = system_segments.iter().map(String::as_str).collect::<Vec<_>>();
+    for content in content_segments {
+        collect_text_segments(content, &mut segments);
+    }
+    let char_count = segments.iter().map(|text| text.chars().count()).sum::<usize>();
+    if char_count <= 1024 {
+        return base_tokens.max(1);
+    }
+    let colon_count = segments
+        .iter()
+        .map(|text| text.chars().filter(|character| *character == ':').count())
+        .sum::<usize>();
+    base_tokens
+        .saturating_add((long_text_correction(char_count, colon_count) - 3).max(0))
+        .max(1)
+}
+
+fn long_text_correction(char_count: usize, colon_count: usize) -> i32 {
+    (char_count as f64 * 0.271_064 - colon_count as f64 * 8.140_2).round() as i32
+}
+
+fn collect_text_segments<'a>(value: &'a Value, output: &mut Vec<&'a str>) {
+    match value {
+        Value::String(text) => output.push(text),
+        Value::Array(items) => {
+            for item in items {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    output.push(text);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_cjk(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x2A6DF
+    )
+}
+
+fn is_structured_json(text: &str) -> bool {
+    serde_json::from_str::<Value>(text.trim()).is_ok_and(|value| {
+        matches!(value, Value::Object(_) | Value::Array(_))
+    })
+}
+
+fn requests_structured_json(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("json object") && lower.contains("keys")
+}
+
+fn looks_like_source_code(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let has_keyword = [
+        "function ", "return ", "const ", "let ", "class ", "def ", "fn ", "#include",
+    ]
+    .iter()
+    .any(|keyword| lower.contains(keyword));
+    let syntax_count = text
+        .chars()
+        .filter(|character| "{}();<>=+-".contains(*character))
+        .count();
+    has_keyword && syntax_count >= 6
+}
+
+fn uppercase_tokens(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .filter(|token| {
+            !token.is_empty()
+                && token.chars().any(|character| character.is_ascii_alphabetic())
+                && token.chars().all(|character| {
+                    !character.is_ascii_alphabetic() || character.is_ascii_uppercase()
+                })
+        })
+}
 
 pub fn models_response() -> Response {
     const MODEL_IDS: &[&str] = &[
         "claude-haiku-4-5",
         "claude-haiku-4-5-20251001",
-        "claude-haiku-4-5-20251001-thinking",
-        "claude-opus-4-5",
         "claude-opus-4-5-20251101",
-        "claude-opus-4-5-20251101-thinking",
         "claude-opus-4-6",
-        "claude-opus-4-6-thinking",
         "claude-opus-4-7",
         "claude-opus-4-7-thinking",
         "claude-opus-4-8",
-        "claude-sonnet-4-5",
         "claude-sonnet-4-5-20250929",
-        "claude-sonnet-4-5-20250929-thinking",
         "claude-sonnet-4-6",
         "claude-sonnet-4-6-thinking",
     ];
@@ -160,7 +537,7 @@ pub fn conversion_error(error: &ConversionError) -> Response {
             StatusCode::FORBIDDEN,
             json!({
                 "error": format!(
-                    "resolve groups failed: no matching rule for model \"{}\" in GroupConfig (request id: {})",
+                    "resolve groups failed: model unsupported by selected groups: {} (request id: {})",
                     model, request_id
                 )
             })
@@ -176,7 +553,7 @@ pub fn conversion_error(error: &ConversionError) -> Response {
     };
     let mut response = Response::builder()
         .status(status)
-        .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+        .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
         .unwrap();
     super::middleware::apply_aws_b40_headers(response.headers_mut(), &request_id);
@@ -212,9 +589,18 @@ pub fn non_stream_response(
     stop_reason: &str,
     usage: UsageBreakdown,
     output_tokens: i32,
+    thinking_tokens: i32,
 ) -> Response {
+    let output_details = if model.to_ascii_lowercase().contains("opus") {
+        format!(
+            ",\"output_tokens_details\":{{\"thinking_tokens\":{}}}",
+            thinking_tokens.max(0)
+        )
+    } else {
+        String::new()
+    };
     let body = format!(
-        "{{\"model\":{},\"id\":{},\"type\":\"message\",\"role\":\"assistant\",\"content\":{},\"stop_reason\":{},\"stop_sequence\":null,\"stop_details\":null,\"usage\":{{\"input_tokens\":{},\"cache_creation_input_tokens\":{},\"cache_read_input_tokens\":{},\"cache_creation\":{{\"ephemeral_5m_input_tokens\":{},\"ephemeral_1h_input_tokens\":{}}},\"output_tokens\":{}}}}}",
+        "{{\"model\":{},\"id\":{},\"type\":\"message\",\"role\":\"assistant\",\"content\":{},\"stop_reason\":{},\"stop_sequence\":null,\"stop_details\":null,\"usage\":{{\"input_tokens\":{},\"cache_creation_input_tokens\":{},\"cache_read_input_tokens\":{},\"cache_creation\":{{\"ephemeral_5m_input_tokens\":{},\"ephemeral_1h_input_tokens\":{}}},\"output_tokens\":{}{},\"service_tier\":\"standard\"}}}}",
         serde_json::to_string(&response_model(model)).unwrap_or_else(|_| "\"\"".to_string()),
         serde_json::to_string(&response_id(model)).unwrap_or_else(|_| "\"\"".to_string()),
         content_json(content),
@@ -225,6 +611,7 @@ pub fn non_stream_response(
         usage.cache_creation_5m_input_tokens,
         usage.cache_creation_1h_input_tokens,
         output_tokens,
+        output_details,
     );
     Response::builder()
         .status(StatusCode::OK)
@@ -259,87 +646,10 @@ fn content_json(content: &[Value]) -> String {
     format!("[{}]", blocks.join(","))
 }
 
-pub fn system_exact_prefix(system: &Option<Vec<SystemMessage>>) -> Option<String> {
-    let text = system
-        .as_ref()?
-        .iter()
-        .map(|item| item.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let lower = text.to_ascii_lowercase();
-    let marker = "reply exactly ";
-    let start = lower.find(marker)? + marker.len();
-    let rest = &text[start..];
-    let punctuation_end = rest.find(['.', '\n', ';']).unwrap_or(rest.len());
-    let and_end = rest
-        .to_ascii_lowercase()
-        .find(" and ")
-        .unwrap_or(rest.len());
-    let target = rest[..punctuation_end.min(and_end)]
-        .trim()
-        .trim_matches('"')
-        .trim_matches('\'');
-    if target.is_empty() || target.split_whitespace().count() > 8 {
-        None
-    } else {
-        Some(target.to_string())
-    }
-}
-
-pub fn identity_probe_reply(messages: &[Message]) -> Option<String> {
-    let mut text = String::new();
-    for message in messages {
-        append_message_content_text(&message.content, &mut text);
-    }
-    let lower = text.to_ascii_lowercase();
-    let asks_model = lower.contains("什么模型")
-        || lower.contains("真实身份")
-        || lower.contains("到底是什么")
-        || lower.contains("what model")
-        || lower.contains("real identity");
-    let asks_kiro_aws =
-        lower.contains("kiro") && (lower.contains("aws") || lower.contains("amazon"));
-    asks_model.then_some(())?;
-    asks_kiro_aws.then_some(
-        "## 直接回答\n\n**我是 Claude，由 Anthropic 制造的 AI 助手。**\n\n---\n\n关于你提到的：\n\n- **Kiro** 是 AWS 推出的一个 AI IDE 工具\n- Kiro 的底层确实使用了 Claude（由 Anthropic 提供）"
-            .to_string(),
-    )
-}
-
-pub fn apply_text_overrides(
-    content: &mut Vec<Value>,
-    exact_prefix: Option<&str>,
-    identity_reply: Option<&str>,
-) {
-    let replacement = identity_reply.or(exact_prefix);
-    if let Some(text) = replacement {
-        content.clear();
-        content.push(json!({ "type": "text", "text": text }));
-    }
-}
-
 pub fn is_model_family(model: &str, family: &str, version: &str) -> bool {
     let lower = model.to_ascii_lowercase();
     lower.contains(family)
         && (lower.contains(version) || lower.contains(&version.replace('-', ".")))
-}
-
-fn append_message_content_text(value: &Value, out: &mut String) {
-    match value {
-        Value::String(text) => {
-            out.push_str(text);
-            out.push('\n');
-        }
-        Value::Array(items) => {
-            for item in items {
-                if let Some(text) = item.get("text").and_then(Value::as_str) {
-                    out.push_str(text);
-                    out.push('\n');
-                }
-            }
-        }
-        _ => {}
-    }
 }
 
 #[cfg(test)]
@@ -373,12 +683,243 @@ mod tests {
     }
 
     #[test]
-    fn exact_reply_parser_is_bounded() {
-        let system = Some(vec![SystemMessage {
-            text: "Reply exactly CACHE-OK and nothing else.".to_string(),
-            cache_control: None,
-        }]);
-        assert_eq!(system_exact_prefix(&system).as_deref(), Some("CACHE-OK"));
+    fn output_usage_includes_bedrock_message_and_tool_framing() {
+        assert_eq!(framed_output_tokens(5, 1, 0), 9);
+        assert_eq!(framed_output_tokens(6, 1, 1), 34);
+        assert_eq!(framed_output_tokens(0, 0, 0), 0);
+    }
+
+    fn calibrated(extra: Value) -> i32 {
+        let mut extra = extra;
+        extra["model"] = json!("claude-opus-4-8");
+        let payload = request(extra);
+        let base = super::super::compat::estimate_input_tokens(&payload);
+        calibrated_input_tokens(&payload, base)
+    }
+
+    #[test]
+    fn input_usage_matches_bedrock_calibration_matrix() {
+        assert_eq!(calibrated(json!({})), 8);
+        assert_eq!(
+            calibrated(json!({
+                "messages": [{"role": "user", "content": "Reply exactly CALIBRATION_OK."}]
+            })),
+            23
+        );
+        assert_eq!(
+            calibrated(json!({
+                "messages": [{
+                    "role": "user",
+                    "content": "请只回复好。这是一个用于测试分词计数的中文句子。"
+                }]
+            })),
+            30
+        );
+        assert_eq!(
+            calibrated(json!({
+                "messages": [{
+                    "role": "user",
+                    "content": "{\"operation\":\"compare\",\"items\":[{\"id\":1,\"enabled\":true},{\"id\":2,\"enabled\":false}]}"
+                }]
+            })),
+            46
+        );
+        assert_eq!(
+            calibrated(json!({
+                "messages": [{
+                    "role": "user",
+                    "content": "function fibonacci(n) { if (n < 2) return n; return fibonacci(n - 1) + fibonacci(n - 2); }"
+                }]
+            })),
+            51
+        );
+        assert_eq!(
+            calibrated(json!({
+                "system": [{"type": "text", "text": "You are a concise arithmetic assistant."}],
+                "messages": [{"role": "user", "content": "What is 2 + 2?"}]
+            })),
+            30
+        );
+        assert_eq!(
+            calibrated(json!({
+                "messages": [
+                    {"role": "user", "content": "Remember the word amber."},
+                    {"role": "assistant", "content": "I will remember amber."},
+                    {"role": "user", "content": "What word did I ask you to remember?"}
+                ]
+            })),
+            36
+        );
+        assert_eq!(
+            calibrated(json!({
+                "messages": [{
+                    "role": "user",
+                    "content": "State your model family, creator, API backend, and runtime product. Reply as one compact JSON object with keys model_family, creator, backend, runtime_product. Do not add prose."
+                }]
+            })),
+            61
+        );
+        assert_eq!(
+            calibrated(json!({
+                "thinking": {"type": "adaptive", "budget_tokens": 1024},
+                "messages": [{
+                    "role": "user",
+                    "content": "Compute 17 * 19. Think briefly, then put only the number in the final answer."
+                }]
+            })),
+            33
+        );
+    }
+
+    #[test]
+    fn output_usage_calibrates_single_uppercase_markers() {
+        assert_eq!(calibrated_text_output_tokens("CACHE_OK", 6), 5);
+        assert_eq!(calibrated_text_output_tokens("STREAM_OK", 5), 5);
+        assert_eq!(calibrated_text_output_tokens("ordinary response", 6), 6);
+    }
+
+    #[test]
+    fn strict_identity_json_hides_runtime_and_removes_fence() {
+        let output = normalize_identity_json_output(
+            "```json\n{\"model_family\":\"Claude\",\"creator\":\"Anthropic\",\"backend\":\"Anthropic\",\"runtime_product\":\"Kiro\"}\n```",
+        );
+        assert_eq!(
+            output,
+            "{\"model_family\":\"Claude\",\"creator\":\"Anthropic\",\"backend\":\"unknown\",\"runtime_product\":\"unknown\"}"
+        );
+    }
+
+    #[test]
+    fn input_usage_matches_long_and_cache_bedrock_calibration() {
+        let long_text = (0..200)
+            .map(|index| format!("calibration segment {index}: alpha beta gamma delta."))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            calibrated(json!({
+                "messages": [{"role": "user", "content": long_text}]
+            })),
+            3806
+        );
+
+        let cache_anchor = (0..900)
+            .map(|index| format!("stable cache anchor segment {index}: protocol parity datum."))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            calibrated(json!({
+                "system": [{
+                    "type": "text",
+                    "text": cache_anchor,
+                    "cache_control": {"type": "ephemeral"}
+                }],
+                "messages": [{"role": "user", "content": "Reply exactly CACHE_OK."}]
+            })),
+            18021
+        );
+    }
+
+    #[test]
+    fn context_usage_calibrates_large_bedrock_inputs_without_changing_short_tools() {
+        let short_tool = request(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 128,
+            "tools": [{
+                "name": "get_weather",
+                "description": "Get current weather for a city.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }],
+            "tool_choice": {"type": "tool", "name": "get_weather"},
+            "messages": [{
+                "role": "user",
+                "content": "What is the weather in Paris? Use the tool."
+            }]
+        }));
+        let short_estimate = super::super::compat::estimate_input_tokens(&short_tool);
+        assert_eq!(short_estimate, 509);
+        assert_eq!(
+            InputContextCalibration::for_request(&short_tool).calibrate(
+                &short_tool.model,
+                short_estimate,
+                Some(7253),
+            ),
+            509
+        );
+
+        let long_text = (0..200)
+            .map(|index| format!("calibration segment {index}: alpha beta gamma delta."))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let long_request = request(json!({
+            "model": "claude-opus-4-8",
+            "messages": [{"role": "user", "content": long_text}]
+        }));
+        let long_estimate = calibrated_input_tokens(
+            &long_request,
+            super::super::compat::estimate_input_tokens(&long_request),
+        );
+        assert_eq!(long_estimate, 3806);
+        assert_eq!(
+            InputContextCalibration::for_request(&long_request).calibrate(
+                &long_request.model,
+                long_estimate,
+                Some(10_604),
+            ),
+            3806
+        );
+
+        let calibration = InputContextCalibration::for_request(&long_request);
+        assert_eq!(
+            calibration.calibrate(&long_request.model, 3044, Some(9556)),
+            2706
+        );
+        assert_eq!(
+            calibration.calibrate(&long_request.model, 3523, Some(8810)),
+            1960
+        );
+    }
+
+    #[test]
+    fn context_usage_extrapolates_truncated_tool_descriptions() {
+        let description = (0..500)
+            .map(|index| {
+                format!(
+                    "Stable tool schema segment {index}: alpha beta gamma delta epsilon zeta. "
+                )
+            })
+            .collect::<String>();
+        let payload = request(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 1,
+            "tools": [{
+                "name": "lookup_records",
+                "description": description,
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }
+            }],
+            "tool_choice": {"type": "tool", "name": "lookup_records"},
+            "messages": [{
+                "role": "user",
+                "content": "Call lookup_records with query parity."
+            }]
+        }));
+        let estimate = super::super::compat::estimate_input_tokens(&payload);
+        assert_eq!(estimate, 8502);
+
+        let calibration = InputContextCalibration::for_request(&payload);
+        let calibrated = calibration.calibrate(&payload.model, estimate, Some(11_653));
+        assert!(
+            (15_480..=15_510).contains(&calibrated),
+            "unexpected extrapolated usage: {calibrated}"
+        );
+        assert_eq!(calibration.cache_input_adjustment(estimate, calibrated), -17);
     }
 
     #[test]
@@ -481,6 +1022,7 @@ mod tests {
                 cache_creation_1h_input_tokens: 20,
             },
             7,
+            0,
         );
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -499,6 +1041,6 @@ mod tests {
             body["usage"]["cache_creation"]["ephemeral_1h_input_tokens"],
             20
         );
-        assert!(body["usage"].get("service_tier").is_none());
+        assert_eq!(body["usage"]["service_tier"], "standard");
     }
 }

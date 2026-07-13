@@ -63,29 +63,3 @@ pub fn count_tokens(text: &str) -> u64 {
     // println!("tokens: {}, acc_tokens: {}", tokens, acc_token);
     acc_token
 }
-
-/// 按本地 token 估算截断文本，返回 `(截断后的文本, 是否发生截断)`。
-pub(crate) fn truncate_to_token_limit(text: &str, max_tokens: i32) -> (String, bool) {
-    let max_tokens = max_tokens.max(0) as u64;
-    if text.is_empty() {
-        return (String::new(), false);
-    }
-    if max_tokens == 0 {
-        return (String::new(), true);
-    }
-    if count_tokens(text) <= max_tokens {
-        return (text.to_string(), false);
-    }
-
-    let mut candidate = String::new();
-    let mut last_good = String::new();
-    for ch in text.chars() {
-        candidate.push(ch);
-        if count_tokens(&candidate) > max_tokens {
-            return (last_good, true);
-        }
-        last_good = candidate.clone();
-    }
-
-    (candidate, false)
-}

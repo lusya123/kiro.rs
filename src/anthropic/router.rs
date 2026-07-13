@@ -1,11 +1,15 @@
 //! Anthropic API 路由配置
 
 use axum::{
+    Json,
     Router,
     extract::DefaultBodyLimit,
+    http::StatusCode,
     middleware,
+    response::IntoResponse,
     routing::{get, post},
 };
+use serde_json::json;
 
 use crate::kiro::provider::KiroProvider;
 
@@ -47,10 +51,15 @@ pub fn create_router_with_provider(
     }
 
     // 需要认证的 /v1 路由
+    let count_tokens_route = if aws_b40_compat {
+        post(aws_b_count_tokens_not_found)
+    } else {
+        post(count_tokens)
+    };
     let v1_routes = Router::new()
         .route("/models", get(get_models).head(head_models))
         .route("/messages", post(post_messages))
-        .route("/messages/count_tokens", post(count_tokens))
+        .route("/messages/count_tokens", count_tokens_route)
         .route("/chat/completions", post(post_chat_completions))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -67,16 +76,25 @@ pub fn create_router_with_provider(
             auth_middleware,
         ));
 
-    Router::new()
+    let router = Router::new()
         .nest("/v1", v1_routes)
         .nest("/cc/v1", cc_v1_routes)
-        .layer(cors_layer())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             aws_b40_headers_middleware,
         ))
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
-        .with_state(state)
+        .with_state(state);
+
+    if aws_b40_compat {
+        router
+    } else {
+        router.layer(cors_layer())
+    }
+}
+
+async fn aws_b_count_tokens_not_found() -> impl IntoResponse {
+    (StatusCode::NOT_FOUND, Json(json!({ "error": "Not Found" })))
 }
 
 #[cfg(test)]
@@ -98,7 +116,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aws_b_router_preserves_models_auth_head_and_cors_contract() {
+    async fn aws_b_router_preserves_models_auth_head_and_options_contract() {
         let (base, server) = spawn_router(true).await;
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -113,7 +131,8 @@ mod tests {
             .expect("AWS-B models request");
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["server"], "lyywafcdn");
-        assert_eq!(response.headers()["x-new-api-version"], "83c64fa5");
+        assert_eq!(response.headers()["x-new-api-version"], "78bb6d21");
+        assert!(response.headers().get("access-control-allow-origin").is_none());
         let body = response.text().await.expect("AWS-B models body");
         assert!(body.contains("\"first_id\":\"claude-haiku-4-5\""));
         assert!(!body.contains("claude-sonnet-5"));
@@ -125,7 +144,7 @@ mod tests {
             .await
             .expect("AWS-B HEAD models request");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert_eq!(response.headers()["x-new-api-version"], "0b8be5cf");
+        assert_eq!(response.headers()["x-new-api-version"], "78bb6d21");
         assert!(response.bytes().await.expect("HEAD body").is_empty());
 
         let response = client
@@ -133,8 +152,9 @@ mod tests {
             .send()
             .await
             .expect("AWS-B OPTIONS request");
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        assert_eq!(response.headers()["access-control-allow-origin"], "*");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(response.headers().get("access-control-allow-origin").is_none());
+        assert_eq!(response.headers()["x-new-api-version"], "78bb6d21");
 
         let response = client
             .post(format!("{base}/v1/messages"))
@@ -147,13 +167,30 @@ mod tests {
             .await
             .expect("AWS-B unauthenticated request");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(response.headers()["x-new-api-version"], "0b8be5cf");
+        assert_eq!(response.headers()["x-new-api-version"], "78bb6d21");
         assert!(
             response
                 .text()
                 .await
                 .expect("AWS-B auth error body")
                 .contains("missing token")
+        );
+
+        let response = client
+            .post(format!("{base}/v1/messages"))
+            .header("x-api-key", "test-key")
+            .header("content-type", "application/json")
+            .body("{")
+            .send()
+            .await
+            .expect("AWS-B malformed JSON request");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()["x-new-api-version"], "78bb6d21");
+        let body: Value = response.json().await.expect("AWS-B malformed JSON body");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("Invalid request: unexpected end"))
         );
 
         server.abort();
@@ -173,16 +210,31 @@ mod tests {
             "messages": [{"role": "user", "content": "你好, count these tokens."}]
         });
 
-        let aws_b_count: Value = client
+        let response = client
             .post(format!("{aws_b_base}/v1/messages/count_tokens"))
             .header("x-api-key", "test-key")
             .json(&request)
             .send()
             .await
-            .expect("AWS-B count_tokens")
+            .expect("AWS-B public count_tokens");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()["x-new-api-version"], "78bb6d21");
+        let body: Value = response
             .json()
             .await
-            .expect("AWS-B count_tokens body");
+            .expect("AWS-B public count_tokens body");
+        assert_eq!(body, json!({ "error": "Not Found" }));
+
+        let aws_b_count: Value = client
+            .post(format!("{aws_b_base}/cc/v1/messages/count_tokens"))
+            .header("x-api-key", "test-key")
+            .json(&request)
+            .send()
+            .await
+            .expect("AWS-B internal count_tokens")
+            .json()
+            .await
+            .expect("AWS-B internal count_tokens body");
         let aws_p_count: Value = client
             .post(format!("{aws_p_base}/v1/messages/count_tokens"))
             .header("x-api-key", "test-key")

@@ -2,7 +2,7 @@
 //!
 //! 实现 Anthropic WebSearch 请求到 Kiro MCP 的转换和响应生成
 
-use std::convert::Infallible;
+use std::{convert::Infallible, time::Instant};
 
 use axum::{
     body::Body,
@@ -226,6 +226,7 @@ pub fn create_websearch_sse_stream(
         search_results,
         input_tokens,
         false,
+        0,
     )
 }
 
@@ -236,6 +237,7 @@ fn create_websearch_sse_stream_with_profile(
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
     aws_b40_compat: bool,
+    invocation_latency_ms: u64,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let events = generate_websearch_events(
         &model,
@@ -244,12 +246,13 @@ fn create_websearch_sse_stream_with_profile(
         search_results,
         input_tokens,
         aws_b40_compat,
+        invocation_latency_ms,
     );
 
     stream::iter(
         events
             .into_iter()
-            .map(|e| Ok(Bytes::from(e.to_sse_string()))),
+            .map(move |e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat)))),
     )
 }
 
@@ -261,6 +264,7 @@ fn generate_websearch_events(
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
     aws_b40_compat: bool,
+    invocation_latency_ms: u64,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
     let message_id = if aws_b40_compat {
@@ -272,6 +276,26 @@ fn generate_websearch_events(
         super::bedrock::response_model(model)
     } else {
         model.to_string()
+    };
+    let start_usage = if aws_b40_compat {
+        json!({
+            "input_tokens": input_tokens,
+            "output_tokens": 16,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 0,
+                "ephemeral_1h_input_tokens": 0
+            },
+            "service_tier": "standard"
+        })
+    } else {
+        json!({
+            "input_tokens": input_tokens,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+        })
     };
 
     // 1. message_start
@@ -286,12 +310,9 @@ fn generate_websearch_events(
                 "model": public_model,
                 "content": [],
                 "stop_reason": null,
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
-                }
+                "stop_sequence": null,
+                "stop_details": null,
+                "usage": start_usage
             }
         }),
     ));
@@ -457,20 +478,40 @@ fn generate_websearch_events(
 
     // 10. message_delta
     // 官方 API 的 message_delta.delta 中没有 stop_sequence 字段
-    let output_tokens = (summary.len() as i32 + 3) / 4; // 简单估算
+    let base_output_tokens = super::claude_tok::count_claude(&summary);
+    let output_tokens = if aws_b40_compat {
+        super::bedrock::framed_output_tokens(base_output_tokens, 3, 0)
+    } else {
+        (summary.len() as i32 + 3) / 4
+    };
+    let delta_usage = if aws_b40_compat {
+        let mut usage = json!({
+            "input_tokens": input_tokens,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "output_tokens": output_tokens,
+            "server_tool_use": { "web_search_requests": 1 }
+        });
+        if model.to_ascii_lowercase().contains("opus") {
+            usage["output_tokens_details"] = json!({ "thinking_tokens": 0 });
+        }
+        usage
+    } else {
+        json!({
+            "output_tokens": output_tokens,
+            "server_tool_use": { "web_search_requests": 1 }
+        })
+    };
     events.push(SseEvent::new(
         "message_delta",
         json!({
             "type": "message_delta",
             "delta": {
-                "stop_reason": "end_turn"
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+                "stop_details": null
             },
-            "usage": {
-                "output_tokens": output_tokens,
-                "server_tool_use": {
-                    "web_search_requests": 1
-                }
-            }
+            "usage": delta_usage
         }),
     ));
 
@@ -480,7 +521,12 @@ fn generate_websearch_events(
         if aws_b40_compat {
             json!({
                 "type": "message_stop",
-                "usage": { "input_tokens": input_tokens, "output_tokens": output_tokens }
+                "amazon-bedrock-invocationMetrics": {
+                    "inputTokenCount": input_tokens,
+                    "outputTokenCount": output_tokens,
+                    "invocationLatency": invocation_latency_ms,
+                    "firstByteLatency": invocation_latency_ms
+                }
             })
         } else {
             json!({ "type": "message_stop" })
@@ -544,6 +590,7 @@ pub async fn handle_websearch_request(
     let (tool_use_id, mcp_request) = create_mcp_request(&query);
 
     // 3. 调用 Kiro MCP API
+    let invocation_started = Instant::now();
     let search_results = match call_mcp_api(&provider, &mcp_request).await {
         Ok(response) => parse_search_results(&response),
         Err(e) => {
@@ -551,6 +598,7 @@ pub async fn handle_websearch_request(
             None
         }
     };
+    let invocation_latency_ms = invocation_started.elapsed().as_millis() as u64;
 
     // 4. 按 stream 参数返回:非流式返回 JSON,流式返回 SSE(真 Anthropic 两种都支持)
     let model = payload.model.clone();
@@ -572,6 +620,7 @@ pub async fn handle_websearch_request(
         search_results,
         input_tokens,
         aws_b40_compat,
+        invocation_latency_ms,
     );
 
     Response::builder()
@@ -637,7 +686,12 @@ fn build_websearch_json(
         None => vec![],
     };
     let summary = generate_search_summary(query, search_results);
-    let output_tokens = (summary.len() as i32 + 3) / 4;
+    let base_output_tokens = super::claude_tok::count_claude(&summary);
+    let output_tokens = if aws_b40_compat {
+        super::bedrock::framed_output_tokens(base_output_tokens, 3, 0)
+    } else {
+        (summary.len() as i32 + 3) / 4
+    };
     let message_id = if aws_b40_compat {
         super::bedrock::response_id(model)
     } else {
@@ -648,6 +702,23 @@ fn build_websearch_json(
     } else {
         model.to_string()
     };
+    let mut usage = json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "server_tool_use": {"web_search_requests": 1}
+    });
+    if aws_b40_compat {
+        usage["cache_creation"] = json!({
+            "ephemeral_5m_input_tokens": 0,
+            "ephemeral_1h_input_tokens": 0
+        });
+        usage["service_tier"] = json!("standard");
+        if model.to_ascii_lowercase().contains("opus") {
+            usage["output_tokens_details"] = json!({ "thinking_tokens": 0 });
+        }
+    }
     json!({
         "id": message_id,
         "type": "message",
@@ -660,13 +731,8 @@ fn build_websearch_json(
         ],
         "stop_reason": "end_turn",
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0,
-            "server_tool_use": {"web_search_requests": 1}
-        }
+        "stop_details": null,
+        "usage": usage
     })
 }
 

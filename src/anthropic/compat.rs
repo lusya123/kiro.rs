@@ -23,7 +23,7 @@ const REQUEST_LIMIT: &str = "1000";
 const TOKENS_LIMIT: &str = "580000";
 const SONNET_TOOL_TOTAL_OVERHEAD_TOKENS: i32 = 501;
 const SONNET_TOOL_PREFIX_OVERHEAD_TOKENS: i32 = 189;
-const OPUS_TOOL_TOTAL_OVERHEAD_TOKENS: i32 = 304;
+const OPUS_TOOL_TOTAL_OVERHEAD_TOKENS: i32 = 454;
 const OPUS_TOOL_PREFIX_OVERHEAD_TOKENS: i32 = 242;
 
 pub fn request_id() -> String {
@@ -1681,6 +1681,31 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
 
         assert_eq!(counts.len(), 1, "token estimate varied: {counts:?}");
+    }
+
+    #[test]
+    fn opus_tool_request_matches_bedrock_reference_count() {
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 128,
+            "tools": [{
+                "name": "get_weather",
+                "description": "Get current weather for a city.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }],
+            "tool_choice": {"type": "tool", "name": "get_weather"},
+            "messages": [{
+                "role": "user",
+                "content": "What is the weather in Paris? Use the tool."
+            }]
+        }))
+        .expect("valid tool request");
+
+        assert_eq!(estimate_input_tokens(&request), 509);
     }
 
     fn identity_req(model: &str, system: Option<&str>, question: &str) -> MessagesRequest {

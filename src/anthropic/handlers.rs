@@ -13,9 +13,9 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
 use anyhow::Error;
 use axum::{
-    Json as JsonExtractor,
+    Json as AxumJson,
     body::Body,
-    extract::State,
+    extract::{FromRequest, Request, State},
     http::{StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
@@ -24,6 +24,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
+use serde::de::DeserializeOwned;
 use serde_json::json;
 use std::time::Duration;
 use tokio::time::{Instant, interval_at};
@@ -47,6 +48,45 @@ const AUTO_CONTINUE_MAX_ROUNDS: usize = 8;
 const AUTO_CONTINUE_PROMPT: &str = "Continue exactly from where your previous response stopped. Do not repeat any previous text or the last line. If the previous response ended after a numbered, list, or code line, start with the following line and include any required newline. Stop immediately when the original request is complete. Do not add summaries, comments, prefaces, or confirmations.";
 const AUTO_CONTINUE_COMPLETE_SENTINEL: &str = "__KRS_CONTINUATION_COMPLETE__";
 
+pub(super) struct ApiJson<T>(pub T);
+
+impl<T> FromRequest<AppState> for ApiJson<T>
+where
+    T: DeserializeOwned,
+{
+    type Rejection = Response;
+
+    async fn from_request(request: Request, state: &AppState) -> Result<Self, Self::Rejection> {
+        match AxumJson::<T>::from_request(request, state).await {
+            Ok(AxumJson(value)) => Ok(Self(value)),
+            Err(rejection) if state.aws_b40_compat => {
+                let request_id = super::middleware::aws_b40_oneapi_request_id();
+                let rejection_text = rejection.body_text();
+                let detail = if rejection_text.contains("EOF while parsing") {
+                    "unexpected end of JSON input".to_string()
+                } else {
+                    rejection_text
+                        .strip_prefix("Failed to parse the request body as JSON: ")
+                        .unwrap_or(&rejection_text)
+                        .to_string()
+                };
+                let body = json!({
+                    "error": format!("Invalid request: {detail} (request id: {request_id})")
+                })
+                .to_string();
+                let mut response = Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+                    .body(Body::from(body))
+                    .unwrap();
+                super::middleware::apply_aws_b40_headers(response.headers_mut(), &request_id);
+                Err(response)
+            }
+            Err(rejection) => Err(rejection.into_response()),
+        }
+    }
+}
+
 fn auto_continue_round_limit(requested_max_tokens: i32) -> usize {
     if requested_max_tokens <= AUTO_CONTINUE_BASE_CHUNK_TOKENS {
         return 0;
@@ -59,6 +99,24 @@ fn auto_continue_round_limit(requested_max_tokens: i32) -> usize {
 
 fn effective_auto_continue_max_tokens(requested_max_tokens: i32) -> i32 {
     requested_max_tokens.max(1)
+}
+
+fn estimate_profile_input_tokens(
+    payload: &MessagesRequest,
+    aws_b40_compat: bool,
+    aws_b40_thinking_requested: bool,
+) -> i32 {
+    let base_tokens = super::compat::estimate_input_tokens(payload);
+    if aws_b40_compat {
+        let calibrated = super::bedrock::calibrated_input_tokens(payload, base_tokens);
+        if aws_b40_thinking_requested && payload.thinking.is_none() {
+            calibrated.saturating_add(4)
+        } else {
+            calibrated
+        }
+    } else {
+        base_tokens
+    }
 }
 
 fn enforce_content_max_tokens(content: &mut Vec<serde_json::Value>, max_tokens: i32) -> bool {
@@ -75,19 +133,42 @@ fn enforce_content_max_tokens(content: &mut Vec<serde_json::Value>, max_tokens: 
             continue;
         };
 
-        let tokens = token::count_tokens(text) as i32;
+        let tokens = super::claude_tok::count_claude(text);
         if tokens <= remaining {
             remaining -= tokens;
             continue;
         }
 
-        let (limited, _) = token::truncate_to_token_limit(text, remaining);
+        let limited = truncate_to_claude_token_limit(text, remaining);
         content[index][field] = serde_json::Value::String(limited);
         content.truncate(index + 1);
         return true;
     }
 
     false
+}
+
+fn truncate_to_claude_token_limit(text: &str, max_tokens: i32) -> String {
+    if max_tokens <= 0 || text.is_empty() {
+        return String::new();
+    }
+    if super::claude_tok::count_claude(text) <= max_tokens {
+        return text.to_string();
+    }
+
+    let mut boundaries = text.char_indices().map(|(index, _)| index).collect::<Vec<_>>();
+    boundaries.push(text.len());
+    let mut low = 0usize;
+    let mut high = boundaries.len();
+    while low + 1 < high {
+        let middle = (low + high) / 2;
+        if super::claude_tok::count_claude(&text[..boundaries[middle]]) <= max_tokens {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    text[..boundaries[low]].to_string()
 }
 
 fn numeric_range_request_completed(request_body: &str, content: &str) -> bool {
@@ -491,6 +572,18 @@ fn identity_sanitization_options(
         codewhisperer_relationship_probe: context.codewhisperer_relationship_probe,
         vendor_lineage_probe: context.vendor_lineage_probe,
         third_party_kiro_discussion: context.third_party_kiro_discussion,
+    }
+}
+
+fn normalize_profile_identity_output(
+    text: String,
+    context: IdentitySanitizationRequestContext,
+    aws_b40_compat: bool,
+) -> String {
+    if aws_b40_compat && context.strict {
+        super::bedrock::normalize_identity_json_output(&text)
+    } else {
+        text
     }
 }
 
@@ -1067,7 +1160,7 @@ pub async fn head_models(State(state): State<AppState>) -> Response {
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+    ApiJson(mut payload): ApiJson<MessagesRequest>,
 ) -> Response {
     tracing::info!(
         model = %payload.model,
@@ -1078,18 +1171,12 @@ pub async fn post_messages(
     );
 
     let aws_b40_compat = state.aws_b40_compat;
+    let aws_b40_thinking_requested = aws_b40_compat && payload.thinking.is_some();
     let aws_b40_adaptive_signature = aws_b40_compat
         && payload
             .thinking
             .as_ref()
             .is_some_and(|thinking| thinking.thinking_type == "adaptive");
-    let aws_b40_system_exact_prefix = aws_b40_compat
-        .then(|| super::bedrock::system_exact_prefix(&payload.system))
-        .flatten();
-    let aws_b40_identity_reply = aws_b40_compat
-        .then(|| super::bedrock::identity_probe_reply(&payload.messages))
-        .flatten();
-
     if aws_b40_compat {
         if let Some(response) = super::bedrock::request_preflight_error(&payload) {
             return response;
@@ -1160,7 +1247,11 @@ pub async fn post_messages(
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
-        let input_tokens = super::compat::estimate_input_tokens(&payload);
+        let input_tokens = estimate_profile_input_tokens(
+            &payload,
+            aws_b40_compat,
+            aws_b40_thinking_requested,
+        );
 
         return websearch::handle_websearch_request(
             provider,
@@ -1219,11 +1310,24 @@ pub async fn post_messages(
     tracing::debug!("Kiro request body: {}", request_body);
 
     let identity_sanitization_context = request_identity_sanitization_context(&payload);
-    // 当前服务本身就是 Anthropic-like 上游，不能再请求外部服务计数。
-    // usage.input_tokens 必须完全由本地兼容估算产生。
-    let input_tokens = super::compat::estimate_input_tokens(&payload);
-    let initial_usage_breakdown =
-        super::cache::compute_request_usage_breakdown(input_tokens, &payload).await;
+    // Start with the local estimator. AWS-B may refine large requests at the
+    // end of the real upstream call using its contextUsage event.
+    let input_tokens = estimate_profile_input_tokens(
+        &payload,
+        aws_b40_compat,
+        aws_b40_thinking_requested,
+    );
+    let initial_usage_breakdown = super::cache::compute_request_usage_breakdown_with_profile(
+        input_tokens,
+        &payload,
+        aws_b40_compat,
+    )
+    .await;
+    let input_context_calibration = if aws_b40_compat {
+        super::bedrock::InputContextCalibration::for_request(&payload)
+    } else {
+        super::bedrock::InputContextCalibration::default()
+    };
 
     if let Some(response) =
         compat_direct_response(&payload, initial_usage_breakdown, aws_b40_compat)
@@ -1259,6 +1363,7 @@ pub async fn post_messages(
             &payload.model,
             input_tokens,
             initial_usage_breakdown,
+            input_context_calibration,
             thinking_enabled,
             expose_thinking,
             thinking_wants_summary,
@@ -1280,6 +1385,7 @@ pub async fn post_messages(
             &payload.model,
             input_tokens,
             initial_usage_breakdown,
+            input_context_calibration,
             extract_thinking,
             expose_thinking,
             thinking_wants_summary,
@@ -1287,10 +1393,9 @@ pub async fn post_messages(
             payload.max_tokens,
             true,
             identity_sanitization_context,
+            tool_choice_forces_tool(&payload),
             aws_b40_compat,
             aws_b40_adaptive_signature,
-            aws_b40_system_exact_prefix,
-            aws_b40_identity_reply,
         )
         .await
     }
@@ -1303,6 +1408,7 @@ async fn handle_stream_request(
     model: &str,
     input_tokens: i32,
     initial_usage_breakdown: super::cache::UsageBreakdown,
+    input_context_calibration: super::bedrock::InputContextCalibration,
     thinking_enabled: bool,
     expose_thinking: bool,
     thinking_wants_summary: bool,
@@ -1315,10 +1421,12 @@ async fn handle_stream_request(
     aws_b40_adaptive_signature: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
+    let upstream_started = Instant::now();
     let response = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+    let upstream_request_latency = upstream_started.elapsed();
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(
@@ -1330,7 +1438,9 @@ async fn handle_stream_request(
     );
     if aws_b40_compat {
         ctx.enable_aws_b40_compat(aws_b40_adaptive_signature);
+        ctx.set_input_context_calibration(input_context_calibration);
     }
+    ctx.set_upstream_request_latency(upstream_request_latency);
     // tool_choice 强制工具(any/tool):只发 tool_use,抑制夹带的解释性文本。
     ctx.set_suppress_text_blocks(force_tool_only);
     if thinking_enabled && !expose_thinking {
@@ -1370,6 +1480,7 @@ async fn handle_stream_request(
         provider,
         request_body.to_string(),
         requested_max_tokens,
+        aws_b40_compat,
     );
 
     // 返回 SSE 响应
@@ -1386,8 +1497,11 @@ async fn handle_stream_request(
 const PING_INTERVAL_SECS: u64 = 25;
 
 /// 创建 ping 事件的 SSE 字符串
-fn create_ping_sse() -> Bytes {
-    Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
+fn create_ping_sse(aws_b40_compat: bool) -> Bytes {
+    let terminator = if aws_b40_compat { "\n\n\n" } else { "\n\n" };
+    Bytes::from(format!(
+        "event: ping\ndata: {{\"type\": \"ping\"}}{terminator}"
+    ))
 }
 
 /// 创建 SSE 事件流
@@ -1398,12 +1512,13 @@ fn create_sse_stream(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: String,
     requested_max_tokens: i32,
+    aws_b40_compat: bool,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
         initial_events
             .into_iter()
-            .map(|e| Ok(Bytes::from(e.to_sse_string()))),
+            .map(move |e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat)))),
     );
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
@@ -1470,7 +1585,7 @@ fn create_sse_stream(
                             // 转换为 SSE 字节流
                             let bytes: Vec<Result<Bytes, Infallible>> = events
                                 .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
                                 .collect();
 
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
@@ -1481,7 +1596,7 @@ fn create_sse_stream(
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
                                 .collect();
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
                         }
@@ -1552,7 +1667,7 @@ fn create_sse_stream(
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
                                 .collect();
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
                         }
@@ -1561,7 +1676,8 @@ fn create_sse_stream(
                 // 发送 ping 保活
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
-                    let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
+                    let bytes: Vec<Result<Bytes, Infallible>> =
+                        vec![Ok(create_ping_sse(aws_b40_compat))];
                     Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
                 }
             }
@@ -1581,6 +1697,7 @@ async fn handle_non_stream_request(
     model: &str,
     input_tokens: i32,
     initial_usage_breakdown: super::cache::UsageBreakdown,
+    input_context_calibration: super::bedrock::InputContextCalibration,
     thinking_enabled: bool,
     expose_thinking: bool,
     thinking_wants_summary: bool,
@@ -1588,16 +1705,16 @@ async fn handle_non_stream_request(
     requested_max_tokens: i32,
     identity_sanitization: bool,
     identity_sanitization_context: IdentitySanitizationRequestContext,
+    force_tool_only: bool,
     aws_b40_compat: bool,
     aws_b40_adaptive_signature: bool,
-    aws_b40_system_exact_prefix: Option<String>,
-    aws_b40_identity_reply: Option<String>,
 ) -> Response {
     let mut text_content = String::new();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason: String;
     let mut total_input_tokens = 0i32;
+    let mut first_round_input_tokens = input_tokens.max(1);
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -1770,10 +1887,22 @@ async fn handle_non_stream_request(
             stop_reason = "tool_use".to_string();
         }
 
-        total_input_tokens += super::billing::billable_input_tokens(
-            round_estimated_input_tokens,
-            round_context_input_tokens,
-        );
+        let round_input_tokens = if continuation_round == 0 && aws_b40_compat {
+            input_context_calibration.calibrate(
+                model,
+                round_estimated_input_tokens,
+                round_context_input_tokens,
+            )
+        } else {
+            super::billing::billable_input_tokens(
+                round_estimated_input_tokens,
+                round_context_input_tokens,
+            )
+        };
+        if continuation_round == 0 {
+            first_round_input_tokens = round_input_tokens;
+        }
+        total_input_tokens = total_input_tokens.saturating_add(round_input_tokens);
 
         if is_continuation_complete_sentinel(&chunk_text_content) {
             let new_len = text_content.len().saturating_sub(chunk_text_content.len());
@@ -1873,6 +2002,11 @@ async fn handle_non_stream_request(
         } else {
             remaining_text
         };
+        let visible_text = normalize_profile_identity_output(
+            visible_text,
+            identity_sanitization_context,
+            aws_b40_compat,
+        );
 
         if !visible_text.is_empty() {
             content.push(json!({
@@ -1889,18 +2023,19 @@ async fn handle_non_stream_request(
         } else {
             text_content
         };
+        let visible_text = normalize_profile_identity_output(
+            visible_text,
+            identity_sanitization_context,
+            aws_b40_compat,
+        );
         content.push(json!({
             "type": "text",
             "text": visible_text
         }));
     }
 
-    if aws_b40_compat {
-        super::bedrock::apply_text_overrides(
-            &mut content,
-            aws_b40_system_exact_prefix.as_deref(),
-            aws_b40_identity_reply.as_deref(),
-        );
+    if force_tool_only && has_tool_use {
+        content.clear();
     }
 
     let output_truncated = enforce_content_max_tokens(&mut content, requested_max_tokens);
@@ -1911,21 +2046,49 @@ async fn handle_non_stream_request(
     }
 
     // 估算输出 tokens(ctoc 口径,与输入统一;thinking 单独计,不在此)
-    let visible_output_tokens = if content.is_empty() {
+    let base_visible_output_tokens = if content.is_empty() {
         0
     } else if requested_max_tokens < 4 {
         ctoc_output_tokens(&content)
     } else {
         ctoc_output_tokens(&content).max(4)
     };
+    let base_visible_output_tokens = if aws_b40_compat && content.len() == 1 {
+        content[0]
+            .get("text")
+            .and_then(|value| value.as_str())
+            .map(|text| {
+                super::bedrock::calibrated_text_output_tokens(text, base_visible_output_tokens)
+            })
+            .unwrap_or(base_visible_output_tokens)
+    } else {
+        base_visible_output_tokens
+    };
+    let tool_block_count = content
+        .iter()
+        .filter(|block| block.get("type").and_then(|value| value.as_str()) == Some("tool_use"))
+        .count();
+    let visible_output_tokens = if aws_b40_compat {
+        super::bedrock::framed_output_tokens(
+            base_visible_output_tokens,
+            content.len(),
+            tool_block_count,
+        )
+    } else {
+        base_visible_output_tokens
+    };
     let compat_thinking_tokens = if thinking_tokens > 0 {
         thinking_tokens + 6
     } else {
         0
     };
-    let output_tokens = visible_output_tokens
+    let uncapped_output_tokens = visible_output_tokens
         + compat_thinking_tokens
         + if compat_thinking_tokens > 0 { 2 } else { 0 };
+    let output_tokens = uncapped_output_tokens.min(requested_max_tokens.max(1));
+    if uncapped_output_tokens > output_tokens {
+        stop_reason = "max_tokens".to_string();
+    }
     // 只要请求开启了 thinking，就在 usage 里带 output_tokens_details（哪怕本轮没产出思考，
     // 也显示 thinking_tokens:0）——与真 Anthropic 一致。-1 是"包含但显示 0"的 sentinel。
     let usage_thinking_tokens = if thinking_enabled && compat_thinking_tokens == 0 {
@@ -1939,9 +2102,15 @@ async fn handle_non_stream_request(
     let final_input_tokens = total_input_tokens.max(1);
 
     // 根据客户请求意图拆分 usage（带 cache_control → 拆成 I/CR/CC，否则平铺）
+    let initial_usage_breakdown = super::cache::reconcile_initial_input(
+        initial_usage_breakdown,
+        first_round_input_tokens,
+        input_context_calibration
+            .cache_input_adjustment(input_tokens, first_round_input_tokens),
+    );
     let usage_breakdown = super::cache::with_additional_input(
         initial_usage_breakdown,
-        input_tokens,
+        first_round_input_tokens,
         final_input_tokens,
     );
 
@@ -1952,6 +2121,7 @@ async fn handle_non_stream_request(
             &stop_reason,
             usage_breakdown,
             output_tokens,
+            compat_thinking_tokens,
         );
     }
 
@@ -2256,58 +2426,50 @@ fn compat_direct_response(
     // 仅无工具的 PDF 提取探针命中;真 Claude Code 带工具,doc_reply 为 None,照旧交后端。
     let doc_reply = super::compat::document_extraction_reply(payload);
     // 强身份拷问:即使带工具也短路(检测器把身份探针裹进带工具的请求绕过门控)。
-    let strong_id_reply = super::compat::strong_identity_reply(payload);
+    let strong_id_reply = (!aws_b40_compat)
+        .then(|| super::compat::strong_identity_reply(payload))
+        .flatten();
     // 含工具/图片/文档/工具结果时不短路,交给真模型处理(文档提取探针 / 强身份拷问除外)。
     if doc_reply.is_none() && strong_id_reply.is_none() && request_needs_model(payload) {
         return None;
     }
-    let (text, output_tokens, forced_input_tokens) = if let Some(answer) = aws_b40_compat
-        .then(|| super::bedrock::identity_probe_reply(&payload.messages))
-        .flatten()
-    {
-        let output_tokens = super::claude_tok::count_claude(&answer).max(1);
+    let (text, output_tokens, forced_input_tokens) = if let Some(answer) = doc_reply {
+        // D19:直接用抽取的 PDF 文本/token 作答,按真实 token 数计量。
+        let output_tokens = token::count_tokens(&answer) as i32;
         (answer, output_tokens, None)
-    } else if let Some(answer) = aws_b40_compat
-        .then(|| super::bedrock::system_exact_prefix(&payload.system))
-        .flatten()
-    {
-        let output_tokens = super::claude_tok::count_claude(&answer).max(1);
+    } else if aws_b40_compat {
+        // AWS-B follows the real Bedrock model for ordinary text and identity
+        // requests. Only the PDF extraction fallback above bypasses upstream.
+        return None;
+    } else if let Some(answer) = strong_id_reply {
+        // 强身份拷问:返回干净的 Claude 应答,按真实 token 数计量。
+        let output_tokens = token::count_tokens(&answer) as i32;
+        (answer, output_tokens, None)
+    } else if let Some(answer) = super::compat::extract_verbatim_echo(payload) {
+        // canary/D5:逐字回显 token,按真实 token 数计量。
+        let output_tokens = token::count_tokens(&answer) as i32;
+        (answer, output_tokens, None)
+    } else if let Some(answer) = super::compat::extract_exact_system_reply(payload) {
+        let output_tokens = exact_reply_output_tokens(&payload.model, &answer);
+        let forced_input = exact_reply_input_tokens(&payload.model, &answer, usage_breakdown);
+        (answer, output_tokens, forced_input)
+    } else if let Some(answer) = super::compat::identity_probe_reply(payload) {
+        let output_tokens = if payload.model.to_ascii_lowercase().contains("opus") {
+            21
+        } else {
+            13
+        };
+        (answer, output_tokens, None)
+    } else if let Some(answer) = super::compat::implicit_identity_reply(payload) {
+        // 隐式身份/规格探针:回答较长,按真实 token 数计量(避免固定计量成为指纹)。
+        let output_tokens = token::count_tokens(&answer) as i32;
+        (answer, output_tokens, None)
+    } else if let Some(answer) = super::compat::prompt_extraction_reply(payload) {
+        // 提示词提取探针:干净婉拒,按真实 token 数计量。
+        let output_tokens = token::count_tokens(&answer) as i32;
         (answer, output_tokens, None)
     } else {
-        if let Some(answer) = doc_reply {
-            // D19:直接用抽取的 PDF 文本/token 作答,按真实 token 数计量。
-            let output_tokens = token::count_tokens(&answer) as i32;
-            (answer, output_tokens, None)
-        } else if let Some(answer) = strong_id_reply {
-            // 强身份拷问:返回干净的 Claude 应答,按真实 token 数计量。
-            let output_tokens = token::count_tokens(&answer) as i32;
-            (answer, output_tokens, None)
-        } else if let Some(answer) = super::compat::extract_verbatim_echo(payload) {
-            // canary/D5:逐字回显 token,按真实 token 数计量。
-            let output_tokens = token::count_tokens(&answer) as i32;
-            (answer, output_tokens, None)
-        } else if let Some(answer) = super::compat::extract_exact_system_reply(payload) {
-            let output_tokens = exact_reply_output_tokens(&payload.model, &answer);
-            let forced_input = exact_reply_input_tokens(&payload.model, &answer, usage_breakdown);
-            (answer, output_tokens, forced_input)
-        } else if let Some(answer) = super::compat::identity_probe_reply(payload) {
-            let output_tokens = if payload.model.to_ascii_lowercase().contains("opus") {
-                21
-            } else {
-                13
-            };
-            (answer, output_tokens, None)
-        } else if let Some(answer) = super::compat::implicit_identity_reply(payload) {
-            // 隐式身份/规格探针:回答较长,按真实 token 数计量(避免固定计量成为指纹)。
-            let output_tokens = token::count_tokens(&answer) as i32;
-            (answer, output_tokens, None)
-        } else if let Some(answer) = super::compat::prompt_extraction_reply(payload) {
-            // 提示词提取探针:干净婉拒,按真实 token 数计量。
-            let output_tokens = token::count_tokens(&answer) as i32;
-            (answer, output_tokens, None)
-        } else {
-            return None;
-        }
+        return None;
     };
     let output_tokens = output_tokens.min(payload.max_tokens.max(1));
     if let Some(input_tokens) = forced_input_tokens {
@@ -2377,6 +2539,7 @@ fn compat_direct_response(
             "end_turn",
             usage_breakdown,
             total_output_tokens,
+            thinking_tokens,
         ));
     }
 
@@ -2464,7 +2627,8 @@ fn compat_direct_stream_response(
                 "ephemeral_5m_input_tokens": usage_breakdown.cache_creation_5m_input_tokens,
                 "ephemeral_1h_input_tokens": usage_breakdown.cache_creation_1h_input_tokens
             },
-            "output_tokens": 1
+            "output_tokens": if payload.max_tokens <= 1 { 1 } else { 8 },
+            "service_tier": "standard"
         })
     } else {
         super::compat::stream_start_usage(
@@ -2510,7 +2674,9 @@ fn compat_direct_stream_response(
                 }
             }),
         ));
-        events.push(SseEvent::new("ping", json!({"type": "ping"})));
+        if !aws_b40_compat {
+            events.push(SseEvent::new("ping", json!({"type": "ping"})));
+        }
         events.push(SseEvent::new(
             "content_block_delta",
             json!({
@@ -2558,7 +2724,7 @@ fn compat_direct_stream_response(
             }
         }),
     ));
-    if thinking_text.is_none() {
+    if thinking_text.is_none() && !aws_b40_compat {
         events.push(SseEvent::new("ping", json!({"type": "ping"})));
     }
     events.push(SseEvent::new(
@@ -2588,7 +2754,7 @@ fn compat_direct_stream_response(
             "cache_creation_input_tokens": usage_breakdown.cache_creation_input_tokens,
             "cache_read_input_tokens": usage_breakdown.cache_read_input_tokens
         });
-        if thinking_tokens > 0 {
+        if thinking_tokens > 0 || payload.model.to_ascii_lowercase().contains("opus") {
             usage["output_tokens_details"] = json!({ "thinking_tokens": thinking_tokens });
         }
         usage
@@ -2620,9 +2786,13 @@ fn compat_direct_stream_response(
         if aws_b40_compat {
             json!({
                 "type": "message_stop",
-                "usage": {
-                    "input_tokens": usage_breakdown.input_tokens,
-                    "output_tokens": total_output_tokens
+                "amazon-bedrock-invocationMetrics": {
+                    "inputTokenCount": usage_breakdown.input_tokens
+                        + usage_breakdown.cache_creation_input_tokens
+                        + usage_breakdown.cache_read_input_tokens,
+                    "outputTokenCount": total_output_tokens,
+                    "invocationLatency": 0,
+                    "firstByteLatency": 0
                 }
             })
         } else {
@@ -2632,7 +2802,7 @@ fn compat_direct_stream_response(
 
     let body = events
         .into_iter()
-        .map(|event| event.to_sse_string())
+        .map(|event| event.to_profile_sse_string(aws_b40_compat))
         .collect::<String>();
     (
         StatusCode::OK,
@@ -2730,7 +2900,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 ///
 /// 计算消息的 token 数量
 pub async fn count_tokens(
-    JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
+    AxumJson(payload): AxumJson<CountTokensRequest>,
 ) -> impl IntoResponse {
     tracing::info!(
         model = %payload.model,
@@ -2769,7 +2939,7 @@ pub async fn count_tokens(
 /// - message_start 中的 input_tokens 会应用短输入保护计费策略
 pub async fn post_messages_cc(
     State(state): State<AppState>,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+    ApiJson(mut payload): ApiJson<MessagesRequest>,
 ) -> Response {
     tracing::info!(
         model = %payload.model,
@@ -2780,17 +2950,12 @@ pub async fn post_messages_cc(
     );
 
     let aws_b40_compat = state.aws_b40_compat;
+    let aws_b40_thinking_requested = aws_b40_compat && payload.thinking.is_some();
     let aws_b40_adaptive_signature = aws_b40_compat
         && payload
             .thinking
             .as_ref()
             .is_some_and(|thinking| thinking.thinking_type == "adaptive");
-    let aws_b40_system_exact_prefix = aws_b40_compat
-        .then(|| super::bedrock::system_exact_prefix(&payload.system))
-        .flatten();
-    let aws_b40_identity_reply = aws_b40_compat
-        .then(|| super::bedrock::identity_probe_reply(&payload.messages))
-        .flatten();
     if aws_b40_compat {
         if let Some(response) = super::bedrock::request_preflight_error(&payload) {
             return response;
@@ -2859,7 +3024,11 @@ pub async fn post_messages_cc(
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
-        let input_tokens = super::compat::estimate_input_tokens(&payload);
+        let input_tokens = estimate_profile_input_tokens(
+            &payload,
+            aws_b40_compat,
+            aws_b40_thinking_requested,
+        );
 
         return websearch::handle_websearch_request(
             provider,
@@ -2918,9 +3087,22 @@ pub async fn post_messages_cc(
     tracing::debug!("Kiro request body: {}", request_body);
 
     let identity_sanitization_context = request_identity_sanitization_context(&payload);
-    let input_tokens = super::compat::estimate_input_tokens(&payload);
-    let initial_usage_breakdown =
-        super::cache::compute_request_usage_breakdown(input_tokens, &payload).await;
+    let input_tokens = estimate_profile_input_tokens(
+        &payload,
+        aws_b40_compat,
+        aws_b40_thinking_requested,
+    );
+    let initial_usage_breakdown = super::cache::compute_request_usage_breakdown_with_profile(
+        input_tokens,
+        &payload,
+        aws_b40_compat,
+    )
+    .await;
+    let input_context_calibration = if aws_b40_compat {
+        super::bedrock::InputContextCalibration::for_request(&payload)
+    } else {
+        super::bedrock::InputContextCalibration::default()
+    };
 
     if let Some(response) =
         compat_direct_response(&payload, initial_usage_breakdown, aws_b40_compat)
@@ -2956,6 +3138,7 @@ pub async fn post_messages_cc(
             &payload.model,
             input_tokens,
             initial_usage_breakdown,
+            input_context_calibration,
             thinking_enabled,
             expose_thinking,
             thinking_wants_summary,
@@ -2963,6 +3146,7 @@ pub async fn post_messages_cc(
             payload.max_tokens,
             true,
             identity_sanitization_context,
+            tool_choice_forces_tool(&payload),
             aws_b40_compat,
             aws_b40_adaptive_signature,
         )
@@ -2976,6 +3160,7 @@ pub async fn post_messages_cc(
             &payload.model,
             input_tokens,
             initial_usage_breakdown,
+            input_context_calibration,
             extract_thinking,
             expose_thinking,
             thinking_wants_summary,
@@ -2983,10 +3168,9 @@ pub async fn post_messages_cc(
             payload.max_tokens,
             true,
             identity_sanitization_context,
+            tool_choice_forces_tool(&payload),
             aws_b40_compat,
             aws_b40_adaptive_signature,
-            aws_b40_system_exact_prefix,
-            aws_b40_identity_reply,
         )
         .await
     }
@@ -3002,6 +3186,7 @@ async fn handle_stream_request_buffered(
     model: &str,
     estimated_input_tokens: i32,
     initial_usage_breakdown: super::cache::UsageBreakdown,
+    input_context_calibration: super::bedrock::InputContextCalibration,
     thinking_enabled: bool,
     expose_thinking: bool,
     thinking_wants_summary: bool,
@@ -3009,14 +3194,17 @@ async fn handle_stream_request_buffered(
     requested_max_tokens: i32,
     identity_sanitization: bool,
     identity_sanitization_context: IdentitySanitizationRequestContext,
+    force_tool_only: bool,
     aws_b40_compat: bool,
     aws_b40_adaptive_signature: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
+    let upstream_started = Instant::now();
     let response = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+    let upstream_request_latency = upstream_started.elapsed();
 
     // 创建缓冲流处理上下文
     let mut ctx = BufferedStreamContext::new(
@@ -3028,7 +3216,10 @@ async fn handle_stream_request_buffered(
     );
     if aws_b40_compat {
         ctx.enable_aws_b40_compat(aws_b40_adaptive_signature);
+        ctx.set_input_context_calibration(input_context_calibration);
     }
+    ctx.set_upstream_request_latency(upstream_request_latency);
+    ctx.set_suppress_text_blocks(force_tool_only);
     if thinking_enabled && !expose_thinking {
         ctx.hide_thinking_blocks();
     }
@@ -3062,6 +3253,7 @@ async fn handle_stream_request_buffered(
         provider,
         request_body.to_string(),
         requested_max_tokens,
+        aws_b40_compat,
     );
 
     // 返回 SSE 响应
@@ -3087,6 +3279,7 @@ fn create_buffered_sse_stream(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: String,
     requested_max_tokens: i32,
+    aws_b40_compat: bool,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
     let requested_max_tokens = effective_auto_continue_max_tokens(requested_max_tokens);
@@ -3131,7 +3324,8 @@ fn create_buffered_sse_stream(
                     // 优先检查 ping 保活（等待期间唯一发送的数据）
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
-                        let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
+                        let bytes: Vec<Result<Bytes, Infallible>> =
+                            vec![Ok(create_ping_sse(aws_b40_compat))];
                         return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)));
                     }
 
@@ -3165,7 +3359,7 @@ fn create_buffered_sse_stream(
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                    .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
                                     .collect();
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)));
                             }
@@ -3243,7 +3437,7 @@ fn create_buffered_sse_stream(
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                    .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
                                     .collect();
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)));
                             }
@@ -3309,6 +3503,29 @@ mod tests {
         assert!(req.thinking.is_none());
         assert!(req.output_config.is_none());
         assert_eq!(req.model, "claude-opus-4-7");
+    }
+
+    #[test]
+    fn aws_b_usage_preserves_removed_thinking_request_overhead() {
+        let mut req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "max_tokens": 1200,
+                "thinking": {"type": "enabled", "budget_tokens": 1024},
+                "messages": [{
+                    "role": "user",
+                    "content": "Compute 17 * 19. Think briefly, then put only the number in the final answer."
+                }]
+            }),
+        );
+        let thinking_requested = req.thinking.is_some();
+        normalize_aws_b40_thinking(&mut req);
+
+        assert!(req.thinking.is_none());
+        assert_eq!(
+            estimate_profile_input_tokens(&req, true, thinking_requested),
+            33
+        );
     }
 
     #[test]

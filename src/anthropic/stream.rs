@@ -2,7 +2,10 @@
 //!
 //! 实现 Kiro → Anthropic 流式响应转换和 SSE 状态管理
 
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    time::{Duration, Instant},
+};
 
 use serde_json::json;
 
@@ -335,11 +338,18 @@ impl SseEvent {
     }
 
     /// 格式化为 SSE 字符串
+    #[cfg(test)]
     pub fn to_sse_string(&self) -> String {
+        self.to_profile_sse_string(false)
+    }
+
+    pub fn to_profile_sse_string(&self, aws_b40_compat: bool) -> String {
+        let terminator = if aws_b40_compat { "\n\n\n" } else { "\n\n" };
         format!(
-            "event: {}\ndata: {}\n\n",
+            "event: {}\ndata: {}{}",
             self.event,
-            serde_json::to_string(&self.data).unwrap_or_default()
+            serde_json::to_string(&self.data).unwrap_or_default(),
+            terminator
         )
     }
 }
@@ -387,6 +397,8 @@ pub struct SseStateManager {
     has_tool_use: bool,
     /// 是否已发出"首个 content_block_start 之后的确定性 ping"
     first_block_started: bool,
+    /// 是否在首个内容块后发送兼容 ping。AWS Bedrock 流不发送该事件。
+    emit_initial_ping: bool,
 }
 
 impl Default for SseStateManager {
@@ -406,7 +418,12 @@ impl SseStateManager {
             stop_reason: None,
             has_tool_use: false,
             first_block_started: false,
+            emit_initial_ping: true,
         }
+    }
+
+    pub fn set_emit_initial_ping(&mut self, emit: bool) {
+        self.emit_initial_ping = emit;
     }
 
     /// 判断指定块是否处于可接收 delta 的打开状态
@@ -516,7 +533,9 @@ impl SseStateManager {
         // 导致 ping 有时跑到 content_block_start 之前——位置不稳即指纹。这里改为确定性注入。
         if !self.first_block_started {
             self.first_block_started = true;
-            events.push(SseEvent::new("ping", json!({"type": "ping"})));
+            if self.emit_initial_ping {
+                events.push(SseEvent::new("ping", json!({"type": "ping"})));
+            }
         }
 
         events
@@ -667,6 +686,10 @@ pub struct StreamContext {
     /// 后端 tool_use_id(`toolu_bdrk_…`)→ 对客户端暴露的 Anthropic 形态 id(`toolu_01…`)。
     /// 同一后端 id 复用同一输出 id,保证同一响应内的块相关性;跨轮由客户端回传该 id 自洽。
     pub tool_output_ids: HashMap<String, String>,
+    /// Tool argument bytes held briefly so Bedrock-style JSON deltas have
+    /// stable structural boundaries rather than upstream transport boundaries.
+    tool_json_pending: HashMap<String, String>,
+    tool_json_prefix_split: HashSet<String>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
     pub tool_name_map: HashMap<String, String>,
     /// thinking 是否启用
@@ -688,6 +711,12 @@ pub struct StreamContext {
     strip_thinking_leading_newline: bool,
     /// 初始请求的 input/cache 拆分。
     pub initial_usage_breakdown: super::cache::UsageBreakdown,
+    /// AWS-B uses the real Kiro context-usage event after removing its fixed
+    /// runtime prompt. Disabled for AWS-P and for short requests.
+    input_context_calibration: super::bedrock::InputContextCalibration,
+    /// First-round calibrated total retained when an automatic continuation
+    /// advances `input_tokens` to a later upstream request.
+    initial_calibrated_input_tokens: Option<i32>,
     /// 疑似截断探测续写时吞掉完成哨兵，避免把内部控制文本发给客户端
     swallow_complete_sentinel_probe: bool,
     /// 探测完成哨兵可能被上游拆成多个 chunk，需要短暂缓冲确认
@@ -714,6 +743,12 @@ pub struct StreamContext {
     /// Preserve the externally observed AWS-B/Bedrock protocol shape.
     aws_b40_compat: bool,
     aws_b40_adaptive_signature: bool,
+    /// `call_api_stream` 返回响应头前已经消耗的时间。
+    upstream_request_latency_ms: u64,
+    /// 从响应头到当前事件处理的计时起点。
+    stream_started_at: Instant,
+    /// 首个上游 EventStream 事件到达的端到端耗时。
+    first_byte_latency_ms: Option<u64>,
 }
 
 impl StreamContext {
@@ -743,6 +778,8 @@ impl StreamContext {
             assistant_raw_content: String::new(),
             tool_block_indices: HashMap::new(),
             tool_output_ids: HashMap::new(),
+            tool_json_pending: HashMap::new(),
+            tool_json_prefix_split: HashSet::new(),
             tool_name_map,
             thinking_enabled,
             expose_thinking: thinking_enabled,
@@ -753,6 +790,8 @@ impl StreamContext {
             text_block_index: None,
             strip_thinking_leading_newline: false,
             initial_usage_breakdown,
+            input_context_calibration: super::bedrock::InputContextCalibration::default(),
+            initial_calibrated_input_tokens: None,
             swallow_complete_sentinel_probe: false,
             complete_sentinel_probe_buffer: String::new(),
             continuation_merge_tail: None,
@@ -763,6 +802,9 @@ impl StreamContext {
             suppress_text_blocks: false,
             aws_b40_compat: false,
             aws_b40_adaptive_signature: false,
+            upstream_request_latency_ms: 0,
+            stream_started_at: Instant::now(),
+            first_byte_latency_ms: None,
         }
     }
 
@@ -771,6 +813,19 @@ impl StreamContext {
         self.aws_b40_adaptive_signature = adaptive_signature;
         self.model = super::bedrock::response_model(&self.model);
         self.message_id = super::bedrock::response_id(&self.model);
+        self.state_manager.set_emit_initial_ping(false);
+    }
+
+    pub fn set_input_context_calibration(
+        &mut self,
+        calibration: super::bedrock::InputContextCalibration,
+    ) {
+        self.input_context_calibration = calibration;
+    }
+
+    pub fn set_upstream_request_latency(&mut self, elapsed: Duration) {
+        self.upstream_request_latency_ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
+        self.stream_started_at = Instant::now();
     }
 
     pub fn hide_thinking_blocks(&mut self) {
@@ -829,6 +884,11 @@ impl StreamContext {
     pub fn create_message_start_event(&self) -> serde_json::Value {
         let breakdown = self.initial_usage_breakdown;
         if self.aws_b40_compat {
+            let initial_output_tokens = match self.output_token_limit {
+                Some(limit) if limit <= 1 => 1,
+                _ if self.suppress_text_blocks => 16,
+                _ => 8,
+            };
             return json!({
                 "type": "message_start",
                 "message": {
@@ -848,7 +908,8 @@ impl StreamContext {
                             "ephemeral_5m_input_tokens": breakdown.cache_creation_5m_input_tokens,
                             "ephemeral_1h_input_tokens": breakdown.cache_creation_1h_input_tokens
                         },
-                        "output_tokens": 1
+                        "output_tokens": initial_output_tokens,
+                        "service_tier": "standard"
                     }
                 }
             });
@@ -904,6 +965,12 @@ impl StreamContext {
 
     /// 处理 Kiro 事件并转换为 Anthropic SSE 事件
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
+        if self.first_byte_latency_ms.is_none() {
+            self.first_byte_latency_ms = Some(
+                self.upstream_request_latency_ms
+                    .saturating_add(self.stream_started_at.elapsed().as_millis() as u64),
+            );
+        }
         if self.output_token_limit_reached {
             return Vec::new();
         }
@@ -1406,14 +1473,15 @@ impl StreamContext {
         }
 
         // 获取或分配块索引
-        let block_index = if let Some(&idx) = self.tool_block_indices.get(&tool_use.tool_use_id) {
-            idx
-        } else {
-            let idx = self.state_manager.next_block_index();
-            self.tool_block_indices
-                .insert(tool_use.tool_use_id.clone(), idx);
-            idx
-        };
+        let (block_index, new_tool_block) =
+            if let Some(&idx) = self.tool_block_indices.get(&tool_use.tool_use_id) {
+                (idx, false)
+            } else {
+                let idx = self.state_manager.next_block_index();
+                self.tool_block_indices
+                    .insert(tool_use.tool_use_id.clone(), idx);
+                (idx, true)
+            };
 
         // AWS-P rewrites the backend id to Anthropic shape; AWS-B deliberately
         // keeps the Bedrock id as part of its public profile.
@@ -1454,11 +1522,39 @@ impl StreamContext {
         );
         events.extend(start_events);
 
+        // Bedrock emits an empty JSON delta immediately after opening a tool
+        // block, before any argument bytes arrive.
+        if self.aws_b40_compat
+            && new_tool_block
+            && let Some(delta_event) = self.state_manager.handle_content_block_delta(
+                block_index,
+                json!({
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": ""
+                    }
+                }),
+            )
+        {
+            events.push(delta_event);
+        }
+
         // 发送参数增量 (ToolUseEvent.input 是 String 类型)
         if !tool_use.input.is_empty() {
             self.output_tokens += (tool_use.input.len() as i32 + 3) / 4; // 估算 token
             self.output_text_acc.push_str(&tool_use.input); // tool 调用 JSON 计入输出(ctoc)
+        }
 
+        let argument_deltas = if self.aws_b40_compat {
+            self.bedrock_tool_argument_deltas(tool_use)
+        } else if tool_use.input.is_empty() {
+            Vec::new()
+        } else {
+            vec![tool_use.input.clone()]
+        };
+        for partial_json in argument_deltas {
             if let Some(delta_event) = self.state_manager.handle_content_block_delta(
                 block_index,
                 json!({
@@ -1466,7 +1562,7 @@ impl StreamContext {
                     "index": block_index,
                     "delta": {
                         "type": "input_json_delta",
-                        "partial_json": tool_use.input
+                        "partial_json": partial_json
                     }
                 }),
             ) {
@@ -1475,13 +1571,141 @@ impl StreamContext {
         }
 
         // 如果是完整的工具调用（stop=true），发送 content_block_stop
-        if tool_use.stop {
-            if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
-                events.push(stop_event);
-            }
+        if tool_use.stop
+            && let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index)
+        {
+            events.push(stop_event);
         }
 
         events
+    }
+
+    fn bedrock_tool_argument_deltas(
+        &mut self,
+        tool_use: &crate::kiro::model::events::ToolUseEvent,
+    ) -> Vec<String> {
+        self.bedrock_tool_argument_deltas_for(
+            &tool_use.tool_use_id,
+            &tool_use.input,
+            tool_use.stop,
+        )
+    }
+
+    fn bedrock_tool_argument_deltas_for(
+        &mut self,
+        id: &str,
+        input: &str,
+        stop: bool,
+    ) -> Vec<String> {
+        let mut pending = self.tool_json_pending.remove(id).unwrap_or_default();
+        pending.push_str(input);
+        let mut deltas = Vec::new();
+
+        if !self.tool_json_prefix_split.contains(id)
+            && pending.starts_with("{\"")
+            && let Some(key_end) = pending[2..].find("\":")
+        {
+            let mut value_start = 2 + key_end + 2;
+            while pending
+                .as_bytes()
+                .get(value_start)
+                .is_some_and(u8::is_ascii_whitespace)
+            {
+                value_start += 1;
+            }
+            deltas.push("{\"".to_string());
+            deltas.push(pending[2..value_start].to_string());
+            pending = pending[value_start..].to_string();
+            self.tool_json_prefix_split.insert(id.to_string());
+        }
+
+        if stop {
+            if !pending.is_empty() {
+                deltas.push(pending);
+            }
+            self.tool_json_prefix_split.remove(id);
+        } else {
+            self.tool_json_pending.insert(id.to_string(), pending);
+        }
+        deltas
+    }
+
+    fn flush_pending_bedrock_tool_arguments(&mut self) -> Vec<SseEvent> {
+        if !self.aws_b40_compat || self.tool_json_pending.is_empty() {
+            return Vec::new();
+        }
+
+        let mut pending = std::mem::take(&mut self.tool_json_pending)
+            .into_iter()
+            .collect::<Vec<_>>();
+        pending.sort_by_key(|(id, _)| {
+            self.tool_block_indices
+                .get(id)
+                .copied()
+                .unwrap_or(i32::MAX)
+        });
+
+        let mut events = Vec::new();
+        for (id, input) in pending {
+            let Some(block_index) = self.tool_block_indices.get(&id).copied() else {
+                self.tool_json_prefix_split.remove(&id);
+                continue;
+            };
+            for partial_json in self.bedrock_tool_argument_deltas_for(&id, &input, true) {
+                if let Some(delta_event) = self.state_manager.handle_content_block_delta(
+                    block_index,
+                    json!({
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": partial_json
+                        }
+                    }),
+                ) {
+                    events.push(delta_event);
+                }
+            }
+        }
+        self.state_manager.set_stop_reason("max_tokens");
+        events
+    }
+
+    fn current_billable_input_tokens(&self) -> i32 {
+        if self.aws_b40_compat {
+            self.input_context_calibration.calibrate(
+                &self.model,
+                self.input_tokens,
+                self.context_input_tokens,
+            )
+        } else {
+            super::billing::billable_input_tokens(self.input_tokens, self.context_input_tokens)
+        }
+    }
+
+    fn final_usage_breakdown(&self) -> super::cache::UsageBreakdown {
+        let current_input_tokens = self.current_billable_input_tokens();
+        let first_round_input_tokens = self
+            .initial_calibrated_input_tokens
+            .unwrap_or(if self.accumulated_input_tokens == 0 {
+                current_input_tokens
+            } else {
+                self.initial_input_tokens
+            });
+        let initial = super::cache::reconcile_initial_input(
+            self.initial_usage_breakdown,
+            first_round_input_tokens,
+            self.input_context_calibration.cache_input_adjustment(
+                self.initial_input_tokens,
+                first_round_input_tokens,
+            ),
+        );
+        super::cache::with_additional_input(
+            initial,
+            first_round_input_tokens,
+            self.accumulated_input_tokens
+                .saturating_add(current_input_tokens),
+        )
     }
 
     /// 生成最终事件序列
@@ -1562,6 +1786,11 @@ impl StreamContext {
             }
         }
 
+        // If the upstream transport ends before its final tool `stop=true`
+        // frame, emit every argument byte already received before closing the
+        // block. The response remains explicitly truncated via max_tokens.
+        events.extend(self.flush_pending_bedrock_tool_arguments());
+
         // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
         // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
         // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
@@ -1576,13 +1805,7 @@ impl StreamContext {
 
         // 自动续写会产生多次上游调用；最终 usage 需要包含所有内部调用的输入。
         // 短请求使用客户请求估算，避免 Kiro 固定上下文底噪让“你好”显示 4K+ input。
-        let final_input_tokens = self.accumulated_input_tokens
-            + super::billing::billable_input_tokens(self.input_tokens, self.context_input_tokens);
-        let breakdown = super::cache::with_additional_input(
-            self.initial_usage_breakdown,
-            self.initial_input_tokens,
-            final_input_tokens,
-        );
+        let breakdown = self.final_usage_breakdown();
 
         // 最终 output_tokens 用 ctoc 对累积的完整输出文本算一次(贪心跨块不可加,故不能逐块累加)。
         // self.output_tokens(字符估算)仅用于流中途的限长/续写判断。
@@ -1592,13 +1815,32 @@ impl StreamContext {
             Some(limit) => super::claude_tok::count_claude(&self.output_text_acc).min(limit.max(0)),
             None => super::claude_tok::count_claude(&self.output_text_acc),
         };
-        let visible_output_tokens = if ctoc_output_tokens > 0 {
+        let base_visible_output_tokens = if ctoc_output_tokens > 0 {
             match self.output_token_limit {
                 Some(limit) if limit < 4 => ctoc_output_tokens,
                 _ => ctoc_output_tokens.max(4),
             }
         } else {
             0
+        };
+        let base_visible_output_tokens = if self.aws_b40_compat
+            && self.tool_block_indices.is_empty()
+        {
+            super::bedrock::calibrated_text_output_tokens(
+                &self.output_text_acc,
+                base_visible_output_tokens,
+            )
+        } else {
+            base_visible_output_tokens
+        };
+        let visible_output_tokens = if self.aws_b40_compat {
+            super::bedrock::framed_output_tokens(
+                base_visible_output_tokens,
+                self.state_manager.active_blocks.len(),
+                self.tool_block_indices.len(),
+            )
+        } else {
+            base_visible_output_tokens
         };
         let thinking_usage_tokens = self.compat_thinking_usage_tokens();
         // 请求开启 thinking 即在 message_delta 带 output_tokens_details（与真 Anthropic 一致），
@@ -1608,9 +1850,20 @@ impl StreamContext {
         } else {
             thinking_usage_tokens
         };
-        let final_output_tokens = visible_output_tokens
+        let uncapped_output_tokens = visible_output_tokens
             + thinking_usage_tokens
             + if thinking_usage_tokens > 0 { 2 } else { 0 };
+        let final_output_tokens = self
+            .output_token_limit
+            .map(|limit| uncapped_output_tokens.min(limit.max(1)))
+            .unwrap_or(uncapped_output_tokens);
+        if self
+            .output_token_limit
+            .is_some_and(|limit| final_output_tokens >= limit.max(1))
+            && !self.state_manager.has_tool_use()
+        {
+            self.state_manager.set_stop_reason("max_tokens");
+        }
         let mut final_events = self.state_manager.generate_final_events(
             breakdown,
             final_output_tokens,
@@ -1618,13 +1871,26 @@ impl StreamContext {
             usage_thinking_tokens,
         );
         if self.aws_b40_compat {
+            let invocation_latency = self
+                .upstream_request_latency_ms
+                .saturating_add(self.stream_started_at.elapsed().as_millis() as u64);
+            let first_byte_latency = self
+                .first_byte_latency_ms
+                .unwrap_or(invocation_latency)
+                .min(invocation_latency);
+            let total_input_tokens = breakdown
+                .input_tokens
+                .saturating_add(breakdown.cache_creation_input_tokens)
+                .saturating_add(breakdown.cache_read_input_tokens);
             for event in &mut final_events {
                 if event.event == "message_stop" {
                     event.data = json!({
                         "type": "message_stop",
-                        "usage": {
-                            "input_tokens": breakdown.input_tokens,
-                            "output_tokens": final_output_tokens
+                        "amazon-bedrock-invocationMetrics": {
+                            "inputTokenCount": total_input_tokens,
+                            "outputTokenCount": final_output_tokens,
+                            "invocationLatency": invocation_latency,
+                            "firstByteLatency": first_byte_latency
                         }
                     });
                 }
@@ -1675,8 +1941,13 @@ impl StreamContext {
     }
 
     pub fn begin_continuation_for_billing(&mut self, next_estimated_input_tokens: i32) {
-        self.accumulated_input_tokens +=
-            super::billing::billable_input_tokens(self.input_tokens, self.context_input_tokens);
+        let current_input_tokens = self.current_billable_input_tokens();
+        if self.accumulated_input_tokens == 0 {
+            self.initial_calibrated_input_tokens = Some(current_input_tokens);
+        }
+        self.accumulated_input_tokens = self
+            .accumulated_input_tokens
+            .saturating_add(current_input_tokens);
         self.input_tokens = next_estimated_input_tokens.max(1);
         self.context_input_tokens = None;
     }
@@ -1781,6 +2052,21 @@ impl BufferedStreamContext {
         self.inner.enable_aws_b40_compat(adaptive_signature);
     }
 
+    pub fn set_input_context_calibration(
+        &mut self,
+        calibration: super::bedrock::InputContextCalibration,
+    ) {
+        self.inner.set_input_context_calibration(calibration);
+    }
+
+    pub fn set_suppress_text_blocks(&mut self, suppress: bool) {
+        self.inner.set_suppress_text_blocks(suppress);
+    }
+
+    pub fn set_upstream_request_latency(&mut self, elapsed: Duration) {
+        self.inner.set_upstream_request_latency(elapsed);
+    }
+
     /// 透传:设置待注入的合成 thinking(见 StreamContext::set_synthetic_thinking)。
     pub fn set_synthetic_thinking(&mut self, thinking: Option<String>) {
         self.inner.set_synthetic_thinking(thinking);
@@ -1820,17 +2106,8 @@ impl BufferedStreamContext {
         let final_events = self.inner.generate_final_events();
         self.event_buffer.extend(final_events);
 
-        // 获取 billable input_tokens；自动续写的额外输入只计入普通 input。
-        let final_input_tokens = self.inner.accumulated_input_tokens
-            + super::billing::billable_input_tokens(
-                self.inner.input_tokens,
-                self.inner.context_input_tokens,
-            );
-        let breakdown = super::cache::with_additional_input(
-            self.inner.initial_usage_breakdown,
-            self.inner.initial_input_tokens,
-            final_input_tokens,
-        );
+        // 获取 profile 校准后的 input/cache 拆分；自动续写的额外输入只计入普通 input。
+        let breakdown = self.inner.final_usage_breakdown();
 
         // 更正 message_start 事件中的 usage（input + cache 字段全部按拆分后回填）
         for event in &mut self.event_buffer {
@@ -1970,6 +2247,8 @@ mod tests {
         assert!(sse_str.starts_with("event: message_start\n"));
         assert!(sse_str.contains("data: "));
         assert!(sse_str.ends_with("\n\n"));
+        assert!(!sse_str.ends_with("\n\n\n"));
+        assert!(event.to_profile_sse_string(true).ends_with("\n\n\n"));
     }
 
     #[test]
@@ -2275,7 +2554,8 @@ mod tests {
             response_usage["cache_creation"]["ephemeral_1h_input_tokens"],
             20
         );
-        assert!(response_usage.get("service_tier").is_none());
+        assert_eq!(response_usage["output_tokens"], 8);
+        assert_eq!(response_usage["service_tier"], "standard");
     }
 
     #[test]
@@ -2298,6 +2578,97 @@ mod tests {
 
         assert_eq!(content_block["id"], "toolu_bdrk_original");
         assert!(content_block.get("caller").is_none());
+        assert!(!events.iter().any(|event| event.event == "ping"));
+        let json_deltas = events
+            .iter()
+            .filter(|event| event.data["delta"]["type"] == "input_json_delta")
+            .collect::<Vec<_>>();
+        assert_eq!(json_deltas.len(), 2);
+        assert_eq!(json_deltas[0].data["delta"]["partial_json"], "");
+        assert_eq!(json_deltas[1].data["delta"]["partial_json"], "{}");
+    }
+
+    #[test]
+    fn aws_b_stream_normalizes_tool_json_structural_boundaries() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 1, false, false, HashMap::new());
+        ctx.enable_aws_b40_compat(false);
+
+        let first = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "get_weather".to_string(),
+            tool_use_id: "toolu_bdrk_original".to_string(),
+            input: "{\"city\": \"".to_string(),
+            stop: false,
+        });
+        let second = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "get_weather".to_string(),
+            tool_use_id: "toolu_bdrk_original".to_string(),
+            input: "Paris\"}".to_string(),
+            stop: true,
+        });
+        let deltas = first
+            .iter()
+            .chain(second.iter())
+            .filter(|event| event.data["delta"]["type"] == "input_json_delta")
+            .map(|event| event.data["delta"]["partial_json"].as_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(deltas, vec!["", "{\"", "city\": ", "\"Paris\"}"]);
+    }
+
+    #[test]
+    fn aws_b_stream_flushes_tool_json_when_upstream_ends_mid_argument() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 509, false, false, HashMap::new());
+        ctx.enable_aws_b40_compat(false);
+
+        let mut events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "get_weather".to_string(),
+            tool_use_id: "toolu_bdrk_original".to_string(),
+            input: "{\"city\":\"Par".to_string(),
+            stop: false,
+        });
+        events.extend(ctx.generate_final_events());
+
+        let reconstructed = events
+            .iter()
+            .filter(|event| event.data["delta"]["type"] == "input_json_delta")
+            .filter_map(|event| event.data["delta"]["partial_json"].as_str())
+            .collect::<String>();
+        assert_eq!(reconstructed, "{\"city\":\"Par");
+
+        let delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+        assert_eq!(delta.data["delta"]["stop_reason"], "max_tokens");
+    }
+
+    #[test]
+    fn aws_b_stream_caps_usage_and_stop_reason_at_max_tokens() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-8",
+            14,
+            false,
+            super::super::cache::UsageBreakdown::flat(14),
+            HashMap::new(),
+        );
+        ctx.enable_aws_b40_compat(false);
+        ctx.set_output_token_limit(1);
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_assistant_response("CALIBRATION_OK");
+        let events = ctx.generate_final_events();
+        let delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+
+        assert_eq!(delta.data["delta"]["stop_reason"], "max_tokens");
+        assert_eq!(delta.data["usage"]["output_tokens"], 1);
+        assert_eq!(
+            delta.data["usage"]["output_tokens_details"]["thinking_tokens"],
+            0
+        );
     }
 
     #[test]
@@ -2330,6 +2701,18 @@ mod tests {
         assert!(usage.get("service_tier").is_none());
         assert!(usage.get("inference_geo").is_none());
         assert!(usage.get("cache_creation").is_none());
+        let bedrock_stop = events
+            .iter()
+            .find(|event| event.event == "message_stop")
+            .expect("AWS-B message_stop");
+        assert_eq!(
+            bedrock_stop.data["amazon-bedrock-invocationMetrics"]["inputTokenCount"],
+            42
+        );
+        assert_eq!(
+            bedrock_stop.data["amazon-bedrock-invocationMetrics"]["outputTokenCount"],
+            8
+        );
 
         let mut aws_p = StreamContext::new_with_thinking(
             "claude-sonnet-4-6",
@@ -2348,7 +2731,14 @@ mod tests {
             .data["usage"];
         assert!(p_usage.get("service_tier").is_none());
         assert!(p_usage.get("inference_geo").is_none());
-        assert_eq!(usage, p_usage);
+        assert_eq!(usage["output_tokens"].as_i64(), Some(8));
+        assert_eq!(p_usage["output_tokens"].as_i64(), Some(4));
+
+        let stop = events
+            .iter()
+            .find(|event| event.event == "message_stop")
+            .expect("AWS-P message_stop");
+        assert!(stop.data.get("amazon-bedrock-invocationMetrics").is_none());
     }
 
     /// 流式 thinking 块必须在 content_block_start 带 signature: ""，
