@@ -1,0 +1,15 @@
+HTTP/1.1 200 OK
+Date: Mon, 13 Jul 2026 17:07:29 GMT
+Content-Type: application/json
+Content-Length: 512
+Connection: keep-alive
+Strict-Transport-Security: max-age=31536000
+Alt-Svc: h3=":443"; ma=2592000
+Referrer-Policy: strict-origin-when-cross-origin
+Via: 1.1 Caddy
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+X-New-Api-Version: 20260501R2
+X-Oneapi-Request-Id: 202607131707281170707168268d9d6xsNULHz5
+Server: lyywafcdn
+

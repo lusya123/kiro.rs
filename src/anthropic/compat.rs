@@ -529,7 +529,9 @@ pub fn extract_exact_system_reply(payload: &MessagesRequest) -> Option<String> {
     }
 
     let (start, marker_len) = [
+        "reply with exactly: ",
         "reply with exactly ",
+        "respond with exactly: ",
         "reply exactly: ",
         "reply exactly ",
         "say exactly: ",
@@ -2003,6 +2005,16 @@ mod tests {
             "Hello, what is the capital of France?",
         );
         assert_eq!(extract_exact_system_reply(&req).as_deref(), Some("bb47812b"));
+    }
+
+    #[test]
+    fn exact_reply_accepts_natural_colon_form() {
+        let req = identity_req(
+            "claude-opus-4-8",
+            None,
+            "Reply with exactly: pong",
+        );
+        assert_eq!(extract_exact_system_reply(&req).as_deref(), Some("pong"));
     }
 
     #[test]

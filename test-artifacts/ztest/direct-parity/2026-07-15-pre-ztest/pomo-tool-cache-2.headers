@@ -1,0 +1,19 @@
+HTTP/1.1 200 OK
+Date: Mon, 13 Jul 2026 15:34:28 GMT
+Content-Type: application/json
+Content-Length: 577
+Connection: keep-alive
+Strict-Transport-Security: max-age=31536000
+Alt-Svc: h3=":443"; ma=2592000
+Vary: Accept-Encoding
+Via: 1.1 Caddy
+X-Amzn-Bedrock-Cache-Read-Input-Token-Count: 0
+X-Amzn-Bedrock-Cache-Write-Input-Token-Count: 15286
+X-Amzn-Bedrock-Input-Token-Count: 213
+X-Amzn-Bedrock-Invocation-Latency: 16669
+X-Amzn-Bedrock-Output-Token-Count: 32
+X-Amzn-Requestid: fb854ceb-28ec-45e2-85d5-3123c72be46d
+X-New-Api-Version: 20260501R2
+X-Oneapi-Request-Id: 20260713233409691355514rwsYkDfU
+Server: lyywafcdn
+

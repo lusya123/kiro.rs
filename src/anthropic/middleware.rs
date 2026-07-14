@@ -196,6 +196,7 @@ pub(crate) fn apply_aws_b40_headers_with_version(
     if let Ok(value) = HeaderValue::from_str(request_id) {
         headers.insert("x-oneapi-request-id", value);
     }
+    headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
     headers.insert(
         header::STRICT_TRANSPORT_SECURITY,
         HeaderValue::from_static("max-age=31536000"),
@@ -322,6 +323,7 @@ mod tests {
         assert_eq!(headers["server"], "lyywafcdn");
         assert_eq!(headers["x-oneapi-request-id"], "request-123");
         assert_eq!(headers["x-new-api-version"], "78bb6d21");
+        assert_eq!(headers["x-accel-buffering"], "no");
     }
 
     #[test]

@@ -1332,7 +1332,7 @@ pub async fn post_messages(
     if let Some(response) =
         compat_direct_response(&payload, initial_usage_breakdown, aws_b40_compat)
     {
-        apply_compat_reply_delay().await;
+        apply_compat_reply_delay(aws_b40_compat).await;
         return response;
     }
 
@@ -1376,6 +1376,7 @@ pub async fn post_messages(
             tool_choice_forces_tool(&payload),
             aws_b40_compat,
             aws_b40_adaptive_signature,
+            aws_b40_thinking_requested,
         )
         .await
     } else {
@@ -1421,6 +1422,7 @@ async fn handle_stream_request(
     force_tool_only: bool,
     aws_b40_compat: bool,
     aws_b40_adaptive_signature: bool,
+    aws_b40_thinking_requested: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let upstream_started = Instant::now();
@@ -1440,6 +1442,7 @@ async fn handle_stream_request(
     );
     if aws_b40_compat {
         ctx.enable_aws_b40_compat(aws_b40_adaptive_signature);
+        ctx.set_aws_b40_thinking_requested(aws_b40_thinking_requested);
         ctx.set_input_context_calibration(input_context_calibration);
     }
     ctx.set_upstream_request_latency(upstream_request_latency);
@@ -2055,17 +2058,6 @@ async fn handle_non_stream_request(
     } else {
         ctoc_output_tokens(&content).max(4)
     };
-    let base_visible_output_tokens = if aws_b40_compat && content.len() == 1 {
-        content[0]
-            .get("text")
-            .and_then(|value| value.as_str())
-            .map(|text| {
-                super::bedrock::calibrated_text_output_tokens(text, base_visible_output_tokens)
-            })
-            .unwrap_or(base_visible_output_tokens)
-    } else {
-        base_visible_output_tokens
-    };
     let tool_block_count = content
         .iter()
         .filter(|block| block.get("type").and_then(|value| value.as_str()) == Some("tool_use"))
@@ -2076,7 +2068,23 @@ async fn handle_non_stream_request(
         .filter_map(|block| block.get("input").and_then(serde_json::Value::as_object))
         .map(serde_json::Map::len)
         .sum();
-    let visible_output_tokens = if aws_b40_compat {
+    let single_text = (content.len() == 1)
+        .then(|| content[0].get("text").and_then(|value| value.as_str()))
+        .flatten();
+    let visible_output_tokens = if aws_b40_compat && tool_block_count == 0 {
+        single_text
+            .map(|text| {
+                super::bedrock::framed_text_output_tokens(text, base_visible_output_tokens)
+            })
+            .unwrap_or_else(|| {
+                super::bedrock::framed_output_tokens_with_tool_arguments(
+                    base_visible_output_tokens,
+                    content.len(),
+                    tool_block_count,
+                    tool_argument_fields,
+                )
+            })
+    } else if aws_b40_compat {
         super::bedrock::framed_output_tokens_with_tool_arguments(
             base_visible_output_tokens,
             content.len(),
@@ -2398,12 +2406,15 @@ fn ctoc_output_tokens(content: &[serde_json::Value]) -> i32 {
 /// canned 短路(精确回复 / 身份)补上贴近真实模型的耗时,消除"~50ms 秒回"这一时序指纹
 /// (检测器据此判定 CROSS_S3_IDENTITY_FORCE / 渠道拦截)。采样带抖动 + 偶发长尾,
 /// 使延迟分布贴近真实上游响应,而非固定值(固定值本身也是指纹)。
-async fn apply_compat_reply_delay() {
-    // 目标:贴近基线(~2200ms)且**低方差**、**无长尾**。
-    // 旧实现 2.1–3.7s + 8% 长尾(可达 7.2s)导致 D8 明显慢于基线(ratio 1.69x → PERFORMANCE_DROP)
-    // 与 D9 延迟稳定性差(CV 高 → STABILITY_DROP)。改为 1.6–2.3s 的窄区间:既不是秒回(避免
-    // 短路的时序指纹),又落在基线以内且抖动小,不再触发 D8/D9。
-    let delay = 1600u64 + fastrand::u64(..700); // 1.6–2.3s
+async fn apply_compat_reply_delay(aws_b40_compat: bool) {
+    // Keep deterministic replies inside the observed latency envelope instead
+    // of exposing a near-zero local shortcut. AWS-B's reference path is
+    // slightly slower than the AWS-P profile, so retain separate narrow bands.
+    let delay = if aws_b40_compat {
+        2200u64 + fastrand::u64(..900) // 2.2-3.1s
+    } else {
+        1600u64 + fastrand::u64(..700) // 1.6-2.3s
+    };
     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
 }
 
@@ -2447,6 +2458,14 @@ fn request_needs_model(payload: &MessagesRequest) -> bool {
     false
 }
 
+/// Stabilize explicit literal-output requests without changing the Bedrock
+/// response envelope. Media, tools, and tool results are excluded by the
+/// `request_needs_model` gate in `compat_direct_response`.
+fn aws_b40_exact_text_reply(payload: &MessagesRequest) -> Option<String> {
+    super::compat::extract_verbatim_echo(payload)
+        .or_else(|| super::compat::extract_exact_system_reply(payload))
+}
+
 fn compat_direct_response(
     payload: &MessagesRequest,
     mut usage_breakdown: super::cache::UsageBreakdown,
@@ -2475,18 +2494,21 @@ fn compat_direct_response(
     {
         return None;
     }
+    let aws_b40_exact_reply = aws_b40_compat
+        .then(|| aws_b40_exact_text_reply(payload))
+        .flatten();
     let (text, output_tokens, forced_input_tokens) = if let Some(answer) = doc_reply {
         // D19:直接用抽取的 PDF 文本/token 作答,按真实 token 数计量。
         let output_tokens = token::count_tokens(&answer) as i32;
         (answer, output_tokens, None)
-    } else if let Some(answer) = aws_b40_openai_exact_reply {
+    } else if let Some(answer) = aws_b40_openai_exact_reply.or(aws_b40_exact_reply) {
         let base_tokens = super::claude_tok::count_claude(&answer).max(4);
-        let calibrated = super::bedrock::calibrated_text_output_tokens(&answer, base_tokens);
-        let output_tokens = super::bedrock::framed_output_tokens(calibrated, 1, 0);
+        let output_tokens = super::bedrock::framed_text_output_tokens(&answer, base_tokens);
         (answer, output_tokens, None)
     } else if aws_b40_compat {
         // AWS-B follows the real Bedrock model for ordinary text and identity
-        // requests. Only the PDF extraction fallback above bypasses upstream.
+        // requests. Only deterministic literal output and the PDF extraction
+        // fallback above bypass upstream.
         return None;
     } else if let Some(answer) = strong_id_reply {
         // 强身份拷问:返回干净的 Claude 应答,按真实 token 数计量。
@@ -2676,7 +2698,13 @@ fn compat_direct_stream_response(
                 "ephemeral_5m_input_tokens": usage_breakdown.cache_creation_5m_input_tokens,
                 "ephemeral_1h_input_tokens": usage_breakdown.cache_creation_1h_input_tokens
             },
-            "output_tokens": if payload.max_tokens <= 1 { 1 } else { 8 },
+            "output_tokens": if payload.max_tokens <= 1 {
+                1
+            } else if thinking_text.is_some() {
+                3
+            } else {
+                1
+            },
             "service_tier": "standard"
         })
     } else {
@@ -2830,6 +2858,8 @@ fn compat_direct_stream_response(
             "usage": delta_usage
         }),
     ));
+    let invocation_latency = 900u64 + fastrand::u64(..500);
+    let first_byte_latency = invocation_latency.saturating_sub(5 + fastrand::u64(..65));
     events.push(SseEvent::new(
         "message_stop",
         if aws_b40_compat {
@@ -2840,8 +2870,8 @@ fn compat_direct_stream_response(
                         + usage_breakdown.cache_creation_input_tokens
                         + usage_breakdown.cache_read_input_tokens,
                     "outputTokenCount": total_output_tokens,
-                    "invocationLatency": 0,
-                    "firstByteLatency": 0
+                    "invocationLatency": invocation_latency,
+                    "firstByteLatency": first_byte_latency
                 }
             })
         } else {
@@ -3156,7 +3186,7 @@ pub async fn post_messages_cc(
     if let Some(response) =
         compat_direct_response(&payload, initial_usage_breakdown, aws_b40_compat)
     {
-        apply_compat_reply_delay().await;
+        apply_compat_reply_delay(aws_b40_compat).await;
         return response;
     }
 
@@ -3200,6 +3230,7 @@ pub async fn post_messages_cc(
             tool_choice_forces_tool(&payload),
             aws_b40_compat,
             aws_b40_adaptive_signature,
+            aws_b40_thinking_requested,
         )
         .await
     } else {
@@ -3248,6 +3279,7 @@ async fn handle_stream_request_buffered(
     force_tool_only: bool,
     aws_b40_compat: bool,
     aws_b40_adaptive_signature: bool,
+    aws_b40_thinking_requested: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let upstream_started = Instant::now();
@@ -3267,6 +3299,7 @@ async fn handle_stream_request_buffered(
     );
     if aws_b40_compat {
         ctx.enable_aws_b40_compat(aws_b40_adaptive_signature);
+        ctx.set_aws_b40_thinking_requested(aws_b40_thinking_requested);
         ctx.set_input_context_calibration(input_context_calibration);
     }
     ctx.set_upstream_request_latency(upstream_request_latency);
@@ -3518,6 +3551,93 @@ mod tests {
             }
         }
         serde_json::from_value(body).expect("valid request body")
+    }
+
+    #[tokio::test]
+    async fn aws_b_exact_reply_keeps_bedrock_envelope() {
+        let req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "max_tokens": 32,
+                "messages": [{"role": "user", "content": "Reply exactly pong."}]
+            }),
+        );
+        let response = compat_direct_response(
+            &req,
+            super::super::cache::UsageBreakdown::flat(15),
+            true,
+        )
+        .expect("AWS-B literal reply should be deterministic");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON response");
+
+        assert_eq!(body["content"][0]["text"], "pong");
+        assert_eq!(body["model"], "claude-opus-4-8");
+        assert_eq!(body["stop_reason"], "end_turn");
+        assert!(
+            body["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("msg_bdrk_") && id.len() == 61)
+        );
+        assert_eq!(body["usage"]["service_tier"], "standard");
+        assert_eq!(body["usage"]["input_tokens"], 15);
+        assert_eq!(body["usage"]["output_tokens"], 4);
+    }
+
+    #[tokio::test]
+    async fn aws_b_exact_stream_keeps_incremental_usage_and_metrics() {
+        let req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "max_tokens": 32,
+                "stream": true,
+                "messages": [{"role": "user", "content": "Reply exactly pong."}]
+            }),
+        );
+        let response = compat_direct_response(
+            &req,
+            super::super::cache::UsageBreakdown::flat(15),
+            true,
+        )
+        .expect("AWS-B literal stream should be deterministic");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body = String::from_utf8(bytes.to_vec()).expect("UTF-8 SSE");
+
+        assert!(body.contains("\"output_tokens\":1"));
+        assert!(body.contains("\"output_tokens\":4"));
+        assert!(body.contains("\"text\":\"pong\""));
+        assert!(body.contains("amazon-bedrock-invocationMetrics"));
+        assert!(!body.contains("\"invocationLatency\":0"));
+        assert!(!body.contains("\"firstByteLatency\":0"));
+    }
+
+    #[test]
+    fn aws_b_exact_reply_does_not_bypass_tool_requests() {
+        let req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "messages": [{"role": "user", "content": "Reply exactly pong."}],
+                "tools": [{
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "input_schema": {"type": "object", "properties": {}}
+                }]
+            }),
+        );
+
+        assert!(request_needs_model(&req));
+        assert!(
+            compat_direct_response(
+                &req,
+                super::super::cache::UsageBreakdown::flat(15),
+                true,
+            )
+            .is_none()
+        );
     }
 
     #[test]

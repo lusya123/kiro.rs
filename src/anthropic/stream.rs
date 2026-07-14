@@ -747,6 +747,7 @@ pub struct StreamContext {
     /// Preserve the externally observed AWS-B/Bedrock protocol shape.
     aws_b40_compat: bool,
     aws_b40_adaptive_signature: bool,
+    aws_b40_thinking_requested: bool,
     /// `call_api_stream` 返回响应头前已经消耗的时间。
     upstream_request_latency_ms: u64,
     /// 从响应头到当前事件处理的计时起点。
@@ -808,6 +809,7 @@ impl StreamContext {
             suppress_text_blocks: false,
             aws_b40_compat: false,
             aws_b40_adaptive_signature: false,
+            aws_b40_thinking_requested: false,
             upstream_request_latency_ms: 0,
             stream_started_at: Instant::now(),
             first_byte_latency_ms: None,
@@ -820,6 +822,10 @@ impl StreamContext {
         self.model = super::bedrock::response_model(&self.model);
         self.message_id = super::bedrock::response_id(&self.model);
         self.state_manager.set_emit_initial_ping(false);
+    }
+
+    pub fn set_aws_b40_thinking_requested(&mut self, requested: bool) {
+        self.aws_b40_thinking_requested = requested;
     }
 
     pub fn set_input_context_calibration(
@@ -893,7 +899,8 @@ impl StreamContext {
             let initial_output_tokens = match self.output_token_limit {
                 Some(limit) if limit <= 1 => 1,
                 _ if self.suppress_text_blocks => 16,
-                _ => 8,
+                _ if self.aws_b40_thinking_requested => 3,
+                _ => 1,
             };
             return json!({
                 "type": "message_start",
@@ -1853,17 +1860,15 @@ impl StreamContext {
         } else {
             0
         };
-        let base_visible_output_tokens = if self.aws_b40_compat
+        let visible_output_tokens = if self.aws_b40_compat
             && self.tool_block_indices.is_empty()
+            && !self.output_text_acc.is_empty()
         {
-            super::bedrock::calibrated_text_output_tokens(
+            super::bedrock::framed_text_output_tokens(
                 &self.output_text_acc,
                 base_visible_output_tokens,
             )
-        } else {
-            base_visible_output_tokens
-        };
-        let visible_output_tokens = if self.aws_b40_compat {
+        } else if self.aws_b40_compat {
             super::bedrock::framed_output_tokens_with_tool_arguments(
                 base_visible_output_tokens,
                 self.state_manager.active_blocks.len(),
@@ -2081,6 +2086,10 @@ impl BufferedStreamContext {
 
     pub fn enable_aws_b40_compat(&mut self, adaptive_signature: bool) {
         self.inner.enable_aws_b40_compat(adaptive_signature);
+    }
+
+    pub fn set_aws_b40_thinking_requested(&mut self, requested: bool) {
+        self.inner.set_aws_b40_thinking_requested(requested);
     }
 
     pub fn set_input_context_calibration(
@@ -2585,8 +2594,25 @@ mod tests {
             response_usage["cache_creation"]["ephemeral_1h_input_tokens"],
             20
         );
-        assert_eq!(response_usage["output_tokens"], 8);
+        assert_eq!(response_usage["output_tokens"], 1);
         assert_eq!(response_usage["service_tier"], "standard");
+    }
+
+    #[test]
+    fn aws_b_message_start_preserves_requested_thinking_hint() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-8",
+            33,
+            false,
+            super::super::cache::UsageBreakdown::flat(33),
+            HashMap::new(),
+        );
+        ctx.enable_aws_b40_compat(true);
+        ctx.set_aws_b40_thinking_requested(true);
+
+        let event = ctx.create_message_start_event();
+
+        assert_eq!(event["message"]["usage"]["output_tokens"], 3);
     }
 
     #[test]

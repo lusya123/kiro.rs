@@ -193,9 +193,11 @@ pub fn framed_output_tokens_with_tool_arguments(
 /// Adjust the shared tokenizer to Bedrock's reported input-usage envelope.
 /// Tool requests already carry their own calibrated schema framing.
 pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i32 {
+    let image_correction = image_block_count(payload).saturating_mul(5);
     if payload.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
         return base_tokens
             .saturating_add(complex_tool_schema_correction(payload))
+            .saturating_add(image_correction)
             .max(1);
     }
 
@@ -217,10 +219,13 @@ pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i
         if payload.system.as_ref().is_some_and(|system| !system.is_empty()) {
             correction -= 8;
         }
-        return base_tokens.saturating_add(correction.max(0)).max(1);
+        return base_tokens
+            .saturating_add(correction.max(0))
+            .saturating_add(image_correction)
+            .max(1);
     }
 
-    let mut correction = -1;
+    let mut correction = image_correction.saturating_sub(1);
     if payload.messages.len() > 1 {
         correction -= ((payload.messages.len() - 1) * 3 / 2) as i32;
     }
@@ -285,6 +290,46 @@ pub fn calibrated_text_output_tokens(text: &str, base_tokens: i32) -> i32 {
         return base_tokens.saturating_sub(1);
     }
     base_tokens
+}
+
+/// Apply Bedrock's text-block framing and its compact accounting for very
+/// short plain tokens. Longer text, markers, and JSON retain the calibrated
+/// structural overhead used by the rest of the profile.
+pub fn framed_text_output_tokens(text: &str, base_tokens: i32) -> i32 {
+    let marker = text.trim();
+    let short_plain = !marker.is_empty()
+        && marker.len() <= 4
+        && marker.bytes().all(|byte| byte.is_ascii_alphanumeric());
+    if short_plain {
+        let compact = super::claude_tok::count_claude(marker).max(1) + 2;
+        return if marker.len() > 1 && marker.bytes().any(|byte| byte.is_ascii_alphabetic()) {
+            compact.max(4)
+        } else {
+            compact
+        };
+    }
+
+    let base_tokens = if serde_json::from_str::<Value>(marker)
+        .is_ok_and(|value| matches!(value, Value::Object(_) | Value::Array(_)))
+    {
+        let framed_text = format!("{text}\n");
+        base_tokens.max(super::claude_tok::count_claude(&framed_text))
+    } else {
+        base_tokens
+    };
+
+    framed_output_tokens(calibrated_text_output_tokens(text, base_tokens), 1, 0)
+}
+
+fn image_block_count(payload: &MessagesRequest) -> i32 {
+    payload
+        .messages
+        .iter()
+        .filter_map(|message| message.content.as_array())
+        .flatten()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("image"))
+        .count()
+        .min(i32::MAX as usize) as i32
 }
 
 /// Keep strict identity probes useful without exposing the upstream runtime.
@@ -876,6 +921,40 @@ mod tests {
             11
         );
         assert_eq!(calibrated_text_output_tokens("ordinary response", 6), 6);
+    }
+
+    #[test]
+    fn short_plain_text_uses_bedrock_compact_output_accounting() {
+        assert_eq!(framed_text_output_tokens("pong", 4), 4);
+        assert_eq!(framed_text_output_tokens("Red", 4), 4);
+        assert_eq!(framed_text_output_tokens("4", 4), 3);
+        assert_eq!(framed_text_output_tokens("CACHE_OK", 6), 9);
+        assert_eq!(
+            framed_text_output_tokens(r#"{"alpha":1,"beta":"two"}"#, 10),
+            18
+        );
+        assert_eq!(
+            framed_text_output_tokens(r#"{"alpha":1,"beta":"two"}"#, 9),
+            18
+        );
+    }
+
+    #[test]
+    fn image_requests_include_bedrock_media_framing() {
+        let payload: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 32,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "unused"}},
+                    {"type": "text", "text": "What color is this image?"}
+                ]
+            }]
+        }))
+        .expect("valid request");
+
+        assert_eq!(calibrated_input_tokens(&payload, 36), 40);
     }
 
     #[test]
