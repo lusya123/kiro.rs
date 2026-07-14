@@ -19,6 +19,7 @@ use super::types::MessagesRequest;
 
 const OUTPUT_MESSAGE_FRAMING_TOKENS: i32 = 4;
 const OUTPUT_TOOL_BLOCK_FRAMING_TOKENS: i32 = 24;
+const OUTPUT_EXTRA_TOOL_ARGUMENT_TOKENS: i32 = 20;
 const KIRO_OPUS_48_CONTEXT_OVERHEAD_TOKENS: i32 = 6_850;
 const KIRO_OPUS_48_TOOL_CONTEXT_OVERHEAD_TOKENS: i32 = 6_762;
 const KIRO_TOOL_DESCRIPTION_LIMIT_CHARS: usize = 10_000;
@@ -176,11 +177,26 @@ pub fn framed_output_tokens(base_tokens: i32, content_blocks: usize, tool_blocks
         + tool_blocks as i32 * OUTPUT_TOOL_BLOCK_FRAMING_TOKENS
 }
 
+pub fn framed_output_tokens_with_tool_arguments(
+    base_tokens: i32,
+    content_blocks: usize,
+    tool_blocks: usize,
+    tool_argument_fields: usize,
+) -> i32 {
+    framed_output_tokens(base_tokens, content_blocks, tool_blocks)
+        + tool_argument_fields
+            .saturating_sub(tool_blocks)
+            .min(i32::MAX as usize) as i32
+            * OUTPUT_EXTRA_TOOL_ARGUMENT_TOKENS
+}
+
 /// Adjust the shared tokenizer to Bedrock's reported input-usage envelope.
 /// Tool requests already carry their own calibrated schema framing.
 pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i32 {
     if payload.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
-        return base_tokens.max(1);
+        return base_tokens
+            .saturating_add(complex_tool_schema_correction(payload))
+            .max(1);
     }
 
     let mut segments = Vec::new();
@@ -217,11 +233,14 @@ pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i
     if segments.iter().any(|text| text.chars().any(is_cjk)) {
         correction += 1;
     }
-    if segments
-        .iter()
-        .any(|text| is_structured_json(text) || requests_structured_json(text))
-    {
+    if segments.iter().any(|text| is_structured_json(text)) {
         correction += 12;
+    } else if let Some(structured_correction) = segments
+        .iter()
+        .filter_map(|text| structured_json_request_correction(text))
+        .max()
+    {
+        correction += structured_correction;
     } else if segments.iter().any(|text| looks_like_source_code(text)) {
         correction += 13;
     }
@@ -238,14 +257,34 @@ pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i
 
 pub fn calibrated_text_output_tokens(text: &str, base_tokens: i32) -> i32 {
     let marker = text.trim();
-    let uppercase_marker = marker.bytes().all(|byte| byte == b'_' || byte.is_ascii_uppercase())
-        && marker.bytes().filter(|byte| *byte == b'_').count() == 1
-        && marker.bytes().any(|byte| byte.is_ascii_uppercase());
-    if uppercase_marker && base_tokens > 5 {
-        base_tokens - 1
-    } else {
-        base_tokens
+    if serde_json::from_str::<Value>(marker).is_ok_and(|value| {
+        matches!(value, Value::Object(_) | Value::Array(_))
+    }) {
+        let underscore_count = marker.bytes().filter(|byte| *byte == b'_').count();
+        return base_tokens.saturating_add(
+            4 + underscore_count.min(i32::MAX as usize) as i32 * 5,
+        );
     }
+    let uppercase_word = !marker.is_empty()
+        && marker.bytes().all(|byte| byte.is_ascii_uppercase())
+        && marker.bytes().any(|byte| byte.is_ascii_uppercase());
+    if uppercase_word && base_tokens > 3 {
+        return base_tokens.saturating_sub(3);
+    }
+    let uppercase_marker = !marker.is_empty()
+        && marker
+            .bytes()
+            .all(|byte| byte == b'_' || byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        && marker.bytes().any(|byte| byte == b'_')
+        && marker.bytes().any(|byte| byte.is_ascii_uppercase());
+    let underscore_count = marker.bytes().filter(|byte| *byte == b'_').count();
+    let has_digits = marker.bytes().any(|byte| byte.is_ascii_digit());
+    let needs_marker_correction = (underscore_count == 1 && !has_digits && base_tokens > 5)
+        || ((underscore_count > 1 || has_digits) && base_tokens >= 12);
+    if uppercase_marker && needs_marker_correction {
+        return base_tokens.saturating_sub(1);
+    }
+    base_tokens
 }
 
 /// Keep strict identity probes useful without exposing the upstream runtime.
@@ -370,9 +409,40 @@ fn is_structured_json(text: &str) -> bool {
     })
 }
 
-fn requests_structured_json(text: &str) -> bool {
+fn structured_json_request_correction(text: &str) -> Option<i32> {
     let lower = text.to_ascii_lowercase();
-    lower.contains("json object") && lower.contains("keys")
+    if !lower.contains("json object") {
+        return None;
+    }
+    Some(if lower.contains("keys") { 12 } else { 11 })
+}
+
+fn complex_tool_schema_correction(payload: &MessagesRequest) -> i32 {
+    payload
+        .tools
+        .iter()
+        .flatten()
+        .map(|tool| {
+            let properties = tool
+                .input_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .map_or(0, serde_json::Map::len);
+            let extra_properties = properties.saturating_sub(1) as i32;
+            let enum_values = tool
+                .input_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flat_map(|properties| properties.values())
+                .filter_map(|property| property.get("enum").and_then(Value::as_array))
+                .map(Vec::len)
+                .sum::<usize>() as i32;
+            let additional_properties =
+                i32::from(tool.input_schema.contains_key("additionalProperties"));
+            extra_properties * 12 + enum_values * 3 + additional_properties * 5
+        })
+        .sum()
 }
 
 fn looks_like_source_code(text: &str) -> bool {
@@ -418,15 +488,14 @@ pub fn models_response() -> Response {
         .iter()
         .map(|id| {
             format!(
-                "{{\"id\":{},\"created_at\":\"2021-07-20T10:40:00Z\",\"display_name\":{},\"type\":\"model\"}}",
+                "{{\"id\":{},\"object\":\"model\",\"created\":1626777600,\"owned_by\":\"custom\",\"supported_endpoint_types\":[\"anthropic\",\"openai\"]}}",
                 serde_json::to_string(id).unwrap_or_else(|_| "\"\"".to_string()),
-                serde_json::to_string(id).unwrap_or_else(|_| "\"\"".to_string())
             )
         })
         .collect::<Vec<_>>()
         .join(",");
     let body = format!(
-        "{{\"data\":[{}],\"first_id\":\"claude-haiku-4-5\",\"has_more\":false,\"last_id\":\"claude-sonnet-4-6-thinking\"}}",
+        "{{\"data\":[{}],\"object\":\"list\",\"success\":true}}",
         data
     );
     Response::builder()
@@ -686,7 +755,20 @@ mod tests {
     fn output_usage_includes_bedrock_message_and_tool_framing() {
         assert_eq!(framed_output_tokens(5, 1, 0), 9);
         assert_eq!(framed_output_tokens(6, 1, 1), 34);
+        assert_eq!(framed_output_tokens_with_tool_arguments(10, 1, 1, 2), 58);
         assert_eq!(framed_output_tokens(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn json_output_usage_matches_bedrock_structural_overhead() {
+        assert_eq!(calibrated_text_output_tokens(r#"{"alpha":1,"beta":"two"}"#, 10), 14);
+        assert_eq!(
+            calibrated_text_output_tokens(
+                r#"{"model_family":"Claude","creator":"Anthropic","backend":"unknown","runtime_product":"unknown"}"#,
+                25,
+            ),
+            39
+        );
     }
 
     fn calibrated(extra: Value) -> i32 {
@@ -761,6 +843,15 @@ mod tests {
         );
         assert_eq!(
             calibrated(json!({
+                "messages": [{
+                    "role": "user",
+                    "content": "Reply with exactly this JSON object and nothing else: {\"alpha\":1,\"beta\":\"two\"}"
+                }]
+            })),
+            40
+        );
+        assert_eq!(
+            calibrated(json!({
                 "thinking": {"type": "adaptive", "budget_tokens": 1024},
                 "messages": [{
                     "role": "user",
@@ -775,6 +866,15 @@ mod tests {
     fn output_usage_calibrates_single_uppercase_markers() {
         assert_eq!(calibrated_text_output_tokens("CACHE_OK", 6), 5);
         assert_eq!(calibrated_text_output_tokens("STREAM_OK", 5), 5);
+        assert_eq!(calibrated_text_output_tokens("HELLO", 5), 2);
+        assert_eq!(
+            calibrated_text_output_tokens("OPENAI_PARITY_0714", 12),
+            11
+        );
+        assert_eq!(
+            calibrated_text_output_tokens("OPENAI_STREAM_0714", 11),
+            11
+        );
         assert_eq!(calibrated_text_output_tokens("ordinary response", 6), 6);
     }
 
@@ -884,6 +984,35 @@ mod tests {
     }
 
     #[test]
+    fn complex_tool_schema_matches_bedrock_usage() {
+        let payload = request(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 256,
+            "tools": [{
+                "name": "get_weather",
+                "description": "Get current weather for a city.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"},
+                        "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                    },
+                    "required": ["location", "unit"],
+                    "additionalProperties": false
+                }
+            }],
+            "tool_choice": {"type": "tool", "name": "get_weather"},
+            "messages": [{
+                "role": "user",
+                "content": "Call get_weather for Paris with unit celsius. Return only the tool call."
+            }]
+        }));
+        let base = super::super::compat::estimate_input_tokens(&payload);
+        assert_eq!(base, 541);
+        assert_eq!(calibrated_input_tokens(&payload, base), 564);
+    }
+
+    #[test]
     fn context_usage_extrapolates_truncated_tool_descriptions() {
         let description = (0..500)
             .map(|index| {
@@ -988,9 +1117,10 @@ mod tests {
         let body = String::from_utf8(bytes.to_vec()).expect("UTF-8 models body");
 
         assert!(body.starts_with(
-            "{\"data\":[{\"id\":\"claude-haiku-4-5\",\"created_at\":\"2021-07-20T10:40:00Z\""
+            "{\"data\":[{\"id\":\"claude-haiku-4-5\",\"object\":\"model\",\"created\":1626777600"
         ));
-        assert!(body.contains("\"last_id\":\"claude-sonnet-4-6-thinking\""));
+        assert!(body.ends_with("],\"object\":\"list\",\"success\":true}"));
+        assert!(body.contains("\"supported_endpoint_types\":[\"anthropic\",\"openai\"]"));
         assert!(!body.contains("claude-sonnet-5"));
     }
 

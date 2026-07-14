@@ -141,6 +141,9 @@ fn default_effort() -> String {
 pub struct Metadata {
     /// 用户 ID，格式如: user_xxx_account__session_0b4445e1-f5be-49e1-87ce-62bbc28ad705
     pub user_id: Option<String>,
+    /// 内部标记：请求来自 OpenAI 兼容端点。
+    #[serde(skip)]
+    pub kiro_rs_openai_compat: Option<bool>,
 }
 
 /// Messages 请求体

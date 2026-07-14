@@ -530,6 +530,8 @@ pub fn extract_exact_system_reply(payload: &MessagesRequest) -> Option<String> {
 
     let (start, marker_len) = [
         "reply with exactly ",
+        "reply exactly: ",
+        "reply exactly ",
         "say exactly: ",
         "say exactly ",
         "respond exactly: ",

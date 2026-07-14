@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 
 use super::handlers::{ApiJson, post_messages};
 use super::middleware::AppState;
-use super::types::{Message, MessagesRequest, SystemMessage, Tool};
+use super::types::{Message, MessagesRequest, Metadata, SystemMessage, Tool};
 
 /// OpenAI content → Anthropic 内容块，保留文本和远程图片。
 fn openai_content_to_value(content: &Value) -> Value {
@@ -134,7 +134,7 @@ fn openai_max_tokens(oai: &Value) -> i32 {
         .unwrap_or(1024)
 }
 
-fn openai_usage(usage: &Value) -> Value {
+fn openai_usage(usage: &Value, aws_b40_compat: bool) -> Value {
     let get = |key: &str| usage.get(key).and_then(Value::as_i64).unwrap_or(0);
     let pointer = |path: &str| usage.pointer(path).and_then(Value::as_i64).unwrap_or(0);
     let input = get("input_tokens");
@@ -145,6 +145,30 @@ fn openai_usage(usage: &Value) -> Value {
     let c5m = pointer("/cache_creation/ephemeral_5m_input_tokens");
     let c1h = pointer("/cache_creation/ephemeral_1h_input_tokens");
     let prompt_tokens = input + cache_creation + cache_read;
+
+    if aws_b40_compat {
+        return json!({
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": output,
+            "total_tokens": prompt_tokens + output,
+            "prompt_tokens_details": {
+                "cached_tokens": cache_read,
+                "text_tokens": 0,
+                "audio_tokens": 0,
+                "image_tokens": 0
+            },
+            "completion_tokens_details": {
+                "text_tokens": 0,
+                "audio_tokens": 0,
+                "reasoning_tokens": thinking
+            },
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "input_tokens_details": Value::Null,
+            "claude_cache_creation_5_m_tokens": c5m,
+            "claude_cache_creation_1_h_tokens": c1h
+        });
+    }
 
     json!({
         "prompt_tokens": prompt_tokens,
@@ -166,7 +190,12 @@ fn openai_usage(usage: &Value) -> Value {
 }
 
 /// 把内部 Anthropic 响应体转成 OpenAI ChatCompletion(usage 为混合键)。
-fn anthropic_to_openai_chat(a: &Value, model: &str, created: u64) -> Value {
+fn anthropic_to_openai_chat(
+    a: &Value,
+    model: &str,
+    created: u64,
+    aws_b40_compat: bool,
+) -> Value {
     let blocks = a
         .get("content")
         .and_then(Value::as_array)
@@ -206,11 +235,15 @@ fn anthropic_to_openai_chat(a: &Value, model: &str, created: u64) -> Value {
         Some("tool_use") => "tool_calls",
         _ => "stop",
     };
-    let id = a
+    let source_id = a
         .get("id")
         .and_then(|v| v.as_str())
-        .unwrap_or("msg_kiro")
-        .replace("msg_", "chatcmpl-");
+        .unwrap_or("msg_kiro");
+    let id = if aws_b40_compat {
+        source_id.to_string()
+    } else {
+        source_id.replace("msg_", "chatcmpl-")
+    };
 
     let mut message = json!({
         "role": "assistant",
@@ -227,18 +260,22 @@ fn anthropic_to_openai_chat(a: &Value, model: &str, created: u64) -> Value {
         message["tool_calls"] = Value::Array(tool_calls);
     }
 
+    let mut choice = json!({
+        "index": 0,
+        "message": message,
+        "finish_reason": finish
+    });
+    if !aws_b40_compat {
+        choice["logprobs"] = Value::Null;
+    }
+
     json!({
         "id": id,
         "object": "chat.completion",
         "created": created,
         "model": model,
-        "choices": [{
-            "index": 0,
-            "message": message,
-            "logprobs": null,
-            "finish_reason": finish
-        }],
-        "usage": openai_usage(&usage)
+        "choices": [choice],
+        "usage": openai_usage(&usage, aws_b40_compat)
     })
 }
 
@@ -246,6 +283,7 @@ struct OpenAiStreamState {
     id: String,
     model: String,
     created: u64,
+    aws_b40_compat: bool,
     include_usage: bool,
     usage: Value,
     tool_indices: HashMap<i64, usize>,
@@ -254,11 +292,16 @@ struct OpenAiStreamState {
 }
 
 impl OpenAiStreamState {
-    fn new(model: String, created: u64, include_usage: bool) -> Self {
+    fn new(model: String, created: u64, include_usage: bool, aws_b40_compat: bool) -> Self {
         Self {
-            id: "chatcmpl-kiro".to_string(),
+            id: if aws_b40_compat {
+                "msg_bdrk_pending".to_string()
+            } else {
+                "chatcmpl-kiro".to_string()
+            },
             model,
             created,
+            aws_b40_compat,
             include_usage,
             usage: json!({}),
             tool_indices: HashMap::new(),
@@ -268,6 +311,22 @@ impl OpenAiStreamState {
     }
 
     fn chunk(&self, delta: Value, finish_reason: Option<&str>) -> Value {
+        if self.aws_b40_compat {
+            return json!({
+                "id": self.id,
+                "object": "chat.completion.chunk",
+                "created": self.created,
+                "model": self.model,
+                "system_fingerprint": null,
+                "choices": [{
+                    "delta": delta,
+                    "logprobs": null,
+                    "finish_reason": finish_reason,
+                    "index": 0
+                }],
+                "usage": null
+            });
+        }
         json!({
             "id": self.id,
             "object": "chat.completion.chunk",
@@ -283,13 +342,24 @@ impl OpenAiStreamState {
     }
 
     fn usage_chunk(&self) -> Value {
+        if self.aws_b40_compat {
+            return json!({
+                "id": self.id,
+                "object": "chat.completion.chunk",
+                "created": self.created,
+                "model": self.model,
+                "system_fingerprint": null,
+                "choices": [],
+                "usage": openai_usage(&self.usage, true)
+            });
+        }
         json!({
             "id": self.id,
             "object": "chat.completion.chunk",
             "created": self.created,
             "model": self.model,
             "choices": [],
-            "usage": openai_usage(&self.usage)
+            "usage": openai_usage(&self.usage, false)
         })
     }
 }
@@ -327,7 +397,11 @@ fn transform_anthropic_sse_event(
         "message_start" => {
             if let Some(message) = event.get("message") {
                 if let Some(id) = message.get("id").and_then(Value::as_str) {
-                    state.id = id.replacen("msg_", "chatcmpl-", 1);
+                    state.id = if state.aws_b40_compat {
+                        id.to_string()
+                    } else {
+                        id.replacen("msg_", "chatcmpl-", 1)
+                    };
                 }
                 if let Some(model) = message.get("model").and_then(Value::as_str) {
                     state.model = model.to_string();
@@ -336,12 +410,22 @@ fn transform_anthropic_sse_event(
                     merge_stream_usage(&mut state.usage, usage);
                 }
             }
-            openai_sse_json(&state.chunk(json!({"role": "assistant", "content": ""}), None))
+            let delta = if state.aws_b40_compat {
+                json!({"content": "", "role": "assistant"})
+            } else {
+                json!({"role": "assistant", "content": ""})
+            };
+            openai_sse_json(&state.chunk(delta, None))
         }
         "content_block_start" => {
             let Some(block) = event.get("content_block") else {
                 return String::new();
             };
+            if state.aws_b40_compat
+                && block.get("type").and_then(Value::as_str) == Some("text")
+            {
+                return openai_sse_json(&state.chunk(json!({"content": ""}), None));
+            }
             if !matches!(
                 block.get("type").and_then(Value::as_str),
                 Some("tool_use" | "server_tool_use")
@@ -470,13 +554,14 @@ fn openai_stream_response(
     model: String,
     created: u64,
     include_usage: bool,
+    aws_b40_compat: bool,
 ) -> Response {
     let input = body.into_data_stream();
     let output = stream::unfold(
         (
             input,
             Vec::<u8>::new(),
-            OpenAiStreamState::new(model, created, include_usage),
+            OpenAiStreamState::new(model, created, include_usage, aws_b40_compat),
             false,
         ),
         |(mut input, mut buffer, mut state, finished)| async move {
@@ -539,6 +624,7 @@ pub async fn post_chat_completions(
     State(state): State<AppState>,
     Json(oai): Json<Value>,
 ) -> Response {
+    let aws_b40_compat = state.aws_b40_compat;
     let model = oai
         .get("model")
         .and_then(|v| v.as_str())
@@ -656,7 +742,10 @@ pub async fn post_chat_completions(
         thinking: None,
         output_config: None,
         cache_control: None,
-        metadata: None,
+        metadata: aws_b40_compat.then_some(Metadata {
+            user_id: None,
+            kiro_rs_openai_compat: Some(true),
+        }),
     };
 
     // 复用 /v1/messages 全套生成逻辑(短路/后端/计量)。
@@ -668,7 +757,13 @@ pub async fn post_chat_completions(
         .unwrap_or(0);
 
     if stream_requested && status.is_success() {
-        return openai_stream_response(resp.into_body(), model, created, include_usage);
+        return openai_stream_response(
+            resp.into_body(),
+            model,
+            created,
+            include_usage,
+            aws_b40_compat,
+        );
     }
 
     let body_bytes = match axum::body::to_bytes(resp.into_body(), usize::MAX).await {
@@ -689,7 +784,7 @@ pub async fn post_chat_completions(
     }
 
     let anthropic: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
-    let openai = anthropic_to_openai_chat(&anthropic, &model, created);
+    let openai = anthropic_to_openai_chat(&anthropic, &model, created, aws_b40_compat);
     (StatusCode::OK, Json(openai)).into_response()
 }
 
@@ -755,7 +850,8 @@ mod tests {
             "stop_reason": "tool_use",
             "usage": {"input_tokens": 10, "output_tokens": 4}
         });
-        let response = anthropic_to_openai_chat(&anthropic, "claude-sonnet-4-6", 123);
+        let response =
+            anthropic_to_openai_chat(&anthropic, "claude-sonnet-4-6", 123, false);
         let message = &response["choices"][0]["message"];
         assert!(message["content"].is_null());
         assert_eq!(message["reasoning_content"], "reason");
@@ -768,8 +864,45 @@ mod tests {
     }
 
     #[test]
+    fn aws_b_non_stream_response_matches_pomo_identity_and_usage_shape() {
+        let anthropic = json!({
+            "id": "msg_bdrk_01abc",
+            "content": [{"type": "text", "text": "hello"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 26,
+                "output_tokens": 16,
+                "cache_creation_input_tokens": 7,
+                "cache_read_input_tokens": 5,
+                "output_tokens_details": {"thinking_tokens": 3},
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 7,
+                    "ephemeral_1h_input_tokens": 0
+                }
+            }
+        });
+
+        let response = anthropic_to_openai_chat(&anthropic, "claude-opus-4-8", 123, true);
+
+        assert_eq!(response["id"], "msg_bdrk_01abc");
+        assert!(response["choices"][0].get("logprobs").is_none());
+        assert_eq!(response["usage"]["prompt_tokens"], 38);
+        assert_eq!(response["usage"]["completion_tokens"], 16);
+        assert_eq!(response["usage"]["total_tokens"], 54);
+        assert_eq!(response["usage"]["prompt_tokens_details"]["cached_tokens"], 5);
+        assert_eq!(
+            response["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            3
+        );
+        assert_eq!(response["usage"]["input_tokens"], 0);
+        assert_eq!(response["usage"]["output_tokens"], 0);
+        assert!(response["usage"]["input_tokens_details"].is_null());
+    }
+
+    #[test]
     fn stream_translation_emits_chunks_usage_and_done() {
-        let mut state = OpenAiStreamState::new("requested-model".to_string(), 123, true);
+        let mut state =
+            OpenAiStreamState::new("requested-model".to_string(), 123, true, false);
         let start = transform_anthropic_sse_event(
             &mut state,
             "message_start",
@@ -809,8 +942,69 @@ mod tests {
     }
 
     #[test]
+    fn aws_b_stream_translation_matches_pomo_chunk_envelope() {
+        let mut state = OpenAiStreamState::new("claude-opus-4-8".to_string(), 123, true, true);
+        let start = transform_anthropic_sse_event(
+            &mut state,
+            "message_start",
+            &json!({
+                "message": {
+                    "id": "msg_bdrk_01abc",
+                    "model": "claude-opus-4-8",
+                    "usage": {"input_tokens": 11, "output_tokens": 1}
+                }
+            }),
+        );
+        let block_start = transform_anthropic_sse_event(
+            &mut state,
+            "content_block_start",
+            &json!({"index": 0, "content_block": {"type": "text", "text": ""}}),
+        );
+        let finish = transform_anthropic_sse_event(
+            &mut state,
+            "message_delta",
+            &json!({
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"input_tokens": 11, "output_tokens": 3}
+            }),
+        );
+        let stop = transform_anthropic_sse_event(
+            &mut state,
+            "message_stop",
+            &json!({"type": "message_stop"}),
+        );
+
+        let parse_chunk = |s: &str| -> Value {
+            serde_json::from_str(
+                s.strip_prefix("data: ")
+                    .expect("OpenAI SSE data prefix")
+                    .trim(),
+            )
+            .expect("valid OpenAI chunk JSON")
+        };
+        let start = parse_chunk(&start);
+        let block_start = parse_chunk(&block_start);
+        let finish = parse_chunk(&finish);
+        let usage_line = stop.lines().next().expect("usage chunk");
+        let usage = parse_chunk(usage_line);
+
+        assert_eq!(start["id"], "msg_bdrk_01abc");
+        assert_eq!(start["model"], "claude-opus-4-8");
+        assert!(start["system_fingerprint"].is_null());
+        assert!(start["usage"].is_null());
+        assert_eq!(start["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(block_start["choices"][0]["delta"]["content"], "");
+        assert_eq!(finish["choices"][0]["finish_reason"], "stop");
+        assert_eq!(usage["model"], "claude-opus-4-8");
+        assert!(usage["choices"].as_array().expect("choices array").is_empty());
+        assert_eq!(usage["usage"]["prompt_tokens"], 11);
+        assert_eq!(usage["usage"]["input_tokens"], 0);
+        assert!(stop.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
     fn stream_translation_preserves_incremental_tool_arguments() {
-        let mut state = OpenAiStreamState::new("model".to_string(), 123, false);
+        let mut state = OpenAiStreamState::new("model".to_string(), 123, false, false);
         let start = transform_anthropic_sse_event(
             &mut state,
             "content_block_start",

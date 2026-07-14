@@ -3,7 +3,7 @@
 use axum::{
     Json,
     Router,
-    extract::DefaultBodyLimit,
+    extract::{DefaultBodyLimit, State},
     http::StatusCode,
     middleware,
     response::IntoResponse,
@@ -61,6 +61,7 @@ pub fn create_router_with_provider(
         .route("/messages", post(post_messages))
         .route("/messages/count_tokens", count_tokens_route)
         .route("/chat/completions", post(post_chat_completions))
+        .route("/responses", post(post_responses))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -95,6 +96,26 @@ pub fn create_router_with_provider(
 
 async fn aws_b_count_tokens_not_found() -> impl IntoResponse {
     (StatusCode::NOT_FOUND, Json(json!({ "error": "Not Found" })))
+}
+
+async fn post_responses(State(state): State<AppState>) -> axum::response::Response {
+    if !state.aws_b40_compat {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let request_id = super::middleware::aws_b40_oneapi_request_id();
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": {
+                "message": format!("not implemented (request id: {request_id})"),
+                "type": "new_api_error",
+                "param": "",
+                "code": "convert_request_failed"
+            }
+        })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -134,7 +155,9 @@ mod tests {
         assert_eq!(response.headers()["x-new-api-version"], "78bb6d21");
         assert!(response.headers().get("access-control-allow-origin").is_none());
         let body = response.text().await.expect("AWS-B models body");
-        assert!(body.contains("\"first_id\":\"claude-haiku-4-5\""));
+        assert!(body.starts_with("{\"data\":["));
+        assert!(body.ends_with("],\"object\":\"list\",\"success\":true}"));
+        assert!(body.contains("\"supported_endpoint_types\":[\"anthropic\",\"openai\"]"));
         assert!(!body.contains("claude-sonnet-5"));
 
         let response = client
@@ -174,6 +197,58 @@ mod tests {
                 .await
                 .expect("AWS-B auth error body")
                 .contains("missing token")
+        );
+
+        let response = client
+            .post(format!("{base}/v1/messages"))
+            .header("x-api-key", "invalid-key")
+            .json(&json!({
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .expect("AWS-B invalid messages token");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            response
+                .text()
+                .await
+                .expect("AWS-B invalid token body")
+                .contains("无效的令牌")
+        );
+
+        let response = client
+            .get(format!("{base}/v1/models"))
+            .header("x-api-key", "invalid-key")
+            .send()
+            .await
+            .expect("AWS-B invalid models token");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            response
+                .json::<Value>()
+                .await
+                .expect("AWS-B invalid models body")["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("无效的令牌"))
+        );
+
+        let response = client
+            .post(format!("{base}/v1/responses"))
+            .header("x-api-key", "test-key")
+            .json(&json!({"model": "claude-opus-4-8", "input": "hello"}))
+            .send()
+            .await
+            .expect("AWS-B responses compatibility request");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response
+                .json::<Value>()
+                .await
+                .expect("AWS-B responses body")["error"]["code"],
+            "convert_request_failed"
         );
 
         let response = client

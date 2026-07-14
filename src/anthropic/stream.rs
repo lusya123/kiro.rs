@@ -690,6 +690,10 @@ pub struct StreamContext {
     /// stable structural boundaries rather than upstream transport boundaries.
     tool_json_pending: HashMap<String, String>,
     tool_json_prefix_split: HashSet<String>,
+    /// Complete argument JSON per tool, retained only until the final frame so
+    /// Bedrock output usage can account for additional argument fields.
+    tool_input_acc: HashMap<String, String>,
+    tool_argument_fields: usize,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
     pub tool_name_map: HashMap<String, String>,
     /// thinking 是否启用
@@ -780,6 +784,8 @@ impl StreamContext {
             tool_output_ids: HashMap::new(),
             tool_json_pending: HashMap::new(),
             tool_json_prefix_split: HashSet::new(),
+            tool_input_acc: HashMap::new(),
+            tool_argument_fields: 0,
             tool_name_map,
             thinking_enabled,
             expose_thinking: thinking_enabled,
@@ -1545,6 +1551,30 @@ impl StreamContext {
         if !tool_use.input.is_empty() {
             self.output_tokens += (tool_use.input.len() as i32 + 3) / 4; // 估算 token
             self.output_text_acc.push_str(&tool_use.input); // tool 调用 JSON 计入输出(ctoc)
+            self.tool_input_acc
+                .entry(tool_use.tool_use_id.clone())
+                .or_default()
+                .push_str(&tool_use.input);
+        }
+        if tool_use.stop {
+            let complete_input = self
+                .tool_input_acc
+                .remove(&tool_use.tool_use_id)
+                .unwrap_or_default();
+            let parsed_input = serde_json::from_str::<serde_json::Value>(&complete_input).ok();
+            if self.aws_b40_compat
+                && let Some(canonical_input) = parsed_input
+                    .as_ref()
+                    .and_then(|value| serde_json::to_string(value).ok())
+                && let Some(start) = self.output_text_acc.rfind(&complete_input)
+            {
+                let canonical_usage_input = format!("{canonical_input}\n");
+                self.output_text_acc
+                    .replace_range(start..start + complete_input.len(), &canonical_usage_input);
+            }
+            self.tool_argument_fields += parsed_input
+                .and_then(|value| value.as_object().map(serde_json::Map::len))
+                .unwrap_or(0);
         }
 
         let argument_deltas = if self.aws_b40_compat {
@@ -1834,10 +1864,11 @@ impl StreamContext {
             base_visible_output_tokens
         };
         let visible_output_tokens = if self.aws_b40_compat {
-            super::bedrock::framed_output_tokens(
+            super::bedrock::framed_output_tokens_with_tool_arguments(
                 base_visible_output_tokens,
                 self.state_manager.active_blocks.len(),
                 self.tool_block_indices.len(),
+                self.tool_argument_fields,
             )
         } else {
             base_visible_output_tokens
@@ -2614,6 +2645,40 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(deltas, vec!["", "{\"", "city\": ", "\"Paris\"}"]);
+
+        let final_events = ctx.generate_final_events();
+        let message_delta = final_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+        assert_eq!(message_delta.data["usage"]["output_tokens"], 34);
+    }
+
+    #[test]
+    fn aws_b_stream_complex_tool_usage_matches_non_stream_bedrock_usage() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 564, false, false, HashMap::new());
+        ctx.enable_aws_b40_compat(false);
+
+        ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "get_weather".to_string(),
+            tool_use_id: "toolu_bdrk_original".to_string(),
+            input: "{\"location\": \"Paris\", ".to_string(),
+            stop: false,
+        });
+        ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "get_weather".to_string(),
+            tool_use_id: "toolu_bdrk_original".to_string(),
+            input: "\"unit\": \"celsius\"}".to_string(),
+            stop: true,
+        });
+
+        let final_events = ctx.generate_final_events();
+        let message_delta = final_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+        assert_eq!(message_delta.data["usage"]["output_tokens"], 58);
     }
 
     #[test]

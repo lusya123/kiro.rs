@@ -665,7 +665,12 @@ fn cache_min_tokens(model: &str) -> i32 {
 
 fn cache_read_supported(model: &str, cache_tokens: i32) -> bool {
     let lower = model.to_ascii_lowercase();
-    !(lower.contains("opus") && cache_tokens > 4_096)
+    let legacy_opus = lower.contains("opus")
+        && (lower.contains("4-6")
+            || lower.contains("4.6")
+            || lower.contains("4-7")
+            || lower.contains("4.7"));
+    !(legacy_opus && cache_tokens > 4_096)
 }
 
 fn cache_key(model: &str, key_material: &str, ttl: CacheTtl) -> String {
@@ -836,6 +841,12 @@ mod tests {
     fn split_zero_or_negative_returns_zero() {
         assert_eq!(split_virtual_cache(0), UsageBreakdown::flat(0));
         assert_eq!(split_virtual_cache(-5), UsageBreakdown::flat(0));
+    }
+
+    #[test]
+    fn opus_48_supports_large_prompt_cache_reads() {
+        assert!(cache_read_supported("claude-opus-4-8", 11_184));
+        assert!(!cache_read_supported("claude-opus-4-7", 11_184));
     }
 
     #[test]

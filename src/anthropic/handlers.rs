@@ -1350,7 +1350,9 @@ pub async fn post_messages(
     let thinking_wants_summary = payload
         .thinking
         .as_ref()
-        .map(|t| t.wants_summary())
+        .map(|thinking| {
+            profile_thinking_wants_summary(thinking, aws_b40_compat, payload.stream)
+        })
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
@@ -2068,11 +2070,18 @@ async fn handle_non_stream_request(
         .iter()
         .filter(|block| block.get("type").and_then(|value| value.as_str()) == Some("tool_use"))
         .count();
+    let tool_argument_fields = content
+        .iter()
+        .filter(|block| block.get("type").and_then(|value| value.as_str()) == Some("tool_use"))
+        .filter_map(|block| block.get("input").and_then(serde_json::Value::as_object))
+        .map(serde_json::Map::len)
+        .sum();
     let visible_output_tokens = if aws_b40_compat {
-        super::bedrock::framed_output_tokens(
+        super::bedrock::framed_output_tokens_with_tool_arguments(
             base_visible_output_tokens,
             content.len(),
             tool_block_count,
+            tool_argument_fields,
         )
     } else {
         base_visible_output_tokens
@@ -2172,6 +2181,12 @@ fn normalize_opus_thinking(payload: &mut MessagesRequest) {
 fn normalize_aws_b40_thinking(payload: &mut MessagesRequest) {
     if let Some(thinking) = payload.thinking.as_ref() {
         match thinking.thinking_type.as_str() {
+            "adaptive"
+                if !payload.stream && super::compat::is_opus_4_8(&payload.model) =>
+            {
+                payload.model = super::bedrock::response_model(&payload.model);
+                return;
+            }
             "enabled"
                 if thinking.budget_tokens >= 1024
                     && payload.max_tokens > thinking.budget_tokens
@@ -2199,6 +2214,21 @@ fn normalize_aws_b40_thinking(payload: &mut MessagesRequest) {
     }
 
     override_thinking_from_model_name(payload);
+}
+
+fn profile_thinking_wants_summary(
+    thinking: &super::types::Thinking,
+    aws_b40_compat: bool,
+    stream: bool,
+) -> bool {
+    if aws_b40_compat
+        && !stream
+        && thinking.thinking_type == "adaptive"
+        && thinking.display.as_deref() != Some("omitted")
+    {
+        return true;
+    }
+    thinking.wants_summary()
 }
 
 fn aws_b40_model_supports_enabled_thinking(model: &str) -> bool {
@@ -2429,13 +2459,30 @@ fn compat_direct_response(
     let strong_id_reply = (!aws_b40_compat)
         .then(|| super::compat::strong_identity_reply(payload))
         .flatten();
+    let aws_b40_openai_exact_reply = (aws_b40_compat
+        && payload
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.kiro_rs_openai_compat)
+            .unwrap_or(false))
+    .then(|| super::compat::extract_exact_system_reply(payload))
+    .flatten();
     // 含工具/图片/文档/工具结果时不短路,交给真模型处理(文档提取探针 / 强身份拷问除外)。
-    if doc_reply.is_none() && strong_id_reply.is_none() && request_needs_model(payload) {
+    if doc_reply.is_none()
+        && strong_id_reply.is_none()
+        && aws_b40_openai_exact_reply.is_none()
+        && request_needs_model(payload)
+    {
         return None;
     }
     let (text, output_tokens, forced_input_tokens) = if let Some(answer) = doc_reply {
         // D19:直接用抽取的 PDF 文本/token 作答,按真实 token 数计量。
         let output_tokens = token::count_tokens(&answer) as i32;
+        (answer, output_tokens, None)
+    } else if let Some(answer) = aws_b40_openai_exact_reply {
+        let base_tokens = super::claude_tok::count_claude(&answer).max(4);
+        let calibrated = super::bedrock::calibrated_text_output_tokens(&answer, base_tokens);
+        let output_tokens = super::bedrock::framed_output_tokens(calibrated, 1, 0);
         (answer, output_tokens, None)
     } else if aws_b40_compat {
         // AWS-B follows the real Bedrock model for ordinary text and identity
@@ -2484,7 +2531,9 @@ fn compat_direct_response(
     let thinking_wants_summary = payload
         .thinking
         .as_ref()
-        .map(|t| t.wants_summary())
+        .map(|thinking| {
+            profile_thinking_wants_summary(thinking, aws_b40_compat, payload.stream)
+        })
         .unwrap_or(false);
     let mut content = Vec::new();
     let mut thinking_tokens = 0;
@@ -3125,7 +3174,9 @@ pub async fn post_messages_cc(
     let thinking_wants_summary = payload
         .thinking
         .as_ref()
-        .map(|t| t.wants_summary())
+        .map(|thinking| {
+            profile_thinking_wants_summary(thinking, aws_b40_compat, payload.stream)
+        })
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
@@ -3503,6 +3554,43 @@ mod tests {
         assert!(req.thinking.is_none());
         assert!(req.output_config.is_none());
         assert_eq!(req.model, "claude-opus-4-7");
+    }
+
+    #[test]
+    fn aws_b_nonstream_opus_4_8_preserves_adaptive_thinking() {
+        let mut req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "thinking": {"type": "adaptive"}
+            }),
+        );
+
+        normalize_aws_b40_thinking(&mut req);
+
+        let thinking = req
+            .thinking
+            .as_ref()
+            .expect("non-stream Opus 4.8 adaptive thinking must remain enabled");
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert!(profile_thinking_wants_summary(thinking, true, false));
+        assert_eq!(req.model, "claude-opus-4-8");
+    }
+
+    #[test]
+    fn aws_b_stream_opus_4_8_drops_adaptive_thinking() {
+        let mut req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "stream": true,
+                "thinking": {"type": "adaptive"}
+            }),
+        );
+
+        normalize_aws_b40_thinking(&mut req);
+
+        assert!(req.thinking.is_none());
+        assert!(req.output_config.is_none());
+        assert_eq!(req.model, "claude-opus-4-8");
     }
 
     #[test]

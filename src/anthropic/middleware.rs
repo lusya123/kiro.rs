@@ -55,18 +55,24 @@ pub async fn auth_middleware(
     next: Next,
 ) -> Response {
     let path = request.uri().path().to_string();
-    match auth::extract_api_key(&request) {
-        Some(key) if auth::constant_time_eq(&key, &state.api_key) => next.run(request).await,
+    let supplied_key = auth::extract_api_key(&request);
+    match supplied_key.as_deref() {
+        Some(key) if auth::constant_time_eq(key, &state.api_key) => next.run(request).await,
         _ => {
             if state.aws_b40_compat {
                 let request_id = aws_b40_oneapi_request_id();
                 if is_messages_path(&path) {
+                    let (status, message) = if supplied_key.is_some() {
+                        (StatusCode::FORBIDDEN, "无效的令牌")
+                    } else {
+                        (StatusCode::UNAUTHORIZED, "missing token")
+                    };
                     let body = format!(
-                        "{{\"error\":\"missing token (request id: {})\"}}",
-                        request_id
+                        "{{\"error\":\"{} (request id: {})\"}}",
+                        message, request_id
                     );
                     let mut response = Response::builder()
-                        .status(StatusCode::UNAUTHORIZED)
+                        .status(status)
                         .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
                         .body(Body::from(body))
                         .unwrap();
@@ -77,7 +83,10 @@ pub async fn auth_middleware(
                 let body = json!({
                     "error": {
                         "code": "",
-                        "message": format!("未提供令牌 (request id: {request_id})"),
+                        "message": format!(
+                            "{} (request id: {request_id})",
+                            if supplied_key.is_some() { "无效的令牌" } else { "未提供令牌" }
+                        ),
                         "type": "new_api_error"
                     }
                 });
@@ -114,7 +123,7 @@ pub async fn aws_b40_headers_middleware(
 
     let mut response = next.run(request).await;
     if state.aws_b40_compat {
-        let messages_success = is_messages_path(&path) && response.status().is_success();
+        let messages_success = is_gateway_completion_path(&path) && response.status().is_success();
         let messages_stream_success = messages_success && is_stream_response(&response);
         let request_id = response
             .headers()
@@ -197,7 +206,6 @@ pub(crate) fn apply_aws_b40_headers_with_version(
 
 fn apply_aws_b40_non_stream_success_headers(headers: &mut header::HeaderMap) {
     headers.insert(header::VIA, HeaderValue::from_static("1.1 Caddy"));
-    headers.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
     headers.insert(
         header::ALT_SVC,
         HeaderValue::from_static("h3=\":443\"; ma=2592000"),
@@ -218,7 +226,7 @@ fn aws_b40_version_for_response(method: &Method, path: &str, response: &Response
         return "78bb6d21";
     }
 
-    if is_messages_path(path) {
+    if is_gateway_completion_path(path) {
         if response.status().is_success() {
             if is_stream_response(response) {
                 "78bb6d21"
@@ -235,6 +243,10 @@ fn aws_b40_version_for_response(method: &Method, path: &str, response: &Response
 
 fn is_messages_path(path: &str) -> bool {
     path == "/messages" || path == "/v1/messages" || path == "/cc/v1/messages"
+}
+
+fn is_gateway_completion_path(path: &str) -> bool {
+    is_messages_path(path) || path == "/chat/completions" || path == "/v1/chat/completions"
 }
 
 fn is_stream_response(response: &Response) -> bool {
@@ -294,6 +306,12 @@ mod tests {
             aws_b40_version_for_response(&Method::GET, "/v1/models", &models),
             "78bb6d21"
         );
+
+        let chat = response(StatusCode::OK, "application/json");
+        assert_eq!(
+            aws_b40_version_for_response(&Method::POST, "/v1/chat/completions", &chat),
+            "20260501R2"
+        );
     }
 
     #[test]
@@ -319,7 +337,7 @@ mod tests {
         let mut headers = header::HeaderMap::new();
         apply_aws_b40_non_stream_success_headers(&mut headers);
         assert_eq!(headers["via"], "1.1 Caddy");
-        assert_eq!(headers["vary"], "Accept-Encoding");
+        assert!(headers.get("vary").is_none());
         assert_eq!(headers["alt-svc"], "h3=\":443\"; ma=2592000");
         assert_eq!(
             headers["referrer-policy"],
