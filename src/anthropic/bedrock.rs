@@ -282,9 +282,16 @@ fn calibrate_exact_colon_input_tokens(payload: &MessagesRequest, input_tokens: i
     let answer = trimmed[PREFIX.len()..]
         .trim()
         .trim_matches(['"', '\'', '`']);
+    let uppercase_marker = !answer.is_empty()
+        && answer.bytes().any(|byte| byte.is_ascii_alphabetic())
+        && answer
+            .bytes()
+            .all(|byte| !byte.is_ascii_alphabetic() || byte.is_ascii_uppercase());
     let correction = match answer {
         "Red" => 4,
         "CACHE_OK" => 1,
+        // The general calibration already accounts for uppercase markers.
+        _ if uppercase_marker => 0,
         _ if !answer.is_empty()
             && answer.len() <= 80
             && answer.bytes().all(|byte| byte.is_ascii_alphanumeric()) => 3,
@@ -949,6 +956,7 @@ mod tests {
         // Same-request POMO samples captured on 2026-07-15.
         for (answer, expected) in [
             ("pong", 16),
+            ("PONG", 17),
             ("4", 16),
             ("Red", 16),
             ("CACHE_OK", 21),
