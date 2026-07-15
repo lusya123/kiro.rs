@@ -1,0 +1,5 @@
+scenario	side	http_code	curl_exit	time_total	input_tokens	cache_creation_input_tokens	cache_read_input_tokens	cache_total_tokens	output_tokens
+tool-history-exact	reference	200	0	2.285501	73	0	0	0	5
+tool-history-exact	target	502	0	8.662462	-1	-1	-1	-2	-1
+tool-history-exact-with-schema	reference	200	0	6.145670	430	0	0	0	5
+tool-history-exact-with-schema	target	502	0	7.540329	-1	-1	-1	-2	-1

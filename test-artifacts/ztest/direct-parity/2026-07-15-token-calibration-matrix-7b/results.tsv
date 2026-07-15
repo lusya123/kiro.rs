@@ -1,0 +1,3 @@
+scenario	side	http_code	curl_exit	time_total	input_tokens	cache_creation_input_tokens	cache_read_input_tokens	cache_total_tokens	output_tokens
+tool-result-one-field-with-schema	reference	200	0	4.351810	426	0	0	0	8
+two-tool-results-with-schema	reference	200	0	11.012165	615	0	0	0	8

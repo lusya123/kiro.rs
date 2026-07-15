@@ -1,0 +1,15 @@
+HTTP/2 200 
+server: nginx
+date: Wed, 15 Jul 2026 08:35:35 GMT
+content-type: application/json
+content-length: 518
+access-control-allow-origin: *
+access-control-expose-headers: x-amzn-requestid,x-request-id,date,x-amzn-usage-reservation-quota,x-amzn-usage-reservation-remaining-quota,x-amzn-usage-reservation-spillover
+strict-transport-security: max-age=31536000; includeSubDomains, max-age=31536000
+vary: origin, access-control-request-method, access-control-request-headers
+x-amzn-requestid: req_5psorqmg3oyzacyfmt3l2kq3hd6v25usmyswi46i4kokpunqy4oa
+x-new-api-version: 1.4.3
+x-oneapi-request-id: 202607150835344952006208268d9d6isuczsCa
+x-request-id: req_5psorqmg3oyzacyfmt3l2kq3hd6v25usmyswi46i4kokpunqy4oa
+x-accel-buffering: no
+

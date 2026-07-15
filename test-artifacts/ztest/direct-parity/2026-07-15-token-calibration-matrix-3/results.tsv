@@ -1,0 +1,12 @@
+scenario	side	http_code	curl_exit	time_total	input_tokens	cache_creation_input_tokens	cache_read_input_tokens	cache_total_tokens	output_tokens
+tool-empty-prompt-minimal	reference	200	0	3.532368	42	0	0	0	8
+tool-result-empty	reference	200	0	2.487922	46	0	0	0	8
+tool-empty-prompt-medium	reference	200	0	3.878889	55	0	0	0	8
+tool-empty-prompt-long	reference	200	0	3.957721	82	0	0	0	8
+tool-result-one-field	reference	200	0	2.552860	69	0	0	0	8
+tool-one-field-long-result	reference	200	0	3.858166	87	0	0	0	8
+tool-three-fields-short	reference	200	0	2.756118	114	0	0	0	8
+tool-four-fields-short	reference	200	0	2.488359	136	0	0	0	8
+tool-one-field-long-name	reference	200	0	2.350889	82	0	0	0	8
+two-tool-results	reference	200	0	2.057266	179	0	0	0	8
+three-tool-results	reference	200	0	2.925313	260	0	0	0	8

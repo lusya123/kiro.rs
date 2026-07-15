@@ -25,6 +25,20 @@ const KIRO_OPUS_48_TOOL_CONTEXT_OVERHEAD_TOKENS: i32 = 6_762;
 const KIRO_TOOL_DESCRIPTION_LIMIT_CHARS: usize = 10_000;
 const BEDROCK_TOOL_BASELINE_CORRECTION_PER_TOOL: i32 = 8;
 const BEDROCK_TOOL_CACHE_SUFFIX_CORRECTION: i32 = -17;
+// Derived from the POMO Opus 4.8 matrices recorded in
+// test-artifacts/ztest/direct-parity/2026-07-15-token-calibration-summary.md.
+const TOOL_HISTORY_TEXT_SCALE: f64 = 1.375;
+const TOOL_HISTORY_BASE_TOKENS: f64 = 18.5;
+const TOOL_HISTORY_PROPERTY_TOKENS: f64 = 17.0;
+const TOOL_HISTORY_INPUT_SCALE: f64 = 1.44;
+const TOOL_HISTORY_NAME_SCALE: f64 = 1.4;
+const TOOL_HISTORY_RESULT_SHORT_SCALE: f64 = 4.0 / 3.0;
+const TOOL_HISTORY_RESULT_LONG_SCALE: f64 = 1.85;
+const TOOL_HISTORY_UNDERSCORE_TOKENS: f64 = 1.0;
+const TOOL_HISTORY_SEQUENTIAL_NEXT_PAIR_TOKENS: f64 = 5.0;
+const TOOL_HISTORY_SCHEMA_BASE_TOKENS: i32 = 327;
+const TOOL_HISTORY_SCHEMA_NEXT_TOOL_TOKENS: i32 = 44;
+const TOOL_HISTORY_SCHEMA_VISIBLE_SCALE: f64 = 0.93;
 
 /// Data needed to turn Kiro's context-usage event into the public Bedrock
 /// input-token envelope. Kiro includes a large fixed runtime prompt and
@@ -194,19 +208,46 @@ pub fn framed_output_tokens_with_tool_arguments(
 /// Tool requests already carry their own calibrated schema framing.
 pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i32 {
     let image_correction = image_block_count(payload).saturating_mul(5);
-    if payload.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
-        return base_tokens
-            .saturating_add(complex_tool_schema_correction(payload))
-            .saturating_add(image_correction)
-            .max(1);
-    }
-
     let mut segments = Vec::new();
     if let Some(system) = &payload.system {
         segments.extend(system.iter().map(|item| item.text.as_str()));
     }
     for message in &payload.messages {
         collect_text_segments(&message.content, &mut segments);
+    }
+
+    if super::compat::is_opus_4_8(&payload.model)
+        && let Some(history) = ToolHistoryFeatures::for_request(payload)
+    {
+        let underscore_count = segments
+            .iter()
+            .map(|text| text.bytes().filter(|byte| *byte == b'_').count())
+            .sum::<usize>();
+        let text_only_tokens = if payload.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+            let mut without_tools = payload.clone();
+            without_tools.tools = None;
+            super::compat::estimate_input_tokens(&without_tools)
+        } else {
+            base_tokens
+        };
+        let mut calibrated = history.calibrated_tokens(text_only_tokens, underscore_count);
+        if let Some(tools) = payload.tools.as_ref().filter(|tools| !tools.is_empty()) {
+            let raw_schema_tokens = base_tokens
+                .saturating_add(complex_tool_schema_correction(payload))
+                .saturating_sub(text_only_tokens);
+            calibrated = calibrated.saturating_add(calibrated_tool_history_schema_tokens(
+                raw_schema_tokens,
+                tools.len(),
+            ));
+        }
+        return calibrated.saturating_add(image_correction).max(1);
+    }
+
+    if payload.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+        return base_tokens
+            .saturating_add(complex_tool_schema_correction(payload))
+            .saturating_add(image_correction)
+            .max(1);
     }
 
     let char_count = segments.iter().map(|text| text.chars().count()).sum::<usize>();
@@ -259,6 +300,171 @@ pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i
 
     let calibrated = base_tokens.saturating_add(correction).max(1);
     calibrate_exact_colon_input_tokens(payload, calibrated)
+}
+
+fn calibrated_tool_history_schema_tokens(raw_schema_tokens: i32, tool_count: usize) -> i32 {
+    let tool_count = tool_count.min(i32::MAX as usize) as i32;
+    if tool_count <= 0 {
+        return 0;
+    }
+    let visible_tokens = raw_schema_tokens
+        .saturating_sub(
+            tool_count.saturating_mul(super::compat::OPUS_TOOL_TOTAL_OVERHEAD_TOKENS),
+        )
+        .max(0);
+    TOOL_HISTORY_SCHEMA_BASE_TOKENS
+        .saturating_add(
+            tool_count
+                .saturating_sub(1)
+                .saturating_mul(TOOL_HISTORY_SCHEMA_NEXT_TOOL_TOKENS),
+        )
+        .saturating_add(
+            (visible_tokens as f64 * TOOL_HISTORY_SCHEMA_VISIBLE_SCALE).round() as i32,
+        )
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ToolHistoryFeatures {
+    tool_uses: i32,
+    tool_results: i32,
+    input_properties: i32,
+    input_tokens: i32,
+    name_tokens: i32,
+    result_tokens: i32,
+    block_tokens: i32,
+    has_parallel_blocks: bool,
+}
+
+impl ToolHistoryFeatures {
+    fn for_request(payload: &MessagesRequest) -> Option<Self> {
+        let mut features = Self::default();
+        for message in &payload.messages {
+            let Some(blocks) = message.content.as_array() else {
+                continue;
+            };
+            let message_tool_uses = blocks
+                .iter()
+                .filter(|block| {
+                    block.get("type").and_then(Value::as_str) == Some("tool_use")
+                })
+                .count();
+            let message_tool_results = blocks
+                .iter()
+                .filter(|block| {
+                    block.get("type").and_then(Value::as_str) == Some("tool_result")
+                })
+                .count();
+            features.has_parallel_blocks |= message_tool_uses > 1 || message_tool_results > 1;
+            for block in blocks {
+                match block.get("type").and_then(Value::as_str) {
+                    Some("tool_use") => {
+                        features.tool_uses = features.tool_uses.saturating_add(1);
+                        features.input_properties = features.input_properties.saturating_add(
+                            block
+                                .get("input")
+                                .and_then(Value::as_object)
+                                .map_or(0, |input| input.len().min(i32::MAX as usize) as i32),
+                        );
+                        features.input_tokens = features.input_tokens.saturating_add(
+                            block.get("input").map_or(1, canonical_value_tokens),
+                        );
+                        features.name_tokens = features.name_tokens.saturating_add(
+                            block
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .map_or(0, super::claude_tok::count_claude),
+                        );
+                        features.block_tokens = features
+                            .block_tokens
+                            .saturating_add(canonical_value_tokens(block));
+                    }
+                    Some("tool_result") => {
+                        features.tool_results = features.tool_results.saturating_add(1);
+                        features.result_tokens = features.result_tokens.saturating_add(
+                            block.get("content").map_or(0, content_value_tokens),
+                        );
+                        features.block_tokens = features
+                            .block_tokens
+                            .saturating_add(canonical_value_tokens(block));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        (features.tool_uses > 0 && features.tool_results == features.tool_uses)
+            .then_some(features)
+    }
+
+    fn calibrated_tokens(&self, text_only_tokens: i32, underscore_count: usize) -> i32 {
+        if self.has_parallel_blocks || text_only_tokens >= 1_024 {
+            let block_framing = self.tool_uses.saturating_mul(4).saturating_sub(2);
+            return text_only_tokens
+                .saturating_add(self.block_tokens)
+                .saturating_add(block_framing)
+                .max(1);
+        }
+
+        let input_extra = self
+            .input_tokens
+            .saturating_sub(self.tool_uses)
+            .max(0) as f64;
+        let name_extra = self
+            .name_tokens
+            .saturating_sub(self.tool_uses)
+            .max(0) as f64;
+        let result_extra = self
+            .result_tokens
+            .saturating_sub(self.tool_results)
+            .max(0) as f64;
+        let result_scale = if result_extra <= 3.0 {
+            TOOL_HISTORY_RESULT_SHORT_SCALE
+        } else {
+            TOOL_HISTORY_RESULT_LONG_SCALE
+        };
+
+        let calibrated = text_only_tokens.max(1) as f64 * TOOL_HISTORY_TEXT_SCALE
+            + self.tool_uses.max(1) as f64 * TOOL_HISTORY_BASE_TOKENS
+            + self.input_properties.max(0) as f64 * TOOL_HISTORY_PROPERTY_TOKENS
+            + input_extra * TOOL_HISTORY_INPUT_SCALE
+            + name_extra * TOOL_HISTORY_NAME_SCALE
+            + result_extra * result_scale
+            + underscore_count as f64 * TOOL_HISTORY_UNDERSCORE_TOKENS
+            + self.tool_uses.saturating_sub(1) as f64
+                * TOOL_HISTORY_SEQUENTIAL_NEXT_PAIR_TOKENS;
+        calibrated
+            .round()
+            .clamp(1.0, i32::MAX as f64) as i32
+    }
+}
+
+fn content_value_tokens(value: &Value) -> i32 {
+    value
+        .as_str()
+        .map(super::claude_tok::count_claude)
+        .unwrap_or_else(|| canonical_value_tokens(value))
+}
+
+fn canonical_value_tokens(value: &Value) -> i32 {
+    serde_json::to_string(&canonical_json_value(value))
+        .map(|value| super::claude_tok::count_claude(&value))
+        .unwrap_or(0)
+}
+
+fn canonical_json_value(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let mut canonical = serde_json::Map::new();
+            for key in keys {
+                canonical.insert(key.clone(), canonical_json_value(&object[key]));
+            }
+            Value::Object(canonical)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonical_json_value).collect()),
+        _ => value.clone(),
+    }
 }
 
 /// Match the short literal-request framing observed from the Bedrock
@@ -973,6 +1179,246 @@ mod tests {
                 "unexpected literal input usage for {answer}"
             );
         }
+    }
+
+    #[test]
+    fn tool_history_usage_matches_pomo_bedrock_matrix() {
+        let single = |prompt: &str, name: &str, input: Value, result: &str| {
+            calibrated(json!({
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_bdrk_01CalibrationMatrix000000001",
+                        "name": name,
+                        "input": input
+                    }]},
+                    {"role": "user", "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_bdrk_01CalibrationMatrix000000001",
+                        "content": result
+                    }]}
+                ]
+            }))
+        };
+
+        let cases = [
+            ("empty", "Call lookup once.", "lookup", json!({}), "ok", 46),
+            (
+                "one field",
+                "Call lookup once.",
+                "lookup",
+                json!({"query": "alpha"}),
+                "ok",
+                69,
+            ),
+            (
+                "exact reply prompt",
+                "Reply with exactly: PONG",
+                "lookup",
+                json!({"query": "alpha"}),
+                "ok",
+                73,
+            ),
+            (
+                "two fields",
+                "Call lookup once.",
+                "get_weather",
+                json!({"location": "Paris", "unit": "celsius"}),
+                "ok",
+                94,
+            ),
+            (
+                "long result",
+                "Call lookup once.",
+                "lookup",
+                json!({"query": "alpha"}),
+                "The lookup completed successfully and returned the requested alpha record.",
+                87,
+            ),
+            (
+                "long input",
+                "Call lookup once.",
+                "lookup",
+                json!({"query": "Find the customer record whose external identifier is alpha-2026 and include every matching regional account."}),
+                "ok",
+                95,
+            ),
+            (
+                "nested input",
+                "Call lookup once.",
+                "lookup",
+                json!({"filters": {"regions": ["us-east-1", "eu-west-1"], "active": true, "minimum_score": 42}}),
+                "ok",
+                105,
+            ),
+        ];
+        for (name, prompt, tool_name, input, result, reference) in cases {
+            let actual = single(prompt, tool_name, input, result);
+            assert!(
+                (actual - reference).abs() <= 2,
+                "{name}: expected within 2 tokens of {reference}, got {actual}"
+            );
+        }
+
+        let history_with_schema = calibrated(json!({
+            "tools": [{
+                "name": "get_weather",
+                "description": "Get current weather for a city.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"},
+                        "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                    },
+                    "required": ["location", "unit"],
+                    "additionalProperties": false
+                }
+            }],
+            "tool_choice": {"type": "auto"},
+            "messages": [
+                {"role": "user", "content": "Call get_weather for Paris with unit celsius. Return only the tool call."},
+                {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_bdrk_01Calibration000000000002",
+                    "name": "get_weather",
+                    "input": {"location": "Paris", "unit": "celsius"}
+                }]},
+                {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_bdrk_01Calibration000000000002",
+                    "content": "18 C and clear"
+                }]}
+            ]
+        }));
+        let simple_history_with_schema = calibrated(json!({
+            "tools": [{
+                "name": "lookup",
+                "description": "Look up one record.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }
+            }],
+            "tool_choice": {"type": "auto"},
+            "messages": [
+                {"role": "user", "content": "Call lookup once."},
+                {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_bdrk_01Calibration000000000005",
+                    "name": "lookup",
+                    "input": {"query": "alpha"}
+                }]},
+                {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_bdrk_01Calibration000000000005",
+                    "content": "ok"
+                }]}
+            ]
+        }));
+
+        let two_tools = calibrated(json!({
+            "messages": [
+                {"role": "user", "content": "Call both lookups."},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_bdrk_01Calibration000000000003", "name": "lookup_alpha", "input": {"query": "alpha"}},
+                    {"type": "tool_use", "id": "toolu_bdrk_01Calibration000000000004", "name": "lookup_beta", "input": {"query": "beta"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_bdrk_01Calibration000000000003", "content": "one"},
+                    {"type": "tool_result", "tool_use_id": "toolu_bdrk_01Calibration000000000004", "content": "two"}
+                ]}
+            ]
+        }));
+        assert_eq!(two_tools, 179);
+
+        let two_tools_sequential = calibrated(json!({
+            "messages": [
+                {"role": "user", "content": "Call the alpha lookup and then the beta lookup."},
+                {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_bdrk_01CalibrationSequential000001",
+                    "name": "lookup_alpha",
+                    "input": {"query": "alpha"}
+                }]},
+                {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_bdrk_01CalibrationSequential000001",
+                    "content": "one"
+                }]},
+                {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_bdrk_01CalibrationSequential000002",
+                    "name": "lookup_beta",
+                    "input": {"query": "beta"}
+                }]},
+                {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_bdrk_01CalibrationSequential000002",
+                    "content": "two"
+                }]}
+            ]
+        }));
+        assert_eq!(two_tools_sequential, 140);
+
+        let two_tools_with_schema = calibrated(json!({
+            "tools": [
+                {
+                    "name": "lookup_alpha",
+                    "description": "Look up the alpha record.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"]
+                    }
+                },
+                {
+                    "name": "lookup_beta",
+                    "description": "Look up the beta record.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"]
+                    }
+                }
+            ],
+            "tool_choice": {"type": "auto"},
+            "messages": [
+                {"role": "user", "content": "Call both lookups."},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_bdrk_01Calibration000000000003", "name": "lookup_alpha", "input": {"query": "alpha"}},
+                    {"type": "tool_use", "id": "toolu_bdrk_01Calibration000000000004", "name": "lookup_beta", "input": {"query": "beta"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_bdrk_01Calibration000000000003", "content": "one"},
+                    {"type": "tool_result", "tool_use_id": "toolu_bdrk_01Calibration000000000004", "content": "two"}
+                ]}
+            ]
+        }));
+        assert!(
+            (simple_history_with_schema - 426).abs() <= 2
+                && (history_with_schema - 523).abs() <= 2
+                && (two_tools_with_schema - 615).abs() <= 2,
+            "tool history schema matrix: simple={simple_history_with_schema}, complex={history_with_schema}, two={two_tools_with_schema}"
+        );
+
+        let three_tools = calibrated(json!({
+            "messages": [
+                {"role": "user", "content": "Call all three lookups."},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_bdrk_01CalibrationMatrix000000011", "name": "lookup_alpha", "input": {"query": "alpha"}},
+                    {"type": "tool_use", "id": "toolu_bdrk_01CalibrationMatrix000000012", "name": "lookup_beta", "input": {"query": "beta"}},
+                    {"type": "tool_use", "id": "toolu_bdrk_01CalibrationMatrix000000013", "name": "lookup_gamma", "input": {"query": "gamma"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_bdrk_01CalibrationMatrix000000011", "content": "one"},
+                    {"type": "tool_result", "tool_use_id": "toolu_bdrk_01CalibrationMatrix000000012", "content": "two"},
+                    {"type": "tool_result", "tool_use_id": "toolu_bdrk_01CalibrationMatrix000000013", "content": "three"}
+                ]}
+            ]
+        }));
+        assert_eq!(three_tools, 260);
     }
 
     #[test]

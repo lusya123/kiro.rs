@@ -1,0 +1,2 @@
+scenario	side	http_code	curl_exit	time_total	input_tokens	cache_creation_input_tokens	cache_read_input_tokens	cache_total_tokens	output_tokens
+two-tool-results-sequential	reference	200	0	2.310778	140	0	0	0	8

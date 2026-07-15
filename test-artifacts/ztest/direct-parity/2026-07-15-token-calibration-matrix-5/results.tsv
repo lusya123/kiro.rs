@@ -1,0 +1,4 @@
+scenario	side	http_code	curl_exit	time_total	input_tokens	cache_creation_input_tokens	cache_read_input_tokens	cache_total_tokens	output_tokens
+system-arithmetic	reference	200	0	2.819685	30	0	0	0	11
+plain-three-turn	reference	200	0	2.468535	23	0	0	0	8
+plain-three-turn-amber	reference	200	0	3.943289	36	0	0	0	16

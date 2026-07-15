@@ -1,0 +1,4 @@
+scenario	side	http_code	curl_exit	time_total	input_tokens	cache_creation_input_tokens	cache_read_input_tokens	cache_total_tokens	output_tokens
+tool-result-one-field	reference	200	0	2.410892	69	0	0	0	8
+tool-one-field-long-value	reference	200	0	2.477387	95	0	0	0	8
+tool-one-field-nested-value	reference	200	0	2.736219	105	0	0	0	8

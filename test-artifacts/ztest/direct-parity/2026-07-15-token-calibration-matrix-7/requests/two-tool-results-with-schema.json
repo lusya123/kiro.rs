@@ -1,0 +1,81 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 8,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Call both lookups."
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_bdrk_01Calibration000000000003",
+          "name": "lookup_alpha",
+          "input": {
+            "query": "alpha"
+          }
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_bdrk_01Calibration000000000004",
+          "name": "lookup_beta",
+          "input": {
+            "query": "beta"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_bdrk_01Calibration000000000003",
+          "content": "one"
+        },
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_bdrk_01Calibration000000000004",
+          "content": "two"
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "lookup_alpha",
+      "description": "Look up the alpha record.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "name": "lookup_beta",
+      "description": "Look up the beta record.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  ],
+  "tool_choice": {
+    "type": "auto"
+  }
+}

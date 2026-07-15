@@ -1,0 +1,59 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 8,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Call all three lookups."
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_bdrk_01CalibrationMatrix000000011",
+          "name": "lookup_alpha",
+          "input": {
+            "query": "alpha"
+          }
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_bdrk_01CalibrationMatrix000000012",
+          "name": "lookup_beta",
+          "input": {
+            "query": "beta"
+          }
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_bdrk_01CalibrationMatrix000000013",
+          "name": "lookup_gamma",
+          "input": {
+            "query": "gamma"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_bdrk_01CalibrationMatrix000000011",
+          "content": "one"
+        },
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_bdrk_01CalibrationMatrix000000012",
+          "content": "two"
+        },
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_bdrk_01CalibrationMatrix000000013",
+          "content": "three"
+        }
+      ]
+    }
+  ]
+}
