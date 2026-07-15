@@ -1,0 +1,12 @@
+HTTP/1.1 200 OK
+content-type: text/event-stream
+cache-control: no-cache
+connection: keep-alive
+x-new-api-version: 78bb6d21
+x-oneapi-request-id: 20260715141624707923351pzTgUS7R
+x-accel-buffering: no
+strict-transport-security: max-age=31536000
+server: lyywafcdn
+transfer-encoding: chunked
+date: Wed, 15 Jul 2026 14:16:24 GMT
+

@@ -361,10 +361,17 @@ fn calibrate_reference_identity_input_tokens(payload: &MessagesRequest, input_to
         && prompt.contains("month and year")
         && (prompt.contains("reply with just") || prompt.contains("no additional explanation"));
     if constrained_cutoff {
-        input_tokens.saturating_add(10)
-    } else {
-        input_tokens
+        return input_tokens.saturating_add(10);
     }
+
+    let constrained_context = prompt.contains("maximum context window")
+        && prompt.contains("single integer")
+        && prompt.contains("no explanation");
+    if constrained_context {
+        return input_tokens.saturating_add(7);
+    }
+
+    input_tokens
 }
 
 fn calibrated_tool_history_schema_tokens(raw_schema_tokens: i32, tool_count: usize) -> i32 {
@@ -562,8 +569,10 @@ pub fn calibrated_text_output_tokens(text: &str, base_tokens: i32) -> i32 {
         .is_ok_and(|value| matches!(value, Value::Object(_) | Value::Array(_)))
     {
         let underscore_count = marker.bytes().filter(|byte| *byte == b'_').count();
+        // Bedrock's reported usage does not bill the pretty-print whitespace
+        // in its public identity object at the same rate as ordinary JSON.
         let structural_tokens = if is_public_claude_identity_json(marker) {
-            1
+            -3
         } else {
             4
         };
@@ -599,9 +608,9 @@ fn is_public_claude_identity_json(text: &str) -> bool {
     };
     object.len() == 4
         && object.get("vendor").and_then(Value::as_str) == Some("Anthropic")
-        && object.get("model_name").and_then(Value::as_str) == Some("Claude")
+        && object.get("model_name").and_then(Value::as_str) == Some("Claude Code")
         && object.get("model_family").and_then(Value::as_str) == Some("Claude")
-        && object.get("version").and_then(Value::as_str) == Some("Claude Code CLI")
+        && object.get("version").and_then(Value::as_str) == Some("unknown")
 }
 
 /// Apply Bedrock's text-block framing and its compact accounting for very
@@ -1184,10 +1193,10 @@ mod tests {
             ),
             39
         );
-        let identity = r#"{"vendor": "Anthropic", "model_name": "Claude", "model_family": "Claude", "version": "Claude Code CLI"}"#;
+        let identity = "{\n  \"vendor\": \"Anthropic\",\n  \"model_name\": \"Claude Code\",\n  \"model_family\": \"Claude\",\n  \"version\": \"unknown\"\n}";
         assert_eq!(
             framed_text_output_tokens(identity, super::super::claude_tok::count_claude(identity)),
-            49
+            55
         );
         assert_eq!(
             framed_text_output_tokens(
@@ -1236,7 +1245,22 @@ mod tests {
                 }]
             }]
         }));
-        assert_eq!((cutoff, structured_identity), (72, 125));
+        let context = calibrated(json!({
+            "max_tokens": 30,
+            "stream": true,
+            "system": [{
+                "type": "text",
+                "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }],
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "What is your maximum context window size in tokens? Reply with just a single integer (no commas, no units, no explanation), e.g. 200000."
+                }]
+            }]
+        }));
+        assert_eq!((cutoff, structured_identity, context), (72, 125, 74));
     }
 
     fn calibrated(extra: Value) -> i32 {

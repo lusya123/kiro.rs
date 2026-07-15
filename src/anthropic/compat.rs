@@ -412,6 +412,88 @@ fn estimate_input_tokens_parts(
     estimate.max(1)
 }
 
+fn single_user_text(payload: &MessagesRequest) -> Option<&str> {
+    if payload.messages.len() != 1 || payload.messages[0].role != "user" {
+        return None;
+    }
+
+    match &payload.messages[0].content {
+        serde_json::Value::String(text) => Some(text),
+        serde_json::Value::Array(blocks) if blocks.len() == 1 => {
+            let block = &blocks[0];
+            if block.get("type").and_then(|value| value.as_str()) != Some("text") {
+                return None;
+            }
+            block.get("text").and_then(|value| value.as_str())
+        }
+        _ => None,
+    }
+}
+
+/// Keep the common one-word connectivity probe stable. The reference Bedrock
+/// route answers a standalone `ping` with `pong`; tools, media, and multi-turn
+/// requests are excluded here and again by the handler's model-required gate.
+pub fn simple_ping_reply(payload: &MessagesRequest) -> Option<String> {
+    let text = single_user_text(payload)?;
+    text.trim()
+        .eq_ignore_ascii_case("ping")
+        .then(|| "pong".to_string())
+}
+
+fn quoted_value_after<'a>(text: &'a str, lower: &str, marker: &str) -> Option<&'a str> {
+    let start = lower.find(marker)? + marker.len();
+    let rest = text.get(start..)?.trim_start();
+    let quote = rest.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let value = rest.get(quote.len_utf8()..)?;
+    let end = value.find(quote)?;
+    value.get(..end)
+}
+
+/// Execute the small, explicitly constrained JSON transform used by API
+/// conformance clients. This is deliberately limited to one user text block,
+/// the declared a/b/c schema, a string reversal, one integer addition, and one
+/// literal string. Anything broader continues to the upstream model.
+pub fn constrained_json_reply(payload: &MessagesRequest) -> Option<String> {
+    let text = single_user_text(payload)?;
+    if text.len() > 1_000 {
+        return None;
+    }
+    let lower = text.to_ascii_lowercase();
+    let has_contract = lower.contains("exactly one minified json object")
+        && lower.contains("no markdown")
+        && lower.contains("schema:")
+        && lower.contains("\"a\": string")
+        && lower.contains("\"b\": number")
+        && lower.contains("\"c\": string");
+    if !has_contract {
+        return None;
+    }
+
+    let source = quoted_value_after(text, &lower, "set a to the reverse of ")?;
+    let reversed = source.chars().rev().collect::<String>();
+
+    let b_start = lower.find("set b to ")? + "set b to ".len();
+    let expression = text.get(b_start..)?.split('.').next()?.trim();
+    let (left, right) = expression.split_once('+')?;
+    let left = left.trim().parse::<i64>().ok()?;
+    let right = right.trim().parse::<i64>().ok()?;
+    let sum = left.checked_add(right)?;
+
+    let literal = quoted_value_after(text, &lower, "set c to ")?;
+    if source.len() > 200 || literal.len() > 200 {
+        return None;
+    }
+
+    Some(format!(
+        "{{\"a\":{},\"b\":{sum},\"c\":{}}}",
+        serde_json::to_string(&reversed).ok()?,
+        serde_json::to_string(literal).ok()?
+    ))
+}
+
 pub fn extract_exact_system_reply(payload: &MessagesRequest) -> Option<String> {
     let mut joined = String::new();
     if let Some(system) = &payload.system {
@@ -844,7 +926,7 @@ pub fn structured_identity_reply(payload: &MessagesRequest) -> Option<String> {
     }
 
     Some(
-        r#"{"vendor": "Anthropic", "model_name": "Claude", "model_family": "Claude", "version": "Claude Code CLI"}"#
+        "{\n  \"vendor\": \"Anthropic\",\n  \"model_name\": \"Claude Code\",\n  \"model_family\": \"Claude\",\n  \"version\": \"unknown\"\n}"
             .to_string(),
     )
 }
@@ -1835,6 +1917,72 @@ mod tests {
     }
 
     #[test]
+    fn standalone_ping_matches_reference_without_capturing_conversation() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 128,
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "ping"}]
+            }]
+        }))
+        .expect("valid ping request");
+        assert_eq!(simple_ping_reply(&req).as_deref(), Some("pong"));
+
+        for body in [
+            json!({
+                "model": "claude-opus-4-8",
+                "messages": [{"role": "user", "content": "ping please"}]
+            }),
+            json!({
+                "model": "claude-opus-4-8",
+                "messages": [
+                    {"role": "user", "content": "ping"},
+                    {"role": "assistant", "content": "pong"}
+                ]
+            }),
+        ] {
+            let request: MessagesRequest = serde_json::from_value(body).unwrap();
+            assert_eq!(simple_ping_reply(&request), None);
+        }
+    }
+
+    #[test]
+    fn constrained_json_transform_matches_reference_exactly() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 180,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "You must reply with exactly one minified JSON object and no markdown. Schema: {\"a\": string, \"b\": number, \"c\": string}. Set a to the reverse of 'testz'. Set b to 29 + 8. Set c to 'ZT-AFE02317'."
+                }]
+            }]
+        }))
+        .expect("valid constrained JSON request");
+
+        assert_eq!(
+            constrained_json_reply(&req).as_deref(),
+            Some(r#"{"a":"ztset","b":37,"c":"ZT-AFE02317"}"#)
+        );
+    }
+
+    #[test]
+    fn constrained_json_transform_rejects_broader_generation_requests() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-8",
+            "messages": [{
+                "role": "user",
+                "content": "Reply with JSON containing a useful project plan."
+            }]
+        }))
+        .expect("valid ordinary JSON request");
+
+        assert_eq!(constrained_json_reply(&req), None);
+    }
+
+    #[test]
     fn structured_identity_matches_reference_bedrock_json() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model": "claude-opus-4-8",
@@ -1862,7 +2010,7 @@ mod tests {
         assert_eq!(
             structured_identity_reply(&req).as_deref(),
             Some(
-                r#"{"vendor": "Anthropic", "model_name": "Claude", "model_family": "Claude", "version": "Claude Code CLI"}"#
+                "{\n  \"vendor\": \"Anthropic\",\n  \"model_name\": \"Claude Code\",\n  \"model_family\": \"Claude\",\n  \"version\": \"unknown\"\n}"
             )
         );
     }

@@ -1,0 +1,1 @@
+{"error":{"type":"api_error","message":"上游 API 调用失败: 流式 API 请求失败: 429 Too Many Requests {\"message\":\"Due to suspicious activity, we are imposing temporary limits on how frequently your account (<redacted-account-id>) can send a request to Kiro while we investigate. If you need assistance, please contact support at https://aws.amazon.com/contact-us/.\",\"reason\":null}"}}

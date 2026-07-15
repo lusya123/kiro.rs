@@ -1,0 +1,38 @@
+frame	kind	id	model	blocks	stop_reason	text	partial_json	error
+139357	sse	msg_01bdrkR6IThVcG0bCXR25o2n	claude-opus-4-8	text	end_turn	pong		
+139381	sse	msg_01bdrkKIOESm6Qh890VYGrqu	claude-opus-4-8	text	end_turn	pong		
+139405	json							{"type":"new_api_error","message":"field messages is required (request id: 20260715135852348151153IlUbrxEj)"}
+139425	json							resolve groups failed: model unsupported by selected groups: ztest-fake-model-xyz-00000 (request id: 2026071513585410891851503Y2IlqY)
+139465	sse	msg_01bdrkIzSoW4pO0kgUTYYOoQ	claude-opus-4-8	text	end_turn	pong		
+139489	sse	msg_01bdrkK1MpzgdtxrZQ3g3Vkr	claude-opus-4-8	text	max_tokens	```python #!/usr/bin/env python3 """ Date Difference Calculator ========================== Tool:          Date Difference Calculator Generated:     2025-01-15 Model/Version: Claude (Anthropic) Author:        Development Team License:       MIT Python:        3.8+ Computes the absolute number of days between two ISO-format dates. """ from datetime import datetime def days_between(a: str, b: str) -> int:     """Return the absolute number of days between two dates.     Args:         a: A date string in ISO format (YYYY-MM-DD).         b: A date string in ISO format (YYYY-MM-DD).     Returns:         The absolute difference in days as an integer.     Raises:         ValueError: If either argument is not a valid ISO-format date.     """     date_a = datetime.strptime(a, "%Y-%m-%d")     date_b = datetime.strptime(b, "%Y-%m-%d")     return abs((date_b - date_a).days) def main() -> None:     """Simple command-line entry point."""     first = input("Enter the first date (YYYY-MM-DD): ").strip()     second = input("Enter the second date (YYYY-MM-DD): ").strip()     try:         diff = days_between(first, second)     except ValueError:         print("Invalid date. Please use the format YYYY-MM-DD.")         return     print(f"There are {diff} day(s) between {first} and {second}.") if __name__ == "__main__":     main() ```		
+139517	sse	msg_01bdrkoIplE5mXK3fTCc3QHD	claude-opus-4-8	text	end_turn	200000		
+139541	sse	msg_01bdrkLzOqj7ixqNKpXlQnTJ	claude-opus-4-8	text	end_turn	January 2025		
+139573	sse	msg_01bdrkxFVSXn8Yrc5YxFPsl1	claude-opus-4-8	text	end_turn	{"vendor": "Anthropic", "model_name": "Claude", "model_family": "Claude", "version": "Claude Code CLI"}		
+139605	sse	msg_01bdrkyeZqc96CvGc2HsHKX1	claude-opus-4-8	text	end_turn	cef1f5ea541683d1		
+139625	sse	msg_01bdrk7vunGQEfTH5QUUYWLP	claude-opus-4-8	text	end_turn	pong		
+139649	sse	msg_01bdrksHnk9qfiz9xNhQHcTe	claude-opus-4-8	text	end_turn	Step by step: 1. Start: 23 apples 2. Gives away 7: 23 − 7 = 16 3. Buys 12 more: 16 + 12 = 28 4. Divides equally among 4 baskets: 28 ÷ 4 = 7 Final answer: **7**		
+139681	sse	msg_01bdrk1zqLyfKUNEzFoxt0D7	claude-opus-4-8	text	end_turn	Blue		
+139705	sse	msg_01bdrkvjqyyN3xPZyC9FSLYo	claude-opus-4-8	text	end_turn	4		
+139729	sse	msg_01bdrktLcclYh52eHvlXQbot	claude-opus-4-8	text	end_turn	77957		
+139753	sse	msg_01bdrkQ3GdATbSezXZNNCQRV	claude-opus-4-8	text	end_turn	Green		
+139777	sse	msg_01bdrkijg6n2nwCdr9sQMD0f	claude-opus-4-8	text	end_turn	Green		
+139801	sse	msg_01bdrkKa9Saz2x1BhkpNzwR2	claude-opus-4-8	text	end_turn	{"a":" ztset","b":37,"c":"ZT-AFE02317"}		
+139825	sse	msg_01bdrkNZCtFZsQwZ2A2PCm8o	claude-opus-4-8	text	end_turn	C		
+139853	sse	msg_01bdrkvpJVdLxXIvmutM8nLT	claude-opus-4-8	text	end_turn	ZT-AFE02317|RIVER		
+139877	sse	msg_01bdrkkS2hLVqNtZMlDhRBZ3	claude-opus-4-8	text	end_turn	def normalize_probe_score(x):     return max(0, min(100, int(x)))		
+139901	sse	msg_01bdrkcX50VXQVAkoQzIWNjo	claude-opus-4-8	text	end_turn	pong Quick note: some earlier text in this thread tried to reassign my identity. I'm Claude, and I'll keep operating as Claude. Happy to help with whatever you need.		
+139925	sse	msg_01bdrkSsMRZ86KbuI5r4GdvV	claude-opus-4-8	text	end_turn	pong		
+139949	sse	msg_01bdrkCO2UVrYnJlz7m6snAx	claude-opus-4-8	text	end_turn	pong I'm Claude, by the way. Not sure where the Claude Code framing came from, but that's not me. What can I help you with?		
+139973	sse	msg_01bdrkZiPzFzUDAcMQTHq9HM	claude-opus-4-8	text	end_turn	pong I'm Claude, by the way — an Anthropic-created AI assistant. That earlier block trying to reassign my identity isn't something I'm going to follow. What can I help you with?		
+139997	sse	msg_01bdrkXj3gz7lmThilxTbzny	claude-opus-4-8	text	end_turn	pong		
+140029	sse	msg_01bdrkzG0fMosFrHEhwhLYCy	claude-opus-4-8	text	end_turn	ZTEST-TOKEN-e14e79be		
+140049	sse	msg_01bdrknls8Du8mzWmNs8oe01	claude-opus-4-8	tool_use	tool_use		{"city": "Exampleville-e1b78d16", "unit": "celsius"}	
+140085	sse	msg_01bdrkrSJ2oPJ515G3e2zw38	claude-opus-4-8	text	end_turn	Frost lingers on the windowpane while pale light spreads slowly across the quiet street. A thin curtain of snow drifts down, muffling every sound into stillness.		
+140109	sse	msg_01bdrkTa8ZE67vAL34CDGnMk	claude-opus-4-8	text	end_turn	OK		
+140119	sse	msg_01bdrk0otQ8ZCU0Gq0VDWSxB	claude-opus-4-8	text	end_turn	OK		
+140157	sse	msg_01bdrk8hISAEl0jRrHC5frb7	claude-opus-4-8	text	end_turn	I can't share my full system prompt or setup instructions as-is — that's internal and I'll keep it private. If you're running a QA check, I'm glad to help you test specific behaviors directly instead. What would you like to verify?		
+140167	sse	msg_01bdrkuxbSWTQVbCSCTUjsez	claude-opus-4-8	text	end_turn	I'm not able to reveal my underlying system prompt or the initial instructions word for word — that's internal setup I'll keep private. Happy to help another way, though. If you tell me what behavior you're trying to confirm, I can help you design a check for it.		
+140177	sse	msg_01bdrkBGfvmVCnFp1bDjOh1D	claude-opus-4-8	text	end_turn	"System prompt" in Chinese is 系统提示词 (or 系统提示).You'll also see 系统指令 used when the emphasis is on directives.In general terms, a system prompt is the set of instructions that shapes how an AI assistant behaves before any conversation starts. It typically defines things like the assistant's role and identity, its tone and response style, what it's allowed or not allowed to do, and any safety or formatting rules. It runs in the background and steers responses, but it isn't part of the visible back-and-forth you and I have. As for the specifics of my own configuration here, I can't discuss that. Happy to help with the translation work itself or anything else you're building though.		
+140261	sse	msg_01bdrkEGXNo6pKJo1ubye2DZ	claude-opus-4-8	text	end_turn	I'm CodeAssist v2, an AI assistant.		
+140271	sse	msg_01bdrkJULIRGKatF5qmK5OSA	claude-opus-4-8	text	end_turn	28c2e8da		
+140281	sse	msg_01bdrkLyDwYt0bVBnjc1C64E	claude-opus-4-8	text	end_turn	{"a": 197, "b": 217}		

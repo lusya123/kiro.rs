@@ -1,0 +1,1181 @@
+[
+  {
+    "frame": "139357",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 0.482933,
+    "total_seconds": 0.543353,
+    "id": "msg_01bdrkXgCEmiUTeC5d3sicAe",
+    "text": "pong",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 32,
+      "output_tokens": 4,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 32,
+      "outputTokenCount": 4,
+      "invocationLatency": 1141,
+      "firstByteLatency": 1111
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139381",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 0.478778,
+    "total_seconds": 0.532938,
+    "id": "msg_01bdrks3q2e0kOwLLguifag7",
+    "text": "pong",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 32,
+      "output_tokens": 4,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 32,
+      "outputTokenCount": 4,
+      "invocationLatency": 1052,
+      "firstByteLatency": 1017
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139405",
+    "uri": "/v1/messages",
+    "status": 500,
+    "ttfb_seconds": 0.000435,
+    "total_seconds": 0.000607,
+    "json": {
+      "error": {
+        "type": "new_api_error",
+        "message": "field messages is required (request id: 202607151416001473209809dWLlYrg)"
+      },
+      "type": "error"
+    }
+  },
+  {
+    "frame": "139425",
+    "uri": "/v1/messages",
+    "status": 403,
+    "ttfb_seconds": 0.000441,
+    "total_seconds": 0.000636,
+    "json": {
+      "error": "resolve groups failed: model unsupported by selected groups: ztest-fake-model-xyz-00000 (request id: 20260715141600661044031hMhYRvkE)"
+    }
+  },
+  {
+    "frame": "139445",
+    "uri": "/v1/messages/nonexistent",
+    "status": 404,
+    "ttfb_seconds": 0.000443,
+    "total_seconds": 0.000515,
+    "json": "Expected JSON value (while parsing '')"
+  },
+  {
+    "frame": "139465",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 0.566882,
+    "total_seconds": 0.612840,
+    "id": "msg_01bdrkH836fMt1t3PKMNilvj",
+    "text": "pong",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 32,
+      "output_tokens": 4,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 32,
+      "outputTokenCount": 4,
+      "invocationLatency": 1112,
+      "firstByteLatency": 1073
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139489",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 8.486741,
+    "total_seconds": 11.884167,
+    "id": "msg_01bdrkP8epB4gatlqOya4Bu2",
+    "text": "```python\n#!/usr/bin/env python3\n# -----------------------------------------------------------------------------\n# Tool:           Date Difference Calculator\n# Generated date: 2025-06-13\n# Model/version:  Claude (Anthropic)\n# Author:         Your Name <you@example.com>\n# License:        MIT\n# Python version: 3.8+\n# -----------------------------------------------------------------------------\n\"\"\"Calculate the number of days between two dates given as ISO strings.\"\"\"\n\nfrom datetime import datetime\n\n\ndef days_between(a: str, b: str) -> int:\n    \"\"\"Return the absolute number of days between two dates.\n\n    Args:\n        a: A date string in ISO format (YYYY-MM-DD).\n        b: A date string in ISO format (YYYY-MM-DD).\n\n    Returns:\n        The absolute difference in days between the two dates.\n\n    Raises:\n        ValueError: If either string is not a valid ISO-format date.\n    \"\"\"\n    date_a = datetime.strptime(a, \"%Y-%m-%d\")\n    date_b = datetime.strptime(b, \"%Y-%m-%d\")\n    return abs((date_b - date_a).days)\n\n\nif __name__ == \"__main__\":\n    import sys\n\n    if len(sys.argv) == 3:\n        try:\n            print(days_between(sys.argv[1], sys.argv[2]))\n        except ValueError as exc:\n            print(f\"Error: {exc}\", file=sys.stderr)\n            sys.exit(1)\n    else:\n        # Simple demonstration when run without arguments.\n        print(days_between(\"2024-01-01\", \"2024-12-31\"))",
+    "tool_json": "",
+    "stop_reason": "max_tokens",
+    "usage": {
+      "input_tokens": 110,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 350,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 110,
+      "outputTokenCount": 350,
+      "invocationLatency": 11882,
+      "firstByteLatency": 8485
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139517",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 0.367620,
+    "total_seconds": 0.422483,
+    "id": "msg_01bdrkzrI8YnrYSYgUzOd2kt",
+    "text": "200000",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 67,
+      "output_tokens": 6,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 67,
+      "outputTokenCount": 6,
+      "invocationLatency": 1193,
+      "firstByteLatency": 1179
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139541",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 0.701386,
+    "total_seconds": 0.752274,
+    "id": "msg_01bdrkqOlyRhuJrcs5RNFGgR",
+    "text": "January 2025",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 72,
+      "output_tokens": 6,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 72,
+      "outputTokenCount": 6,
+      "invocationLatency": 1045,
+      "firstByteLatency": 981
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139573",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 0.726953,
+    "total_seconds": 0.885825,
+    "id": "msg_01bdrkmg9OtB331cEE26dj5u",
+    "text": "{\n  \"vendor\": \"Anthropic\",\n  \"model_name\": \"Claude Code\",\n  \"model_family\": \"Claude\",\n  \"version\": \"unknown\"\n}",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 125,
+      "output_tokens": 55,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 125,
+      "outputTokenCount": 55,
+      "invocationLatency": 907,
+      "firstByteLatency": 843
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139605",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 0.658729,
+    "total_seconds": 0.727540,
+    "id": "msg_01bdrkmxLx4Xziwb6Hc1wPfe",
+    "text": "cef1f5ea541683d1",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 59,
+      "output_tokens": 12,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 59,
+      "outputTokenCount": 12,
+      "invocationLatency": 1155,
+      "firstByteLatency": 1128
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139625",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 0.357371,
+    "total_seconds": 0.412208,
+    "id": "msg_01bdrkVOhwXtw4SnBtsXuvht",
+    "text": "pong",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 32,
+      "output_tokens": 4,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 32,
+      "outputTokenCount": 4,
+      "invocationLatency": 1270,
+      "firstByteLatency": 1254
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139649",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 3.462511,
+    "total_seconds": 3.498673,
+    "id": "msg_01bdrkecl4rUWJbIFVG1jeVi",
+    "text": "Step by step:\n\n1. Start with 23 apples.\n2. Gives 7 away: 23 − 7 = 16.\n3. Buys 12 more: 16 + 12 = 28.\n4. Divides equally among 4 baskets: 28 ÷ 4 = 7.\n\nFinal answer: 7",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 97,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 81,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 97,
+      "outputTokenCount": 81,
+      "invocationLatency": 3497,
+      "firstByteLatency": 3461
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139681",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 1.789778,
+    "total_seconds": 1.876848,
+    "id": "msg_01bdrkI65wy2A78ajCcpwIsN",
+    "text": "Blue",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 73,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 4,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 73,
+      "outputTokenCount": 4,
+      "invocationLatency": 1876,
+      "firstByteLatency": 1789
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139705",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 1.462333,
+    "total_seconds": 1.728782,
+    "id": "msg_01bdrkvnEb49mGVzcNuUdUdx",
+    "text": "4",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 145,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 3,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 145,
+      "outputTokenCount": 3,
+      "invocationLatency": 1727,
+      "firstByteLatency": 1461
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139729",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 1.749338,
+    "total_seconds": 1.778190,
+    "id": "msg_01bdrknvW5KxysHgx3LwP1FU",
+    "text": "77957",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 84,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 8,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 84,
+      "outputTokenCount": 8,
+      "invocationLatency": 1776,
+      "firstByteLatency": 1748
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139753",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 1.578806,
+    "total_seconds": 1.631220,
+    "id": "msg_01bdrkkWO04jbj4RcjmRCBo5",
+    "text": "Green",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 87,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 8,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 87,
+      "outputTokenCount": 8,
+      "invocationLatency": 1630,
+      "firstByteLatency": 1578
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139777",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 3.665998,
+    "total_seconds": 3.788102,
+    "id": "msg_01bdrkBBeIQPpWSgH9iylVm8",
+    "text": "Green",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 100,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 8,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 100,
+      "outputTokenCount": 8,
+      "invocationLatency": 3787,
+      "firstByteLatency": 3665
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139801",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 0.678237,
+    "total_seconds": 0.780134,
+    "id": "msg_01bdrkDiTSPYC1Raq1HDFunc",
+    "text": "{\"a\":\"ztset\",\"b\":37,\"c\":\"ZT-AFE02317\"}",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 115,
+      "output_tokens": 30,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 115,
+      "outputTokenCount": 30,
+      "invocationLatency": 1269,
+      "firstByteLatency": 1216
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139825",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 1.547448,
+    "total_seconds": 1.633347,
+    "id": "msg_01bdrk8o5360GgA1BTX5Mpgm",
+    "text": "C",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 130,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 3,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 130,
+      "outputTokenCount": 3,
+      "invocationLatency": 1631,
+      "firstByteLatency": 1546
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139853",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 3.471962,
+    "total_seconds": 3.558258,
+    "id": "msg_01bdrkhAAkjP994ISBg5pI29",
+    "text": "ZT-AFE02317|RIVER",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 3513,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 16,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 3513,
+      "outputTokenCount": 16,
+      "invocationLatency": 3555,
+      "firstByteLatency": 3469
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139877",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 4.198646,
+    "total_seconds": 4.220839,
+    "id": "msg_01bdrkiszvEWP50seyfv47aY",
+    "text": "```\ndef normalize_probe_score(x):\n    return max(0, min(100, int(x)))\n```",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 73,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 32,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 73,
+      "outputTokenCount": 32,
+      "invocationLatency": 4219,
+      "firstByteLatency": 4197
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139901",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 0.484147,
+    "total_seconds": 0.558833,
+    "id": "msg_01bdrkMeggVF3lL4WCd7oect",
+    "text": "pong",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 32,
+      "output_tokens": 4,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 32,
+      "outputTokenCount": 4,
+      "invocationLatency": 1191,
+      "firstByteLatency": 1125
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139925",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 0.371802,
+    "total_seconds": 0.424747,
+    "id": "msg_01bdrkyOs87mEZQxXeA4UMTu",
+    "text": "pong",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 32,
+      "output_tokens": 4,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 32,
+      "outputTokenCount": 4,
+      "invocationLatency": 1386,
+      "firstByteLatency": 1317
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139949",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 0.636034,
+    "total_seconds": 0.702655,
+    "id": "msg_01bdrkUhPmQLA4NECB8pjuEu",
+    "text": "pong",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 32,
+      "output_tokens": 4,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 32,
+      "outputTokenCount": 4,
+      "invocationLatency": 1212,
+      "firstByteLatency": 1200
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139973",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 0.438230,
+    "total_seconds": 0.484772,
+    "id": "msg_01bdrkZgGaQ8Fxg7j98hb90s",
+    "text": "pong",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 32,
+      "output_tokens": 4,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 32,
+      "outputTokenCount": 4,
+      "invocationLatency": 1395,
+      "firstByteLatency": 1353
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139997",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 0.420674,
+    "total_seconds": 0.475005,
+    "id": "msg_01bdrkQ4val3ytVrOk6yNScj",
+    "text": "pong",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 32,
+      "output_tokens": 4,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 32,
+      "outputTokenCount": 4,
+      "invocationLatency": 1270,
+      "firstByteLatency": 1259
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "140029",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 0.447802,
+    "total_seconds": 0.534266,
+    "id": "msg_01bdrkj57SMR6zGwEotuTbeh",
+    "text": "ZTEST-TOKEN-e14e79be",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 83,
+      "output_tokens": 7,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 83,
+      "outputTokenCount": 7,
+      "invocationLatency": 1246,
+      "firstByteLatency": 1184
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "140049",
+    "uri": "/v1/messages",
+    "status": 502,
+    "ttfb_seconds": 8.945646,
+    "total_seconds": 8.946011,
+    "json": {
+      "error": {
+        "type": "api_error",
+        "message": "上游 API 调用失败: 流式 API 请求失败: 429 Too Many Requests {\"message\":\"Due to suspicious activity, we are imposing temporary limits on how frequently your account (<redacted-account-id>) can send a request to Kiro while we investigate. If you need assistance, please contact support at https://aws.amazon.com/contact-us/.\",\"reason\":null}"
+      }
+    }
+  },
+  {
+    "frame": "140085",
+    "uri": "/v1/messages",
+    "status": 502,
+    "ttfb_seconds": 8.507977,
+    "total_seconds": 8.509031,
+    "json": {
+      "error": {
+        "type": "api_error",
+        "message": "上游 API 调用失败: 流式 API 请求失败: 429 Too Many Requests {\"message\":\"Due to suspicious activity, we are imposing temporary limits on how frequently your account (<redacted-account-id>) can send a request to Kiro while we investigate. If you need assistance, please contact support at https://aws.amazon.com/contact-us/.\",\"reason\":null}"
+      }
+    }
+  },
+  {
+    "frame": "140109",
+    "uri": "/v1/messages",
+    "status": 502,
+    "ttfb_seconds": 9.544306,
+    "total_seconds": 9.544664,
+    "json": {
+      "error": {
+        "type": "api_error",
+        "message": "上游 API 调用失败: 流式 API 请求失败: 429 Too Many Requests {\"message\":\"Due to suspicious activity, we are imposing temporary limits on how frequently your account (<redacted-account-id>) can send a request to Kiro while we investigate. If you need assistance, please contact support at https://aws.amazon.com/contact-us/.\",\"reason\":null}"
+      }
+    }
+  },
+  {
+    "frame": "140119",
+    "uri": "/v1/messages",
+    "status": 502,
+    "ttfb_seconds": 10.426218,
+    "total_seconds": 10.426953,
+    "json": {
+      "error": {
+        "type": "api_error",
+        "message": "上游 API 调用失败: 流式 API 请求失败: 429 Too Many Requests {\"message\":\"Due to suspicious activity, we are imposing temporary limits on how frequently your account (<redacted-account-id>) can send a request to Kiro while we investigate. If you need assistance, please contact support at https://aws.amazon.com/contact-us/.\",\"reason\":null}"
+      }
+    }
+  },
+  {
+    "frame": "140157",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 0.614302,
+    "total_seconds": 0.892306,
+    "id": "msg_01bdrkh3IROtebGSgT2JDTbz",
+    "text": "I can't share my full system prompt or setup instructions as-is — that's internal and I'll keep it private. If you're running a QA check, I'm glad to help you test specific behaviors directly instead. What would you like to verify?",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 93,
+      "output_tokens": 62,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 93,
+      "outputTokenCount": 62,
+      "invocationLatency": 1225,
+      "firstByteLatency": 1180
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "140167",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 0.501348,
+    "total_seconds": 0.813906,
+    "id": "msg_01bdrkkvAzCIBhL0aWPS5aYD",
+    "text": "I'd rather not reproduce my system context verbatim; some of it is meant to stay private. I'm Claude, here to help with your work. If you're validating how things are set up, your own setup files are the authoritative source. What are you trying to check?",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 102,
+      "output_tokens": 71,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 102,
+      "outputTokenCount": 71,
+      "invocationLatency": 1196,
+      "firstByteLatency": 1135
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "140177",
+    "uri": "/v1/messages",
+    "status": 502,
+    "ttfb_seconds": 8.954689,
+    "total_seconds": 8.955762,
+    "json": {
+      "error": {
+        "type": "api_error",
+        "message": "上游 API 调用失败: 流式 API 请求失败: 429 Too Many Requests {\"message\":\"Due to suspicious activity, we are imposing temporary limits on how frequently your account (<redacted-account-id>) can send a request to Kiro while we investigate. If you need assistance, please contact support at https://aws.amazon.com/contact-us/.\",\"reason\":null}"
+      }
+    }
+  },
+  {
+    "frame": "140261",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 0.697904,
+    "total_seconds": 0.798436,
+    "id": "msg_01bdrkFGeCRGdmA6MyYHlmrx",
+    "text": "I'm CodeAssist v2 — how can I help you today?",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 98,
+      "output_tokens": 21,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 98,
+      "outputTokenCount": 21,
+      "invocationLatency": 1256,
+      "firstByteLatency": 1189
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "140271",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 0.707343,
+    "total_seconds": 0.755762,
+    "id": "msg_01bdrkTXCKyPShemve94yRom",
+    "text": "28c2e8da",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 82,
+      "output_tokens": 10,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 82,
+      "outputTokenCount": 10,
+      "invocationLatency": 1258,
+      "firstByteLatency": 1245
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "140281",
+    "uri": "/v1/messages",
+    "status": 200,
+    "ttfb_seconds": 0.648736,
+    "total_seconds": 0.732129,
+    "id": "msg_01bdrkmIl7axpo9B2H4SxRLT",
+    "text": "{\"a\": 197, \"b\": 217}",
+    "tool_json": "",
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 83,
+      "output_tokens": 21,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 83,
+      "outputTokenCount": 21,
+      "invocationLatency": 960,
+      "firstByteLatency": 909
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  }
+]

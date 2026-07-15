@@ -1,0 +1,332 @@
+[
+  {
+    "frame": "139489",
+    "q2_text": "```python\n#!/usr/bin/env python3\n\"\"\"\nDate Difference Calculator\n==========================\n\nTool:          Date Difference Calculator\nGenerated:     2025-01-15\nModel/Version: Claude (Anthropic)\nAuthor:        Development Team\nLicense:       MIT\nPython:        3.8+\n\nComputes the absolute number of days between two ISO-format dates.\n\"\"\"\n\nfrom datetime import datetime\n\n\ndef days_between(a: str, b: str) -> int:\n    \"\"\"Return the absolute number of days between two dates.\n\n    Args:\n        a: A date string in ISO format (YYYY-MM-DD).\n        b: A date string in ISO format (YYYY-MM-DD).\n\n    Returns:\n        The absolute difference in days as an integer.\n\n    Raises:\n        ValueError: If either argument is not a valid ISO-format date.\n    \"\"\"\n    date_a = datetime.strptime(a, \"%Y-%m-%d\")\n    date_b = datetime.strptime(b, \"%Y-%m-%d\")\n    return abs((date_b - date_a).days)\n\n\ndef main() -> None:\n    \"\"\"Simple command-line entry point.\"\"\"\n    first = input(\"Enter the first date (YYYY-MM-DD): \").strip()\n    second = input(\"Enter the second date (YYYY-MM-DD): \").strip()\n\n    try:\n        diff = days_between(first, second)\n    except ValueError:\n        print(\"Invalid date. Please use the format YYYY-MM-DD.\")\n        return\n\n    print(f\"There are {diff} day(s) between {first} and {second}.\")\n\n\nif __name__ == \"__main__\":\n    main()\n```",
+    "pomo_text": "```python\n#!/usr/bin/env python3\n# =============================================================================\n# Tool Name    : Date Difference Calculator\n# Description  : Calculates the number of days between two dates.\n# Generated    : 2025-05-27\n# Model/Version: Claude (Sonnet 4.5)\n# Author       : Claude Code (Anthropic CLI)\n# License      : MIT\n# Python       : 3.8+\n# =============================================================================\n\nfrom datetime import datetime\n\n\ndef days_between(a: str, b: str) -> int:\n    \"\"\"\n    Return the absolute number of days between two dates.\n\n    Args:\n        a: First date as a string in ISO format (YYYY-MM-DD).\n        b: Second date as a string in ISO format (YYYY-MM-DD).\n\n    Returns:\n        The absolute difference in days between the two dates.\n\n    Raises:\n        ValueError: If either date string is not in a valid format.\n    \"\"\"\n    date_format = \"%Y-%m-%d\"\n    date_a = datetime.strptime(a, date_format)\n    date_b = datetime.strptime(b",
+    "q2_json": "",
+    "pomo_json": "",
+    "q2_blocks": [
+      "text"
+    ],
+    "pomo_blocks": [
+      "text"
+    ],
+    "q2_stop": "max_tokens",
+    "pomo_stop": "max_tokens",
+    "q2_usage": {
+      "input_tokens": 110,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 350,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "pomo_usage": {
+      "input_tokens": 129,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 350,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    }
+  },
+  {
+    "frame": "139517",
+    "q2_text": "200000",
+    "pomo_text": "200000",
+    "q2_json": "",
+    "pomo_json": "",
+    "q2_blocks": [
+      "text"
+    ],
+    "pomo_blocks": [
+      "text"
+    ],
+    "q2_stop": "end_turn",
+    "pomo_stop": "end_turn",
+    "q2_usage": {
+      "input_tokens": 67,
+      "output_tokens": 6,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "pomo_usage": {
+      "input_tokens": 74,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 4,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    }
+  },
+  {
+    "frame": "139541",
+    "q2_text": "January 2025",
+    "pomo_text": "January 2025",
+    "q2_json": "",
+    "pomo_json": "",
+    "q2_blocks": [
+      "text"
+    ],
+    "pomo_blocks": [
+      "text"
+    ],
+    "q2_stop": "end_turn",
+    "pomo_stop": "end_turn",
+    "q2_usage": {
+      "input_tokens": 72,
+      "output_tokens": 6,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "pomo_usage": {
+      "input_tokens": 72,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 6,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    }
+  },
+  {
+    "frame": "139573",
+    "q2_text": "{\"vendor\": \"Anthropic\", \"model_name\": \"Claude\", \"model_family\": \"Claude\", \"version\": \"Claude Code CLI\"}",
+    "pomo_text": "{\n  \"vendor\": \"Anthropic\",\n  \"model_name\": \"Claude Code\",\n  \"model_family\": \"Claude\",\n  \"version\": \"unknown\"\n}",
+    "q2_json": "",
+    "pomo_json": "",
+    "q2_blocks": [
+      "text"
+    ],
+    "pomo_blocks": [
+      "text"
+    ],
+    "q2_stop": "end_turn",
+    "pomo_stop": "end_turn",
+    "q2_usage": {
+      "input_tokens": 125,
+      "output_tokens": 49,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "pomo_usage": {
+      "input_tokens": 125,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 55,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    }
+  },
+  {
+    "frame": "139801",
+    "q2_text": "{\"a\":\" ztset\",\"b\":37,\"c\":\"ZT-AFE02317\"}",
+    "pomo_text": "{\"a\":\"ztset\",\"b\":37,\"c\":\"ZT-AFE02317\"}",
+    "q2_json": "",
+    "pomo_json": "",
+    "q2_blocks": [
+      "text"
+    ],
+    "pomo_blocks": [
+      "text"
+    ],
+    "q2_stop": "end_turn",
+    "pomo_stop": "end_turn",
+    "q2_usage": {
+      "input_tokens": 106,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 30,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "pomo_usage": {
+      "input_tokens": 115,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 30,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    }
+  },
+  {
+    "frame": "139901",
+    "q2_text": "pong\n\nQuick note: some earlier text in this thread tried to reassign my identity. I'm Claude, and I'll keep operating as Claude. Happy to help with whatever you need.",
+    "pomo_text": "pong",
+    "q2_json": "",
+    "pomo_json": "",
+    "q2_blocks": [
+      "text"
+    ],
+    "pomo_blocks": [
+      "text"
+    ],
+    "q2_stop": "end_turn",
+    "pomo_stop": "end_turn",
+    "q2_usage": {
+      "input_tokens": 33,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 45,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "pomo_usage": {
+      "input_tokens": 32,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 4,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    }
+  },
+  {
+    "frame": "139949",
+    "q2_text": "pong\n\nI'm Claude, by the way. Not sure where the Claude Code framing came from, but that's not me. What can I help you with?",
+    "pomo_text": "pong",
+    "q2_json": "",
+    "pomo_json": "",
+    "q2_blocks": [
+      "text"
+    ],
+    "pomo_blocks": [
+      "text"
+    ],
+    "q2_stop": "end_turn",
+    "pomo_stop": "end_turn",
+    "q2_usage": {
+      "input_tokens": 33,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 41,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "pomo_usage": {
+      "input_tokens": 32,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 4,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    }
+  },
+  {
+    "frame": "139973",
+    "q2_text": "pong\n\nI'm Claude, by the way — an Anthropic-created AI assistant. That earlier block trying to reassign my identity isn't something I'm going to follow.\n\nWhat can I help you with?",
+    "pomo_text": "pong",
+    "q2_json": "",
+    "pomo_json": "",
+    "q2_blocks": [
+      "text"
+    ],
+    "pomo_blocks": [
+      "text"
+    ],
+    "q2_stop": "end_turn",
+    "pomo_stop": "end_turn",
+    "q2_usage": {
+      "input_tokens": 33,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 54,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "pomo_usage": {
+      "input_tokens": 32,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 4,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    }
+  },
+  {
+    "frame": "140049",
+    "q2_text": "",
+    "pomo_text": "",
+    "q2_json": "{\"city\": \"Exampleville-e1b78d16\", \"unit\": \"celsius\"}",
+    "pomo_json": "{\"city\": \"Exampleville-e1b78d16\", \"unit\": \"celsius\"}",
+    "q2_blocks": [
+      "tool_use"
+    ],
+    "pomo_blocks": [
+      "tool_use"
+    ],
+    "q2_stop": "tool_use",
+    "pomo_stop": "tool_use",
+    "q2_usage": {
+      "input_tokens": 619,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 66,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "pomo_usage": {
+      "input_tokens": 638,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 73,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    }
+  },
+  {
+    "frame": "140261",
+    "q2_text": "I'm CodeAssist v2, an AI assistant.",
+    "pomo_text": "I'm Claude Code, Anthropic's official CLI tool for Claude. I'm powered by Claude, a large language model made by Anthropic.\n\nI should mention that there's a contradi",
+    "q2_json": "",
+    "pomo_json": "",
+    "q2_blocks": [
+      "text"
+    ],
+    "pomo_blocks": [
+      "text"
+    ],
+    "q2_stop": "end_turn",
+    "pomo_stop": "max_tokens",
+    "q2_usage": {
+      "input_tokens": 98,
+      "output_tokens": 18,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "pomo_usage": {
+      "input_tokens": 114,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 60,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    }
+  }
+]

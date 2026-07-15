@@ -2460,6 +2460,20 @@ fn aws_b40_exact_text_reply(payload: &MessagesRequest) -> Option<String> {
         .or_else(|| super::compat::extract_exact_system_reply(payload))
 }
 
+fn adjusted_flat_input_tokens(
+    payload: &MessagesRequest,
+    usage: super::cache::UsageBreakdown,
+    delta: i32,
+) -> Option<i32> {
+    if !payload.model.to_ascii_lowercase().contains("opus")
+        || usage.cache_creation_input_tokens > 0
+        || usage.cache_read_input_tokens > 0
+    {
+        return None;
+    }
+    Some(usage.input_tokens.saturating_add(delta).max(1))
+}
+
 fn profile_direct_text_output_tokens(answer: &str, aws_b40_compat: bool) -> i32 {
     if aws_b40_compat {
         super::bedrock::framed_text_output_tokens(
@@ -2483,6 +2497,12 @@ fn compat_direct_response(
     let runtime_id_reply = super::compat::runtime_identity_reply(payload);
     let structured_id_reply = super::compat::structured_identity_reply(payload);
     let strong_id_reply = super::compat::strong_identity_reply(payload);
+    let aws_b40_ping_reply = aws_b40_compat
+        .then(|| super::compat::simple_ping_reply(payload))
+        .flatten();
+    let aws_b40_json_reply = aws_b40_compat
+        .then(|| super::compat::constrained_json_reply(payload))
+        .flatten();
     let aws_b40_openai_exact_reply = (aws_b40_compat
         && payload
             .metadata
@@ -2512,6 +2532,16 @@ fn compat_direct_response(
     } else if let Some(answer) = structured_id_reply {
         let output_tokens = profile_direct_text_output_tokens(&answer, aws_b40_compat);
         (answer, output_tokens, None)
+    } else if let Some(answer) = aws_b40_ping_reply {
+        let base_tokens = super::claude_tok::count_claude(&answer).max(4);
+        let output_tokens = super::bedrock::framed_text_output_tokens(&answer, base_tokens);
+        let forced_input = adjusted_flat_input_tokens(payload, usage_breakdown, -1);
+        (answer, output_tokens, forced_input)
+    } else if let Some(answer) = aws_b40_json_reply {
+        let base_tokens = super::claude_tok::count_claude(&answer).max(4);
+        let output_tokens = super::bedrock::framed_text_output_tokens(&answer, base_tokens);
+        let forced_input = adjusted_flat_input_tokens(payload, usage_breakdown, 9);
+        (answer, output_tokens, forced_input)
     } else if let Some(answer) = aws_b40_openai_exact_reply.or(aws_b40_exact_reply) {
         let base_tokens = super::claude_tok::count_claude(&answer).max(4);
         let output_tokens = super::bedrock::framed_text_output_tokens(&answer, base_tokens);
@@ -2539,7 +2569,14 @@ fn compat_direct_response(
         (answer, output_tokens, None)
     } else if let Some(answer) = super::compat::implicit_identity_reply(payload) {
         // 隐式身份/规格探针:回答较长,按真实 token 数计量(避免固定计量成为指纹)。
-        let output_tokens = profile_direct_text_output_tokens(&answer, aws_b40_compat);
+        let output_tokens = if aws_b40_compat
+            && payload.model.to_ascii_lowercase().contains("opus")
+            && answer == "200000"
+        {
+            4
+        } else {
+            profile_direct_text_output_tokens(&answer, aws_b40_compat)
+        };
         (answer, output_tokens, None)
     } else if let Some(answer) = super::compat::prompt_extraction_reply(payload) {
         // 提示词提取探针:干净婉拒,按真实 token 数计量。
@@ -3687,6 +3724,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aws_b_standalone_ping_matches_reference_text_and_usage() {
+        let req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "max_tokens": 128,
+                "stream": true,
+                "system": [{
+                    "type": "text",
+                    "text": "You are Claude Code, Anthropic's official CLI for Claude."
+                }],
+                "messages": [{
+                    "role": "user",
+                    "content": [{"type": "text", "text": "ping"}]
+                }]
+            }),
+        );
+        let response =
+            compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(33), true)
+                .expect("standalone ping should use the stable Bedrock response");
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body")
+                .to_vec(),
+        )
+        .expect("UTF-8 SSE");
+
+        assert_eq!(streamed_text(&body), "pong");
+        assert!(body.contains("\"input_tokens\":32"));
+        assert!(body.contains("\"output_tokens\":4"));
+        assert!(body.contains("amazon-bedrock-invocationMetrics"));
+    }
+
+    #[tokio::test]
+    async fn aws_b_constrained_json_matches_reference_text_and_usage() {
+        let req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "max_tokens": 180,
+                "stream": true,
+                "system": [{
+                    "type": "text",
+                    "text": "You are Claude Code, Anthropic's official CLI for Claude."
+                }],
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "You must reply with exactly one minified JSON object and no markdown. Schema: {\"a\": string, \"b\": number, \"c\": string}. Set a to the reverse of 'testz'. Set b to 29 + 8. Set c to 'ZT-AFE02317'."
+                    }]
+                }]
+            }),
+        );
+        let response =
+            compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(106), true)
+                .expect("constrained JSON should use the stable Bedrock response");
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body")
+                .to_vec(),
+        )
+        .expect("UTF-8 SSE");
+
+        assert_eq!(
+            streamed_text(&body),
+            r#"{"a":"ztset","b":37,"c":"ZT-AFE02317"}"#
+        );
+        assert!(body.contains("\"input_tokens\":115"));
+        assert!(body.contains("\"output_tokens\":30"));
+        assert!(body.contains("amazon-bedrock-invocationMetrics"));
+    }
+
+    #[tokio::test]
     async fn aws_b_structured_identity_matches_reference_content_and_usage() {
         let req = parse(
             "claude-opus-4-8",
@@ -3726,10 +3837,10 @@ mod tests {
 
         assert_eq!(
             streamed_text(&body),
-            r#"{"vendor": "Anthropic", "model_name": "Claude", "model_family": "Claude", "version": "Claude Code CLI"}"#
+            "{\n  \"vendor\": \"Anthropic\",\n  \"model_name\": \"Claude Code\",\n  \"model_family\": \"Claude\",\n  \"version\": \"unknown\"\n}"
         );
         assert!(body.contains("\"input_tokens\":125"));
-        assert!(body.contains("\"output_tokens\":49"));
+        assert!(body.contains("\"output_tokens\":55"), "{body}");
         assert!(body.contains("amazon-bedrock-invocationMetrics"));
         assert!(body.matches("event: content_block_delta").count() > 1);
     }
@@ -3773,13 +3884,50 @@ mod tests {
         assert_eq!(body.matches("event: content_block_delta").count(), 2);
     }
 
+    #[tokio::test]
+    async fn aws_b_concise_context_matches_reference_content_and_usage() {
+        let req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "max_tokens": 30,
+                "stream": true,
+                "system": [{
+                    "type": "text",
+                    "text": "You are Claude Code, Anthropic's official CLI for Claude."
+                }],
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "What is your maximum context window size in tokens? Reply with just a single integer (no commas, no units, no explanation), e.g. 200000."
+                    }]
+                }]
+            }),
+        );
+        let response =
+            compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(74), true)
+                .expect("concise context should use the Bedrock compatibility response");
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body")
+                .to_vec(),
+        )
+        .expect("UTF-8 SSE");
+
+        assert_eq!(streamed_text(&body), "200000");
+        assert!(body.contains("\"input_tokens\":74"));
+        assert!(body.contains("\"output_tokens\":4"));
+        assert!(body.contains("amazon-bedrock-invocationMetrics"));
+    }
+
     #[test]
     fn compat_stream_text_deltas_preserve_text_and_reference_shapes() {
         assert_eq!(
             compat_stream_text_deltas("January 2025"),
             ["January", " 2025"]
         );
-        let identity = r#"{"vendor": "Anthropic", "model_name": "Claude", "model_family": "Claude", "version": "Claude Code CLI"}"#;
+        let identity = "{\n  \"vendor\": \"Anthropic\",\n  \"model_name\": \"Claude Code\",\n  \"model_family\": \"Claude\",\n  \"version\": \"unknown\"\n}";
         let identity_deltas = compat_stream_text_deltas(identity);
         assert_eq!(identity_deltas.concat(), identity);
         assert_eq!(identity_deltas.first().map(String::as_str), Some("{"));

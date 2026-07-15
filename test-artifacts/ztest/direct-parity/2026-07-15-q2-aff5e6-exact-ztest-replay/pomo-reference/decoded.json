@@ -1,0 +1,514 @@
+[
+  {
+    "frame": "139489",
+    "id": "msg_bdrk_gcnz7cryg37fnhwoicugq7qgtrhfthmo7uaw6cvw2qh25zpbhcjq",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "text": "```python\n#!/usr/bin/env python3\n# =============================================================================\n# Tool Name    : Date Difference Calculator\n# Description  : Calculates the number of days between two dates.\n# Generated    : 2025-05-27\n# Model/Version: Claude (Sonnet 4.5)\n# Author       : Claude Code (Anthropic CLI)\n# License      : MIT\n# Python       : 3.8+\n# =============================================================================\n\nfrom datetime import datetime\n\n\ndef days_between(a: str, b: str) -> int:\n    \"\"\"\n    Return the absolute number of days between two dates.\n\n    Args:\n        a: First date as a string in ISO format (YYYY-MM-DD).\n        b: Second date as a string in ISO format (YYYY-MM-DD).\n\n    Returns:\n        The absolute difference in days between the two dates.\n\n    Raises:\n        ValueError: If either date string is not in a valid format.\n    \"\"\"\n    date_format = \"%Y-%m-%d\"\n    date_a = datetime.strptime(a, date_format)\n    date_b = datetime.strptime(b",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "max_tokens",
+    "start_usage": {
+      "input_tokens": 129,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 8,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 129,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 350,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": null,
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139517",
+    "id": "msg_bdrk_4uhxkfvhawqvlfrfmwksm5aaiip7c3ekb5isrx43bjyhax74ygjq",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "text": "200000",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 74,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 74,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 4,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": null,
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139541",
+    "id": "msg_bdrk_fl2zqjtojcwfvnqwjxlctp3u7huzhrhvwbmtdl2lrqvgxjq4oqsq",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "text": "January 2025",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 72,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 72,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 6,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": null,
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139573",
+    "id": "msg_bdrk_kfevxs7exlnec4e2ebyxzynfkarspnofwdlukcf6ntntjbj2sx5a",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "text": "{\n  \"vendor\": \"Anthropic\",\n  \"model_name\": \"Claude Code\",\n  \"model_family\": \"Claude\",\n  \"version\": \"unknown\"\n}",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 125,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 8,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 125,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 55,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": null,
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139801",
+    "id": "msg_bdrk_3j5q4gts2xylwgichbl2dojin4shgnzxozuw6c2l6toa3z7ghp4q",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "text": "{\"a\":\"ztset\",\"b\":37,\"c\":\"ZT-AFE02317\"}",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 115,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 4,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 115,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 30,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": null,
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139901",
+    "id": "msg_bdrk_ddtpfkipt6nlvcbealfuoqfadxt4lsf7w56sp2eyq5p2pwbwi5hq",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "text": "pong",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 32,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 32,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 4,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": null,
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139949",
+    "id": "msg_bdrk_lnqpckvwe55xfhrw4alayxhgrxk2lxhsffb4hswkz4tapcj7itta",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "text": "pong",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 32,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 32,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 4,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": null,
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139973",
+    "id": "msg_bdrk_fju6wup74cu6jqk323cepf56gx5pvues6id7ds5v2sn6skokkdka",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "text": "pong",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 32,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 32,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 4,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": null,
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "140049",
+    "id": "msg_bdrk_5kyl3hxqso36vz745zeapldgoqmo4lpglscq7avvejkehwx2cvpa",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "tool_use"
+    ],
+    "text": "",
+    "partial_json": "{\"city\": \"Exampleville-e1b78d16\", \"unit\": \"celsius\"}",
+    "tool_blocks": [
+      {
+        "type": "tool_use",
+        "id": "toolu_bdrk_01VykurAXENydS5adi9dL7Cb",
+        "name": "get_weather",
+        "input": {}
+      }
+    ],
+    "stop_reason": "tool_use",
+    "start_usage": {
+      "input_tokens": 638,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 8,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 638,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 73,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": null,
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "140261",
+    "id": "msg_bdrk_75poij2uw7gwy5j7cuh75qw6qkhfumvuso34s4kzqxxendhlqmfq",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "text": "I'm Claude Code, Anthropic's official CLI tool for Claude. I'm powered by Claude, a large language model made by Anthropic.\n\nI should mention that there's a contradi",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "max_tokens",
+    "start_usage": {
+      "input_tokens": 114,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 4,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 114,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 60,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": null,
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  }
+]

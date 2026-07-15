@@ -1,0 +1,28 @@
+event: message_start
+data: {"type":"message_start","message":{"model":"claude-opus-4-8","id":"msg_01bdrkP8epB4gatlqOya4Bu2","type":"message","role":"assistant","content":[],"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":110,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":1,"service_tier":"standard"}}}
+
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"```python\n#!/usr/bin/env python3\n# -----------------------------------------------------------------------------\n# Tool:           Date Difference Calculator\n# Generated date: 2025-06-13\n# Model/version:  Claude (Anthropic)\n# Author:         Your Name <you@example.com>\n# License:        MIT\n# Python version: 3.8+\n# -----------------------------------------------------------------------------\n\"\"\"Calculate the number of days between two dates given as ISO strings.\"\"\"\n\nfrom datetime import datetime\n\n\ndef days_between(a: str, b: str) -> int:\n    \"\"\"Return the absolute number of days between two dates.\n\n    Args:\n        a: A date string in ISO format (YYYY-MM-DD).\n        b: A date string in ISO format (YYYY-MM-DD).\n\n    Returns:\n        The absolute difference in days between the two dates.\n\n    Raises:\n        ValueError: If either string is not a valid ISO-format date.\n    \"\"\"\n    date_a = datetime.strptime(a, \"%Y-%m-%d\")\n    date_b = datetime.strptime(b, \"%Y-%m-%d\")\n    return abs((date_b - date_a).days)\n\n\nif __name__ == \"__main__\":\n    import sys\n\n    if len(sys.argv) == 3:\n        try:\n            print(days_between(sys.argv[1], sys.argv[2]))\n        except ValueError as exc:\n            print(f\"Error: {exc}\", file=sys.stderr)\n            sys.exit(1)\n"}}
+
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"    else:\n        # Simple demonstration when run without arguments.\n        print(days_between(\"2024-01-01\", \"2024-12-31\"))"}}
+
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null,"stop_details":null},"usage":{"input_tokens":110,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":350,"output_tokens_details":{"thinking_tokens":0}}}
+
+
+event: message_stop
+data: {"type":"message_stop","amazon-bedrock-invocationMetrics":{"inputTokenCount":110,"outputTokenCount":350,"invocationLatency":11882,"firstByteLatency":8485}}
+
+
