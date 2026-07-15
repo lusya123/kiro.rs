@@ -1,0 +1,18 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 8,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Use the helper."
+    },
+    {
+      "role": "assistant",
+      "content": "Done."
+    },
+    {
+      "role": "user",
+      "content": "Continue."
+    }
+  ]
+}

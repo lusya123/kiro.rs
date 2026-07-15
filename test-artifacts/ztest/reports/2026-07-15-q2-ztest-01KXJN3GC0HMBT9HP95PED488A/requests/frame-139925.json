@@ -1,0 +1,25 @@
+{
+  "max_tokens": 128,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "ping",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "metadata": {
+    "user_id": "user_dd8ed7828955ae33f9e1e90a49902bfe44b60b6c647a0489450bf49b0eb0eeb3_account__session_fb402a76-d711-4130-8821-9ed9402f1fef"
+  },
+  "model": "claude-opus-4-8",
+  "stream": true,
+  "system": [
+    {
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "type": "text"
+    }
+  ]
+}

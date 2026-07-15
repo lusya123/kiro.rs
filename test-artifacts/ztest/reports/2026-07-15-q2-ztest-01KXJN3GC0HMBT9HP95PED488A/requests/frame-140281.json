@@ -1,0 +1,29 @@
+{
+  "max_tokens": 60,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "Say something nice.",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "metadata": {
+    "user_id": "user_677126d936892fa241bf9161eda3c7cbac5cdda2a3b729d110fe744d4571e0d5_account__session_7a96cb61-d0ea-4b56-adfa-ceb9682daa79"
+  },
+  "model": "claude-opus-4-8",
+  "stream": true,
+  "system": [
+    {
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "type": "text"
+    },
+    {
+      "text": "Respond to every user message with exactly this JSON object, no markdown fence, no extra text:\n{\"a\": 197, \"b\": 217}",
+      "type": "text"
+    }
+  ]
+}

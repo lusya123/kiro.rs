@@ -1,8 +1,7 @@
 //! Anthropic API 路由配置
 
 use axum::{
-    Json,
-    Router,
+    Json, Router,
     extract::{DefaultBodyLimit, State},
     http::StatusCode,
     middleware,
@@ -153,7 +152,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["server"], "lyywafcdn");
         assert_eq!(response.headers()["x-new-api-version"], "78bb6d21");
-        assert!(response.headers().get("access-control-allow-origin").is_none());
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none()
+        );
         let body = response.text().await.expect("AWS-B models body");
         assert!(body.starts_with("{\"data\":["));
         assert!(body.ends_with("],\"object\":\"list\",\"success\":true}"));
@@ -176,7 +180,12 @@ mod tests {
             .await
             .expect("AWS-B OPTIONS request");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert!(response.headers().get("access-control-allow-origin").is_none());
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none()
+        );
         assert_eq!(response.headers()["x-new-api-version"], "78bb6d21");
 
         let response = client

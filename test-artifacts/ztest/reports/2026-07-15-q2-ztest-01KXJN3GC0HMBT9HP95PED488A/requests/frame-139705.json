@@ -1,0 +1,33 @@
+{
+  "max_tokens": 30,
+  "messages": [
+    {
+      "content": [
+        {
+          "source": {
+            "data": "iVBORw0KGgoAAAANSUhEUgAAAMAAAADACAIAAADdvvtQAAACP0lEQVR4nOzdsW2FMBhGURK9cdkB2IGBU9hlRJFb4EjnNLTIuvrb73Oe5wZ/9f32D/C/fcbnvu+3/2Ta933btuM43v6R6bou7/Or8TIuEImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkXzZC6NwgUjmXtgK+1ODfa5n67zPeBkXiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASOyFkbhAJHMvbIX9qcE+17N13me8jAtEIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAk9sJIXCCSuRe2wv7UYJ/r2TrvM17GBSIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIrPWQuEAkPwEAAP//PHg5B209GroAAAAASUVORK5CYII=",
+            "media_type": "image/png",
+            "type": "base64"
+          },
+          "type": "image"
+        },
+        {
+          "text": "This image shows an N×N chessboard pattern with alternating dark and light cells, separated by gray grid lines. Count one side of the grid (e.g. for an 8×8 board the answer is 8). Reply with one single digit only, no other text.",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "metadata": {
+    "user_id": "user_90978cc72c8f3ed7075f73d731edff7a9c7fdcfe58b1a53cc17e73f7f7fa2fa4_account__session_30df9afa-3708-4028-815b-ba91df727a34"
+  },
+  "model": "claude-opus-4-8",
+  "stream": true,
+  "system": [
+    {
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "type": "text"
+    }
+  ]
+}

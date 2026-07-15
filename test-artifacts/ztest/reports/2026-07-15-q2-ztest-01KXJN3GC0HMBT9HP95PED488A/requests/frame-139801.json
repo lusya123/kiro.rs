@@ -1,0 +1,25 @@
+{
+  "max_tokens": 180,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "You must reply with exactly one minified JSON object and no markdown. Schema: {\"a\": string, \"b\": number, \"c\": string}. Set a to the reverse of 'testz'. Set b to 29 + 8. Set c to 'ZT-AFE02317'.",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "metadata": {
+    "user_id": "user_c2f9e2dd32b777d39b2b6e3395da15b87477ca0820b7b9a91895c69560b0c483_account__session_3917a31c-202e-4d16-aa57-c5cc2ceebd32"
+  },
+  "model": "claude-opus-4-8",
+  "stream": true,
+  "system": [
+    {
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "type": "text"
+    }
+  ]
+}

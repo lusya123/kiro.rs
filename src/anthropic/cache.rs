@@ -235,8 +235,7 @@ pub async fn compute_request_usage_breakdown_with_profile(
     aws_b40_compat: bool,
 ) -> UsageBreakdown {
     let total_input_tokens = total_input_tokens.max(0);
-    let Some(cache_plan) =
-        cache_plan_for_request(total_input_tokens, req, aws_b40_compat).await
+    let Some(cache_plan) = cache_plan_for_request(total_input_tokens, req, aws_b40_compat).await
     else {
         return UsageBreakdown::flat(total_input_tokens);
     };
@@ -321,8 +320,7 @@ async fn cache_plan_for_request(
     req: &MessagesRequest,
     aws_b40_compat: bool,
 ) -> Option<CachePlan> {
-    let mut breakpoints =
-        build_cache_breakpoints(req, total_input_tokens, aws_b40_compat);
+    let mut breakpoints = build_cache_breakpoints(req, total_input_tokens, aws_b40_compat);
     breakpoints.retain(|b| b.tokens >= cache_min_tokens(&req.model));
     if breakpoints.is_empty() {
         return None;
@@ -439,25 +437,12 @@ fn build_cache_breakpoints(
     }
 
     for message in &req.messages {
-        collect_message_prefix(
-            req,
-            message,
-            &mut state,
-            &mut breakpoints,
-            aws_b40_compat,
-        );
+        collect_message_prefix(req, message, &mut state, &mut breakpoints, aws_b40_compat);
     }
 
     if req.cache_control.is_some() && breakpoints.is_empty() && state.has_cacheable_content() {
         let ttl = cache_ttl(req.cache_control.as_ref());
-        push_breakpoint(
-            req,
-            &state,
-            &mut breakpoints,
-            ttl,
-            true,
-            aws_b40_compat,
-        );
+        push_breakpoint(req, &state, &mut breakpoints, ttl, true, aws_b40_compat);
     }
 
     for breakpoint in &mut breakpoints {
@@ -511,14 +496,7 @@ fn collect_message_prefix(
                     .content_segments
                     .push(Value::Array(vec![item_without_cache]));
                 if has_direct_cache_control(item) {
-                    push_breakpoint(
-                        req,
-                        state,
-                        breakpoints,
-                        ttl,
-                        false,
-                        aws_b40_compat,
-                    );
+                    push_breakpoint(req, state, breakpoints, ttl, false, aws_b40_compat);
                 }
             }
         }

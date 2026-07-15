@@ -1,0 +1,10 @@
+HTTP/2 502 
+server: nginx
+date: Wed, 15 Jul 2026 10:20:52 GMT
+content-type: application/json
+content-length: 430
+x-new-api-version: 78bb6d21
+x-oneapi-request-id: 20260715102052855113313wajPHP9g
+x-accel-buffering: no
+strict-transport-security: max-age=31536000
+

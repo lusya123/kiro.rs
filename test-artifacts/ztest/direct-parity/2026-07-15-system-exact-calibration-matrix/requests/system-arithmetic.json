@@ -1,0 +1,11 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 16,
+  "system": "You are a concise arithmetic assistant.",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is 2 + 2?"
+    }
+  ]
+}

@@ -1,0 +1,114 @@
+
+===================================================================
+Follow: tcp,ascii
+Filter: tcp.stream eq 8069
+Node 0: 172.17.0.1:39856
+Node 1: 172.17.0.2:8990
+1799
+POST /v1/messages HTTP/1.1
+Host: q2.quietfox.sbs
+X-Real-IP: 45.192.104.25
+X-Forwarded-For: 45.192.104.25
+X-Forwarded-Proto: https
+Content-Length: 891
+anthropic-beta: claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,effort-2025-11-24
+x-stainless-runtime: node
+x-stainless-timeout: 600
+content-type: application/json
+x-stainless-package-version: 0.81.0
+authorization: [REDACTED]
+x-claude-code-session-id: d8cfd3c1-6b18-4de9-90b1-3f7163992ab2
+x-stainless-runtime-version: v22.19.0
+x-stainless-lang: js
+accept-encoding: gzip, deflate
+x-stainless-os: Windows
+x-stainless-arch: x64
+x-stainless-retry-count: 0
+x-app: cli
+accept: application/json
+user-agent: claude-cli/2.1.98 (external, cli)
+sec-fetch-mode: cors
+anthropic-version: 2023-06-01
+accept-language: *
+anthropic-dangerous-direct-browser-access: true
+
+{"max_tokens":256,"messages":[{"content":[{"text":"You MUST call the get_weather tool to look up the current weather in Exampleville-e1b78d16. Use unit=celsius. Do NOT reply in plain text - only a tool call counts as a valid answer.","type":"text"}],"role":"user"}],"metadata":{"user_id":"user_a5b026018638391e652323c0629c901147389385c0da3be7fa8da5eb14208420_account__session_0ff30dba-5889-487c-bc27-96f24043ff71"},"model":"claude-opus-4-8","stream":true,"system":[{"text":"You are Claude Code, Anthropic's official CLI for Claude.","type":"text"}],"tool_choice":{"type":"any"},"tools":[{"description":"Get the current weather for a given city.","input_schema":{"properties":{"city":{"description":"The city name.","type":"string"},"unit":{"description":"Temperature unit.","enum":["celsius","fahrenheit"],"type":"string"}},"required":["city","unit"],"type":"object"},"name":"get_weather"}]}
+	826
+HTTP/1.1 200 OK
+content-type: text/event-stream
+cache-control: no-cache
+connection: keep-alive
+x-new-api-version: 78bb6d21
+x-oneapi-request-id: 20260715102950207761330h843gmy9
+x-accel-buffering: no
+strict-transport-security: max-age=31536000
+server: lyywafcdn
+transfer-encoding: chunked
+date: Wed, 15 Jul 2026 10:29:50 GMT
+
+1E3
+event: message_start
+data: {"type":"message_start","message":{"model":"claude-opus-4-8","id":"msg_bdrk_hlyykozkxx3g8vl31faasceqnkw4e6dox20e7lgf7ft1d19roiei","type":"message","role":"assistant","content":[],"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":619,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":16,"service_tier":"standard"}}}
+
+
+
+
+	329
+BB
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_bdrk_011zetJjvX64Fgq4WvJzxHpV","name":"get_weather","input":{}}}
+
+
+
+82
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}
+
+
+
+
+	283
+85
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\""}}
+
+
+
+8A
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"city\": "}}
+
+
+
+
+	265
+B3
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"Exampleville-e1b78d16\", \"unit\": \"celsius\"}"}}
+
+
+
+4A
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+
+
+
+	484
+11C
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null,"stop_details":null},"usage":{"input_tokens":619,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":66,"output_tokens_details":{"thinking_tokens":0}}}
+
+
+
+B6
+event: message_stop
+data: {"type":"message_stop","amazon-bedrock-invocationMetrics":{"inputTokenCount":619,"outputTokenCount":66,"invocationLatency":4229,"firstByteLatency":4183}}
+
+
+
+0
+
+
+===================================================================

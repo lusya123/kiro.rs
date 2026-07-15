@@ -518,7 +518,9 @@ pub(crate) fn extract_pdf_text(base64_data: &str) -> Option<String> {
             let (s, next) = read_pdf_string(&bytes, i);
             // 前瞻窗口内出现 Tj/TJ 才当作"文本显示算子"的字符串(避免抓到结构里的普通括号串)。
             let end = (next + 12).min(n);
-            let follows_show = bytes[next..end].windows(2).any(|w| w == b"Tj" || w == b"TJ");
+            let follows_show = bytes[next..end]
+                .windows(2)
+                .any(|w| w == b"Tj" || w == b"TJ");
             if follows_show {
                 let t = s.trim();
                 if !t.is_empty() {
@@ -1805,7 +1807,12 @@ mod tests {
         let Some(Message::User(first)) = result.conversation_state.history.first() else {
             panic!("identity override should be injected");
         };
-        assert!(first.user_input_message.content.contains("Never call yourself Kiro"));
+        assert!(
+            first
+                .user_input_message
+                .content
+                .contains("Never call yourself Kiro")
+        );
         // 用户的真实编码请求原样进入 current_message，不被覆盖文本污染。
         let content = &result
             .conversation_state

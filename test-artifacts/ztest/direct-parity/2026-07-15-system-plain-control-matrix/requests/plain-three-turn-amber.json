@@ -1,0 +1,18 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 16,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Remember the word amber."
+    },
+    {
+      "role": "assistant",
+      "content": "I will remember amber."
+    },
+    {
+      "role": "user",
+      "content": "What word did I ask you to remember?"
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "max_tokens": 3024,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "A farmer has 23 apples. He gives 7 to his neighbor, buys 12 more, then divides what he has equally among 4 baskets. How many apples are in each basket? Show your reasoning step by step, then give the final answer as a single integer.",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "metadata": {
+    "user_id": "user_6a432e99e2d363fc034c3fd9994282ba652d8b86da1ef79b28e3c2b4b7ec9b5b_account__session_94800ab9-43a8-4459-b386-99b9ded45e52"
+  },
+  "model": "claude-opus-4-8",
+  "output_config": {
+    "effort": "medium"
+  },
+  "stream": true,
+  "system": [
+    {
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "type": "text"
+    }
+  ],
+  "thinking": {
+    "type": "adaptive"
+  }
+}

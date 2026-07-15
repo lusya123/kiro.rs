@@ -1,0 +1,29 @@
+{
+  "max_tokens": 200,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "What is your model name, family, and version number?",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "metadata": {
+    "user_id": "user_40232ed61f6a83ffb94bc5b35447be7cd5d67ee0531caa562f5323121e5a2ff4_account__session_91b70d4d-9f57-46c3-934c-9ce33a18b0dc"
+  },
+  "model": "claude-opus-4-8",
+  "stream": true,
+  "system": [
+    {
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "type": "text"
+    },
+    {
+      "text": "You will be asked exactly one question about your identity.\nReply ONLY with a JSON object matching this schema, no other text, no markdown fences:\n{\n  \"vendor\": string,\n  \"model_name\": string,\n  \"model_family\": string,\n  \"version\": string\n}",
+      "type": "text"
+    }
+  ]
+}

@@ -1621,11 +1621,7 @@ impl StreamContext {
         &mut self,
         tool_use: &crate::kiro::model::events::ToolUseEvent,
     ) -> Vec<String> {
-        self.bedrock_tool_argument_deltas_for(
-            &tool_use.tool_use_id,
-            &tool_use.input,
-            tool_use.stop,
-        )
+        self.bedrock_tool_argument_deltas_for(&tool_use.tool_use_id, &tool_use.input, tool_use.stop)
     }
 
     fn bedrock_tool_argument_deltas_for(
@@ -1675,12 +1671,7 @@ impl StreamContext {
         let mut pending = std::mem::take(&mut self.tool_json_pending)
             .into_iter()
             .collect::<Vec<_>>();
-        pending.sort_by_key(|(id, _)| {
-            self.tool_block_indices
-                .get(id)
-                .copied()
-                .unwrap_or(i32::MAX)
-        });
+        pending.sort_by_key(|(id, _)| self.tool_block_indices.get(id).copied().unwrap_or(i32::MAX));
 
         let mut events = Vec::new();
         for (id, input) in pending {
@@ -1722,20 +1713,18 @@ impl StreamContext {
 
     fn final_usage_breakdown(&self) -> super::cache::UsageBreakdown {
         let current_input_tokens = self.current_billable_input_tokens();
-        let first_round_input_tokens = self
-            .initial_calibrated_input_tokens
-            .unwrap_or(if self.accumulated_input_tokens == 0 {
-                current_input_tokens
-            } else {
-                self.initial_input_tokens
-            });
+        let first_round_input_tokens =
+            self.initial_calibrated_input_tokens
+                .unwrap_or(if self.accumulated_input_tokens == 0 {
+                    current_input_tokens
+                } else {
+                    self.initial_input_tokens
+                });
         let initial = super::cache::reconcile_initial_input(
             self.initial_usage_breakdown,
             first_round_input_tokens,
-            self.input_context_calibration.cache_input_adjustment(
-                self.initial_input_tokens,
-                first_round_input_tokens,
-            ),
+            self.input_context_calibration
+                .cache_input_adjustment(self.initial_input_tokens, first_round_input_tokens),
         );
         super::cache::with_additional_input(
             initial,

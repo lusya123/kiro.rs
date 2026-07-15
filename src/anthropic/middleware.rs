@@ -67,10 +67,8 @@ pub async fn auth_middleware(
                     } else {
                         (StatusCode::UNAUTHORIZED, "missing token")
                     };
-                    let body = format!(
-                        "{{\"error\":\"{} (request id: {})\"}}",
-                        message, request_id
-                    );
+                    let body =
+                        format!("{{\"error\":\"{} (request id: {})\"}}", message, request_id);
                     let mut response = Response::builder()
                         .status(status)
                         .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
@@ -112,11 +110,8 @@ pub async fn aws_b40_headers_middleware(
 
     if state.aws_b40_compat && request.method() == Method::OPTIONS {
         let request_id = aws_b40_oneapi_request_id();
-        let mut response = (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "Not Found" })),
-        )
-            .into_response();
+        let mut response =
+            (StatusCode::NOT_FOUND, Json(json!({ "error": "Not Found" }))).into_response();
         apply_aws_b40_headers_with_version(response.headers_mut(), &request_id, "78bb6d21");
         return response;
     }
@@ -330,11 +325,17 @@ mod tests {
     fn aws_b_non_stream_success_id_and_headers_match_gateway_shape() {
         let request_id = aws_b40_messages_success_request_id();
         assert_eq!(request_id.len(), 39);
-        assert!(request_id[..23].chars().all(|character| character.is_ascii_digit()));
+        assert!(
+            request_id[..23]
+                .chars()
+                .all(|character| character.is_ascii_digit())
+        );
         assert_eq!(&request_id[23..31], "8268d9d6");
-        assert!(request_id[31..]
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric()));
+        assert!(
+            request_id[31..]
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric())
+        );
 
         let mut headers = header::HeaderMap::new();
         apply_aws_b40_non_stream_success_headers(&mut headers);

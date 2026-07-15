@@ -1,0 +1,53 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 8,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Call lookup once."
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_bdrk_01Calibration000000000005",
+          "name": "lookup",
+          "input": {
+            "query": "alpha"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_bdrk_01Calibration000000000005",
+          "content": "ok"
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "lookup",
+      "description": "Look up one record.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  ],
+  "tool_choice": {
+    "type": "auto"
+  }
+}

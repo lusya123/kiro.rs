@@ -1,0 +1,11 @@
+scenario	side	http_code	curl_exit	time_total	input_tokens	cache_creation_input_tokens	cache_read_input_tokens	cache_total_tokens	output_tokens
+plain-no-system-control	reference	200	0	5.174510	23	0	0	0	3
+plain-no-system-control	target	200	0	3.603783	21	0	0	0	3
+plain-system-a-repeat-8	reference	200	0	4.040879	32	0	0	0	3
+plain-system-a-repeat-8	target	200	0	3.325616	35	0	0	0	3
+plain-system-alpha-repeat-8	reference	200	0	2.903190	48	0	0	0	3
+plain-system-alpha-repeat-8	target	200	0	3.120908	35	0	0	0	3
+plain-system-continuous-x48	reference	200	0	2.126181	72	0	0	0	3
+plain-system-continuous-x48	target	200	0	3.317619	43	0	0	0	3
+plain-system-neutral-long	reference	200	0	2.356877	75	0	0	0	3
+plain-system-neutral-long	target	200	0	3.770006	62	0	0	0	3

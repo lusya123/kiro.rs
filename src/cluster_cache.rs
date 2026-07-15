@@ -15,10 +15,10 @@
 //! 每个 API 请求只做 1~4 次极小操作(EXISTS/SET EX);所有操作带短超时,超时/故障即本地回退。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
@@ -265,7 +265,10 @@ async fn try_connect(addr: &str) -> Option<redis::aio::MultiplexedConnection> {
     let url = format!("redis://{addr}/");
     let client = redis::Client::open(url).ok()?;
     let conn_fut = client.get_multiplexed_async_connection();
-    let mut conn = tokio::time::timeout(CONNECT_TIMEOUT, conn_fut).await.ok()?.ok()?;
+    let mut conn = tokio::time::timeout(CONNECT_TIMEOUT, conn_fut)
+        .await
+        .ok()?
+        .ok()?;
     let ping = redis::cmd("PING");
     tokio::time::timeout(CONNECT_TIMEOUT, ping.query_async::<String>(&mut conn))
         .await
@@ -386,7 +389,9 @@ fn handle_set(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
                 i += 1;
             }
             b"EX" if i + 1 < args.len() => {
-                ex = std::str::from_utf8(&args[i + 1]).ok().and_then(|s| s.parse().ok());
+                ex = std::str::from_utf8(&args[i + 1])
+                    .ok()
+                    .and_then(|s| s.parse().ok());
                 i += 2;
             }
             _ => i += 1,
@@ -426,7 +431,9 @@ fn handle_expire(args: &[Vec<u8>], store: &Store) -> Vec<u8> {
     if args.len() < 3 {
         return b"-ERR wrong number of arguments\r\n".to_vec();
     }
-    let secs: Option<u64> = std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok());
+    let secs: Option<u64> = std::str::from_utf8(&args[2])
+        .ok()
+        .and_then(|s| s.parse().ok());
     let mut m = store.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(entry) = m.get_mut(&args[1]) {
         entry.1 = now_expiry(secs);
@@ -613,9 +620,7 @@ mod tests {
 
         // 服务仍存活:新客户端能正常读写。
         let c = ClusterCache::shared(
-            try_connect(&addr)
-                .await
-                .expect("恶意输入后服务应仍存活"),
+            try_connect(&addr).await.expect("恶意输入后服务应仍存活"),
             "client",
         );
         let ttl = Duration::from_secs(300);

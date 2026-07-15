@@ -1,0 +1,31 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 8,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Call get_weather for Paris with unit celsius. Return only the tool call."
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_bdrk_01Calibration000000000008",
+          "name": "lookup",
+          "input": {}
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_bdrk_01Calibration000000000008",
+          "content": "ok"
+        }
+      ]
+    }
+  ]
+}

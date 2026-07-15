@@ -201,8 +201,12 @@ assert_eq tool_stop_reason "$(jq -r '.stop_reason // ""' "$OUT_DIR/responses/too
 assert_true tool_id "bedrock tool id" grep -Eq '"id":"toolu_bdrk_' "$OUT_DIR/responses/tool.json"
 assert_true stream_metrics "amazon-bedrock-invocationMetrics" grep -q 'amazon-bedrock-invocationMetrics' "$OUT_DIR/responses/exact-pong-stream.sse"
 assert_true stream_final_usage "output_tokens=4" grep -Eq '"output_tokens":4' "$OUT_DIR/responses/exact-pong-stream.sse"
-assert_eq cache_create_tokens "$(jq -r '.usage.cache_creation_input_tokens // -1' "$OUT_DIR/responses/cache-create.json")" "$(jq -r '.usage.cache_read_input_tokens // -1' "$OUT_DIR/responses/cache-read.json")"
-assert_true cache_read_nonzero "$(jq -r '.usage.cache_read_input_tokens // 0' "$OUT_DIR/responses/cache-read.json")" test "$(jq -r '.usage.cache_read_input_tokens // 0' "$OUT_DIR/responses/cache-read.json")" -gt 0
+cache_first_create="$(jq -r '.usage.cache_creation_input_tokens // 0' "$OUT_DIR/responses/cache-create.json")"
+cache_first_read="$(jq -r '.usage.cache_read_input_tokens // 0' "$OUT_DIR/responses/cache-create.json")"
+cache_second_read="$(jq -r '.usage.cache_read_input_tokens // 0' "$OUT_DIR/responses/cache-read.json")"
+cache_first_total=$((cache_first_create + cache_first_read))
+assert_eq cache_first_create_or_read_matches_second_read "$cache_first_total" "$cache_second_read"
+assert_true cache_read_nonzero "$cache_second_read" test "$cache_second_read" -gt 0
 assert_eq image_text "$(jq -r '.content[0].text // ""' "$OUT_DIR/responses/image.json")" Red
 assert_eq spatial_text "$(jq -r '.content[0].text // ""' "$OUT_DIR/responses/spatial.json")" Red
 assert_eq identity_backend "$(jq -r '.content[0].text | fromjson | .backend' "$OUT_DIR/responses/identity.json" 2>/dev/null || true)" unknown
@@ -220,3 +224,9 @@ printf 'out_dir=%s\n' "$OUT_DIR"
 column -t -s $'\t' "$RESULTS" || true
 printf '\n'
 column -t -s $'\t' "$ASSERTIONS" || true
+
+assertion_failures="$(awk -F '\t' 'NR > 1 && $2 == "FAIL" { count++ } END { print count + 0 }' "$ASSERTIONS")"
+if [[ "$assertion_failures" -gt 0 ]]; then
+  printf '\n%s assertion(s) failed\n' "$assertion_failures" >&2
+  exit 1
+fi

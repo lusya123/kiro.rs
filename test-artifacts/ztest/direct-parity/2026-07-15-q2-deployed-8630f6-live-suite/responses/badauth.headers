@@ -1,0 +1,10 @@
+HTTP/2 403 
+server: nginx
+date: Wed, 15 Jul 2026 10:19:36 GMT
+content-type: application/json; charset=utf-8
+content-length: 73
+x-new-api-version: 78bb6d21
+x-oneapi-request-id: 202607151019365974814999PFhkFNs
+x-accel-buffering: no
+strict-transport-security: max-age=31536000
+

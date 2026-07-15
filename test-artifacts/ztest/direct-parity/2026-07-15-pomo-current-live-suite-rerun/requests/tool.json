@@ -1,0 +1,40 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 256,
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Get current weather for a city.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "location": {
+            "type": "string"
+          },
+          "unit": {
+            "type": "string",
+            "enum": [
+              "celsius",
+              "fahrenheit"
+            ]
+          }
+        },
+        "required": [
+          "location",
+          "unit"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "tool_choice": {
+    "type": "tool",
+    "name": "get_weather"
+  },
+  "messages": [
+    {
+      "role": "user",
+      "content": "Call get_weather for Paris with unit celsius. Return only the tool call."
+    }
+  ]
+}

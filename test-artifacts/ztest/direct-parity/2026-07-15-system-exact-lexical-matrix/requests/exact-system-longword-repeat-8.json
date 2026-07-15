@@ -1,0 +1,11 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 16,
+  "system": "abcdefghij abcdefghij abcdefghij abcdefghij abcdefghij abcdefghij abcdefghij abcdefghij",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Reply with exactly: pong"
+    }
+  ]
+}

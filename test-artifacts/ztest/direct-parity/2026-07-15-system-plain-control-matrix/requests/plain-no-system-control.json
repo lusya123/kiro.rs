@@ -1,0 +1,10 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 16,
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is 2 + 2? Reply with only the number."
+    }
+  ]
+}

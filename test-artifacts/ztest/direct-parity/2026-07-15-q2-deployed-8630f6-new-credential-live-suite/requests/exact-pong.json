@@ -1,0 +1,10 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 32,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Reply with exactly: pong"
+    }
+  ]
+}

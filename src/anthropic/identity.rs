@@ -294,7 +294,10 @@ const CONTEXTUAL_IDENTITY_REPLACEMENTS: &[(&str, &str)] = &[
         "an amazon codewhisperer assistant",
         "an AI assistant created by Anthropic",
     ),
-    ("a codewhisperer assistant", "an AI assistant created by Anthropic"),
+    (
+        "a codewhisperer assistant",
+        "an AI assistant created by Anthropic",
+    ),
     ("codewhisperer assistant", "AI assistant"),
     ("https://kiro.dev", "https://www.anthropic.com"),
     ("http://kiro.dev", "https://www.anthropic.com"),
@@ -623,10 +626,7 @@ pub fn sanitize_identity_text_for_request_with_options(
 /// 没有显式自指标记(如裸句 “I should respond as Kiro”,不含 “I am/我是” 之类 marker),裸品牌
 /// token 也会被改写为 Claude/Anthropic。代价是极少数“思考里客观提到 Kiro 产品”的场景也会被
 /// 改写;但思考通道没有正常讨论 Kiro 的诉求,身份泄漏的风险远大于此,取从严。
-pub fn sanitize_thinking_identity_text(
-    text: &str,
-    options: IdentitySanitizationOptions,
-) -> String {
+pub fn sanitize_thinking_identity_text(text: &str, options: IdentitySanitizationOptions) -> String {
     if text.is_empty() {
         return String::new();
     }
@@ -680,7 +680,9 @@ fn collapse_identity_replacement_duplicates(text: &str) -> String {
             }
             let dup = wstart > i
                 && s[wstart..j].eq_ignore_ascii_case(word)
-                && COLLAPSE_DUP_WORDS.iter().any(|w| word.eq_ignore_ascii_case(w));
+                && COLLAPSE_DUP_WORDS
+                    .iter()
+                    .any(|w| word.eq_ignore_ascii_case(w));
             out.push_str(word);
             if dup {
                 // 删掉分隔与第二个同词(保留第一个及其后续边界)。
@@ -1588,8 +1590,17 @@ fn replace_word_cs(text: &str, needle: &str, repl: &str) -> String {
     let mut i = 0;
     while i < tb.len() {
         if i + nlen <= tb.len() && &tb[i..i + nlen] == needle.as_bytes() {
-            let before_ok = i == 0 || text[..i].chars().next_back().map(|c| !word(c)).unwrap_or(true);
-            let after_ok = text[i + nlen..].chars().next().map(|c| !word(c)).unwrap_or(true);
+            let before_ok = i == 0
+                || text[..i]
+                    .chars()
+                    .next_back()
+                    .map(|c| !word(c))
+                    .unwrap_or(true);
+            let after_ok = text[i + nlen..]
+                .chars()
+                .next()
+                .map(|c| !word(c))
+                .unwrap_or(true);
             if before_ok && after_ok {
                 out.push_str(repl);
                 i += nlen;
@@ -3271,7 +3282,8 @@ mod tests {
     fn thinking_sanitizer_preserves_ordinary_reasoning() {
         let opts = IdentitySanitizationOptions::strict(false);
         // 与身份无关的正常思考不应被破坏。
-        let normal = "Let me compute 17 - 8 = 9, then add 3 to get 12. I'll double-check the arithmetic.";
+        let normal =
+            "Let me compute 17 - 8 = 9, then add 3 to get 12. I'll double-check the arithmetic.";
         assert_eq!(sanitize_thinking_identity_text(normal, opts), normal);
         // 空思考(opus 经 Kiro 常见)返回空。
         assert_eq!(sanitize_thinking_identity_text("", opts), "");

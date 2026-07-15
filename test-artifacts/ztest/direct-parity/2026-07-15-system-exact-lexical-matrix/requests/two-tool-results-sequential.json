@@ -1,0 +1,56 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 8,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Call the alpha lookup and then the beta lookup."
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_bdrk_01CalibrationSequential000001",
+          "name": "lookup_alpha",
+          "input": {
+            "query": "alpha"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_bdrk_01CalibrationSequential000001",
+          "content": "one"
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_bdrk_01CalibrationSequential000002",
+          "name": "lookup_beta",
+          "input": {
+            "query": "beta"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_bdrk_01CalibrationSequential000002",
+          "content": "two"
+        }
+      ]
+    }
+  ]
+}

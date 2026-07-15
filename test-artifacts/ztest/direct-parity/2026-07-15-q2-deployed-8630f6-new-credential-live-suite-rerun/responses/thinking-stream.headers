@@ -1,0 +1,10 @@
+HTTP/2 200 
+server: nginx
+date: Wed, 15 Jul 2026 10:31:46 GMT
+content-type: text/event-stream
+cache-control: no-cache
+x-new-api-version: 78bb6d21
+x-oneapi-request-id: 202607151031467253419197judlC9P
+x-accel-buffering: no
+strict-transport-security: max-age=31536000
+

@@ -1,0 +1,11 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 16,
+  "system": "Keep responses direct, accurate, concise, and useful. Follow the requested output format without adding explanations, examples, caveats, or unrelated implementation details.",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is 2 + 2? Reply with only the number."
+    }
+  ]
+}

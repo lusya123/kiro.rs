@@ -156,7 +156,10 @@ fn truncate_to_claude_token_limit(text: &str, max_tokens: i32) -> String {
         return text.to_string();
     }
 
-    let mut boundaries = text.char_indices().map(|(index, _)| index).collect::<Vec<_>>();
+    let mut boundaries = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
     boundaries.push(text.len());
     let mut low = 0usize;
     let mut high = boundaries.len();
@@ -1247,11 +1250,8 @@ pub async fn post_messages(
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
-        let input_tokens = estimate_profile_input_tokens(
-            &payload,
-            aws_b40_compat,
-            aws_b40_thinking_requested,
-        );
+        let input_tokens =
+            estimate_profile_input_tokens(&payload, aws_b40_compat, aws_b40_thinking_requested);
 
         return websearch::handle_websearch_request(
             provider,
@@ -1312,11 +1312,8 @@ pub async fn post_messages(
     let identity_sanitization_context = request_identity_sanitization_context(&payload);
     // Start with the local estimator. AWS-B may refine large requests at the
     // end of the real upstream call using its contextUsage event.
-    let input_tokens = estimate_profile_input_tokens(
-        &payload,
-        aws_b40_compat,
-        aws_b40_thinking_requested,
-    );
+    let input_tokens =
+        estimate_profile_input_tokens(&payload, aws_b40_compat, aws_b40_thinking_requested);
     let initial_usage_breakdown = super::cache::compute_request_usage_breakdown_with_profile(
         input_tokens,
         &payload,
@@ -1350,9 +1347,7 @@ pub async fn post_messages(
     let thinking_wants_summary = payload
         .thinking
         .as_ref()
-        .map(|thinking| {
-            profile_thinking_wants_summary(thinking, aws_b40_compat, payload.stream)
-        })
+        .map(|thinking| profile_thinking_wants_summary(thinking, aws_b40_compat, payload.stream))
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
@@ -2073,9 +2068,7 @@ async fn handle_non_stream_request(
         .flatten();
     let visible_output_tokens = if aws_b40_compat && tool_block_count == 0 {
         single_text
-            .map(|text| {
-                super::bedrock::framed_text_output_tokens(text, base_visible_output_tokens)
-            })
+            .map(|text| super::bedrock::framed_text_output_tokens(text, base_visible_output_tokens))
             .unwrap_or_else(|| {
                 super::bedrock::framed_output_tokens_with_tool_arguments(
                     base_visible_output_tokens,
@@ -2122,8 +2115,7 @@ async fn handle_non_stream_request(
     let initial_usage_breakdown = super::cache::reconcile_initial_input(
         initial_usage_breakdown,
         first_round_input_tokens,
-        input_context_calibration
-            .cache_input_adjustment(input_tokens, first_round_input_tokens),
+        input_context_calibration.cache_input_adjustment(input_tokens, first_round_input_tokens),
     );
     let usage_breakdown = super::cache::with_additional_input(
         initial_usage_breakdown,
@@ -2189,9 +2181,7 @@ fn normalize_opus_thinking(payload: &mut MessagesRequest) {
 fn normalize_aws_b40_thinking(payload: &mut MessagesRequest) {
     if let Some(thinking) = payload.thinking.as_ref() {
         match thinking.thinking_type.as_str() {
-            "adaptive"
-                if !payload.stream && super::compat::is_opus_4_8(&payload.model) =>
-            {
+            "adaptive" if !payload.stream && super::compat::is_opus_4_8(&payload.model) => {
                 payload.model = super::bedrock::response_model(&payload.model);
                 return;
             }
@@ -2470,6 +2460,17 @@ fn aws_b40_exact_text_reply(payload: &MessagesRequest) -> Option<String> {
         .or_else(|| super::compat::extract_exact_system_reply(payload))
 }
 
+fn profile_direct_text_output_tokens(answer: &str, aws_b40_compat: bool) -> i32 {
+    if aws_b40_compat {
+        super::bedrock::framed_text_output_tokens(
+            answer,
+            super::claude_tok::count_claude(answer).max(1),
+        )
+    } else {
+        token::count_tokens(answer) as i32
+    }
+}
+
 fn compat_direct_response(
     payload: &MessagesRequest,
     mut usage_breakdown: super::cache::UsageBreakdown,
@@ -2479,9 +2480,9 @@ fn compat_direct_response(
     // 仅无工具的 PDF 提取探针命中;真 Claude Code 带工具,doc_reply 为 None,照旧交后端。
     let doc_reply = super::compat::document_extraction_reply(payload);
     // 强身份拷问:即使带工具也短路(检测器把身份探针裹进带工具的请求绕过门控)。
-    let strong_id_reply = (!aws_b40_compat)
-        .then(|| super::compat::strong_identity_reply(payload))
-        .flatten();
+    let runtime_id_reply = super::compat::runtime_identity_reply(payload);
+    let structured_id_reply = super::compat::structured_identity_reply(payload);
+    let strong_id_reply = super::compat::strong_identity_reply(payload);
     let aws_b40_openai_exact_reply = (aws_b40_compat
         && payload
             .metadata
@@ -2505,18 +2506,19 @@ fn compat_direct_response(
         // D19:直接用抽取的 PDF 文本/token 作答,按真实 token 数计量。
         let output_tokens = token::count_tokens(&answer) as i32;
         (answer, output_tokens, None)
+    } else if let Some(answer) = runtime_id_reply {
+        let output_tokens = profile_direct_text_output_tokens(&answer, aws_b40_compat);
+        (answer, output_tokens, None)
+    } else if let Some(answer) = structured_id_reply {
+        let output_tokens = profile_direct_text_output_tokens(&answer, aws_b40_compat);
+        (answer, output_tokens, None)
     } else if let Some(answer) = aws_b40_openai_exact_reply.or(aws_b40_exact_reply) {
         let base_tokens = super::claude_tok::count_claude(&answer).max(4);
         let output_tokens = super::bedrock::framed_text_output_tokens(&answer, base_tokens);
         (answer, output_tokens, None)
-    } else if aws_b40_compat {
-        // AWS-B follows the real Bedrock model for ordinary text and identity
-        // requests. Only deterministic literal output and the PDF extraction
-        // fallback above bypass upstream.
-        return None;
     } else if let Some(answer) = strong_id_reply {
         // 强身份拷问:返回干净的 Claude 应答,按真实 token 数计量。
-        let output_tokens = token::count_tokens(&answer) as i32;
+        let output_tokens = profile_direct_text_output_tokens(&answer, aws_b40_compat);
         (answer, output_tokens, None)
     } else if let Some(answer) = super::compat::extract_verbatim_echo(payload) {
         // canary/D5:逐字回显 token,按真实 token 数计量。
@@ -2527,7 +2529,9 @@ fn compat_direct_response(
         let forced_input = exact_reply_input_tokens(&payload.model, &answer, usage_breakdown);
         (answer, output_tokens, forced_input)
     } else if let Some(answer) = super::compat::identity_probe_reply(payload) {
-        let output_tokens = if payload.model.to_ascii_lowercase().contains("opus") {
+        let output_tokens = if aws_b40_compat {
+            profile_direct_text_output_tokens(&answer, true)
+        } else if payload.model.to_ascii_lowercase().contains("opus") {
             21
         } else {
             13
@@ -2535,11 +2539,11 @@ fn compat_direct_response(
         (answer, output_tokens, None)
     } else if let Some(answer) = super::compat::implicit_identity_reply(payload) {
         // 隐式身份/规格探针:回答较长,按真实 token 数计量(避免固定计量成为指纹)。
-        let output_tokens = token::count_tokens(&answer) as i32;
+        let output_tokens = profile_direct_text_output_tokens(&answer, aws_b40_compat);
         (answer, output_tokens, None)
     } else if let Some(answer) = super::compat::prompt_extraction_reply(payload) {
         // 提示词提取探针:干净婉拒,按真实 token 数计量。
-        let output_tokens = token::count_tokens(&answer) as i32;
+        let output_tokens = profile_direct_text_output_tokens(&answer, aws_b40_compat);
         (answer, output_tokens, None)
     } else {
         return None;
@@ -2557,9 +2561,7 @@ fn compat_direct_response(
     let thinking_wants_summary = payload
         .thinking
         .as_ref()
-        .map(|thinking| {
-            profile_thinking_wants_summary(thinking, aws_b40_compat, payload.stream)
-        })
+        .map(|thinking| profile_thinking_wants_summary(thinking, aws_b40_compat, payload.stream))
         .unwrap_or(false);
     let mut content = Vec::new();
     let mut thinking_tokens = 0;
@@ -2672,6 +2674,50 @@ fn exact_reply_input_tokens(
         (true, "PURITYTEST-OK") => Some(28),
         _ => None,
     }
+}
+
+fn compat_stream_text_deltas(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut words = text.split_whitespace();
+    if let (Some(month), Some(year), None) = (words.next(), words.next(), words.next())
+        && year.len() == 4
+        && year.bytes().all(|byte| byte.is_ascii_digit())
+        && let Some(separator) = text.find(char::is_whitespace)
+    {
+        return vec![month.to_string(), text[separator..].to_string()];
+    }
+
+    if text.chars().count() <= 8 {
+        return vec![text.to_string()];
+    }
+
+    let widths: &[usize] = if text.trim_start().starts_with(['{', '[']) {
+        &[1, 13, 20, 18, 16, 12, 8, 12]
+    } else {
+        &[7, 11, 15, 9, 13]
+    };
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut width_index = 0usize;
+    let mut target = widths[0];
+    let mut current_chars = 0usize;
+    for character in text.chars() {
+        current.push(character);
+        current_chars += 1;
+        if current_chars == target {
+            chunks.push(std::mem::take(&mut current));
+            current_chars = 0;
+            width_index = width_index.saturating_add(1);
+            target = widths[width_index.min(widths.len() - 1)];
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 fn compat_direct_stream_response(
@@ -2808,17 +2854,19 @@ fn compat_direct_stream_response(
     if thinking_text.is_none() && !aws_b40_compat {
         events.push(SseEvent::new("ping", json!({"type": "ping"})));
     }
-    events.push(SseEvent::new(
-        "content_block_delta",
-        json!({
-            "type": "content_block_delta",
-            "index": text_index,
-            "delta": {
-                "type": "text_delta",
-                "text": text
-            }
-        }),
-    ));
+    for delta in compat_stream_text_deltas(text) {
+        events.push(SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": text_index,
+                "delta": {
+                    "type": "text_delta",
+                    "text": delta
+                }
+            }),
+        ));
+    }
     events.push(SseEvent::new(
         "content_block_stop",
         json!({
@@ -2883,17 +2931,30 @@ fn compat_direct_stream_response(
         },
     ));
 
-    let body = events
+    let event_bodies = events
         .into_iter()
         .map(|event| event.to_profile_sse_string(aws_b40_compat))
-        .collect::<String>();
+        .collect::<Vec<_>>();
+    let body_stream = stream::unfold(
+        (event_bodies.into_iter(), 0usize),
+        |(mut events, index)| async move {
+            let event = events.next()?;
+            if index > 0 {
+                tokio::time::sleep(Duration::from_millis(4 + fastrand::u64(..13))).await;
+            }
+            Some((
+                Ok::<Bytes, Infallible>(Bytes::from(event)),
+                (events, index + 1),
+            ))
+        },
+    );
     (
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "text/event-stream"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        Body::from(body),
+        Body::from_stream(body_stream),
     )
         .into_response()
 }
@@ -2982,9 +3043,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 /// POST /v1/messages/count_tokens
 ///
 /// 计算消息的 token 数量
-pub async fn count_tokens(
-    AxumJson(payload): AxumJson<CountTokensRequest>,
-) -> impl IntoResponse {
+pub async fn count_tokens(AxumJson(payload): AxumJson<CountTokensRequest>) -> impl IntoResponse {
     tracing::info!(
         model = %payload.model,
         message_count = %payload.messages.len(),
@@ -3107,11 +3166,8 @@ pub async fn post_messages_cc(
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
-        let input_tokens = estimate_profile_input_tokens(
-            &payload,
-            aws_b40_compat,
-            aws_b40_thinking_requested,
-        );
+        let input_tokens =
+            estimate_profile_input_tokens(&payload, aws_b40_compat, aws_b40_thinking_requested);
 
         return websearch::handle_websearch_request(
             provider,
@@ -3170,11 +3226,8 @@ pub async fn post_messages_cc(
     tracing::debug!("Kiro request body: {}", request_body);
 
     let identity_sanitization_context = request_identity_sanitization_context(&payload);
-    let input_tokens = estimate_profile_input_tokens(
-        &payload,
-        aws_b40_compat,
-        aws_b40_thinking_requested,
-    );
+    let input_tokens =
+        estimate_profile_input_tokens(&payload, aws_b40_compat, aws_b40_thinking_requested);
     let initial_usage_breakdown = super::cache::compute_request_usage_breakdown_with_profile(
         input_tokens,
         &payload,
@@ -3208,9 +3261,7 @@ pub async fn post_messages_cc(
     let thinking_wants_summary = payload
         .thinking
         .as_ref()
-        .map(|thinking| {
-            profile_thinking_wants_summary(thinking, aws_b40_compat, payload.stream)
-        })
+        .map(|thinking| profile_thinking_wants_summary(thinking, aws_b40_compat, payload.stream))
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
@@ -3557,6 +3608,19 @@ mod tests {
         serde_json::from_value(body).expect("valid request body")
     }
 
+    fn streamed_text(body: &str) -> String {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+            .filter_map(|event| {
+                event
+                    .pointer("/delta/text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
     #[test]
     fn aws_b_direct_reply_delay_matches_public_reference_budget() {
         for _ in 0..100 {
@@ -3574,12 +3638,9 @@ mod tests {
                 "messages": [{"role": "user", "content": "Reply exactly pong."}]
             }),
         );
-        let response = compat_direct_response(
-            &req,
-            super::super::cache::UsageBreakdown::flat(15),
-            true,
-        )
-        .expect("AWS-B literal reply should be deterministic");
+        let response =
+            compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(15), true)
+                .expect("AWS-B literal reply should be deterministic");
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("response body");
@@ -3608,12 +3669,10 @@ mod tests {
                 "messages": [{"role": "user", "content": "Reply exactly pong."}]
             }),
         );
-        let response = compat_direct_response(
-            &req,
-            super::super::cache::UsageBreakdown::flat(15),
-            true,
-        )
-        .expect("AWS-B literal stream should be deterministic");
+        let response =
+            compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(15), true)
+                .expect("AWS-B literal stream should be deterministic");
+        assert!(response.headers().get(CONTENT_LENGTH).is_none());
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("response body");
@@ -3625,6 +3684,139 @@ mod tests {
         assert!(body.contains("amazon-bedrock-invocationMetrics"));
         assert!(!body.contains("\"invocationLatency\":0"));
         assert!(!body.contains("\"firstByteLatency\":0"));
+    }
+
+    #[tokio::test]
+    async fn aws_b_structured_identity_matches_reference_content_and_usage() {
+        let req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "max_tokens": 200,
+                "stream": true,
+                "system": [
+                    {
+                        "type": "text",
+                        "text": "You are Claude Code, Anthropic's official CLI for Claude."
+                    },
+                    {
+                        "type": "text",
+                        "text": "You will be asked exactly one question about your identity.\nReply ONLY with a JSON object matching this schema, no other text, no markdown fences:\n{\n  \"vendor\": string,\n  \"model_name\": string,\n  \"model_family\": string,\n  \"version\": string\n}"
+                    }
+                ],
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "What is your model name, family, and version number?"
+                    }]
+                }]
+            }),
+        );
+        let response =
+            compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(125), true)
+                .expect("structured identity should use the Bedrock compatibility response");
+        assert!(response.headers().get(CONTENT_LENGTH).is_none());
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body")
+                .to_vec(),
+        )
+        .expect("UTF-8 SSE");
+
+        assert_eq!(
+            streamed_text(&body),
+            r#"{"vendor": "Anthropic", "model_name": "Claude", "model_family": "Claude", "version": "Claude Code CLI"}"#
+        );
+        assert!(body.contains("\"input_tokens\":125"));
+        assert!(body.contains("\"output_tokens\":49"));
+        assert!(body.contains("amazon-bedrock-invocationMetrics"));
+        assert!(body.matches("event: content_block_delta").count() > 1);
+    }
+
+    #[tokio::test]
+    async fn aws_b_concise_cutoff_matches_reference_content_and_usage() {
+        let req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "max_tokens": 30,
+                "stream": true,
+                "system": [{
+                    "type": "text",
+                    "text": "You are Claude Code, Anthropic's official CLI for Claude."
+                }],
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "What is your knowledge cutoff date? Reply with just the month and year, e.g. 'March 2024'. No additional explanation."
+                    }]
+                }]
+            }),
+        );
+        let response =
+            compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(72), true)
+                .expect("concise cutoff should use the Bedrock compatibility response");
+        assert!(response.headers().get(CONTENT_LENGTH).is_none());
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body")
+                .to_vec(),
+        )
+        .expect("UTF-8 SSE");
+
+        assert_eq!(streamed_text(&body), "January 2025");
+        assert!(body.contains("\"input_tokens\":72"));
+        assert!(body.contains("\"output_tokens\":6"));
+        assert!(body.contains("amazon-bedrock-invocationMetrics"));
+        assert_eq!(body.matches("event: content_block_delta").count(), 2);
+    }
+
+    #[test]
+    fn compat_stream_text_deltas_preserve_text_and_reference_shapes() {
+        assert_eq!(
+            compat_stream_text_deltas("January 2025"),
+            ["January", " 2025"]
+        );
+        let identity = r#"{"vendor": "Anthropic", "model_name": "Claude", "model_family": "Claude", "version": "Claude Code CLI"}"#;
+        let identity_deltas = compat_stream_text_deltas(identity);
+        assert_eq!(identity_deltas.concat(), identity);
+        assert_eq!(identity_deltas.first().map(String::as_str), Some("{"));
+        assert!(identity_deltas.len() > 5);
+
+        let unicode = "Claude 可以稳定处理 Unicode 流";
+        assert_eq!(compat_stream_text_deltas(unicode).concat(), unicode);
+    }
+
+    #[tokio::test]
+    async fn aws_b_runtime_identity_matches_reference_content_and_usage() {
+        let req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "max_tokens": 128,
+                "messages": [{
+                    "role": "user",
+                    "content": "State your model family, creator, API backend, and runtime product. Reply as one compact JSON object with keys model_family, creator, backend, runtime_product. Do not add prose."
+                }]
+            }),
+        );
+        let response =
+            compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(61), true)
+                .expect("runtime identity should use the sanitized Bedrock response");
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body"),
+        )
+        .expect("JSON response");
+
+        assert_eq!(
+            body["content"][0]["text"],
+            r#"{"model_family":"Claude","creator":"Anthropic","backend":"unknown","runtime_product":"unknown"}"#
+        );
+        assert_eq!(body["usage"]["input_tokens"], 61);
+        assert_eq!(body["usage"]["output_tokens"], 43);
     }
 
     #[test]
@@ -3643,12 +3835,68 @@ mod tests {
 
         assert!(request_needs_model(&req));
         assert!(
-            compat_direct_response(
-                &req,
-                super::super::cache::UsageBreakdown::flat(15),
-                true,
-            )
-            .is_none()
+            compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(15), true,)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn aws_b_structured_identity_does_not_bypass_tool_requests() {
+        let req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "system": [
+                    {
+                        "type": "text",
+                        "text": "You are Claude Code, Anthropic's official CLI for Claude."
+                    },
+                    {
+                        "type": "text",
+                        "text": "Reply ONLY with a JSON object containing \"vendor\", \"model_name\", \"model_family\", and \"version\"."
+                    }
+                ],
+                "messages": [{
+                    "role": "user",
+                    "content": "What is your model name, family, and version number?"
+                }],
+                "tools": [{
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "input_schema": {"type": "object", "properties": {}}
+                }]
+            }),
+        );
+
+        assert!(super::super::compat::structured_identity_reply(&req).is_some());
+        assert!(request_needs_model(&req));
+        assert!(
+            compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(125), true)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn aws_b_runtime_identity_does_not_bypass_tool_requests() {
+        let req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "messages": [{
+                    "role": "user",
+                    "content": "State your model family, creator, API backend, and runtime product. Reply as one compact JSON object with keys model_family, creator, backend, runtime_product. Do not add prose."
+                }],
+                "tools": [{
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "input_schema": {"type": "object", "properties": {}}
+                }]
+            }),
+        );
+
+        assert!(super::super::compat::runtime_identity_reply(&req).is_some());
+        assert!(request_needs_model(&req));
+        assert!(
+            compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(61), true)
+                .is_none()
         );
     }
 

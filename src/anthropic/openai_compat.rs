@@ -190,12 +190,7 @@ fn openai_usage(usage: &Value, aws_b40_compat: bool) -> Value {
 }
 
 /// 把内部 Anthropic 响应体转成 OpenAI ChatCompletion(usage 为混合键)。
-fn anthropic_to_openai_chat(
-    a: &Value,
-    model: &str,
-    created: u64,
-    aws_b40_compat: bool,
-) -> Value {
+fn anthropic_to_openai_chat(a: &Value, model: &str, created: u64, aws_b40_compat: bool) -> Value {
     let blocks = a
         .get("content")
         .and_then(Value::as_array)
@@ -235,10 +230,7 @@ fn anthropic_to_openai_chat(
         Some("tool_use") => "tool_calls",
         _ => "stop",
     };
-    let source_id = a
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("msg_kiro");
+    let source_id = a.get("id").and_then(|v| v.as_str()).unwrap_or("msg_kiro");
     let id = if aws_b40_compat {
         source_id.to_string()
     } else {
@@ -421,9 +413,7 @@ fn transform_anthropic_sse_event(
             let Some(block) = event.get("content_block") else {
                 return String::new();
             };
-            if state.aws_b40_compat
-                && block.get("type").and_then(Value::as_str) == Some("text")
-            {
+            if state.aws_b40_compat && block.get("type").and_then(Value::as_str) == Some("text") {
                 return openai_sse_json(&state.chunk(json!({"content": ""}), None));
             }
             if !matches!(
@@ -850,8 +840,7 @@ mod tests {
             "stop_reason": "tool_use",
             "usage": {"input_tokens": 10, "output_tokens": 4}
         });
-        let response =
-            anthropic_to_openai_chat(&anthropic, "claude-sonnet-4-6", 123, false);
+        let response = anthropic_to_openai_chat(&anthropic, "claude-sonnet-4-6", 123, false);
         let message = &response["choices"][0]["message"];
         assert!(message["content"].is_null());
         assert_eq!(message["reasoning_content"], "reason");
@@ -889,7 +878,10 @@ mod tests {
         assert_eq!(response["usage"]["prompt_tokens"], 38);
         assert_eq!(response["usage"]["completion_tokens"], 16);
         assert_eq!(response["usage"]["total_tokens"], 54);
-        assert_eq!(response["usage"]["prompt_tokens_details"]["cached_tokens"], 5);
+        assert_eq!(
+            response["usage"]["prompt_tokens_details"]["cached_tokens"],
+            5
+        );
         assert_eq!(
             response["usage"]["completion_tokens_details"]["reasoning_tokens"],
             3
@@ -901,8 +893,7 @@ mod tests {
 
     #[test]
     fn stream_translation_emits_chunks_usage_and_done() {
-        let mut state =
-            OpenAiStreamState::new("requested-model".to_string(), 123, true, false);
+        let mut state = OpenAiStreamState::new("requested-model".to_string(), 123, true, false);
         let start = transform_anthropic_sse_event(
             &mut state,
             "message_start",
@@ -996,7 +987,12 @@ mod tests {
         assert_eq!(block_start["choices"][0]["delta"]["content"], "");
         assert_eq!(finish["choices"][0]["finish_reason"], "stop");
         assert_eq!(usage["model"], "claude-opus-4-8");
-        assert!(usage["choices"].as_array().expect("choices array").is_empty());
+        assert!(
+            usage["choices"]
+                .as_array()
+                .expect("choices array")
+                .is_empty()
+        );
         assert_eq!(usage["usage"]["prompt_tokens"], 11);
         assert_eq!(usage["usage"]["input_tokens"], 0);
         assert!(stop.ends_with("data: [DONE]\n\n"));

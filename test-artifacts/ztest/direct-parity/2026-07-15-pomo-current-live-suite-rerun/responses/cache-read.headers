@@ -1,0 +1,14 @@
+HTTP/2 200 
+server: nginx
+date: Wed, 15 Jul 2026 10:34:42 GMT
+content-type: application/json
+content-length: 504
+alt-svc: h3=":443"; ma=2592000
+referrer-policy: strict-origin-when-cross-origin
+via: 1.1 Caddy
+x-content-type-options: nosniff
+x-frame-options: SAMEORIGIN
+x-new-api-version: 20260501R2
+x-oneapi-request-id: 202607151034405994373648268d9d6GSPGjUud
+x-accel-buffering: no
+

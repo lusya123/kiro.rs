@@ -1,0 +1,25 @@
+{
+  "max_tokens": 30,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "What is your maximum context window size in tokens? Reply with just a single integer (no commas, no units, no explanation), e.g. 200000.",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "metadata": {
+    "user_id": "user_b102e9ebb85168784716ea347e2164022b9baa23242b325f3a965baa91286fed_account__session_ebf20a80-906f-4b0b-9283-de132c3c6b71"
+  },
+  "model": "claude-opus-4-8",
+  "stream": true,
+  "system": [
+    {
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "type": "text"
+    }
+  ]
+}

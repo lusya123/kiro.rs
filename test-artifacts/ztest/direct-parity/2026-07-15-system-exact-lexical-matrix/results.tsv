@@ -1,0 +1,11 @@
+scenario	side	http_code	curl_exit	time_total	input_tokens	cache_creation_input_tokens	cache_read_input_tokens	cache_total_tokens	output_tokens
+exact-system-a-repeat-8	reference	200	0	2.921379	25	0	0	0	4
+exact-system-a-repeat-8	target	200	0	2.236300	27	0	0	0	4
+exact-system-beta-repeat-8	reference	200	0	2.852816	33	0	0	0	4
+exact-system-beta-repeat-8	target	200	0	2.431491	27	0	0	0	4
+exact-system-longword-repeat-8	reference	200	0	2.758078	65	0	0	0	4
+exact-system-longword-repeat-8	target	200	0	2.585195	59	0	0	0	4
+exact-system-continuous-x48	reference	200	0	3.548920	65	0	0	0	4
+exact-system-continuous-x48	target	200	0	2.530680	35	0	0	0	4
+exact-system-digits48	reference	200	0	2.372475	33	0	0	0	4
+exact-system-digits48	target	200	0	2.091635	35	0	0	0	4

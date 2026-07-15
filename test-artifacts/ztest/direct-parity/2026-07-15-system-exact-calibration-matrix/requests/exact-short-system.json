@@ -1,0 +1,11 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 16,
+  "system": "Be concise and follow the requested output format.",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Reply with exactly: PONG"
+    }
+  ]
+}

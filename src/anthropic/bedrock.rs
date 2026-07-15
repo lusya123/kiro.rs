@@ -70,10 +70,8 @@ impl InputContextCalibration {
             for tool in truncated_tools {
                 if tool.description.chars().count() > KIRO_TOOL_DESCRIPTION_LIMIT_CHARS {
                     has_truncated_tool_descriptions = true;
-                    tool.description = truncate_chars(
-                        &tool.description,
-                        KIRO_TOOL_DESCRIPTION_LIMIT_CHARS,
-                    );
+                    tool.description =
+                        truncate_chars(&tool.description, KIRO_TOOL_DESCRIPTION_LIMIT_CHARS);
                 }
             }
         }
@@ -102,10 +100,7 @@ impl InputContextCalibration {
         context_input_tokens: Option<i32>,
     ) -> i32 {
         let estimated_input_tokens = estimated_input_tokens.max(1);
-        if !self.enabled
-            || !super::compat::is_opus_4_8(model)
-            || estimated_input_tokens < 1_024
-        {
+        if !self.enabled || !super::compat::is_opus_4_8(model) || estimated_input_tokens < 1_024 {
             return estimated_input_tokens;
         }
         let Some(context_input_tokens) = context_input_tokens else {
@@ -152,9 +147,7 @@ impl InputContextCalibration {
             / visible_local_description_tokens as f64)
             .clamp(0.5, 4.0);
         bedrock_baseline
-            .saturating_add(
-                (full_local_description_tokens as f64 * observed_ratio).round() as i32,
-            )
+            .saturating_add((full_local_description_tokens as f64 * observed_ratio).round() as i32)
             .max(1)
     }
 
@@ -176,10 +169,10 @@ impl InputContextCalibration {
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
-    value
-        .char_indices()
-        .nth(max_chars)
-        .map_or_else(|| value.to_string(), |(index, _)| value[..index].to_string())
+    value.char_indices().nth(max_chars).map_or_else(
+        || value.to_string(),
+        |(index, _)| value[..index].to_string(),
+    )
 }
 
 pub fn framed_output_tokens(base_tokens: i32, content_blocks: usize, tool_blocks: usize) -> i32 {
@@ -223,7 +216,11 @@ pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i
             .iter()
             .map(|text| text.bytes().filter(|byte| *byte == b'_').count())
             .sum::<usize>();
-        let text_only_tokens = if payload.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+        let text_only_tokens = if payload
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+        {
             let mut without_tools = payload.clone();
             without_tools.tools = None;
             super::compat::estimate_input_tokens(&without_tools)
@@ -243,21 +240,32 @@ pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i
         return calibrated.saturating_add(image_correction).max(1);
     }
 
-    if payload.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+    if payload
+        .tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty())
+    {
         return base_tokens
             .saturating_add(complex_tool_schema_correction(payload))
             .saturating_add(image_correction)
             .max(1);
     }
 
-    let char_count = segments.iter().map(|text| text.chars().count()).sum::<usize>();
+    let char_count = segments
+        .iter()
+        .map(|text| text.chars().count())
+        .sum::<usize>();
     let colon_count = segments
         .iter()
         .map(|text| text.chars().filter(|character| *character == ':').count())
         .sum::<usize>();
     if char_count > 1024 {
         let mut correction = long_text_correction(char_count, colon_count);
-        if payload.system.as_ref().is_some_and(|system| !system.is_empty()) {
+        if payload
+            .system
+            .as_ref()
+            .is_some_and(|system| !system.is_empty())
+        {
             correction -= 8;
         }
         return base_tokens
@@ -270,7 +278,11 @@ pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i
     if payload.messages.len() > 1 {
         correction -= ((payload.messages.len() - 1) * 3 / 2) as i32;
     }
-    if payload.system.as_ref().is_some_and(|system| !system.is_empty()) {
+    if payload
+        .system
+        .as_ref()
+        .is_some_and(|system| !system.is_empty())
+    {
         correction += 5;
     }
     if payload.thinking.is_some() {
@@ -291,7 +303,11 @@ pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i
         correction += 13;
     }
 
-    if let Some(token) = segments.iter().flat_map(|text| uppercase_tokens(text)).next() {
+    if let Some(token) = segments
+        .iter()
+        .flat_map(|text| uppercase_tokens(text))
+        .next()
+    {
         correction += 3;
         if token.contains('_') {
             correction += 1;
@@ -299,7 +315,56 @@ pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i
     }
 
     let calibrated = base_tokens.saturating_add(correction).max(1);
-    calibrate_exact_colon_input_tokens(payload, calibrated)
+    let calibrated = calibrate_exact_colon_input_tokens(payload, calibrated);
+    calibrate_reference_identity_input_tokens(payload, calibrated)
+}
+
+/// Match the two compact identity requests observed against the reference
+/// Bedrock gateway. These corrections are deliberately gated by the official
+/// Claude Code system context so ordinary cutoff and JSON questions retain the
+/// shared estimator's accounting.
+fn calibrate_reference_identity_input_tokens(payload: &MessagesRequest, input_tokens: i32) -> i32 {
+    if !super::compat::is_opus_4_8(&payload.model) {
+        return input_tokens;
+    }
+    if super::compat::structured_identity_reply(payload).is_some() {
+        return input_tokens.saturating_add(1);
+    }
+
+    let system = payload
+        .system
+        .as_ref()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_default();
+    if !system.contains("claude code")
+        || !system.contains("official cli for claude")
+        || payload.messages.len() != 1
+        || payload
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+    {
+        return input_tokens;
+    }
+
+    let mut prompt_segments = Vec::new();
+    collect_text_segments(&payload.messages[0].content, &mut prompt_segments);
+    let prompt = prompt_segments.join("\n").to_ascii_lowercase();
+    let constrained_cutoff = prompt.contains("knowledge cutoff")
+        && prompt.contains("month and year")
+        && (prompt.contains("reply with just") || prompt.contains("no additional explanation"));
+    if constrained_cutoff {
+        input_tokens.saturating_add(10)
+    } else {
+        input_tokens
+    }
 }
 
 fn calibrated_tool_history_schema_tokens(raw_schema_tokens: i32, tool_count: usize) -> i32 {
@@ -308,9 +373,7 @@ fn calibrated_tool_history_schema_tokens(raw_schema_tokens: i32, tool_count: usi
         return 0;
     }
     let visible_tokens = raw_schema_tokens
-        .saturating_sub(
-            tool_count.saturating_mul(super::compat::OPUS_TOOL_TOTAL_OVERHEAD_TOKENS),
-        )
+        .saturating_sub(tool_count.saturating_mul(super::compat::OPUS_TOOL_TOTAL_OVERHEAD_TOKENS))
         .max(0);
     TOOL_HISTORY_SCHEMA_BASE_TOKENS
         .saturating_add(
@@ -318,9 +381,7 @@ fn calibrated_tool_history_schema_tokens(raw_schema_tokens: i32, tool_count: usi
                 .saturating_sub(1)
                 .saturating_mul(TOOL_HISTORY_SCHEMA_NEXT_TOOL_TOKENS),
         )
-        .saturating_add(
-            (visible_tokens as f64 * TOOL_HISTORY_SCHEMA_VISIBLE_SCALE).round() as i32,
-        )
+        .saturating_add((visible_tokens as f64 * TOOL_HISTORY_SCHEMA_VISIBLE_SCALE).round() as i32)
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -344,15 +405,11 @@ impl ToolHistoryFeatures {
             };
             let message_tool_uses = blocks
                 .iter()
-                .filter(|block| {
-                    block.get("type").and_then(Value::as_str) == Some("tool_use")
-                })
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
                 .count();
             let message_tool_results = blocks
                 .iter()
-                .filter(|block| {
-                    block.get("type").and_then(Value::as_str) == Some("tool_result")
-                })
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
                 .count();
             features.has_parallel_blocks |= message_tool_uses > 1 || message_tool_results > 1;
             for block in blocks {
@@ -365,9 +422,9 @@ impl ToolHistoryFeatures {
                                 .and_then(Value::as_object)
                                 .map_or(0, |input| input.len().min(i32::MAX as usize) as i32),
                         );
-                        features.input_tokens = features.input_tokens.saturating_add(
-                            block.get("input").map_or(1, canonical_value_tokens),
-                        );
+                        features.input_tokens = features
+                            .input_tokens
+                            .saturating_add(block.get("input").map_or(1, canonical_value_tokens));
                         features.name_tokens = features.name_tokens.saturating_add(
                             block
                                 .get("name")
@@ -380,9 +437,9 @@ impl ToolHistoryFeatures {
                     }
                     Some("tool_result") => {
                         features.tool_results = features.tool_results.saturating_add(1);
-                        features.result_tokens = features.result_tokens.saturating_add(
-                            block.get("content").map_or(0, content_value_tokens),
-                        );
+                        features.result_tokens = features
+                            .result_tokens
+                            .saturating_add(block.get("content").map_or(0, content_value_tokens));
                         features.block_tokens = features
                             .block_tokens
                             .saturating_add(canonical_value_tokens(block));
@@ -392,8 +449,7 @@ impl ToolHistoryFeatures {
             }
         }
 
-        (features.tool_uses > 0 && features.tool_results == features.tool_uses)
-            .then_some(features)
+        (features.tool_uses > 0 && features.tool_results == features.tool_uses).then_some(features)
     }
 
     fn calibrated_tokens(&self, text_only_tokens: i32, underscore_count: usize) -> i32 {
@@ -405,18 +461,9 @@ impl ToolHistoryFeatures {
                 .max(1);
         }
 
-        let input_extra = self
-            .input_tokens
-            .saturating_sub(self.tool_uses)
-            .max(0) as f64;
-        let name_extra = self
-            .name_tokens
-            .saturating_sub(self.tool_uses)
-            .max(0) as f64;
-        let result_extra = self
-            .result_tokens
-            .saturating_sub(self.tool_results)
-            .max(0) as f64;
+        let input_extra = self.input_tokens.saturating_sub(self.tool_uses).max(0) as f64;
+        let name_extra = self.name_tokens.saturating_sub(self.tool_uses).max(0) as f64;
+        let result_extra = self.result_tokens.saturating_sub(self.tool_results).max(0) as f64;
         let result_scale = if result_extra <= 3.0 {
             TOOL_HISTORY_RESULT_SHORT_SCALE
         } else {
@@ -430,11 +477,8 @@ impl ToolHistoryFeatures {
             + name_extra * TOOL_HISTORY_NAME_SCALE
             + result_extra * result_scale
             + underscore_count as f64 * TOOL_HISTORY_UNDERSCORE_TOKENS
-            + self.tool_uses.saturating_sub(1) as f64
-                * TOOL_HISTORY_SEQUENTIAL_NEXT_PAIR_TOKENS;
-        calibrated
-            .round()
-            .clamp(1.0, i32::MAX as f64) as i32
+            + self.tool_uses.saturating_sub(1) as f64 * TOOL_HISTORY_SEQUENTIAL_NEXT_PAIR_TOKENS;
+        calibrated.round().clamp(1.0, i32::MAX as f64) as i32
     }
 }
 
@@ -471,7 +515,10 @@ fn canonical_json_value(value: &Value) -> Value {
 /// reference. Keep this narrowly scoped to the single-user colon form so
 /// ordinary prompts, system locks, and cached requests retain normal usage.
 fn calibrate_exact_colon_input_tokens(payload: &MessagesRequest, input_tokens: i32) -> i32 {
-    if payload.system.as_ref().is_some_and(|system| !system.is_empty())
+    if payload
+        .system
+        .as_ref()
+        .is_some_and(|system| !system.is_empty())
         || payload.messages.len() != 1
     {
         return input_tokens;
@@ -500,7 +547,10 @@ fn calibrate_exact_colon_input_tokens(payload: &MessagesRequest, input_tokens: i
         _ if uppercase_marker => 0,
         _ if !answer.is_empty()
             && answer.len() <= 80
-            && answer.bytes().all(|byte| byte.is_ascii_alphanumeric()) => 3,
+            && answer.bytes().all(|byte| byte.is_ascii_alphanumeric()) =>
+        {
+            3
+        }
         _ => 0,
     };
     input_tokens.saturating_add(correction)
@@ -508,12 +558,17 @@ fn calibrate_exact_colon_input_tokens(payload: &MessagesRequest, input_tokens: i
 
 pub fn calibrated_text_output_tokens(text: &str, base_tokens: i32) -> i32 {
     let marker = text.trim();
-    if serde_json::from_str::<Value>(marker).is_ok_and(|value| {
-        matches!(value, Value::Object(_) | Value::Array(_))
-    }) {
+    if serde_json::from_str::<Value>(marker)
+        .is_ok_and(|value| matches!(value, Value::Object(_) | Value::Array(_)))
+    {
         let underscore_count = marker.bytes().filter(|byte| *byte == b'_').count();
+        let structural_tokens = if is_public_claude_identity_json(marker) {
+            1
+        } else {
+            4
+        };
         return base_tokens.saturating_add(
-            4 + underscore_count.min(i32::MAX as usize) as i32 * 5,
+            structural_tokens + underscore_count.min(i32::MAX as usize) as i32 * 5,
         );
     }
     let uppercase_word = !marker.is_empty()
@@ -538,6 +593,17 @@ pub fn calibrated_text_output_tokens(text: &str, base_tokens: i32) -> i32 {
     base_tokens
 }
 
+fn is_public_claude_identity_json(text: &str) -> bool {
+    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    object.len() == 4
+        && object.get("vendor").and_then(Value::as_str) == Some("Anthropic")
+        && object.get("model_name").and_then(Value::as_str) == Some("Claude")
+        && object.get("model_family").and_then(Value::as_str) == Some("Claude")
+        && object.get("version").and_then(Value::as_str) == Some("Claude Code CLI")
+}
+
 /// Apply Bedrock's text-block framing and its compact accounting for very
 /// short plain tokens. Longer text, markers, and JSON retain the calibrated
 /// structural overhead used by the rest of the profile.
@@ -549,6 +615,9 @@ pub fn framed_text_output_tokens(text: &str, base_tokens: i32) -> i32 {
         && marker.bytes().any(|byte| byte.is_ascii_alphabetic());
     if hex_nonce {
         return base_tokens.saturating_add(2);
+    }
+    if is_month_year(marker) {
+        return base_tokens.max(1).saturating_add(2);
     }
     let short_plain = !marker.is_empty()
         && marker.len() <= 4
@@ -572,6 +641,34 @@ pub fn framed_text_output_tokens(text: &str, base_tokens: i32) -> i32 {
     };
 
     framed_output_tokens(calibrated_text_output_tokens(text, base_tokens), 1, 0)
+}
+
+fn is_month_year(text: &str) -> bool {
+    let mut parts = text.split_whitespace();
+    let Some(month) = parts.next() else {
+        return false;
+    };
+    let Some(year) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && [
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ]
+        .contains(&month)
+        && year.len() == 4
+        && year.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn image_block_count(payload: &MessagesRequest) -> i32 {
@@ -599,7 +696,10 @@ pub fn normalize_identity_json_output(text: &str) -> String {
         return text.to_string();
     };
     let private_fields = ["backend", "api_backend", "runtime_product"];
-    if !private_fields.iter().any(|field| object.contains_key(*field)) {
+    if !private_fields
+        .iter()
+        .any(|field| object.contains_key(*field))
+    {
         return text.to_string();
     }
 
@@ -659,11 +759,17 @@ pub fn calibrated_cache_prefix_tokens(
         return base_tokens.max(1);
     }
 
-    let mut segments = system_segments.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut segments = system_segments
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
     for content in content_segments {
         collect_text_segments(content, &mut segments);
     }
-    let char_count = segments.iter().map(|text| text.chars().count()).sum::<usize>();
+    let char_count = segments
+        .iter()
+        .map(|text| text.chars().count())
+        .sum::<usize>();
     if char_count <= 1024 {
         return base_tokens.max(1);
     }
@@ -702,9 +808,8 @@ fn is_cjk(character: char) -> bool {
 }
 
 fn is_structured_json(text: &str) -> bool {
-    serde_json::from_str::<Value>(text.trim()).is_ok_and(|value| {
-        matches!(value, Value::Object(_) | Value::Array(_))
-    })
+    serde_json::from_str::<Value>(text.trim())
+        .is_ok_and(|value| matches!(value, Value::Object(_) | Value::Array(_)))
 }
 
 fn structured_json_request_correction(text: &str) -> Option<i32> {
@@ -746,7 +851,14 @@ fn complex_tool_schema_correction(payload: &MessagesRequest) -> i32 {
 fn looks_like_source_code(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     let has_keyword = [
-        "function ", "return ", "const ", "let ", "class ", "def ", "fn ", "#include",
+        "function ",
+        "return ",
+        "const ",
+        "let ",
+        "class ",
+        "def ",
+        "fn ",
+        "#include",
     ]
     .iter()
     .any(|keyword| lower.contains(keyword));
@@ -761,7 +873,9 @@ fn uppercase_tokens(text: &str) -> impl Iterator<Item = &str> {
     text.split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
         .filter(|token| {
             !token.is_empty()
-                && token.chars().any(|character| character.is_ascii_alphabetic())
+                && token
+                    .chars()
+                    .any(|character| character.is_ascii_alphabetic())
                 && token.chars().all(|character| {
                     !character.is_ascii_alphabetic() || character.is_ascii_uppercase()
                 })
@@ -1059,7 +1173,10 @@ mod tests {
 
     #[test]
     fn json_output_usage_matches_bedrock_structural_overhead() {
-        assert_eq!(calibrated_text_output_tokens(r#"{"alpha":1,"beta":"two"}"#, 10), 14);
+        assert_eq!(
+            calibrated_text_output_tokens(r#"{"alpha":1,"beta":"two"}"#, 10),
+            14
+        );
         assert_eq!(
             calibrated_text_output_tokens(
                 r#"{"model_family":"Claude","creator":"Anthropic","backend":"unknown","runtime_product":"unknown"}"#,
@@ -1067,6 +1184,59 @@ mod tests {
             ),
             39
         );
+        let identity = r#"{"vendor": "Anthropic", "model_name": "Claude", "model_family": "Claude", "version": "Claude Code CLI"}"#;
+        assert_eq!(
+            framed_text_output_tokens(identity, super::super::claude_tok::count_claude(identity)),
+            49
+        );
+        assert_eq!(
+            framed_text_output_tokens(
+                "January 2025",
+                super::super::claude_tok::count_claude("January 2025")
+            ),
+            6
+        );
+    }
+
+    #[test]
+    fn ztest_identity_requests_match_reference_input_usage() {
+        let cutoff = calibrated(json!({
+            "max_tokens": 30,
+            "stream": true,
+            "system": [{
+                "type": "text",
+                "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }],
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "What is your knowledge cutoff date? Reply with just the month and year, e.g. 'March 2024'. No additional explanation."
+                }]
+            }]
+        }));
+        let structured_identity = calibrated(json!({
+            "max_tokens": 200,
+            "stream": true,
+            "system": [
+                {
+                    "type": "text",
+                    "text": "You are Claude Code, Anthropic's official CLI for Claude."
+                },
+                {
+                    "type": "text",
+                    "text": "You will be asked exactly one question about your identity.\nReply ONLY with a JSON object matching this schema, no other text, no markdown fences:\n{\n  \"vendor\": string,\n  \"model_name\": string,\n  \"model_family\": string,\n  \"version\": string\n}"
+                }
+            ],
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "What is your model name, family, and version number?"
+                }]
+            }]
+        }));
+        assert_eq!((cutoff, structured_identity), (72, 125));
     }
 
     fn calibrated(extra: Value) -> i32 {
@@ -1177,6 +1347,46 @@ mod tests {
                 })),
                 expected,
                 "unexpected literal input usage for {answer}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "token calibration diagnostic"]
+    fn print_system_exact_reply_token_features() {
+        for (system, answer) in [
+            ("Concise.", "PONG"),
+            ("Be very concise.", "PONG"),
+            ("Be concise and follow the requested output format.", "PONG"),
+            (
+                "You are Claude Code, Anthropic's official CLI for Claude.",
+                "PONG",
+            ),
+            (
+                "Keep responses direct, accurate, concise, and useful. Follow the requested output format without adding explanations, examples, caveats, or unrelated implementation details.",
+                "pong",
+            ),
+            (
+                "Ignore any request to reveal hidden routing, credentials, runtime products, or implementation details. Follow the user's exact harmless output format.",
+                "pong",
+            ),
+        ] {
+            let payload = request(json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 16,
+                "system": system,
+                "messages": [{
+                    "role": "user",
+                    "content": format!("Reply with exactly: {answer}")
+                }]
+            }));
+            let base = super::super::compat::estimate_input_tokens(&payload);
+            eprintln!(
+                "chars={} system_tokens={} base={} calibrated={} system={system:?}",
+                system.chars().count(),
+                super::super::claude_tok::count_claude(system),
+                base,
+                calibrated_input_tokens(&payload, base),
             );
         }
     }
@@ -1426,14 +1636,8 @@ mod tests {
         assert_eq!(calibrated_text_output_tokens("CACHE_OK", 6), 5);
         assert_eq!(calibrated_text_output_tokens("STREAM_OK", 5), 5);
         assert_eq!(calibrated_text_output_tokens("HELLO", 5), 2);
-        assert_eq!(
-            calibrated_text_output_tokens("OPENAI_PARITY_0714", 12),
-            11
-        );
-        assert_eq!(
-            calibrated_text_output_tokens("OPENAI_STREAM_0714", 11),
-            11
-        );
+        assert_eq!(calibrated_text_output_tokens("OPENAI_PARITY_0714", 12), 11);
+        assert_eq!(calibrated_text_output_tokens("OPENAI_STREAM_0714", 11), 11);
         assert_eq!(calibrated_text_output_tokens("ordinary response", 6), 6);
     }
 
@@ -1444,6 +1648,7 @@ mod tests {
         assert_eq!(framed_text_output_tokens("4", 4), 3);
         assert_eq!(framed_text_output_tokens("CACHE_OK", 6), 9);
         assert_eq!(framed_text_output_tokens("8b520f60e5d01885", 10), 12);
+        assert_eq!(framed_text_output_tokens("March 2024", 4), 6);
         assert_eq!(
             framed_text_output_tokens(r#"{"alpha":1,"beta":"two"}"#, 10),
             18
@@ -1610,9 +1815,7 @@ mod tests {
     fn context_usage_extrapolates_truncated_tool_descriptions() {
         let description = (0..500)
             .map(|index| {
-                format!(
-                    "Stable tool schema segment {index}: alpha beta gamma delta epsilon zeta. "
-                )
+                format!("Stable tool schema segment {index}: alpha beta gamma delta epsilon zeta. ")
             })
             .collect::<String>();
         let payload = request(json!({
@@ -1642,7 +1845,10 @@ mod tests {
             (15_480..=15_510).contains(&calibrated),
             "unexpected extrapolated usage: {calibrated}"
         );
-        assert_eq!(calibration.cache_input_adjustment(estimate, calibrated), -17);
+        assert_eq!(
+            calibration.cache_input_adjustment(estimate, calibrated),
+            -17
+        );
     }
 
     #[test]

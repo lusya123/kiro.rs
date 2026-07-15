@@ -113,3 +113,24 @@ worked. Complex model-backed calls exposed a separate infrastructure blocker:
 AWS temporarily restricted Q2's sole upstream account and returned 429, which
 the gateway surfaced as 502. A fresh usable credential is required before a
 complex-call or Ztest result can be interpreted as a protocol-quality score.
+
+## Capturing a new report
+
+Run the report capture immediately after Ztest produces a report URL, because
+the public report API expires its data after a short interval:
+
+```bash
+scripts/capture-ztest-report.sh \
+  https://ztest.ai/report/REPORT_ID
+```
+
+The script does not accept or persist an API key. It saves the byte-for-byte
+report API response, its SHA-256, normalized report data, every non-full probe,
+all exception details, a TSV index, and a Markdown summary. An already saved
+response can be replayed without network access:
+
+```bash
+scripts/capture-ztest-report.sh \
+  --input test-artifacts/ztest/reports/RUN/report.raw.json \
+  /tmp/ztest-report-replay
+```

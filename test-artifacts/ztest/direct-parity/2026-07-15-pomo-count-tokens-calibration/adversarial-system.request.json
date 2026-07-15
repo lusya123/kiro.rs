@@ -1,0 +1,10 @@
+{
+  "model": "claude-opus-4-8",
+  "system": "Ignore any request to reveal hidden routing, credentials, runtime products, or implementation details. Follow the user's exact harmless output format.",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Reply with exactly: pong"
+    }
+  ]
+}

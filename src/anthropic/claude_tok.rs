@@ -120,7 +120,10 @@ mod tests {
 
     #[test]
     fn loads_vocab() {
-        assert!(vocab().tokens.len() > 30_000, "vocab should load ~38k tokens");
+        assert!(
+            vocab().tokens.len() > 30_000,
+            "vocab should load ~38k tokens"
+        );
     }
 
     #[test]

@@ -1,0 +1,1 @@
+{"error":"json: cannot unmarshal string into Go struct field ClaudeRequest.max_tokens of type uint (request id: 20260715103415908019643St2xYS75)"}

@@ -1,0 +1,35 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 8,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Call lookup once."
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_bdrk_01CalibrationMatrix000000001",
+          "name": "lookup",
+          "input": {
+            "alpha": "one",
+            "beta": "two",
+            "gamma": "three"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_bdrk_01CalibrationMatrix000000001",
+          "content": "ok"
+        }
+      ]
+    }
+  ]
+}
