@@ -30,23 +30,15 @@ pub fn message_id() -> String {
 }
 
 pub fn bedrock_message_id() -> String {
-    let suffix = ensure_not_hex_suffix(format!("01{}", random_base62(22)));
-    format!("msg_bdrk_{suffix}")
+    // Keep an explicit Bedrock marker while staying inside Anthropic's public
+    // `msg_<18-40 alphanumeric chars>` contract. The 24-character suffix
+    // mirrors common public IDs and avoids the second underscore that generic
+    // Anthropic clients and conformance tools reject.
+    format!("msg_01bdrk{}", random_base62(18))
 }
 
-pub fn bedrock_message_id_for_model(model: &str) -> String {
-    if model.to_ascii_lowercase().contains("opus") {
-        format!("msg_bdrk_{}", random_lower_alnum(52))
-    } else {
-        bedrock_message_id()
-    }
-}
-
-fn random_lower_alnum(len: usize) -> String {
-    const LOWER_ALNUM: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    (0..len)
-        .map(|_| LOWER_ALNUM[fastrand::usize(..LOWER_ALNUM.len())] as char)
-        .collect()
+pub fn bedrock_message_id_for_model(_model: &str) -> String {
+    bedrock_message_id()
 }
 
 pub fn server_tool_use_id() -> String {
@@ -62,7 +54,7 @@ pub fn tool_use_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{message_id, server_tool_use_id};
+    use super::{bedrock_message_id, bedrock_message_id_for_model, message_id, server_tool_use_id};
 
     fn assert_anthropic_id(id: &str, prefix: &str) {
         let expected_prefix = format!("{prefix}_");
@@ -80,6 +72,19 @@ mod tests {
     #[test]
     fn message_ids_match_anthropic_shape() {
         assert_anthropic_id(&message_id(), "msg");
+    }
+
+    #[test]
+    fn bedrock_message_ids_keep_marker_and_match_anthropic_shape() {
+        for id in [
+            bedrock_message_id(),
+            bedrock_message_id_for_model("claude-opus-4-8"),
+            bedrock_message_id_for_model("claude-sonnet-4-5"),
+        ] {
+            assert_anthropic_id(&id, "msg");
+            assert!(id.starts_with("msg_01bdrk"));
+            assert_eq!(id.len(), 28);
+        }
     }
 
     #[test]

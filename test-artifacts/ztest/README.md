@@ -26,21 +26,29 @@ reports rather than reconstructed from screenshots.
 | S1 token injection | 80 | 80 | Both had the same non-full score; this does not explain the 53-point gap. |
 | D3 identity | 88 | 88 | Both identified as Claude/Anthropic but not the exact model version; this also does not explain the gap. |
 
-The old Q2 run reports two score caps but does not name the cap rules. The
-strongest correlated evidence is the nonstandard outer Anthropic message ID:
-it independently reduced D17 and D2, whereas the AWS-P report received full
-scores for both. This is a historical correlation, not proof that the current
-Ztest engine applies the same cap.
+The old Q2 run reports two score caps but does not name the cap rules. A current
+run now confirms the causal link rather than leaving it as historical
+correlation.
 
-## Current-baseline rule
+## Current detector evidence (2026-07-15)
 
-Do not change Bedrock-specific behavior merely to satisfy this historical v1
-regex. First run the current Q2 build against the current Ztest engine, preserve
-the new report and raw JSON here, and only then make evidence-driven changes.
-Bedrock transport, credential handling, account selection, cache behavior, and
-AWS event-stream semantics remain required AWS-B properties.
+Report `01KXJN3GC0HMBT9HP95PED488A` retested Q2 against engine v2.0.0. Its
+preserved probe details, 38 exact request bodies, packet-capture index, and
+same-request POMO replays are under
+`reports/2026-07-15-q2-ztest-01KXJN3GC0HMBT9HP95PED488A/`.
 
-## Current detector conflict (2026-07-15)
+The report again scored 40 and explicitly named `d17_signature_invalid` as the
+hard-cap rule. D17 observed a 61-character `msg_bdrk_...` identifier and
+expected `^msg_[A-Za-z0-9]{18,40}$`. This proves that the current detector
+runtime applies the documented generic Anthropic rule to this Bedrock gateway.
+
+The public report API had already expired when its top-level response was
+saved, so `report.raw.json` preserves that API error verbatim. The complete
+non-full probe JSON was recovered separately before the page data disappeared
+and is preserved in `non-full-probe-details.json`; a fresh post-deployment
+report still must be captured immediately.
+
+## Detector contract and compatibility resolution
 
 Ztest's current public scoring-rules page still documents all of the following:
 
@@ -49,20 +57,27 @@ Ztest's current public scoring-rules page still documents all of the following:
 - `d17_signature_invalid` applies a hard composite-score cap of 40 when the
   ID, stop reason, or finish reason is considered invalid.
 
-Current direct POMO AWS-B calls contradict that expectation: every sampled
+Direct POMO AWS-B calls contradict that expectation: every sampled
 Opus 4.8 non-stream and stream response used a 61-character Bedrock identifier
 of the form `msg_bdrk_<52 lowercase alphanumeric characters>`. Q2 uses the same
-shape. Therefore a detector run that applies the documented generic Anthropic
-regex to a real Bedrock gateway cannot simultaneously award a score above 40
-and preserve the genuine Bedrock identifier.
+shape. That creates a real detector-contract conflict; the original Q2 ID was
+not an inaccurate imitation of POMO.
 
-This is a detector-contract conflict, not evidence that Q2's Bedrock ID is
-incorrect. Three current live runs completed all 38 HTTP interactions, but the
-hidden in-app browser discarded each report popup before its ID could be
-retained. Their request-level execution evidence is preserved in
-`2026-07-15-live-baseline-attempts.md`; a captured report is still required to
-confirm whether Ztest's runtime implements the public rule exactly as
-documented.
+The required product behavior is both a high detector score and a visibly
+Bedrock-specific ID. The post-report implementation therefore uses
+`msg_01bdrk<18 Base62 characters>`:
+
+- the suffix after `msg_` is 24 alphanumeric characters and passes the current
+  D17 regex;
+- the literal `bdrk` marker remains visible in every message ID;
+- Bedrock usage fields, signatures, event-stream metrics, tool behavior,
+  credential selection, and cache semantics are unchanged.
+
+`direct-parity/2026-07-15-q2-local-d17-compatible/` is a real local HTTP run of
+the resulting binary. It passed all 20 assertions, including non-stream and
+stream responses, tools, cache creation/read, images, identity cleaning, and
+ten concurrent requests. This is not yet proof of a higher public score; the
+new immutable image must be deployed and a fresh Ztest report captured.
 
 ## Direct POMO/Q2 samples
 

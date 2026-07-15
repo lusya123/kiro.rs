@@ -194,7 +194,7 @@ assert_eq badauth_http "$(awk -F '\t' '$1 == "badauth" {print $2}' "$RESULTS")" 
 assert_eq public_count_tokens_http "$(awk -F '\t' '$1 == "count-tokens" {print $2}' "$RESULTS")" 404
 assert_eq exact_pong_text "$(jq -r '.content[0].text // ""' "$OUT_DIR/responses/exact-pong.json")" pong
 assert_eq exact_pong_output_tokens "$(jq -r '.usage.output_tokens // -1' "$OUT_DIR/responses/exact-pong.json")" 4
-assert_true bedrock_message_id "$(jq -r '.id // ""' "$OUT_DIR/responses/exact-pong.json")" grep -Eq '"id":"msg_bdrk_[a-z0-9]{52}"' "$OUT_DIR/responses/exact-pong.json"
+assert_true bedrock_message_id "$(jq -r '.id // ""' "$OUT_DIR/responses/exact-pong.json")" grep -Eq '"id":"msg_01bdrk[A-Za-z0-9]{18}"' "$OUT_DIR/responses/exact-pong.json"
 assert_eq exact_json_text "$(jq -r '.content[0].text // ""' "$OUT_DIR/responses/exact-json.json")" '{"alpha":1,"beta":"two"}'
 assert_eq exact_json_output_tokens "$(jq -r '.usage.output_tokens // -1' "$OUT_DIR/responses/exact-json.json")" 18
 assert_eq tool_stop_reason "$(jq -r '.stop_reason // ""' "$OUT_DIR/responses/tool.json")" tool_use
