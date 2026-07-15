@@ -100,3 +100,16 @@ matches and residual differences. Confirmed improvements include:
 This is not proof of a current Ztest score. A captured post-deployment report
 is still required, and the detector's documented `msg_01...` requirement
 continues to conflict with the genuine POMO AWS-B `msg_bdrk_*` identifier.
+
+## Deployed Q2 replay (2026-07-15)
+
+`direct-parity/2026-07-15-q2-deployed-e9fa9b/` contains the complete live suite
+against the immutable Q2 deployment. The matching POMO reference is in
+`direct-parity/2026-07-15-pomo-live-suite-reference/`, and the next local
+token/latency fix is in `direct-parity/2026-07-15-local-next-fix/`.
+
+The deployed gateway, deterministic responses, streams, cache, and concurrency
+worked. Complex model-backed calls exposed a separate infrastructure blocker:
+AWS temporarily restricted Q2's sole upstream account and returned 429, which
+the gateway surfaced as 502. A fresh usable credential is required before a
+complex-call or Ztest result can be interpreted as a protocol-quality score.

@@ -1,0 +1,21 @@
+assertion	result	detail
+models_http	PASS	200
+noauth_http	PASS	401
+badauth_http	PASS	403
+public_count_tokens_http	PASS	404
+exact_pong_text	PASS	pong
+exact_pong_output_tokens	PASS	4
+bedrock_message_id	PASS	msg_bdrk_s2ai8s3isuhbxdxdurzzu26zsyqg4go9uyj61m1wjiunnwy2pzyz
+exact_json_text	PASS	{"alpha":1,"beta":"two"}
+exact_json_output_tokens	PASS	18
+tool_stop_reason	FAIL	expected=tool_use actual=
+tool_id	FAIL	bedrock tool id
+stream_metrics	PASS	amazon-bedrock-invocationMetrics
+stream_final_usage	PASS	output_tokens=4
+cache_create_tokens	PASS	3376
+cache_read_nonzero	PASS	3376
+image_text	FAIL	expected=Red actual=
+spatial_text	FAIL	expected=Red actual=
+identity_backend	FAIL	expected=unknown actual=
+identity_runtime	FAIL	expected=unknown actual=
+concurrent_exact_pong	PASS	10

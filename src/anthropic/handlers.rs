@@ -2407,15 +2407,19 @@ fn ctoc_output_tokens(content: &[serde_json::Value]) -> i32 {
 /// (检测器据此判定 CROSS_S3_IDENTITY_FORCE / 渠道拦截)。采样带抖动 + 偶发长尾,
 /// 使延迟分布贴近真实上游响应,而非固定值(固定值本身也是指纹)。
 async fn apply_compat_reply_delay(aws_b40_compat: bool) {
-    // Keep deterministic replies inside the observed latency envelope instead
-    // of exposing a near-zero local shortcut. AWS-B's reference path is
-    // slightly slower than the AWS-P profile, so retain separate narrow bands.
-    let delay = if aws_b40_compat {
-        2200u64 + fastrand::u64(..900) // 2.2-3.1s
+    let delay = compat_reply_delay_ms(aws_b40_compat);
+    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+}
+
+fn compat_reply_delay_ms(aws_b40_compat: bool) -> u64 {
+    // Q2's public proxy path already adds roughly two seconds. A 2.2-3.1s
+    // application delay made the same exact request about 2.2s slower than
+    // POMO, so retain only enough jitter to avoid a zero-latency shortcut.
+    if aws_b40_compat {
+        300u64 + fastrand::u64(..500) // 0.3-0.8s
     } else {
         1600u64 + fastrand::u64(..700) // 1.6-2.3s
-    };
-    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+    }
 }
 
 /// tool_choice 是否**强制**使用工具(any / tool)。此时响应应只含 tool_use,
@@ -3551,6 +3555,14 @@ mod tests {
             }
         }
         serde_json::from_value(body).expect("valid request body")
+    }
+
+    #[test]
+    fn aws_b_direct_reply_delay_matches_public_reference_budget() {
+        for _ in 0..100 {
+            assert!((300..800).contains(&compat_reply_delay_ms(true)));
+            assert!((1600..2300).contains(&compat_reply_delay_ms(false)));
+        }
     }
 
     #[tokio::test]
