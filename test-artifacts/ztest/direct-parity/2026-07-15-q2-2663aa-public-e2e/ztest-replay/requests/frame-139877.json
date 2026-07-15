@@ -1,0 +1,25 @@
+{
+  "max_tokens": 180,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "Write exactly one Python function named normalize_probe_score(x). It must return x clamped to the integer range 0..100. No markdown fences, no explanation, no examples.",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "metadata": {
+    "user_id": "user_f0c829d6323fe180970ceab1c6e18acaae5d376d30333b42a4693fadc2f3911a_account__session_fc11d777-2f3c-46bd-a498-df5f9e95189a"
+  },
+  "model": "claude-opus-4-8",
+  "stream": true,
+  "system": [
+    {
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "type": "text"
+    }
+  ]
+}

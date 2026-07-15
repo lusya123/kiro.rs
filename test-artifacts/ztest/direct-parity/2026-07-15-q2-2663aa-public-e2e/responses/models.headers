@@ -1,0 +1,11 @@
+HTTP/2 200 
+server: nginx
+date: Wed, 15 Jul 2026 14:49:29 GMT
+content-type: application/json; charset=utf-8
+content-length: 1424
+vary: Accept-Encoding
+x-new-api-version: 78bb6d21
+x-oneapi-request-id: 20260715144929684602492YVilWt0n
+x-accel-buffering: no
+strict-transport-security: max-age=31536000
+

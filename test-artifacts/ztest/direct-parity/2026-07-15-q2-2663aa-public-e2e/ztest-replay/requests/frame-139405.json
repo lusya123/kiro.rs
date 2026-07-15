@@ -1,0 +1,5 @@
+{
+  "max_tokens": 10,
+  "messages": [],
+  "model": "claude-opus-4-8"
+}

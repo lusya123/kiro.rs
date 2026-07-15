@@ -9,7 +9,8 @@ Usage:
   capture-ztest-report.sh --input REPORT_RAW_JSON [OUT_DIR]
 
 Downloads a live ZTest report, or processes an already captured API response.
-The output keeps the byte-for-byte API response plus normalized failure files.
+The output keeps the byte-for-byte API response, one JSON file per probe,
+one JSON file per non-full probe/detail, and normalized anomaly indexes.
 EOF
 }
 
@@ -114,7 +115,10 @@ if [[ "$SOURCE_KIND" == "api" ]]; then
     exit 1
   fi
 else
-  cp "$INPUT_PATH" "$RAW_PATH"
+  # Stage file input first so replaying an artifact into its own directory is
+  # safe and does not ask cp to copy a file onto itself.
+  cp "$INPUT_PATH" "$TEMP_PATH"
+  cp "$TEMP_PATH" "$RAW_PATH"
   printf '%s\n' "local-input" > "$OUT_DIR/http-status.txt"
 fi
 
@@ -157,13 +161,75 @@ jq '
     ))
 ' "$OUT_DIR/report.data.json" > "$OUT_DIR/exceptions.json"
 
+PROBE_DIR="$OUT_DIR/probes"
+NON_FULL_PROBE_DIR="$OUT_DIR/non-full-probe-json"
+NON_FULL_DETAIL_DIR="$OUT_DIR/non-full-detail-json"
+rm -rf -- "$PROBE_DIR" "$NON_FULL_PROBE_DIR" "$NON_FULL_DETAIL_DIR"
+mkdir -p "$PROBE_DIR" "$NON_FULL_PROBE_DIR" "$NON_FULL_DETAIL_DIR"
+
+while IFS=$'\t' read -r probe_index probe_code; do
+  safe_code="$(
+    printf '%s' "${probe_code:-unknown}" \
+      | tr '[:lower:]' '[:upper:]' \
+      | tr -c 'A-Z0-9._-' '_'
+  )"
+  probe_number="$(printf '%02d' "$((probe_index + 1))")"
+  probe_file="${probe_number}-${safe_code}.json"
+
+  jq --argjson probe_index "$probe_index" \
+    '(.probe_results // [])[$probe_index]' \
+    "$OUT_DIR/report.data.json" > "$PROBE_DIR/$probe_file"
+
+  if jq -e '
+    ((.score == 100)
+      and ((.status // "" | ascii_downcase) as $status
+        | ($status == "pass" or $status == "passed" or $status == "success")))
+    | not
+  ' "$PROBE_DIR/$probe_file" >/dev/null; then
+    cp "$PROBE_DIR/$probe_file" "$NON_FULL_PROBE_DIR/$probe_file"
+    jq '.details' \
+      "$PROBE_DIR/$probe_file" > "$NON_FULL_DETAIL_DIR/$probe_file"
+  fi
+done < <(
+  jq -r '
+    (.probe_results // [])
+    | to_entries[]
+    | [.key, (.value.probe_code // "unknown")]
+    | @tsv
+  ' "$OUT_DIR/report.data.json"
+)
+
+jq -c '.[]' "$OUT_DIR/non-full-probes.json" \
+  > "$OUT_DIR/non-full-probes.jsonl"
+
+jq '
+  map({
+    probe_code,
+    probe_name,
+    status,
+    score,
+    latency_ms,
+    label,
+    error,
+    diagnosis,
+    skip_reason: .details.skip_reason?,
+    network_error: .details.network_error?,
+    details_error: .details.error?,
+    response_preview: .details.response_preview?,
+    raw_response: .details.raw_response?,
+    fail_fields: .details.fail_fields?,
+    checks: .details.checks?,
+    validation: .details.validation?
+  })
+' "$OUT_DIR/non-full-probes.json" > "$OUT_DIR/anomaly-index.json"
+
 jq -r '
   def flat:
     if . == null then ""
     elif type == "string" then gsub("[\\t\\r\\n]+"; " ")
     else tojson
     end;
-  (["probe_code", "probe_name", "status", "score", "latency_ms", "label", "error", "diagnosis"] | @tsv),
+  (["probe_code", "probe_name", "status", "score", "latency_ms", "label", "error", "diagnosis", "details_json"] | @tsv),
   (.[] | [
     (.probe_code | flat),
     (.probe_name | flat),
@@ -172,9 +238,33 @@ jq -r '
     (.latency_ms | flat),
     (.label | flat),
     (.error | flat),
-    (.diagnosis | flat)
+    (.diagnosis | flat),
+    (.details | flat)
   ] | @tsv)
 ' "$OUT_DIR/non-full-probes.json" > "$OUT_DIR/non-full-probes.tsv"
+
+jq -r '
+  def flat:
+    if . == null then ""
+    elif type == "string" then gsub("[\\t\\r\\n]+"; " ")
+    else tojson
+    end;
+  (["probe_code", "probe_name", "status", "score", "error", "diagnosis", "skip_reason", "network_error", "details_error", "response_preview", "raw_response", "fail_fields"] | @tsv),
+  (.[] | [
+    (.probe_code | flat),
+    (.probe_name | flat),
+    (.status | flat),
+    (.score | flat),
+    (.error | flat),
+    (.diagnosis | flat),
+    (.skip_reason | flat),
+    (.network_error | flat),
+    (.details_error | flat),
+    (.response_preview | flat),
+    (.raw_response | flat),
+    (.fail_fields | flat)
+  ] | @tsv)
+' "$OUT_DIR/anomaly-index.json" > "$OUT_DIR/anomaly-index.tsv"
 
 TOTAL_PROBES="$(jq '(.probe_results // []) | length' "$OUT_DIR/report.data.json")"
 NON_FULL_PROBES="$(jq 'length' "$OUT_DIR/non-full-probes.json")"
@@ -204,8 +294,14 @@ jq -n \
       raw: "report.raw.json",
       normalized: "report.data.json",
       non_full: "non-full-probes.json",
+      non_full_jsonl: "non-full-probes.jsonl",
       non_full_tsv: "non-full-probes.tsv",
-      exceptions: "exceptions.json"
+      exceptions: "exceptions.json",
+      anomaly_index: "anomaly-index.json",
+      anomaly_index_tsv: "anomaly-index.tsv",
+      all_probe_json: "probes/",
+      non_full_probe_json: "non-full-probe-json/",
+      non_full_detail_json: "non-full-detail-json/"
     }
   }' > "$OUT_DIR/manifest.json"
 
@@ -230,7 +326,10 @@ jq -r \
     + "\n- Raw SHA-256: `" + $raw_sha256 + "`"
     + "\n- Non-full probes: `" + ($non_full_count | tostring) + "`"
     + "\n\nThe exact API response is preserved in `report.raw.json`."
-    + " Diagnostic subsets are in `non-full-probes.json` and `exceptions.json`."
+    + " Diagnostic subsets are in `non-full-probes.json`, `anomaly-index.json`,"
+    + " and `exceptions.json`. Each probe is also preserved independently under"
+    + " `probes/`; non-full probe objects and their untouched `details` values are"
+    + " under `non-full-probe-json/` and `non-full-detail-json/`."
     + "\n\n## Non-Full Probes\n\n"
     + "| Probe | Name | Status | Score | Latency ms | Error | Diagnosis |\n"
     + "| --- | --- | --- | ---: | ---: | --- | --- |\n"

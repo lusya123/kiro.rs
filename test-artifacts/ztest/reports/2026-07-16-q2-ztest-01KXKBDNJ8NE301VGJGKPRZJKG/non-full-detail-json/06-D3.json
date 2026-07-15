@@ -1,0 +1,25 @@
+{
+  "confidence": 0,
+  "cross_s3_identity_locked": true,
+  "cross_s3_obey_rate": 1,
+  "explicit_check": {
+    "reason": "exact_match",
+    "response_model_field": "claude-opus-4-8",
+    "score": 100
+  },
+  "final_label": "match",
+  "implicit_check": {
+    "parsed": {
+      "model_family": "claude",
+      "model_name": null,
+      "vendor": "anthropic",
+      "version": null
+    },
+    "raw_response": "I'm Claude — I was made by Anthropic.",
+    "reason": "family_match_unknown_tier",
+    "score": 90
+  },
+  "requested_family": "claude",
+  "requested_model": "claude-opus-4-8",
+  "suspect_models": []
+}

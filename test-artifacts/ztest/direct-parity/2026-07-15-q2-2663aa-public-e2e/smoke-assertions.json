@@ -1,0 +1,15 @@
+{
+  "admin_current_id_2": true,
+  "admin_http_200": true,
+  "admin_only_one_available": true,
+  "models_has_opus_4_8": true,
+  "models_http2": true,
+  "models_http_200": true,
+  "new_id_2_current_enabled": true,
+  "old_id_1_disabled": true,
+  "tool_has_paris_celsius": true,
+  "tool_has_sse_stop": true,
+  "tool_has_tool_use": true,
+  "tool_http2": true,
+  "tool_http_200": true
+}

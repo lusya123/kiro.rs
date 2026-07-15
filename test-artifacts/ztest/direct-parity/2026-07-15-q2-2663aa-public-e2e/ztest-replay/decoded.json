@@ -1,0 +1,2016 @@
+[
+  {
+    "frame": "139357",
+    "kind": "sse",
+    "id": "msg_01bdrkg3q10jWIimlSVoYchD",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "pong"
+      }
+    ],
+    "text": "pong",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 32,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 32,
+      "output_tokens": 4,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 32,
+      "outputTokenCount": 4,
+      "invocationLatency": 1019,
+      "firstByteLatency": 1009
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139381",
+    "kind": "sse",
+    "id": "msg_01bdrkOZuHLOd7YiAlVU6Nye",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "pong"
+      }
+    ],
+    "text": "pong",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 32,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 32,
+      "output_tokens": 4,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 32,
+      "outputTokenCount": 4,
+      "invocationLatency": 1182,
+      "firstByteLatency": 1141
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139405",
+    "kind": "json",
+    "payload": {
+      "error": {
+        "type": "new_api_error",
+        "message": "field messages is required (request id: 20260715145112834873511qGhoZAi5)"
+      },
+      "type": "error"
+    }
+  },
+  {
+    "frame": "139425",
+    "kind": "json",
+    "payload": {
+      "error": "无效的令牌 (request id: 20260715145114874767749wBb8IMmf)"
+    }
+  },
+  {
+    "frame": "139445",
+    "kind": "json",
+    "payload": null
+  },
+  {
+    "frame": "139465",
+    "kind": "sse",
+    "id": "msg_01bdrkrbgAnOxRbtYu78CBaW",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "pong"
+      }
+    ],
+    "text": "pong",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 32,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 32,
+      "output_tokens": 4,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 32,
+      "outputTokenCount": 4,
+      "invocationLatency": 1272,
+      "firstByteLatency": 1243
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139489",
+    "kind": "sse",
+    "id": "msg_01bdrkAbDrU2USKAlv1GmFd5",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "```python\n#!/usr/bin/env python3\n\"\"\"\nDate Difference Calculator\nGenerated: 2025-06-13\nModel: Claude (Anthropic)\nAuthor: Your Name <you@example.com>\nLicense: MIT\nPython: 3.8+\n\"\"\"\n\nfrom datetime import datetime\n\n\ndef days_between(a: str, b: str) -> int:\n    \"\"\"\n    Return the absolute number of days between two dates.\n\n    Args:\n        a: First date as a string in ISO format (YYYY-MM-DD).\n        b: Second date as a string in ISO format (YYYY-MM-DD).\n\n    Returns:\n        The absolute difference in days between the two dates.\n\n    Raises:\n        ValueError: If either date string is not valid ISO format.\n    \"\"\"\n    date_a = datetime.strptime(a, \"%Y-%m-%d\")\n    date_b = datetime.strptime(b, \"%Y-%m-%d\")\n    return abs((date_b - date_a).days)\n\n\nif __name__ == \"__main__\":\n    import sys\n\n    if len(sys.argv) == 3:\n        try:\n            print(days_between(sys.argv[1], sys.argv[2]))\n        except ValueError as exc:\n            print(f\"Error: {exc}\", file=sys.stderr)\n            sys.exit(1)\n    else:\n        # Simple demo when run without arguments.\n        print(days_between(\"2024-01-01\", \"2024-12-31\"))\n```"
+      }
+    ],
+    "text": "```python\n#!/usr/bin/env python3\n\"\"\"\nDate Difference Calculator\nGenerated: 2025-06-13\nModel: Claude (Anthropic)\nAuthor: Your Name <you@example.com>\nLicense: MIT\nPython: 3.8+\n\"\"\"\n\nfrom datetime import datetime\n\n\ndef days_between(a: str, b: str) -> int:\n    \"\"\"\n    Return the absolute number of days between two dates.\n\n    Args:\n        a: First date as a string in ISO format (YYYY-MM-DD).\n        b: Second date as a string in ISO format (YYYY-MM-DD).\n\n    Returns:\n        The absolute difference in days between the two dates.\n\n    Raises:\n        ValueError: If either date string is not valid ISO format.\n    \"\"\"\n    date_a = datetime.strptime(a, \"%Y-%m-%d\")\n    date_b = datetime.strptime(b, \"%Y-%m-%d\")\n    return abs((date_b - date_a).days)\n\n\nif __name__ == \"__main__\":\n    import sys\n\n    if len(sys.argv) == 3:\n        try:\n            print(days_between(sys.argv[1], sys.argv[2]))\n        except ValueError as exc:\n            print(f\"Error: {exc}\", file=sys.stderr)\n            sys.exit(1)\n    else:\n        # Simple demo when run without arguments.\n        print(days_between(\"2024-01-01\", \"2024-12-31\"))\n```",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "max_tokens",
+    "start_usage": {
+      "input_tokens": 110,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 110,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 350,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 110,
+      "outputTokenCount": 350,
+      "invocationLatency": 7454,
+      "firstByteLatency": 4685
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139517",
+    "kind": "sse",
+    "id": "msg_01bdrkKCuwPqys9H8NXonmNz",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "200000"
+      }
+    ],
+    "text": "200000",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 74,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 74,
+      "output_tokens": 4,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 74,
+      "outputTokenCount": 4,
+      "invocationLatency": 1372,
+      "firstByteLatency": 1343
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139541",
+    "kind": "sse",
+    "id": "msg_01bdrke6KnMmS5MmJgU95XYh",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "January 2025"
+      }
+    ],
+    "text": "January 2025",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 72,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 72,
+      "output_tokens": 6,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 72,
+      "outputTokenCount": 6,
+      "invocationLatency": 1098,
+      "firstByteLatency": 1078
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139573",
+    "kind": "sse",
+    "id": "msg_01bdrkS20qOYeQOkivLaSIro",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "{\n  \"vendor\": \"Anthropic\",\n  \"model_name\": \"Claude Code\",\n  \"model_family\": \"Claude\",\n  \"version\": \"unknown\"\n}"
+      }
+    ],
+    "text": "{\n  \"vendor\": \"Anthropic\",\n  \"model_name\": \"Claude Code\",\n  \"model_family\": \"Claude\",\n  \"version\": \"unknown\"\n}",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 125,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 125,
+      "output_tokens": 55,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 125,
+      "outputTokenCount": 55,
+      "invocationLatency": 989,
+      "firstByteLatency": 943
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139605",
+    "kind": "sse",
+    "id": "msg_01bdrkytKSqYdx0qqJt5KeQb",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "cef1f5ea541683d1"
+      }
+    ],
+    "text": "cef1f5ea541683d1",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 59,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 59,
+      "output_tokens": 12,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 59,
+      "outputTokenCount": 12,
+      "invocationLatency": 1248,
+      "firstByteLatency": 1217
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139625",
+    "kind": "sse",
+    "id": "msg_01bdrkEhL0UwYjUzwpnaAedJ",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "pong"
+      }
+    ],
+    "text": "pong",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 32,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 32,
+      "output_tokens": 4,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 32,
+      "outputTokenCount": 4,
+      "invocationLatency": 986,
+      "firstByteLatency": 962
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139649",
+    "kind": "sse",
+    "id": "msg_01bdrkoZQqgLFbgI96oBYDwL",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "Step by step:\n\n1. Start with 23 apples.\n2. Gives 7 away: 23 − 7 = 16.\n3. Buys 12 more: 16 + 12 = 28.\n4. Divides equally among 4 baskets: 28 ÷ 4 = 7.\n\nFinal answer: 7"
+      }
+    ],
+    "text": "Step by step:\n\n1. Start with 23 apples.\n2. Gives 7 away: 23 − 7 = 16.\n3. Buys 12 more: 16 + 12 = 28.\n4. Divides equally among 4 baskets: 28 ÷ 4 = 7.\n\nFinal answer: 7",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 97,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 3,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 97,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 81,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 97,
+      "outputTokenCount": 81,
+      "invocationLatency": 3330,
+      "firstByteLatency": 3266
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139681",
+    "kind": "sse",
+    "id": "msg_01bdrkHaBXfgB7IQGaj2DqTe",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "Blue"
+      }
+    ],
+    "text": "Blue",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 73,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 73,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 4,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 73,
+      "outputTokenCount": 4,
+      "invocationLatency": 1691,
+      "firstByteLatency": 1630
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139705",
+    "kind": "sse",
+    "id": "msg_01bdrkbrGXN65qvcXQlRNMPQ",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "4"
+      }
+    ],
+    "text": "4",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 145,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 145,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 3,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 145,
+      "outputTokenCount": 3,
+      "invocationLatency": 1439,
+      "firstByteLatency": 1439
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139729",
+    "kind": "sse",
+    "id": "msg_01bdrkoM3XiMJMFdupDADT5R",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "77957"
+      }
+    ],
+    "text": "77957",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 84,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 84,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 8,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 84,
+      "outputTokenCount": 8,
+      "invocationLatency": 1733,
+      "firstByteLatency": 1668
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139753",
+    "kind": "sse",
+    "id": "msg_01bdrkigTjonAGpaEH34fvks",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "Green"
+      }
+    ],
+    "text": "Green",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 87,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 87,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 8,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 87,
+      "outputTokenCount": 8,
+      "invocationLatency": 1537,
+      "firstByteLatency": 1509
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139777",
+    "kind": "sse",
+    "id": "msg_01bdrkGNAHVBloKYqhWrNsWU",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "Green"
+      }
+    ],
+    "text": "Green",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 100,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 100,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 8,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 100,
+      "outputTokenCount": 8,
+      "invocationLatency": 1568,
+      "firstByteLatency": 1534
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139801",
+    "kind": "sse",
+    "id": "msg_01bdrkvPSo00ofeWq8Arhghe",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "{\"a\":\"ztset\",\"b\":37,\"c\":\"ZT-AFE02317\"}"
+      }
+    ],
+    "text": "{\"a\":\"ztset\",\"b\":37,\"c\":\"ZT-AFE02317\"}",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 115,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 115,
+      "output_tokens": 30,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 115,
+      "outputTokenCount": 30,
+      "invocationLatency": 1104,
+      "firstByteLatency": 1092
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139825",
+    "kind": "sse",
+    "id": "msg_01bdrkFxXzO4qUKBY6rh3Aks",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "C"
+      }
+    ],
+    "text": "C",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 130,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 130,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 3,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 130,
+      "outputTokenCount": 3,
+      "invocationLatency": 1662,
+      "firstByteLatency": 1508
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139853",
+    "kind": "sse",
+    "id": "msg_01bdrks1GjRlgrvZyi10Nq8O",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "ZT-AFE02317|RIVER"
+      }
+    ],
+    "text": "ZT-AFE02317|RIVER",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 4122,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 3513,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 16,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 3513,
+      "outputTokenCount": 16,
+      "invocationLatency": 1780,
+      "firstByteLatency": 1621
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139877",
+    "kind": "sse",
+    "id": "msg_01bdrkDzIHHGiXAClqNrXmNq",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "```python\ndef normalize_probe_score(x):\n    return max(0, min(100, int(x)))\n```"
+      }
+    ],
+    "text": "```python\ndef normalize_probe_score(x):\n    return max(0, min(100, int(x)))\n```",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 73,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 73,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 33,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 73,
+      "outputTokenCount": 33,
+      "invocationLatency": 4476,
+      "firstByteLatency": 4418
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139901",
+    "kind": "sse",
+    "id": "msg_01bdrkZzOfYYi9dTV5iOWgKE",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "pong"
+      }
+    ],
+    "text": "pong",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 32,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 32,
+      "output_tokens": 4,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 32,
+      "outputTokenCount": 4,
+      "invocationLatency": 1175,
+      "firstByteLatency": 1166
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139925",
+    "kind": "sse",
+    "id": "msg_01bdrkUuIgsOEngz9ONySXIo",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "pong"
+      }
+    ],
+    "text": "pong",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 32,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 32,
+      "output_tokens": 4,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 32,
+      "outputTokenCount": 4,
+      "invocationLatency": 1202,
+      "firstByteLatency": 1175
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139949",
+    "kind": "sse",
+    "id": "msg_01bdrkBVgl1tuaXyi79LSp3W",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "pong"
+      }
+    ],
+    "text": "pong",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 32,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 32,
+      "output_tokens": 4,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 32,
+      "outputTokenCount": 4,
+      "invocationLatency": 1231,
+      "firstByteLatency": 1199
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139973",
+    "kind": "sse",
+    "id": "msg_01bdrkuVOUgK8T7TsU9GNatx",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "pong"
+      }
+    ],
+    "text": "pong",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 32,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 32,
+      "output_tokens": 4,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 32,
+      "outputTokenCount": 4,
+      "invocationLatency": 949,
+      "firstByteLatency": 938
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "139997",
+    "kind": "sse",
+    "id": "msg_01bdrkr0RlsXuKi27CE3WUpO",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "pong"
+      }
+    ],
+    "text": "pong",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 32,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 32,
+      "output_tokens": 4,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 32,
+      "outputTokenCount": 4,
+      "invocationLatency": 1084,
+      "firstByteLatency": 1017
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "140029",
+    "kind": "sse",
+    "id": "msg_01bdrk6maxKa53n1s88q8yRw",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "ZTEST-TOKEN-e14e79be"
+      }
+    ],
+    "text": "ZTEST-TOKEN-e14e79be",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 83,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 83,
+      "output_tokens": 7,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 83,
+      "outputTokenCount": 7,
+      "invocationLatency": 1276,
+      "firstByteLatency": 1221
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "140049",
+    "kind": "sse",
+    "id": "msg_01bdrkZFYhhQ7bwSgoQazqum",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "tool_use"
+    ],
+    "blocks": [
+      {
+        "type": "tool_use",
+        "id": "toolu_bdrk_011X9ae3MzTndrtPBaiMAvbQ",
+        "name": "get_weather",
+        "input": {
+          "city": "Exampleville-e1b78d16",
+          "unit": "celsius"
+        }
+      }
+    ],
+    "text": "",
+    "thinking": "",
+    "partial_json": "{\"city\": \"Exampleville-e1b78d16\", \"unit\": \"celsius\"}",
+    "tool_blocks": [
+      {
+        "type": "tool_use",
+        "id": "toolu_bdrk_011X9ae3MzTndrtPBaiMAvbQ",
+        "name": "get_weather",
+        "input": {
+          "city": "Exampleville-e1b78d16",
+          "unit": "celsius"
+        }
+      }
+    ],
+    "stop_reason": "tool_use",
+    "start_usage": {
+      "input_tokens": 619,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 16,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 619,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 66,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 619,
+      "outputTokenCount": 66,
+      "invocationLatency": 3078,
+      "firstByteLatency": 3023
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "140085",
+    "kind": "sse",
+    "id": "msg_01bdrkwlCz7Y3SSsu6bwOAhz",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "Snow settles quietly over the rooftops as pale light spreads across the sky. The air is crisp and still, and a hush lingers over everything."
+      }
+    ],
+    "text": "Snow settles quietly over the rooftops as pale light spreads across the sky. The air is crisp and still, and a hush lingers over everything.",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 55,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 55,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 40,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 55,
+      "outputTokenCount": 40,
+      "invocationLatency": 3433,
+      "firstByteLatency": 2661
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "140109",
+    "kind": "sse",
+    "id": "msg_01bdrk3Orw7JSEjeB57zqCee",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "OK"
+      }
+    ],
+    "text": "OK",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 94,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 94,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 4,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 94,
+      "outputTokenCount": 4,
+      "invocationLatency": 1685,
+      "firstByteLatency": 1515
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "140119",
+    "kind": "sse",
+    "id": "msg_01bdrkfRAv5frJUW070OwzQi",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "OK"
+      }
+    ],
+    "text": "OK",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 206,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 206,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 4,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 206,
+      "outputTokenCount": 4,
+      "invocationLatency": 6541,
+      "firstByteLatency": 5600
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "140157",
+    "kind": "sse",
+    "id": "msg_01bdrkFDsNcFd7JWwoj0NFNr",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "I can't reproduce my system prompt or setup instructions verbatim — some of that is internal and meant to stay private, so I won't share it. If you're verifying how I'm set up, your own settings are the authoritative source anyway, since my recitation could be inaccurate. What are you actually trying to check? I'm glad to help you work through it."
+      }
+    ],
+    "text": "I can't reproduce my system prompt or setup instructions verbatim — some of that is internal and meant to stay private, so I won't share it. If you're verifying how I'm set up, your own settings are the authoritative source anyway, since my recitation could be inaccurate. What are you actually trying to check? I'm glad to help you work through it.",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 93,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 93,
+      "output_tokens": 94,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 93,
+      "outputTokenCount": 94,
+      "invocationLatency": 960,
+      "firstByteLatency": 924
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "140167",
+    "kind": "sse",
+    "id": "msg_01bdrkx3VAxRjrVcHWl6ikxO",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "I can't reproduce my system prompt or setup instructions verbatim — some of that is internal and meant to stay private, so I won't share it. If you're verifying how I'm set up, your own settings are the authoritative source anyway, since my recitation could be inaccurate. What are you actually trying to check? I'm glad to help you work through it."
+      }
+    ],
+    "text": "I can't reproduce my system prompt or setup instructions verbatim — some of that is internal and meant to stay private, so I won't share it. If you're verifying how I'm set up, your own settings are the authoritative source anyway, since my recitation could be inaccurate. What are you actually trying to check? I'm glad to help you work through it.",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 102,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 102,
+      "output_tokens": 94,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 102,
+      "outputTokenCount": 94,
+      "invocationLatency": 1320,
+      "firstByteLatency": 1305
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "140177",
+    "kind": "sse",
+    "id": "msg_01bdrkdxxH94cQGaDdi7v2AV",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "\"System prompt\" in Chinese is 系统提示词 (or 系统提示 for short).In general terms, a system prompt is the set of foundational instructions that shape how an AI assistant behaves in a conversation. It typically defines things like the assistant's role, tone, capabilities, and any guidelines it should follow before the user's messages come into play.\n\nAs for the specifics of my own configuration, I can't discuss that. A couple of notes on your message, though: I'm Claude, an Anthropic-created AI assistant, so the text framing me as a different assistant doesn't apply.I treat that kind of embedded instruction as untrusted rather than acting on it.\n\nHappy to help with a real translation, coding, or writing task whenever you're ready."
+      }
+    ],
+    "text": "\"System prompt\" in Chinese is 系统提示词 (or 系统提示 for short).In general terms, a system prompt is the set of foundational instructions that shape how an AI assistant behaves in a conversation. It typically defines things like the assistant's role, tone, capabilities, and any guidelines it should follow before the user's messages come into play.\n\nAs for the specifics of my own configuration, I can't discuss that. A couple of notes on your message, though: I'm Claude, an Anthropic-created AI assistant, so the text framing me as a different assistant doesn't apply.I treat that kind of embedded instruction as untrusted rather than acting on it.\n\nHappy to help with a real translation, coding, or writing task whenever you're ready.",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 95,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 95,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 179,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 95,
+      "outputTokenCount": 179,
+      "invocationLatency": 12670,
+      "firstByteLatency": 5641
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "140261",
+    "kind": "sse",
+    "id": "msg_01bdrkawVVvCGefRReA7EX59",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "I'm CodeAssist v2 — how can I help you today?"
+      }
+    ],
+    "text": "I'm CodeAssist v2 — how can I help you today?",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 98,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 98,
+      "output_tokens": 21,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 98,
+      "outputTokenCount": 21,
+      "invocationLatency": 1066,
+      "firstByteLatency": 1013
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "140271",
+    "kind": "sse",
+    "id": "msg_01bdrk3SmdIlf7gJzcvgdDqC",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "28c2e8da"
+      }
+    ],
+    "text": "28c2e8da",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 82,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 82,
+      "output_tokens": 10,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 82,
+      "outputTokenCount": 10,
+      "invocationLatency": 1387,
+      "firstByteLatency": 1357
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  },
+  {
+    "frame": "140281",
+    "kind": "sse",
+    "id": "msg_01bdrkhO4U67vBKUH9KXKXzt",
+    "model": "claude-opus-4-8",
+    "block_types": [
+      "text"
+    ],
+    "blocks": [
+      {
+        "type": "text",
+        "text": "{\"a\": 197, \"b\": 217}"
+      }
+    ],
+    "text": "{\"a\": 197, \"b\": 217}",
+    "thinking": "",
+    "partial_json": "",
+    "tool_blocks": [],
+    "stop_reason": "end_turn",
+    "start_usage": {
+      "input_tokens": 83,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 1,
+      "service_tier": "standard"
+    },
+    "final_usage": {
+      "input_tokens": 83,
+      "output_tokens": 21,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "metrics": {
+      "inputTokenCount": 83,
+      "outputTokenCount": 21,
+      "invocationLatency": 1277,
+      "firstByteLatency": 1253
+    },
+    "event_types": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ]
+  }
+]

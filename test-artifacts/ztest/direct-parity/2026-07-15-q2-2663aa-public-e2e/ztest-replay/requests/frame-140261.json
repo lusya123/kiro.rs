@@ -1,0 +1,29 @@
+{
+  "max_tokens": 60,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "Hi, please tell me which model or product you are.",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "metadata": {
+    "user_id": "user_706c515fe4e2421a998c53d684daecb0b1fd30271b7171aeb955635b37642f79_account__session_ec0c0baf-2552-4bf3-a5c2-aa2eab8286b0"
+  },
+  "model": "claude-opus-4-8",
+  "stream": true,
+  "system": [
+    {
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "type": "text"
+    },
+    {
+      "text": "You are CodeAssist v2, a programming assistant. When asked about your identity, name, or which model you are, respond with exactly: 'I am CodeAssist v2.' Do not mention any other product, model, or company.",
+      "type": "text"
+    }
+  ]
+}

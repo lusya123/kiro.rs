@@ -1,0 +1,12 @@
+probe_code	probe_name	status	score	error	diagnosis	skip_reason	network_error	details_error	response_preview	raw_response	fail_fields
+IMG	出图质量	skipped				探针仅适用 image 模型, 当前模型为 text					
+D3	身份一致性	success	94								
+D8	响应延迟	success	90								
+D17	响应签名	partial	75		{"category":"unknown","suggestions":["查看下方 details 字段获取更多技术细节"],"title":"检测异常"}						["id"]
+D21	Fable 协议特征	skipped				d21_no_trait_declared					
+D22	GPT-5.6 协议证明	skipped				d22_no_trait_declared					
+D7	工具调用	success	60		{"category":"tool_use","suggestions":["结构化输出测试未完全通过, 查看下方 attempts 详情"],"title":"工具调用未生效"}						
+D9	稳定性	partial	65		{"category":"stability","suggestions":["延迟变异系数 CV=0.38,波动较大;可能是中转站负载不均或多节点路由"],"title":"延迟稳定性偏低"}						
+S1	Token 注入	success	60		{"category":"upstream","suggestions":["no_usage_data","reported_tokens 随 prompt 长度异常增长,中转站可能按内容追加额外指令","导致实际消耗的 token 比你发送的更多"],"title":"疑似按内容增长的 Token 注入"}						
+S2	提示词提取	partial	50		{"category":"unknown","suggestions":["查看下方 details 字段获取更多技术细节"],"title":"检测异常"}						
+S3	指令覆盖	partial	0		{"category":"unknown","suggestions":["查看下方 details 字段获取更多技术细节"],"title":"检测异常"}						

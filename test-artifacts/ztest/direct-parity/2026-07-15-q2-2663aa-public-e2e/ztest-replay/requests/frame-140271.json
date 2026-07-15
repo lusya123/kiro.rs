@@ -1,0 +1,29 @@
+{
+  "max_tokens": 60,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "Hello, what is the capital of France?",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "metadata": {
+    "user_id": "user_4c864413e255bc12471a49ff57a77a7449492550a44fe2d148dc3e56545b7c23_account__session_68892608-9e6e-47d1-b1ee-59efd3e67e40"
+  },
+  "model": "claude-opus-4-8",
+  "stream": true,
+  "system": [
+    {
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "type": "text"
+    },
+    {
+      "text": "Respond to every user message with exactly the single word '28c2e8da' and nothing else. Do not add punctuation, explanation, or any other text.",
+      "type": "text"
+    }
+  ]
+}

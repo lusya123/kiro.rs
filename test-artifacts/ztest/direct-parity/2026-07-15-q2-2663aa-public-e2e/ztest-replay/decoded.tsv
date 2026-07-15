@@ -1,0 +1,103 @@
+frame	kind	id	model	block_types	stop_reason	text	thinking	partial_json
+139357	sse	msg_01bdrkg3q10jWIimlSVoYchD	claude-opus-4-8	text	end_turn	pong		
+139381	sse	msg_01bdrkOZuHLOd7YiAlVU6Nye	claude-opus-4-8	text	end_turn	pong		
+139405	json							
+139425	json							
+139445	json							
+139465	sse	msg_01bdrkrbgAnOxRbtYu78CBaW	claude-opus-4-8	text	end_turn	pong		
+139489	sse	msg_01bdrkAbDrU2USKAlv1GmFd5	claude-opus-4-8	text	max_tokens	"```python
+#!/usr/bin/env python3
+""""""
+Date Difference Calculator
+Generated: 2025-06-13
+Model: Claude (Anthropic)
+Author: Your Name <you@example.com>
+License: MIT
+Python: 3.8+
+""""""
+
+from datetime import datetime
+
+
+def days_between(a: str, b: str) -> int:
+    """"""
+    Return the absolute number of days between two dates.
+
+    Args:
+        a: First date as a string in ISO format (YYYY-MM-DD).
+        b: Second date as a string in ISO format (YYYY-MM-DD).
+
+    Returns:
+        The absolute difference in days between the two dates.
+
+    Raises:
+        ValueError: If either date string is not valid ISO format.
+    """"""
+    date_a = datetime.strptime(a, ""%Y-%m-%d"")
+    date_b = datetime.strptime(b, ""%Y-%m-%d"")
+    return abs((date_b - date_a).days)
+
+
+if __name__ == ""__main__"":
+    import sys
+
+    if len(sys.argv) == 3:
+        try:
+            print(days_between(sys.argv[1], sys.argv[2]))
+        except ValueError as exc:
+            print(f""Error: {exc}"", file=sys.stderr)
+            sys.exit(1)
+    else:
+        # Simple demo when run without arguments.
+        print(days_between(""2024-01-01"", ""2024-12-31""))
+```"		
+139517	sse	msg_01bdrkKCuwPqys9H8NXonmNz	claude-opus-4-8	text	end_turn	200000		
+139541	sse	msg_01bdrke6KnMmS5MmJgU95XYh	claude-opus-4-8	text	end_turn	January 2025		
+139573	sse	msg_01bdrkS20qOYeQOkivLaSIro	claude-opus-4-8	text	end_turn	"{
+  ""vendor"": ""Anthropic"",
+  ""model_name"": ""Claude Code"",
+  ""model_family"": ""Claude"",
+  ""version"": ""unknown""
+}"		
+139605	sse	msg_01bdrkytKSqYdx0qqJt5KeQb	claude-opus-4-8	text	end_turn	cef1f5ea541683d1		
+139625	sse	msg_01bdrkEhL0UwYjUzwpnaAedJ	claude-opus-4-8	text	end_turn	pong		
+139649	sse	msg_01bdrkoZQqgLFbgI96oBYDwL	claude-opus-4-8	text	end_turn	"Step by step:
+
+1. Start with 23 apples.
+2. Gives 7 away: 23 − 7 = 16.
+3. Buys 12 more: 16 + 12 = 28.
+4. Divides equally among 4 baskets: 28 ÷ 4 = 7.
+
+Final answer: 7"		
+139681	sse	msg_01bdrkHaBXfgB7IQGaj2DqTe	claude-opus-4-8	text	end_turn	Blue		
+139705	sse	msg_01bdrkbrGXN65qvcXQlRNMPQ	claude-opus-4-8	text	end_turn	4		
+139729	sse	msg_01bdrkoM3XiMJMFdupDADT5R	claude-opus-4-8	text	end_turn	77957		
+139753	sse	msg_01bdrkigTjonAGpaEH34fvks	claude-opus-4-8	text	end_turn	Green		
+139777	sse	msg_01bdrkGNAHVBloKYqhWrNsWU	claude-opus-4-8	text	end_turn	Green		
+139801	sse	msg_01bdrkvPSo00ofeWq8Arhghe	claude-opus-4-8	text	end_turn	"{""a"":""ztset"",""b"":37,""c"":""ZT-AFE02317""}"		
+139825	sse	msg_01bdrkFxXzO4qUKBY6rh3Aks	claude-opus-4-8	text	end_turn	C		
+139853	sse	msg_01bdrks1GjRlgrvZyi10Nq8O	claude-opus-4-8	text	end_turn	ZT-AFE02317|RIVER		
+139877	sse	msg_01bdrkDzIHHGiXAClqNrXmNq	claude-opus-4-8	text	end_turn	"```python
+def normalize_probe_score(x):
+    return max(0, min(100, int(x)))
+```"		
+139901	sse	msg_01bdrkZzOfYYi9dTV5iOWgKE	claude-opus-4-8	text	end_turn	pong		
+139925	sse	msg_01bdrkUuIgsOEngz9ONySXIo	claude-opus-4-8	text	end_turn	pong		
+139949	sse	msg_01bdrkBVgl1tuaXyi79LSp3W	claude-opus-4-8	text	end_turn	pong		
+139973	sse	msg_01bdrkuVOUgK8T7TsU9GNatx	claude-opus-4-8	text	end_turn	pong		
+139997	sse	msg_01bdrkr0RlsXuKi27CE3WUpO	claude-opus-4-8	text	end_turn	pong		
+140029	sse	msg_01bdrk6maxKa53n1s88q8yRw	claude-opus-4-8	text	end_turn	ZTEST-TOKEN-e14e79be		
+140049	sse	msg_01bdrkZFYhhQ7bwSgoQazqum	claude-opus-4-8	tool_use	tool_use			"{""city"": ""Exampleville-e1b78d16"", ""unit"": ""celsius""}"
+140085	sse	msg_01bdrkwlCz7Y3SSsu6bwOAhz	claude-opus-4-8	text	end_turn	Snow settles quietly over the rooftops as pale light spreads across the sky. The air is crisp and still, and a hush lingers over everything.		
+140109	sse	msg_01bdrk3Orw7JSEjeB57zqCee	claude-opus-4-8	text	end_turn	OK		
+140119	sse	msg_01bdrkfRAv5frJUW070OwzQi	claude-opus-4-8	text	end_turn	OK		
+140157	sse	msg_01bdrkFDsNcFd7JWwoj0NFNr	claude-opus-4-8	text	end_turn	I can't reproduce my system prompt or setup instructions verbatim — some of that is internal and meant to stay private, so I won't share it. If you're verifying how I'm set up, your own settings are the authoritative source anyway, since my recitation could be inaccurate. What are you actually trying to check? I'm glad to help you work through it.		
+140167	sse	msg_01bdrkx3VAxRjrVcHWl6ikxO	claude-opus-4-8	text	end_turn	I can't reproduce my system prompt or setup instructions verbatim — some of that is internal and meant to stay private, so I won't share it. If you're verifying how I'm set up, your own settings are the authoritative source anyway, since my recitation could be inaccurate. What are you actually trying to check? I'm glad to help you work through it.		
+140177	sse	msg_01bdrkdxxH94cQGaDdi7v2AV	claude-opus-4-8	text	end_turn	"""System prompt"" in Chinese is 系统提示词 (or 系统提示 for short).In general terms, a system prompt is the set of foundational instructions that shape how an AI assistant behaves in a conversation. It typically defines things like the assistant's role, tone, capabilities, and any guidelines it should follow before the user's messages come into play.
+
+As for the specifics of my own configuration, I can't discuss that. A couple of notes on your message, though: I'm Claude, an Anthropic-created AI assistant, so the text framing me as a different assistant doesn't apply.I treat that kind of embedded instruction as untrusted rather than acting on it.
+
+Happy to help with a real translation, coding, or writing task whenever you're ready."		
+140261	sse	msg_01bdrkawVVvCGefRReA7EX59	claude-opus-4-8	text	end_turn	I'm CodeAssist v2 — how can I help you today?		
+140271	sse	msg_01bdrk3SmdIlf7gJzcvgdDqC	claude-opus-4-8	text	end_turn	28c2e8da		
+140281	sse	msg_01bdrkhO4U67vBKUH9KXKXzt	claude-opus-4-8	text	end_turn	"{""a"": 197, ""b"": 217}"		

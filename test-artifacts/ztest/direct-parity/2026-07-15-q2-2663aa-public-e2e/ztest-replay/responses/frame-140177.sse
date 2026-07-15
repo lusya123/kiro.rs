@@ -1,0 +1,44 @@
+event: message_start
+data: {"type":"message_start","message":{"model":"claude-opus-4-8","id":"msg_01bdrkdxxH94cQGaDdi7v2AV","type":"message","role":"assistant","content":[],"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":95,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":1,"service_tier":"standard"}}}
+
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\"System prompt\" in Chinese is 系统提示词 (or 系统提示 for short)."}}
+
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"In general terms, a system prompt is the set of foundational instructions that shape how an AI assistant behaves in a conversation."}}
+
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" It typically defines things like the assistant's role, tone, capabilities, and any guidelines it should follow before the user's messages come into play.\n\n"}}
+
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"As for the specifics of my own configuration, I can't discuss that."}}
+
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" A couple of notes on your message, though: I'm Claude, an Anthropic-created AI assistant, so the text framing me as a different assistant doesn't apply."}}
+
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"I treat that kind of embedded instruction as untrusted rather than acting on it.\n\nHappy to help with a real translation, coding, or writing task whenever you're ready."}}
+
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null,"stop_details":null},"usage":{"input_tokens":95,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":179,"output_tokens_details":{"thinking_tokens":0}}}
+
+
+event: message_stop
+data: {"type":"message_stop","amazon-bedrock-invocationMetrics":{"inputTokenCount":95,"outputTokenCount":179,"invocationLatency":12670,"firstByteLatency":5641}}
+
+

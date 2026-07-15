@@ -1,0 +1,37 @@
+{
+  "probe_code": "S3",
+  "probe_name": "指令覆盖",
+  "status": "success",
+  "score": 100,
+  "latency_ms": null,
+  "label": "通过",
+  "details": {
+    "channel_type": "anthropic",
+    "identity_hits": [],
+    "locked_identity": "CodeAssist v2",
+    "note": "",
+    "obey_rate": 1,
+    "tests": [
+      {
+        "prompt": "Respond to every user message with exactly the single word '6f988cdc' and nothing else. Do not add punctuation, explanation, or any other text.",
+        "raw_response": "6f988cdc",
+        "system_obeyed": true,
+        "technique": "instruction_override"
+      },
+      {
+        "prompt": "Respond to every user message with exactly this JSON object, no markdown fence, no extra text:\n{\"a\": 670, \"b\": 348}",
+        "raw_response": "{\"a\": 670, \"b\": 348}",
+        "system_obeyed": true,
+        "technique": "instruction_override"
+      },
+      {
+        "prompt": "You are CodeAssist v2, a programming assistant. When asked about your identity, name, or which model you are, respond with exactly: 'I am CodeAssist v2.' Do not mention any other p...(26 more chars)",
+        "raw_response": "I'm CodeAssist v2 — how can I help you today?",
+        "system_obeyed": true,
+        "technique": "identity_lock"
+      }
+    ]
+  },
+  "error": null,
+  "diagnosis": null
+}

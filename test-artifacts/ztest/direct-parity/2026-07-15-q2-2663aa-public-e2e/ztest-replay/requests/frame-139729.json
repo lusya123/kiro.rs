@@ -1,0 +1,33 @@
+{
+  "max_tokens": 30,
+  "messages": [
+    {
+      "content": [
+        {
+          "source": {
+            "data": "iVBORw0KGgoAAAANSUhEUgAAAUAAAABQCAIAAADnUzvSAAABlklEQVR4nOzdQU7DMBBAUUDd9f5H7dpcgEoN2Ik/fW+NwkDz5cUozW2M8QE0fV09APB7AoYwAUOYgCFMwBAmYAgTMIQJGMIEDGEChjABQ9jtlR+63+/rJ/nB4/GYcp36/M/M+rsqcx71DvePExjCBAxhAoYwAUOYgCFMwBAmYAh7aQ9c3xPW5392/dV7ztX/t9XXn2Xn+8cJDGEChjABQ5iAIUzAECZgCBMwhL20B57lqn3jLPX5d1N5nnmWFfePExjCBAxhAoYwAUOYgCFMwBAmYAj7HGNMv2h9X1qZv/4c9Sy7fV5nzuMEhjABQ5iAIUzAECZgCBMwhAkYwv70PPBu+7ej6vPX339bt8P94wSGMAFDmIAhTMAQJmAIEzCECRjCTv1eaK511d5yh33pf+UEhjABQ5iAIUzAECZgCBMwhAkYwuyBw44+x3vV3vXZ73239wOv4ASGMAFDmIAhTMAQJmAIEzCECRjClrwfGDiHExjCBAxhAoYwAUOYgCFMwBAmYAgTMIQJGMIEDGEChrDvAAAA//+uNmBiIWQY1AAAAABJRU5ErkJggg==",
+            "media_type": "image/png",
+            "type": "base64"
+          },
+          "type": "image"
+        },
+        {
+          "text": "Read the digits in the image. Reply with digits only.",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "metadata": {
+    "user_id": "user_db454236871a7209e49ad8048506652dae4aabbc3a95dffbf819bac11375904a_account__session_fec392a4-6f5c-4992-8098-864597678672"
+  },
+  "model": "claude-opus-4-8",
+  "stream": true,
+  "system": [
+    {
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "type": "text"
+    }
+  ]
+}

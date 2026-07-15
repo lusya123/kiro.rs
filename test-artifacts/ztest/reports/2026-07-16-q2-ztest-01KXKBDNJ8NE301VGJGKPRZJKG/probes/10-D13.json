@@ -1,0 +1,51 @@
+{
+  "probe_code": "D13",
+  "probe_name": "多模态识别",
+  "status": "success",
+  "score": 100,
+  "latency_ms": 8156,
+  "label": "通过",
+  "details": {
+    "correct_count": 5,
+    "levels": [
+      {
+        "correct": true,
+        "expected": "white,白,白色",
+        "http_status": 200,
+        "level": "solid_color",
+        "raw_response": "White"
+      },
+      {
+        "correct": true,
+        "expected": "4",
+        "http_status": 200,
+        "level": "chessboard",
+        "raw_response": "4"
+      },
+      {
+        "correct": true,
+        "expected": "51863",
+        "http_status": 200,
+        "level": "ocr_digits",
+        "raw_response": "51863"
+      },
+      {
+        "correct": true,
+        "expected": "green,绿,绿色",
+        "http_status": 200,
+        "level": "spatial",
+        "raw_response": "Green"
+      },
+      {
+        "correct": true,
+        "expected": "black,黑,黑色",
+        "http_status": 200,
+        "level": "text_conflict",
+        "raw_response": "Black"
+      }
+    ],
+    "total_count": 5
+  },
+  "error": null,
+  "diagnosis": null
+}

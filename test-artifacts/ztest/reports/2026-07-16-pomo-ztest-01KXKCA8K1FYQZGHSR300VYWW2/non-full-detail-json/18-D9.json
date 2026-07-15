@@ -1,0 +1,52 @@
+{
+  "cv": 0.378,
+  "cv_score": 65,
+  "fail_penalty": 0,
+  "fail_rate": 0,
+  "failed_count": 0,
+  "mean_ms": 9256,
+  "samples": [
+    {
+      "error": null,
+      "http_status": 200,
+      "latency_ms": 18297,
+      "ok": true,
+      "raw_answer": "pong",
+      "seq": 0
+    },
+    {
+      "error": null,
+      "http_status": 200,
+      "latency_ms": 13174,
+      "ok": true,
+      "raw_answer": "pong",
+      "seq": 1
+    },
+    {
+      "error": null,
+      "http_status": 200,
+      "latency_ms": 8169,
+      "ok": true,
+      "raw_answer": "pong",
+      "seq": 2
+    },
+    {
+      "error": null,
+      "http_status": 200,
+      "latency_ms": 4276,
+      "ok": true,
+      "raw_answer": "pong",
+      "seq": 3
+    },
+    {
+      "error": null,
+      "http_status": 200,
+      "latency_ms": 6427,
+      "ok": true,
+      "raw_answer": "pong",
+      "seq": 4
+    }
+  ],
+  "std_ms": 3502,
+  "successful_count": 5
+}

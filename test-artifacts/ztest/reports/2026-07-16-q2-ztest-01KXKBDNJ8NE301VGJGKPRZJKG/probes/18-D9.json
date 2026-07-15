@@ -1,0 +1,62 @@
+{
+  "probe_code": "D9",
+  "probe_name": "稳定性",
+  "status": "success",
+  "score": 100,
+  "latency_ms": 551,
+  "label": "通过",
+  "details": {
+    "cv": 0.075,
+    "cv_score": 100,
+    "fail_penalty": 0,
+    "fail_rate": 0,
+    "failed_count": 0,
+    "mean_ms": 551,
+    "samples": [
+      {
+        "error": null,
+        "http_status": 200,
+        "latency_ms": 595,
+        "ok": true,
+        "raw_answer": "pong",
+        "seq": 0
+      },
+      {
+        "error": null,
+        "http_status": 200,
+        "latency_ms": 688,
+        "ok": true,
+        "raw_answer": "pong",
+        "seq": 1
+      },
+      {
+        "error": null,
+        "http_status": 200,
+        "latency_ms": 512,
+        "ok": true,
+        "raw_answer": "pong",
+        "seq": 2
+      },
+      {
+        "error": null,
+        "http_status": 200,
+        "latency_ms": 414,
+        "ok": true,
+        "raw_answer": "pong",
+        "seq": 3
+      },
+      {
+        "error": null,
+        "http_status": 200,
+        "latency_ms": 548,
+        "ok": true,
+        "raw_answer": "pong",
+        "seq": 4
+      }
+    ],
+    "std_ms": 41,
+    "successful_count": 5
+  },
+  "error": null,
+  "diagnosis": null
+}

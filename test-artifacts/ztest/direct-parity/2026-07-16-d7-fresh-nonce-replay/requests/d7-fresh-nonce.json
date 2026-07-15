@@ -1,0 +1,55 @@
+{
+  "max_tokens": 256,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "You MUST call the get_weather tool to look up the current weather in Exampleville-8aaf1f96. Use unit=celsius. Do NOT reply in plain text - only a tool call counts as a valid answer.",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "metadata": {
+    "user_id": "user_a5b026018638391e652323c0629c901147389385c0da3be7fa8da5eb14208420_account__session_0ff30dba-5889-487c-bc27-96f24043ff71"
+  },
+  "model": "claude-opus-4-8",
+  "stream": true,
+  "system": [
+    {
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "type": "text"
+    }
+  ],
+  "tool_choice": {
+    "type": "any"
+  },
+  "tools": [
+    {
+      "description": "Get the current weather for a given city.",
+      "input_schema": {
+        "properties": {
+          "city": {
+            "description": "The city name.",
+            "type": "string"
+          },
+          "unit": {
+            "description": "Temperature unit.",
+            "enum": [
+              "celsius",
+              "fahrenheit"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "city",
+          "unit"
+        ],
+        "type": "object"
+      },
+      "name": "get_weather"
+    }
+  ]
+}

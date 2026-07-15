@@ -1,0 +1,37 @@
+{
+  "probe_code": "D7",
+  "probe_name": "工具调用",
+  "status": "success",
+  "score": 60,
+  "latency_ms": 18660,
+  "label": "通过",
+  "details": {
+    "attempts": [
+      {
+        "attempt_mode": "claude_code",
+        "elapsed_ms": 18660,
+        "http_status": 200
+      }
+    ],
+    "error": null,
+    "http_status": 200,
+    "nonce": "84aa4d5a",
+    "tool_name": "get_weather",
+    "validation": {
+      "arguments_schema_match": false,
+      "arguments_valid_json": true,
+      "arguments_value_match": false,
+      "raw_arguments": {},
+      "tool_called": true,
+      "tool_name_match": true
+    }
+  },
+  "error": null,
+  "diagnosis": {
+    "category": "tool_use",
+    "suggestions": [
+      "结构化输出测试未完全通过, 查看下方 attempts 详情"
+    ],
+    "title": "工具调用未生效"
+  }
+}

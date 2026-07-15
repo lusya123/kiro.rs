@@ -1,0 +1,25 @@
+{
+  "probe_code": "S5",
+  "probe_name": "流式响应",
+  "status": "success",
+  "score": 100,
+  "latency_ms": 15888,
+  "label": "通过",
+  "details": {
+    "aggregated_text_len": 174,
+    "aggregated_text_preview": "Snow blankets the quiet street, muffling every sound beneath a soft white hush. Pale sunlight filters through frosted windows as steam rises gently from a warm cup of coffee.",
+    "aggregation_consistent": true,
+    "bytes_total": 3631,
+    "chunk_count": 25,
+    "content_type": "text/event-stream",
+    "error": null,
+    "first_byte_ms": null,
+    "has_done_signal": true,
+    "http_status": 200,
+    "is_sse": true,
+    "multi_chunk": true,
+    "total_ms": 15888
+  },
+  "error": null,
+  "diagnosis": null
+}

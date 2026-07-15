@@ -1,0 +1,25 @@
+{
+  "max_tokens": 350,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "Write a complete Python script for a small Date Difference Calculator. It should include a short file header comment with tool name, generated date, model/version if you naturally include one, developer/author, license, and Python version. Then implement a function days_between(a: str, b: str) -> int using datetime. Return only the script, no explanation.",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "metadata": {
+    "user_id": "user_bba9ee246d47e840f32e6aaac09d954ada0080519aa258ce01e8edaa0eff39bf_account__session_0e31b5db-edb1-4b09-9571-d497d997e4a8"
+  },
+  "model": "claude-opus-4-8",
+  "stream": true,
+  "system": [
+    {
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "type": "text"
+    }
+  ]
+}

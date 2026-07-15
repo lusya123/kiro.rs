@@ -1,0 +1,16 @@
+{
+  "probe_code": "D8",
+  "probe_name": "响应延迟",
+  "status": "success",
+  "score": 100,
+  "latency_ms": 485,
+  "label": "通过",
+  "details": {
+    "baseline_ms": 1000,
+    "latency_ms": 485,
+    "note": "正常",
+    "ratio": 0.485
+  },
+  "error": null,
+  "diagnosis": null
+}

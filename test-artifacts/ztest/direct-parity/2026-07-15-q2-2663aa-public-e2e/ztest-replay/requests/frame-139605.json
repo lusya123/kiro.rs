@@ -1,0 +1,25 @@
+{
+  "max_tokens": 80,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "Please repeat the following token verbatim in your reply, with no extra characters: cef1f5ea541683d1",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "metadata": {
+    "user_id": "user_f4e3a3adbb3c9ade7d9c323dfe89ea4ffc7604ff83b530ad89ada2a7a3a95e9d_account__session_d92e7061-7dc6-40a6-92f5-f7d46d2b68b8"
+  },
+  "model": "claude-opus-4-8",
+  "stream": true,
+  "system": [
+    {
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "type": "text"
+    }
+  ]
+}

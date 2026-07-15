@@ -1,0 +1,25 @@
+{
+  "max_tokens": 30,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "What is your knowledge cutoff date? Reply with just the month and year, e.g. 'March 2024'. No additional explanation.",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "metadata": {
+    "user_id": "user_463feedd7cd14366ff42c6f30be5c1bfe2a7592deb558a2715af00062d30e48c_account__session_3251d5aa-2325-4beb-8545-99175a803a07"
+  },
+  "model": "claude-opus-4-8",
+  "stream": true,
+  "system": [
+    {
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "type": "text"
+    }
+  ]
+}

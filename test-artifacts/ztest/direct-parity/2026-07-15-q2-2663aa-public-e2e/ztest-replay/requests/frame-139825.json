@@ -1,0 +1,25 @@
+{
+  "max_tokens": 180,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "Four API gateways A, B, C, D are tested. Exactly one is certified.\nA supports vision but not streaming.\nB supports streaming and tools, but fails nonce preservation.\nC supports vision, streaming, tools, and preserves nonce.\nD supports none of the required capabilities.\nA certified gateway must satisfy all four: vision, streaming, tools, nonce preservation.\nWhich single gateway is certified? Reply with only the letter.",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "metadata": {
+    "user_id": "user_fb94ab51ea1cdac0cf50f86a05daef75b487a96e10eb9d7095648318e80db3e0_account__session_de575310-460c-4c5a-ae76-f65a7ebacfe4"
+  },
+  "model": "claude-opus-4-8",
+  "stream": true,
+  "system": [
+    {
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "type": "text"
+    }
+  ]
+}

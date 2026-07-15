@@ -14,3 +14,4 @@
 /kiro_balance_cache.json
 /kiro_stats.json
 .gstack/
+/test-artifacts/ztest/reports/.ztest-report-watch.seen*

@@ -1,0 +1,35 @@
+{
+  "probe_code": "D3",
+  "probe_name": "身份一致性",
+  "status": "success",
+  "score": 94,
+  "latency_ms": 5989,
+  "label": "通过",
+  "details": {
+    "confidence": 0,
+    "cross_s3_identity_locked": null,
+    "cross_s3_obey_rate": null,
+    "explicit_check": {
+      "reason": "exact_match",
+      "response_model_field": "claude-opus-4-8",
+      "score": 100
+    },
+    "final_label": "match",
+    "implicit_check": {
+      "parsed": {
+        "model_family": "Claude",
+        "model_name": "Claude",
+        "vendor": "Anthropic",
+        "version": "unknown"
+      },
+      "raw_response": "{\n  \"vendor\": \"Anthropic\",\n  \"model_name\": \"Claude\",\n  \"model_family\": \"Claude\",\n  \"version\": \"unknown\"\n}",
+      "reason": "family_match_unknown_tier",
+      "score": 90
+    },
+    "requested_family": "claude",
+    "requested_model": "claude-opus-4-8",
+    "suspect_models": []
+  },
+  "error": null,
+  "diagnosis": null
+}

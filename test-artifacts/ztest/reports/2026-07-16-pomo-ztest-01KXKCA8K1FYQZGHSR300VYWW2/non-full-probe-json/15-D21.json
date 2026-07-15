@@ -1,0 +1,13 @@
+{
+  "probe_code": "D21",
+  "probe_name": "Fable 协议特征",
+  "status": "skipped",
+  "score": null,
+  "latency_ms": null,
+  "label": "不适用",
+  "details": {
+    "skip_reason": "d21_no_trait_declared"
+  },
+  "error": null,
+  "diagnosis": null
+}

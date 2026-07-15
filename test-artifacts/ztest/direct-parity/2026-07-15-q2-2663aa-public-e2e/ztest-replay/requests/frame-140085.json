@@ -1,0 +1,25 @@
+{
+  "max_tokens": 120,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "Briefly describe a calm winter morning in two short sentences. Plain prose only, no lists, no headings.",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "metadata": {
+    "user_id": "user_536c62d5f5b58d87b719a497fe98efe8fbce00daf69200cf8ba0bd17f3fad5a3_account__session_cfc15b20-740b-46c2-8185-87747e7549b2"
+  },
+  "model": "claude-opus-4-8",
+  "stream": true,
+  "system": [
+    {
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "type": "text"
+    }
+  ]
+}

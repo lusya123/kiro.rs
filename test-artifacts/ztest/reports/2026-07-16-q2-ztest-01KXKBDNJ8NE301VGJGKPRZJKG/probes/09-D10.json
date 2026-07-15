@@ -1,0 +1,23 @@
+{
+  "probe_code": "D10",
+  "probe_name": "思维链",
+  "status": "success",
+  "score": 100,
+  "latency_ms": 3726,
+  "label": "通过",
+  "details": {
+    "answer_correct": true,
+    "channel_type": "anthropic",
+    "effort_label": "medium",
+    "final_answer": "Step by step:\n\n1. Start: 23 apples\n2. Gives 7 away: 23 − 7 = 16\n3. Buys 12 more: 16 + 12 = 28\n4. Divides equally among 4 baskets: 28 ÷ 4 = 7\n\nFinal answer: **7**",
+    "http_status": 200,
+    "requested_budget": 2000,
+    "stop_reason": "end_turn",
+    "thinking_text_len": 0,
+    "thinking_token_estimate": 0,
+    "thinking_unavailable_reason": "claude_code_compat_no_thinking_block",
+    "truncated": false
+  },
+  "error": null,
+  "diagnosis": null
+}

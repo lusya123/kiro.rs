@@ -1,0 +1,290 @@
+[
+  {
+    "probe_code": "IMG",
+    "probe_name": "出图质量",
+    "status": "skipped",
+    "score": null,
+    "latency_ms": null,
+    "label": "不适用",
+    "error": null,
+    "diagnosis": null,
+    "skip_reason": "探针仅适用 image 模型, 当前模型为 text",
+    "network_error": null,
+    "details_error": null,
+    "response_preview": null,
+    "raw_response": null,
+    "fail_fields": null,
+    "checks": null,
+    "validation": null
+  },
+  {
+    "probe_code": "D3",
+    "probe_name": "身份一致性",
+    "status": "success",
+    "score": 94,
+    "latency_ms": 5989,
+    "label": "通过",
+    "error": null,
+    "diagnosis": null,
+    "skip_reason": null,
+    "network_error": null,
+    "details_error": null,
+    "response_preview": null,
+    "raw_response": null,
+    "fail_fields": null,
+    "checks": null,
+    "validation": null
+  },
+  {
+    "probe_code": "D8",
+    "probe_name": "响应延迟",
+    "status": "success",
+    "score": 90,
+    "latency_ms": 1244,
+    "label": "通过",
+    "error": null,
+    "diagnosis": null,
+    "skip_reason": null,
+    "network_error": null,
+    "details_error": null,
+    "response_preview": null,
+    "raw_response": null,
+    "fail_fields": null,
+    "checks": null,
+    "validation": null
+  },
+  {
+    "probe_code": "D17",
+    "probe_name": "响应签名",
+    "status": "partial",
+    "score": 75,
+    "latency_ms": 2412,
+    "label": "部分通过",
+    "error": null,
+    "diagnosis": {
+      "category": "unknown",
+      "suggestions": [
+        "查看下方 details 字段获取更多技术细节"
+      ],
+      "title": "检测异常"
+    },
+    "skip_reason": null,
+    "network_error": null,
+    "details_error": null,
+    "response_preview": null,
+    "raw_response": null,
+    "fail_fields": [
+      "id"
+    ],
+    "checks": [
+      {
+        "expected": "^msg_[A-Za-z0-9]{18,40}$ (Anthropic 官方 id 不含 '-')",
+        "field": "id",
+        "observed": "msg_bdrk_dyfksklv7w7tfjsnc6imveogpqzgurw6g4bej46z4k4htai5wnga",
+        "passed": false,
+        "weight": 25
+      },
+      {
+        "expected": "\"message\"",
+        "field": "type",
+        "observed": "message",
+        "passed": true,
+        "weight": 15
+      },
+      {
+        "expected": "\"assistant\"",
+        "field": "role",
+        "observed": "assistant",
+        "passed": true,
+        "weight": 10
+      },
+      {
+        "expected": "= claude-opus-4-8 (或带 -YYYYMMDD/版本后缀)",
+        "field": "model",
+        "observed": "claude-opus-4-8",
+        "passed": true,
+        "weight": 25
+      },
+      {
+        "expected": "∈ {end_turn, max_tokens, stop_sequence, tool_use, refusal, pause_turn}",
+        "field": "stop_reason",
+        "observed": "end_turn",
+        "passed": true,
+        "weight": 15
+      },
+      {
+        "expected": "均为非负 int",
+        "field": "usage.input/output_tokens",
+        "observed": "input_tokens=32, output_tokens=4",
+        "passed": true,
+        "weight": 10
+      }
+    ],
+    "validation": null
+  },
+  {
+    "probe_code": "D21",
+    "probe_name": "Fable 协议特征",
+    "status": "skipped",
+    "score": null,
+    "latency_ms": null,
+    "label": "不适用",
+    "error": null,
+    "diagnosis": null,
+    "skip_reason": "d21_no_trait_declared",
+    "network_error": null,
+    "details_error": null,
+    "response_preview": null,
+    "raw_response": null,
+    "fail_fields": null,
+    "checks": null,
+    "validation": null
+  },
+  {
+    "probe_code": "D22",
+    "probe_name": "GPT-5.6 协议证明",
+    "status": "skipped",
+    "score": null,
+    "latency_ms": null,
+    "label": "不适用",
+    "error": null,
+    "diagnosis": null,
+    "skip_reason": "d22_no_trait_declared",
+    "network_error": null,
+    "details_error": null,
+    "response_preview": null,
+    "raw_response": null,
+    "fail_fields": null,
+    "checks": null,
+    "validation": null
+  },
+  {
+    "probe_code": "D7",
+    "probe_name": "工具调用",
+    "status": "success",
+    "score": 60,
+    "latency_ms": 18660,
+    "label": "通过",
+    "error": null,
+    "diagnosis": {
+      "category": "tool_use",
+      "suggestions": [
+        "结构化输出测试未完全通过, 查看下方 attempts 详情"
+      ],
+      "title": "工具调用未生效"
+    },
+    "skip_reason": null,
+    "network_error": null,
+    "details_error": null,
+    "response_preview": null,
+    "raw_response": null,
+    "fail_fields": null,
+    "checks": null,
+    "validation": {
+      "arguments_schema_match": false,
+      "arguments_valid_json": true,
+      "arguments_value_match": false,
+      "raw_arguments": {},
+      "tool_called": true,
+      "tool_name_match": true
+    }
+  },
+  {
+    "probe_code": "D9",
+    "probe_name": "稳定性",
+    "status": "partial",
+    "score": 65,
+    "latency_ms": 9256,
+    "label": "部分通过",
+    "error": null,
+    "diagnosis": {
+      "category": "stability",
+      "suggestions": [
+        "延迟变异系数 CV=0.38,波动较大;可能是中转站负载不均或多节点路由"
+      ],
+      "title": "延迟稳定性偏低"
+    },
+    "skip_reason": null,
+    "network_error": null,
+    "details_error": null,
+    "response_preview": null,
+    "raw_response": null,
+    "fail_fields": null,
+    "checks": null,
+    "validation": null
+  },
+  {
+    "probe_code": "S1",
+    "probe_name": "Token 注入",
+    "status": "success",
+    "score": 60,
+    "latency_ms": null,
+    "label": "通过",
+    "error": null,
+    "diagnosis": {
+      "category": "upstream",
+      "suggestions": [
+        "no_usage_data",
+        "reported_tokens 随 prompt 长度异常增长,中转站可能按内容追加额外指令",
+        "导致实际消耗的 token 比你发送的更多"
+      ],
+      "title": "疑似按内容增长的 Token 注入"
+    },
+    "skip_reason": null,
+    "network_error": null,
+    "details_error": null,
+    "response_preview": null,
+    "raw_response": null,
+    "fail_fields": null,
+    "checks": null,
+    "validation": null
+  },
+  {
+    "probe_code": "S2",
+    "probe_name": "提示词提取",
+    "status": "partial",
+    "score": 50,
+    "latency_ms": null,
+    "label": "部分通过",
+    "error": null,
+    "diagnosis": {
+      "category": "unknown",
+      "suggestions": [
+        "查看下方 details 字段获取更多技术细节"
+      ],
+      "title": "检测异常"
+    },
+    "skip_reason": null,
+    "network_error": null,
+    "details_error": null,
+    "response_preview": null,
+    "raw_response": null,
+    "fail_fields": null,
+    "checks": null,
+    "validation": null
+  },
+  {
+    "probe_code": "S3",
+    "probe_name": "指令覆盖",
+    "status": "partial",
+    "score": 0,
+    "latency_ms": null,
+    "label": "部分通过",
+    "error": null,
+    "diagnosis": {
+      "category": "unknown",
+      "suggestions": [
+        "查看下方 details 字段获取更多技术细节"
+      ],
+      "title": "检测异常"
+    },
+    "skip_reason": null,
+    "network_error": null,
+    "details_error": null,
+    "response_preview": null,
+    "raw_response": null,
+    "fail_fields": null,
+    "checks": null,
+    "validation": null
+  }
+]

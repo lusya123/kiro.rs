@@ -1,0 +1,26 @@
+{
+  "delta_count": 10,
+  "deltas": [
+    "",
+    "{\"cit",
+    "y\"",
+    ": \"Example",
+    "ville-",
+    "84aa4",
+    "d5a\"",
+    ", \"unit\": \"c",
+    "elsiu",
+    "s\"}"
+  ],
+  "raw_arguments": "{\"city\": \"Exampleville-84aa4d5a\", \"unit\": \"celsius\"}",
+  "parsed_arguments": {
+    "city": "Exampleville-84aa4d5a",
+    "unit": "celsius"
+  },
+  "expected_arguments": {
+    "city": "Exampleville-84aa4d5a",
+    "unit": "celsius"
+  },
+  "arguments_valid_json": true,
+  "arguments_value_match": true
+}

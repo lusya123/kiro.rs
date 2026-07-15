@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ZTest popup capture harness</title>
+    <style>
+      html,
+      body,
+      iframe {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        border: 0;
+      }
+
+      body {
+        overflow: hidden;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      ZTest opens completed reports asynchronously in a new window. The
+      in-app browser can discard that child window while still returning a
+      truthy WindowProxy. Omitting allow-popups makes window.open() fail in a
+      standards-defined way, so ZTest exposes its own fallback report link.
+    -->
+    <iframe
+      title="ZTest"
+      src="https://ztest.ai/"
+      sandbox="allow-forms allow-modals allow-same-origin allow-scripts"
+    ></iframe>
+  </body>
+</html>

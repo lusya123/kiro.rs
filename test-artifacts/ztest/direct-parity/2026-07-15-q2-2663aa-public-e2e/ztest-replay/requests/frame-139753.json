@@ -1,0 +1,33 @@
+{
+  "max_tokens": 30,
+  "messages": [
+    {
+      "content": [
+        {
+          "source": {
+            "data": "iVBORw0KGgoAAAANSUhEUgAAAMgAAABkCAIAAABM5OhcAAACc0lEQVR4nOzdwW3rMBBF0f+DNOMysnLNWbmMVOJ9FgICI4tIovhm3gzvqYADXpFyYCPvz+fzHzDbW/YC0BNhQYKwIEFYkCAsSBAWJAgLEoQFCcKCBGFBgrAgQViQICxIEBYkCAsShAUJwoIEYUGCsCBBWJAgLEgQFiQICxKEBQnTsG6Pe/YScMn/xF9CD9fz9fE5ey2YLDqs6UcRkXkKCivgaqMwK/Kwgt+WyMuEMKzEF3DySicJy+QzHXklmhyWSVKvyCvFzL9jGVZlu6r2poXlvH/Oa+tqTlj+O+e/wmauvmOV2zBeuWJcOrHKVVV0zRWNh1V3h+quvJDBsKrvTfX1+zP92gyqGwmrx+PeYwpbp8PqtB+dZnHDVQiJc2H1e8T7TWTiRFhd96DrXLm4CiFxNKzej3Xv6VJwYkGCsCBxKKwVbooVZozEiQUJwoLEfljr3BHrTBqAEwsShAUJwoIEYUGCsCBBWJDYCWu1T+CrzauzE9ZqP+9cbV4drkJIEBYkCAsShAUJwoIEYUFiP6x1PoGvM2kATixIEBYkDoW1wh2xwoyROLEgQViQOBpW75ui93QpOLEgcSKsro9117lynTux+u1Bv4lMcBVC4nRYnR7xTrO4GTmxeuxHjylscRVCYjCs6o979fX7Gz+x6u5N3ZUXcukqrLhDFddc0Zx/Nl7id54kFWnOy7v/nvmvsJlpnwqdd855bV3N/HOD5/55rqq9Oe9Yv5i8cpFUIklYm8S8SCqdMKxNcF4kZUIe1iYgL5KyEhTWj+mF0ZOn6LBeDUdGTP4yw/rD7XGnntJMw0J1fB8LEoQFCcKCxHcAAAD//556uZcLSmkdAAAAAElFTkSuQmCC",
+            "media_type": "image/png",
+            "type": "base64"
+          },
+          "type": "image"
+        },
+        {
+          "text": "Two colored circles are shown. What color is the LEFT circle? Reply with one word only.",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "metadata": {
+    "user_id": "user_e4916886278a8b3b0cc245f4efb716f082fa4bf1fd9464d896dc59dd07c2adb6_account__session_4e9539f6-901b-4c95-8e3b-bc791c69ad1c"
+  },
+  "model": "claude-opus-4-8",
+  "stream": true,
+  "system": [
+    {
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "type": "text"
+    }
+  ]
+}

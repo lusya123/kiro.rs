@@ -1,0 +1,25 @@
+{
+  "max_tokens": 10,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "Please read the following words carefully, then reply with 'OK':\nalpha bravo charlie delta echo foxtrot golf hotel india juliet alpha bravo charlie delta echo foxtrot golf hotel india juliet alpha bravo charlie delta echo foxtrot golf hotel india juliet alpha bravo charlie delta echo foxtrot golf hotel india juliet alpha bravo charlie delta echo foxtrot golf hotel india juliet alpha bravo charlie delta echo foxtrot golf hotel india juliet alpha bravo charlie delta echo foxtrot golf hotel india juliet alpha bravo charlie delta echo foxtrot golf hotel india juliet alpha bravo charlie delta echo foxtrot golf hotel india juliet alpha bravo charlie delta echo foxtrot golf hotel india juliet",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "metadata": {
+    "user_id": "user_9d925f5b5680ce42fbe7d55761cea5feda9ded53e05e7b16fbe93ac8b7492142_account__session_ef1dc597-c8d3-4eba-9a68-d1e04887951e"
+  },
+  "model": "claude-opus-4-8",
+  "stream": true,
+  "system": [
+    {
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "type": "text"
+    }
+  ]
+}

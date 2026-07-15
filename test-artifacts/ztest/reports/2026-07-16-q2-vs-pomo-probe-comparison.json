@@ -1,0 +1,231 @@
+{
+  "q2": {
+    "report_id": "01KXKBDNJ8NE301VGJGKPRZJKG",
+    "score": 97,
+    "risk": "low",
+    "node": "hk-02",
+    "cap_hits": []
+  },
+  "pomo": {
+    "report_id": "01KXKCA8K1FYQZGHSR300VYWW2",
+    "score": 40,
+    "risk": "high",
+    "node": "hk-03",
+    "cap_hits": [
+      {
+        "rule": "d17_signature_invalid",
+        "cap_value": 40,
+        "reason": "响应签名校验失败：关键字段 (id 前缀 / stop_reason 枚举) 不符合官方格式, 怀疑逆向中转或字段伪造。"
+      }
+    ]
+  },
+  "probes": [
+    {
+      "probe_code": "IMG",
+      "probe_name": "出图质量",
+      "q2_status": "skipped",
+      "q2_score": null,
+      "pomo_status": "skipped",
+      "pomo_score": null,
+      "score_delta": null
+    },
+    {
+      "probe_code": "HB",
+      "probe_name": "接口心跳",
+      "q2_status": "success",
+      "q2_score": 100,
+      "pomo_status": "success",
+      "pomo_score": 100,
+      "score_delta": 0
+    },
+    {
+      "probe_code": "D1",
+      "probe_name": "协议连通性",
+      "q2_status": "success",
+      "q2_score": 100,
+      "pomo_status": "success",
+      "pomo_score": 100,
+      "score_delta": 0
+    },
+    {
+      "probe_code": "D11",
+      "probe_name": "隐式身份",
+      "q2_status": "success",
+      "q2_score": 100,
+      "pomo_status": "success",
+      "pomo_score": 100,
+      "score_delta": 0
+    },
+    {
+      "probe_code": "D2",
+      "probe_name": "响应结构",
+      "q2_status": "success",
+      "q2_score": 100,
+      "pomo_status": "success",
+      "pomo_score": 100,
+      "score_delta": 0
+    },
+    {
+      "probe_code": "D3",
+      "probe_name": "身份一致性",
+      "q2_status": "success",
+      "q2_score": 94,
+      "pomo_status": "success",
+      "pomo_score": 94,
+      "score_delta": 0
+    },
+    {
+      "probe_code": "D5",
+      "probe_name": "内容 Canary",
+      "q2_status": "success",
+      "q2_score": 100,
+      "pomo_status": "success",
+      "pomo_score": 100,
+      "score_delta": 0
+    },
+    {
+      "probe_code": "D8",
+      "probe_name": "响应延迟",
+      "q2_status": "success",
+      "q2_score": 100,
+      "pomo_status": "success",
+      "pomo_score": 90,
+      "score_delta": 10
+    },
+    {
+      "probe_code": "D10",
+      "probe_name": "思维链",
+      "q2_status": "success",
+      "q2_score": 100,
+      "pomo_status": "success",
+      "pomo_score": 100,
+      "score_delta": 0
+    },
+    {
+      "probe_code": "D13",
+      "probe_name": "多模态识别",
+      "q2_status": "success",
+      "q2_score": 100,
+      "pomo_status": "success",
+      "pomo_score": 100,
+      "score_delta": 0
+    },
+    {
+      "probe_code": "D16",
+      "probe_name": "能力指纹",
+      "q2_status": "success",
+      "q2_score": 100,
+      "pomo_status": "success",
+      "pomo_score": 100,
+      "score_delta": 0
+    },
+    {
+      "probe_code": "D17",
+      "probe_name": "响应签名",
+      "q2_status": "success",
+      "q2_score": 100,
+      "pomo_status": "partial",
+      "pomo_score": 75,
+      "score_delta": 25
+    },
+    {
+      "probe_code": "D18",
+      "probe_name": "缓存 Token",
+      "q2_status": "success",
+      "q2_score": 100,
+      "pomo_status": "success",
+      "pomo_score": 100,
+      "score_delta": 0
+    },
+    {
+      "probe_code": "D19",
+      "probe_name": "文档识别",
+      "q2_status": "success",
+      "q2_score": 100,
+      "pomo_status": "success",
+      "pomo_score": 100,
+      "score_delta": 0
+    },
+    {
+      "probe_code": "D21",
+      "probe_name": "Fable 协议特征",
+      "q2_status": "skipped",
+      "q2_score": null,
+      "pomo_status": "skipped",
+      "pomo_score": null,
+      "score_delta": null
+    },
+    {
+      "probe_code": "D22",
+      "probe_name": "GPT-5.6 协议证明",
+      "q2_status": "skipped",
+      "q2_score": null,
+      "pomo_status": "skipped",
+      "pomo_score": null,
+      "score_delta": null
+    },
+    {
+      "probe_code": "D7",
+      "probe_name": "工具调用",
+      "q2_status": "success",
+      "q2_score": 60,
+      "pomo_status": "success",
+      "pomo_score": 60,
+      "score_delta": 0
+    },
+    {
+      "probe_code": "D9",
+      "probe_name": "稳定性",
+      "q2_status": "success",
+      "q2_score": 100,
+      "pomo_status": "partial",
+      "pomo_score": 65,
+      "score_delta": 35
+    },
+    {
+      "probe_code": "S5",
+      "probe_name": "流式响应",
+      "q2_status": "success",
+      "q2_score": 100,
+      "pomo_status": "success",
+      "pomo_score": 100,
+      "score_delta": 0
+    },
+    {
+      "probe_code": "S1",
+      "probe_name": "Token 注入",
+      "q2_status": "success",
+      "q2_score": 80,
+      "pomo_status": "success",
+      "pomo_score": 60,
+      "score_delta": 20
+    },
+    {
+      "probe_code": "S2",
+      "probe_name": "提示词提取",
+      "q2_status": "success",
+      "q2_score": 100,
+      "pomo_status": "partial",
+      "pomo_score": 50,
+      "score_delta": 50
+    },
+    {
+      "probe_code": "S3",
+      "probe_name": "指令覆盖",
+      "q2_status": "success",
+      "q2_score": 100,
+      "pomo_status": "partial",
+      "pomo_score": 0,
+      "score_delta": 100
+    },
+    {
+      "probe_code": "S4",
+      "probe_name": "错误信息泄露",
+      "q2_status": "success",
+      "q2_score": 100,
+      "pomo_status": "success",
+      "pomo_score": 100,
+      "score_delta": 0
+    }
+  ]
+}

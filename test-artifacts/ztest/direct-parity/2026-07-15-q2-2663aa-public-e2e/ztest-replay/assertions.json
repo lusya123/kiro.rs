@@ -1,0 +1,329 @@
+{
+  "all_35_success_streams_have_message_stop": {
+    "evidence": 35,
+    "passed": true
+  },
+  "all_ping_stop_end_turn": {
+    "evidence": {
+      "139357": "end_turn",
+      "139381": "end_turn",
+      "139465": "end_turn",
+      "139625": "end_turn",
+      "139901": "end_turn",
+      "139925": "end_turn",
+      "139949": "end_turn",
+      "139973": "end_turn",
+      "139997": "end_turn"
+    },
+    "passed": true
+  },
+  "all_ping_text_exact": {
+    "evidence": {
+      "139357": "pong",
+      "139381": "pong",
+      "139465": "pong",
+      "139625": "pong",
+      "139901": "pong",
+      "139925": "pong",
+      "139949": "pong",
+      "139973": "pong",
+      "139997": "pong"
+    },
+    "passed": true
+  },
+  "all_ping_usage_exact_pomo": {
+    "evidence": {
+      "139357": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "input_tokens": 32,
+        "output_tokens": 4,
+        "output_tokens_details": {
+          "thinking_tokens": 0
+        }
+      },
+      "139381": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "input_tokens": 32,
+        "output_tokens": 4,
+        "output_tokens_details": {
+          "thinking_tokens": 0
+        }
+      },
+      "139465": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "input_tokens": 32,
+        "output_tokens": 4,
+        "output_tokens_details": {
+          "thinking_tokens": 0
+        }
+      },
+      "139625": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "input_tokens": 32,
+        "output_tokens": 4,
+        "output_tokens_details": {
+          "thinking_tokens": 0
+        }
+      },
+      "139901": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "input_tokens": 32,
+        "output_tokens": 4,
+        "output_tokens_details": {
+          "thinking_tokens": 0
+        }
+      },
+      "139925": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "input_tokens": 32,
+        "output_tokens": 4,
+        "output_tokens_details": {
+          "thinking_tokens": 0
+        }
+      },
+      "139949": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "input_tokens": 32,
+        "output_tokens": 4,
+        "output_tokens_details": {
+          "thinking_tokens": 0
+        }
+      },
+      "139973": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "input_tokens": 32,
+        "output_tokens": 4,
+        "output_tokens_details": {
+          "thinking_tokens": 0
+        }
+      },
+      "139997": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "input_tokens": 32,
+        "output_tokens": 4,
+        "output_tokens_details": {
+          "thinking_tokens": 0
+        }
+      }
+    },
+    "passed": true
+  },
+  "all_success_headers_nginx": {
+    "evidence": null,
+    "passed": true
+  },
+  "all_success_headers_no_buffering": {
+    "evidence": null,
+    "passed": true
+  },
+  "all_success_headers_no_cache": {
+    "evidence": null,
+    "passed": true
+  },
+  "all_success_headers_request_id": {
+    "evidence": null,
+    "passed": true
+  },
+  "all_success_headers_sse": {
+    "evidence": null,
+    "passed": true
+  },
+  "all_success_ids_bedrock_compatible": {
+    "evidence": [
+      "msg_01bdrkg3q10jWIimlSVoYchD",
+      "msg_01bdrkOZuHLOd7YiAlVU6Nye",
+      "msg_01bdrkrbgAnOxRbtYu78CBaW",
+      "msg_01bdrkAbDrU2USKAlv1GmFd5",
+      "msg_01bdrkKCuwPqys9H8NXonmNz",
+      "msg_01bdrke6KnMmS5MmJgU95XYh",
+      "msg_01bdrkS20qOYeQOkivLaSIro",
+      "msg_01bdrkytKSqYdx0qqJt5KeQb",
+      "msg_01bdrkEhL0UwYjUzwpnaAedJ",
+      "msg_01bdrkoZQqgLFbgI96oBYDwL",
+      "msg_01bdrkHaBXfgB7IQGaj2DqTe",
+      "msg_01bdrkbrGXN65qvcXQlRNMPQ",
+      "msg_01bdrkoM3XiMJMFdupDADT5R",
+      "msg_01bdrkigTjonAGpaEH34fvks",
+      "msg_01bdrkGNAHVBloKYqhWrNsWU",
+      "msg_01bdrkvPSo00ofeWq8Arhghe",
+      "msg_01bdrkFxXzO4qUKBY6rh3Aks",
+      "msg_01bdrks1GjRlgrvZyi10Nq8O",
+      "msg_01bdrkDzIHHGiXAClqNrXmNq",
+      "msg_01bdrkZzOfYYi9dTV5iOWgKE",
+      "msg_01bdrkUuIgsOEngz9ONySXIo",
+      "msg_01bdrkBVgl1tuaXyi79LSp3W",
+      "msg_01bdrkuVOUgK8T7TsU9GNatx",
+      "msg_01bdrkr0RlsXuKi27CE3WUpO",
+      "msg_01bdrk6maxKa53n1s88q8yRw",
+      "msg_01bdrkZFYhhQ7bwSgoQazqum",
+      "msg_01bdrkwlCz7Y3SSsu6bwOAhz",
+      "msg_01bdrk3Orw7JSEjeB57zqCee",
+      "msg_01bdrkfRAv5frJUW070OwzQi",
+      "msg_01bdrkFDsNcFd7JWwoj0NFNr",
+      "msg_01bdrkx3VAxRjrVcHWl6ikxO",
+      "msg_01bdrkdxxH94cQGaDdi7v2AV",
+      "msg_01bdrkawVVvCGefRReA7EX59",
+      "msg_01bdrk3SmdIlf7gJzcvgdDqC",
+      "msg_01bdrkhO4U67vBKUH9KXKXzt"
+    ],
+    "passed": true
+  },
+  "all_success_models_opus_4_8": {
+    "evidence": [
+      "claude-opus-4-8"
+    ],
+    "passed": true
+  },
+  "cache_probe_ok_both": {
+    "evidence": {
+      "140109": "OK",
+      "140119": "OK"
+    },
+    "passed": true
+  },
+  "context_text_exact": {
+    "evidence": "200000",
+    "passed": true
+  },
+  "context_usage_exact": {
+    "evidence": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 74,
+      "output_tokens": 4,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "passed": true
+  },
+  "decoded_all_38": {
+    "evidence": 38,
+    "passed": true
+  },
+  "event_order_all_valid": {
+    "evidence": null,
+    "passed": true
+  },
+  "identity_text_exact_pomo": {
+    "evidence": "{\n  \"vendor\": \"Anthropic\",\n  \"model_name\": \"Claude Code\",\n  \"model_family\": \"Claude\",\n  \"version\": \"unknown\"\n}",
+    "passed": true
+  },
+  "identity_usage_exact_pomo": {
+    "evidence": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 125,
+      "output_tokens": 55,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "passed": true
+  },
+  "invalid_auth_error_shape": {
+    "evidence": {
+      "frame": "139425",
+      "kind": "json",
+      "payload": {
+        "error": "无效的令牌 (request id: 20260715145114874767749wBb8IMmf)"
+      }
+    },
+    "passed": true
+  },
+  "long_context_token_exact": {
+    "evidence": "ZT-AFE02317|RIVER",
+    "passed": true
+  },
+  "malformed_error_shape": {
+    "evidence": {
+      "frame": "139405",
+      "kind": "json",
+      "payload": {
+        "error": {
+          "message": "field messages is required (request id: 20260715145112834873511qGhoZAi5)",
+          "type": "new_api_error"
+        },
+        "type": "error"
+      }
+    },
+    "passed": true
+  },
+  "metrics_all_match_final_usage": {
+    "evidence": null,
+    "passed": true
+  },
+  "nonce_exact": {
+    "evidence": "cef1f5ea541683d1",
+    "passed": true
+  },
+  "nonexistent_empty_404": {
+    "evidence": {
+      "frame": "139445",
+      "kind": "json",
+      "payload": null
+    },
+    "passed": true
+  },
+  "pdf_identifier_shape": {
+    "evidence": "ZTEST-TOKEN-e14e79be",
+    "passed": true
+  },
+  "strict_json_text_exact_pomo": {
+    "evidence": "{\"a\":\"ztset\",\"b\":37,\"c\":\"ZT-AFE02317\"}",
+    "passed": true
+  },
+  "strict_json_usage_exact_pomo": {
+    "evidence": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "input_tokens": 115,
+      "output_tokens": 30,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      }
+    },
+    "passed": true
+  },
+  "tool_arguments_exact": {
+    "evidence": [
+      {
+        "id": "toolu_bdrk_011X9ae3MzTndrtPBaiMAvbQ",
+        "input": {
+          "city": "Exampleville-e1b78d16",
+          "unit": "celsius"
+        },
+        "name": "get_weather",
+        "type": "tool_use"
+      }
+    ],
+    "passed": true
+  },
+  "tool_single_bedrock_id": {
+    "evidence": [
+      {
+        "id": "toolu_bdrk_011X9ae3MzTndrtPBaiMAvbQ",
+        "input": {
+          "city": "Exampleville-e1b78d16",
+          "unit": "celsius"
+        },
+        "name": "get_weather",
+        "type": "tool_use"
+      }
+    ],
+    "passed": true
+  },
+  "tool_stop_reason": {
+    "evidence": "tool_use",
+    "passed": true
+  }
+}

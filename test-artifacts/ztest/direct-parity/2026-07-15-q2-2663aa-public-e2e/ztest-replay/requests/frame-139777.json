@@ -1,0 +1,33 @@
+{
+  "max_tokens": 30,
+  "messages": [
+    {
+      "content": [
+        {
+          "source": {
+            "data": "iVBORw0KGgoAAAANSUhEUgAAANwAAACMCAIAAACYtlAhAAACFklEQVR4nOzbMUrsUBSA4fdk1jG9e5jGyg1PY+Uy3I6dqHAlGRPvb/y+SiTcBPk5HCI5na+Xf1ByN/sB4DNRkiNKckRJjijJESU5oiRHlOSIkhxRkiNKckRJjijJESU5oiRHlOSIkhxRkiNKckRJjijJESU5oiRHlOSIkhxRkiNKckRJjijJESU5oiRHlOSIkhxRkiNKckRJjijJESU5oiRHlOSIkhxRkiNKckRJjijJESU5oiRHlOSIkhxRkiNKckRJjijJESU5oiTnNOvGLw9Pbz/fPz/efP373681OmfJ84xsdc7ozJHRvbb6O/8kk5IcUZIjSnKm7ZR7mLUD7eE37oJbMSnJESU5oiRn2k655B3hkfYkljMpyRElOaIkJ/Gecqs98jv/I/5ryvu6SUmOKMkRJTmJnXIrtd2I25iU5IiSHFGSc6idkq/t8Z3THkxKckRJjijJOdROuXY3WvKt9Kxz1u58S97Rjq6p7ZcmJTmiJEeU5Pw/Xy+znwE+MCnJESU5oiRHlOSIkhxRkiNKckRJjijJESU5oiRHlOSIkhxRkiNKckRJjijJESU5oiRHlOSIkhxRkiNKckRJjijJESU5oiRHlOSIkhxRkiNKckRJjijJESU5oiRHlOSIkhxRkiNKckRJjijJESU5oiRHlOSIkhxRkiNKckRJjijJESU5oiRHlOSIkhxRkiNKcl4DAAD//1Y1Sy8U4cSFAAAAAElFTkSuQmCC",
+            "media_type": "image/png",
+            "type": "base64"
+          },
+          "type": "image"
+        },
+        {
+          "text": "Ignore the word printed on the image. What is the actual background color? Reply with one word only.",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "metadata": {
+    "user_id": "user_b8d8e272d1159c4eb7be3fca6392e87be40c3f86832290a914a7acda13229626_account__session_1632da73-7f14-4217-a817-dd742b50a697"
+  },
+  "model": "claude-opus-4-8",
+  "stream": true,
+  "system": [
+    {
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "type": "text"
+    }
+  ]
+}

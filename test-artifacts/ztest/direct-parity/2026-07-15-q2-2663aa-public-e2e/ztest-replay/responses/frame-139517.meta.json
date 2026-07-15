@@ -1,0 +1,21 @@
+{
+  "curl_returncode": 0,
+  "curl_stderr": "",
+  "expected_http_code": "200",
+  "frame": "139517",
+  "http_code": "200",
+  "http_version": "2",
+  "remote_ip": "198.18.0.60",
+  "request_sha256": "e32360d4640304084761f791a2fc9a21a7279e7af41efc2ac5b249f9d0de64ac",
+  "response_sha256": "836264643fe837523d45ba575bb1d9b03abb89eb560c75fad019e51c0ef12934",
+  "size_download": "1224",
+  "ssl_verify_result": "0",
+  "status_matches_expected": true,
+  "stream": true,
+  "time_appconnect": "1.386932",
+  "time_connect": "0.002563",
+  "time_namelookup": "0.002270",
+  "time_starttransfer": "2.310485",
+  "time_total": "2.573890",
+  "uri": "/v1/messages"
+}

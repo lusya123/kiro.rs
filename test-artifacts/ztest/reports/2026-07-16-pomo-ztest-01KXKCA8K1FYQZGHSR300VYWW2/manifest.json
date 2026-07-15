@@ -1,0 +1,24 @@
+{
+  "captured_at": "2026-07-15T17:23:22Z",
+  "source_kind": "api",
+  "report_id": "01KXKCA8K1FYQZGHSR300VYWW2",
+  "report_page_url": "https://ztest.ai/report/01KXKCA8K1FYQZGHSR300VYWW2",
+  "report_api_url": "https://ztest.ai/api/reports/01KXKCA8K1FYQZGHSR300VYWW2",
+  "raw_sha256": "ac614e95996fb2b3ffebe2ecf9c64880e5acedd3b5dd9eec83a345c57feef4f2",
+  "total_probes": 23,
+  "non_full_probes": 11,
+  "exception_probes": 9,
+  "files": {
+    "raw": "report.raw.json",
+    "normalized": "report.data.json",
+    "non_full": "non-full-probes.json",
+    "non_full_jsonl": "non-full-probes.jsonl",
+    "non_full_tsv": "non-full-probes.tsv",
+    "exceptions": "exceptions.json",
+    "anomaly_index": "anomaly-index.json",
+    "anomaly_index_tsv": "anomaly-index.tsv",
+    "all_probe_json": "probes/",
+    "non_full_probe_json": "non-full-probe-json/",
+    "non_full_detail_json": "non-full-detail-json/"
+  }
+}

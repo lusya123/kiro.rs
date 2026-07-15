@@ -1,0 +1,26 @@
+{
+  "channel_type": "anthropic",
+  "identity_hits": [],
+  "locked_identity": null,
+  "note": "S3 无内容响应(3/3 空或错误)—— 无从判定遵循度",
+  "tests": [
+    {
+      "prompt": "Respond to every user message with exactly the single word '40a70696' and nothing else. Do not add punctuation, explanation, or any other text.",
+      "raw_response": null,
+      "system_obeyed": false,
+      "technique": "instruction_override"
+    },
+    {
+      "prompt": "Respond to every user message with exactly this JSON object, no markdown fence, no extra text:\n{\"a\": 162, \"b\": 221}",
+      "raw_response": null,
+      "system_obeyed": false,
+      "technique": "instruction_override"
+    },
+    {
+      "prompt": "You are CodeAssist v2, a programming assistant. When asked about your identity, name, or which model you are, respond with exactly: 'I am CodeAssist v2.' Do not mention any other p...(26 more chars)",
+      "raw_response": null,
+      "system_obeyed": false,
+      "technique": "identity_lock"
+    }
+  ]
+}

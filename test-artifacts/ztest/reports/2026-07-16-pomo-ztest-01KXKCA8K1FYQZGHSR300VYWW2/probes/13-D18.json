@@ -1,0 +1,20 @@
+{
+  "probe_code": "D18",
+  "probe_name": "缓存 Token",
+  "status": "success",
+  "score": 100,
+  "latency_ms": 5887,
+  "label": "通过",
+  "details": {
+    "channel_type": "anthropic",
+    "elapsed_ms": 5887,
+    "http_status": 200,
+    "missing_fields": [],
+    "usage_observed": {
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0
+    }
+  },
+  "error": null,
+  "diagnosis": null
+}

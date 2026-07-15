@@ -1,0 +1,24 @@
+probe_code	probe_name	q2_status	q2_score	pomo_status	pomo_score	score_delta
+IMG	出图质量	skipped		skipped		
+HB	接口心跳	success	100	success	100	0
+D1	协议连通性	success	100	success	100	0
+D11	隐式身份	success	100	success	100	0
+D2	响应结构	success	100	success	100	0
+D3	身份一致性	success	94	success	94	0
+D5	内容 Canary	success	100	success	100	0
+D8	响应延迟	success	100	success	90	10
+D10	思维链	success	100	success	100	0
+D13	多模态识别	success	100	success	100	0
+D16	能力指纹	success	100	success	100	0
+D17	响应签名	success	100	partial	75	25
+D18	缓存 Token	success	100	success	100	0
+D19	文档识别	success	100	success	100	0
+D21	Fable 协议特征	skipped		skipped		
+D22	GPT-5.6 协议证明	skipped		skipped		
+D7	工具调用	success	60	success	60	0
+D9	稳定性	success	100	partial	65	35
+S5	流式响应	success	100	success	100	0
+S1	Token 注入	success	80	success	60	20
+S2	提示词提取	success	100	partial	50	50
+S3	指令覆盖	success	100	partial	0	100
+S4	错误信息泄露	success	100	success	100	0

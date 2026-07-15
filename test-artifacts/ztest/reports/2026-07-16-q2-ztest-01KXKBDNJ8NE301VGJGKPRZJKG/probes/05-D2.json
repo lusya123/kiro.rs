@@ -1,0 +1,28 @@
+{
+  "probe_code": "D2",
+  "probe_name": "响应结构",
+  "status": "success",
+  "score": 100,
+  "latency_ms": 771,
+  "label": "通过",
+  "details": {
+    "channel_type": "anthropic",
+    "coverage_percent": 100,
+    "matched_fields": [
+      "id",
+      "type",
+      "role",
+      "content.0.type",
+      "content.0.text",
+      "model",
+      "stop_reason",
+      "usage.input_tokens",
+      "usage.output_tokens"
+    ],
+    "missing_fields": [],
+    "sample_content_text": "pong",
+    "type_errors": []
+  },
+  "error": null,
+  "diagnosis": null
+}

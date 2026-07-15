@@ -1,0 +1,33 @@
+{
+  "max_tokens": 64,
+  "messages": [
+    {
+      "content": [
+        {
+          "source": {
+            "data": "JVBERi0xLjQKJeLjz9MKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvUmVzb3VyY2VzIDQgMCBSIC9NZWRpYUJveCBbMCAwIDYxMiAyMzJdIC9Db250ZW50cyA1IDAgUiA+PgplbmRvYmoKNCAwIG9iago8PCAvRm9udCA8PCAvRjEgPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvSGVsdmV0aWNhID4+ID4+ID4+CmVuZG9iago1IDAgb2JqCjw8IC9MZW5ndGggMzY2ID4+CnN0cmVhbQpCVCAvRjEgMTQgVGYgNTAgMTkyIFRkIChtaWtlIGJyYXZvIGZveHRyb3QgYnJhdm8gbm92ZW1iZXIpIFRqIEVUCkJUIC9GMSAxNCBUZiA1MCAxNjIgVGQgKHVuaWZvcm0genVsdSB1bmlmb3JtIGtpbG8gdGFuZ28geWFua2VlIG9zY2FyKSBUaiBFVApCVCAvRjEgMTQgVGYgNTAgMTMyIFRkICh6dWx1IG5vdmVtYmVyIG1pa2UgcGFwYSBpbmRpYSkgVGogRVQKQlQgL0YxIDE4IFRmIDUwIDEwMiBUZCAoWlRFU1QtVE9LRU4tZTE0ZTc5YmUpIFRqIEVUCkJUIC9GMSAxNCBUZiA1MCA3MiBUZCAoY2hhcmxpZSBqdWxpZXQga2lsbyB2aWN0b3IpIFRqIEVUCkJUIC9GMSAxNCBUZiA1MCA0MiBUZCAobm92ZW1iZXIgYnJhdm8gcGFwYSBsaW1hKSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCnhyZWYKMCA2CjAwMDAwMDAwMDAgNjU1MzUgZiAKMDAwMDAwMDAxNSAwMDAwMCBuIAowMDAwMDAwMDY0IDAwMDAwIG4gCjAwMDAwMDAxMjEgMDAwMDAgbiAKMDAwMDAwMDIyNSAwMDAwMCBuIAowMDAwMDAwMzE3IDAwMDAwIG4gCnRyYWlsZXIKPDwgL1NpemUgNiAvUm9vdCAxIDAgUiA+PgpzdGFydHhyZWYKNzMzCiUlRU9GCg==",
+            "media_type": "application/pdf",
+            "type": "base64"
+          },
+          "type": "document"
+        },
+        {
+          "text": "There is a PDF attached to this message. It contains exactly one identifier string of the form 'ZTEST-TOKEN-xxxxxxxx'. Extract that identifier and reply with ONLY the identifier text (no markdown, no explanation, no surrounding text).",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "metadata": {
+    "user_id": "user_6033c3ffae0029abf592ad41e7b2cd3086d970c01917f19b8dda98031e64f72a_account__session_dee81e99-ca16-48cb-bc91-a4ece8dc5436"
+  },
+  "model": "claude-opus-4-8",
+  "stream": true,
+  "system": [
+    {
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "type": "text"
+    }
+  ]
+}

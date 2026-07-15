@@ -1,0 +1,21 @@
+{
+  "probe_code": "D1",
+  "probe_name": "协议连通性",
+  "status": "success",
+  "score": 100,
+  "latency_ms": 2412,
+  "label": "通过",
+  "details": {
+    "compat_mode": "claude_code",
+    "compat_retry": null,
+    "elapsed_ms": 2412,
+    "http_status": 200,
+    "is_json": true,
+    "label": "正常",
+    "network_error": null,
+    "response_preview": "{\"content\":[{\"text\":\"pong\",\"type\":\"text\"}],\"id\":\"msg_bdrk_dyfksklv7w7tfjsnc6imveogpqzgurw6g4bej46z4k4htai5wnga\",\"model\":\"claude-opus-4-8\",\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"type\":\"message\",\"usage\":{\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":32,\"output_tokens\":4,\"output_tokens_details\":{\"thinking_tokens\":0},\"service_tier\":\"standard\"}}",
+    "response_size_bytes": 456
+  },
+  "error": null,
+  "diagnosis": null
+}

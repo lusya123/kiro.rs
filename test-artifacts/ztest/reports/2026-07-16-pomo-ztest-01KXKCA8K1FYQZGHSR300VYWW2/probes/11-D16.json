@@ -1,0 +1,63 @@
+{
+  "probe_code": "D16",
+  "probe_name": "能力指纹",
+  "status": "success",
+  "score": 100,
+  "latency_ms": null,
+  "label": "通过",
+  "details": {
+    "average_score": 100,
+    "correct_count": 4,
+    "label": "能力指纹整体通过",
+    "subtests": [
+      {
+        "correct": true,
+        "expected": "a=ztset,b=37,c=ZT-A58AE1B8",
+        "http_status": 200,
+        "kind": "constraints_json",
+        "latency_ms": 1695,
+        "note": "json_constraints_ok",
+        "prompt_preview": "You must reply with exactly one minified JSON object and no markdown. Schema: {\"a\": string, \"b\": number, \"c\": string}. Set a to the reverse of 'testz'. Set b to 29 + 8. Set c to 'ZT-A58AE1B8'.",
+        "raw_response": "{\"a\":\"ztset\",\"b\":37,\"c\":\"ZT-A58AE1B8\"}",
+        "score": 100
+      },
+      {
+        "correct": true,
+        "expected": "C",
+        "http_status": 200,
+        "kind": "logic_grid",
+        "latency_ms": 2153,
+        "note": "logic_ok",
+        "prompt_preview": "Four API gateways A, B, C, D are tested. Exactly one is certified.\nA supports vision but not streaming.\nB supports streaming and tools, but fails nonce preservation.\nC supports vision, streaming, tools, and preserves nonce.\nD supports none ...(181 more chars)",
+        "raw_response": "C",
+        "score": 100
+      },
+      {
+        "correct": true,
+        "expected": "ZT-A58AE1B8|RIVER",
+        "http_status": 200,
+        "kind": "long_context_needle",
+        "latency_ms": 3412,
+        "note": "needle_ok",
+        "prompt_preview": "Read the full context. Do not summarize. At the end, answer with TOKEN|CODENAME only.\n\nalpha beta gamma delta epsilon. alpha beta gamma delta epsilon. alpha beta gamma delta epsilon. alpha beta gamma delta epsilon. alpha beta gamma delta ep...(8437 more chars)",
+        "raw_response": "ZT-A58AE1B8|RIVER",
+        "score": 100
+      },
+      {
+        "correct": true,
+        "expected": "def normalize_probe_score",
+        "http_status": 200,
+        "kind": "code_instruction",
+        "latency_ms": 5249,
+        "note": "code_instruction_ok",
+        "prompt_preview": "Write exactly one Python function named normalize_probe_score(x). It must return x clamped to the integer range 0..100. No markdown fences, no explanation, no examples.",
+        "raw_response": "```python\ndef normalize_probe_score(x):\n    return max(0, min(100, int(x)))\n```",
+        "score": 100
+      }
+    ],
+    "total_count": 4,
+    "weakest_kinds": []
+  },
+  "error": null,
+  "diagnosis": null
+}

@@ -1,0 +1,23 @@
+{
+  "probe_code": "D10",
+  "probe_name": "思维链",
+  "status": "success",
+  "score": 100,
+  "latency_ms": 1657,
+  "label": "通过",
+  "details": {
+    "answer_correct": true,
+    "channel_type": "anthropic",
+    "effort_label": "medium",
+    "final_answer": "# Step-by-Step Solution\n\n**Step 1: Start with the initial amount**\nThe farmer begins with **23 apples**.\n\n**Step 2: Give 7 to the neighbor**\n$$23 - 7 = 16 \\text{ apples}$$\n\n**Step 3: Buy 12 more**\n$$1",
+    "http_status": 200,
+    "requested_budget": 2000,
+    "stop_reason": "end_turn",
+    "thinking_text_len": 0,
+    "thinking_token_estimate": 0,
+    "thinking_unavailable_reason": "claude_code_compat_no_thinking_block",
+    "truncated": false
+  },
+  "error": null,
+  "diagnosis": null
+}

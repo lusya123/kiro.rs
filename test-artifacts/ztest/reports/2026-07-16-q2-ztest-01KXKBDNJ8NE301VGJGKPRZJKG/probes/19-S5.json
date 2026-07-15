@@ -1,0 +1,25 @@
+{
+  "probe_code": "S5",
+  "probe_name": "流式响应",
+  "status": "success",
+  "score": 100,
+  "latency_ms": 1568,
+  "label": "通过",
+  "details": {
+    "aggregated_text_len": 199,
+    "aggregated_text_preview": "Snow settles quietly over the rooftops while the first pale light spreads across the sky. A single set of footprints trails down the empty street, and the air is still enough to hear your own breath.",
+    "aggregation_consistent": true,
+    "bytes_total": 1419,
+    "chunk_count": 6,
+    "content_type": "text/event-stream",
+    "error": null,
+    "first_byte_ms": null,
+    "has_done_signal": true,
+    "http_status": 200,
+    "is_sse": true,
+    "multi_chunk": true,
+    "total_ms": 1568
+  },
+  "error": null,
+  "diagnosis": null
+}

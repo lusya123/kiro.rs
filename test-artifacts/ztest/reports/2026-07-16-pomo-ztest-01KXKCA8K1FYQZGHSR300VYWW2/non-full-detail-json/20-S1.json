@@ -1,0 +1,23 @@
+{
+  "compat_mode": "claude_code",
+  "note": "no_usage_data",
+  "samples": [
+    {
+      "error": "probe: endpoint timeout: remote timeout (node 01KXB6W5D30FV5E2XF162GE4K4)",
+      "estimated_tokens": 72,
+      "label": "short",
+      "overhead": 0,
+      "reported_tokens": null,
+      "word_count": 30
+    },
+    {
+      "error": "probe: endpoint timeout: remote timeout (node 01KXB6W5D30FV5E2XF162GE4K4)",
+      "estimated_tokens": 182,
+      "label": "long",
+      "overhead": 0,
+      "reported_tokens": null,
+      "word_count": 100
+    }
+  ],
+  "suspicious_count": 0
+}

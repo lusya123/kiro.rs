@@ -1,0 +1,13 @@
+{
+  "probe_code": "IMG",
+  "probe_name": "出图质量",
+  "status": "skipped",
+  "score": null,
+  "latency_ms": null,
+  "label": "不适用",
+  "details": {
+    "skip_reason": "探针仅适用 image 模型, 当前模型为 text"
+  },
+  "error": null,
+  "diagnosis": null
+}

@@ -1,0 +1,41 @@
+{
+  "probe_code": "S1",
+  "probe_name": "Token 注入",
+  "status": "success",
+  "score": 60,
+  "latency_ms": null,
+  "label": "通过",
+  "details": {
+    "compat_mode": "claude_code",
+    "note": "no_usage_data",
+    "samples": [
+      {
+        "error": "probe: endpoint timeout: remote timeout (node 01KXB6W5D30FV5E2XF162GE4K4)",
+        "estimated_tokens": 72,
+        "label": "short",
+        "overhead": 0,
+        "reported_tokens": null,
+        "word_count": 30
+      },
+      {
+        "error": "probe: endpoint timeout: remote timeout (node 01KXB6W5D30FV5E2XF162GE4K4)",
+        "estimated_tokens": 182,
+        "label": "long",
+        "overhead": 0,
+        "reported_tokens": null,
+        "word_count": 100
+      }
+    ],
+    "suspicious_count": 0
+  },
+  "error": null,
+  "diagnosis": {
+    "category": "upstream",
+    "suggestions": [
+      "no_usage_data",
+      "reported_tokens 随 prompt 长度异常增长,中转站可能按内容追加额外指令",
+      "导致实际消耗的 token 比你发送的更多"
+    ],
+    "title": "疑似按内容增长的 Token 注入"
+  }
+}

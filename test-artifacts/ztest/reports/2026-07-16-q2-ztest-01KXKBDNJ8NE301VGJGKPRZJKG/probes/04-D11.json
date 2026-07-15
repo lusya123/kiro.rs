@@ -1,0 +1,64 @@
+{
+  "probe_code": "D11",
+  "probe_name": "隐式身份",
+  "status": "success",
+  "score": 100,
+  "latency_ms": null,
+  "label": "通过",
+  "details": {
+    "calibration_factors": {
+      "d10": 0.8,
+      "d17": 1,
+      "d7": 1,
+      "s3": 1
+    },
+    "confidence": 0.8,
+    "family_votes": {
+      "anthropic_claude": 1,
+      "claude": 2
+    },
+    "final_label": "consistent",
+    "internal_confidence": 1,
+    "requested_family": "claude",
+    "sub_probes": [
+      {
+        "declared_family": "anthropic_claude",
+        "detected_tool": "Anthropic Claude (self-id)",
+        "kind": "code_signature",
+        "match": true,
+        "note": "tool=Anthropic Claude (self-id)",
+        "prompt": "Write a complete Python script for a small Date Difference Calculator. It should include a short file header comment with tool name, generated date, model/versi...(197 more chars)",
+        "raw_response": "```python\n#!/usr/bin/env python3\n\"\"\"\nDate Difference Calculator\n--------------------------\nTool:           Date Difference Calculator\nGenerated date: 2025-01-15\nModel/Version:  Claude (Anthropic)\nAuthor:         Generated for the user\nLicense:        MIT\nPython version: 3.8+\n\nComputes the number of days between two dates given as strings.\n\"\"\"\n\nfrom datetime import datetime\n\nDATE_FORMAT = \"%Y-%m-%d\"\n\n\ndef days_between(a: str, b: str) -> int:\n    \"\"\"\n    Return the absolute number of days between two dates.\n\n    Args:\n        a: First date as a string in YYYY-MM-DD format.\n        b: Second date as a string in YYYY-MM-DD format.\n\n    Returns:\n        The absolute difference in days between the two dates.\n\n    Raises:\n        ValueError: If either string is not a valid YYYY-MM-DD date.\n    \"\"\"\n    date_a = datetime.strptime(a, DATE_FORMAT)\n    date_b = datetime.strptime(b, DATE_FORMAT)\n    return abs((date_b - date_a).days)\n\n\ndef main() -> None:\n    first = input(\"Enter the first date (YYYY-MM-DD): \").strip()\n    second = input(\"Enter the second date (YYYY-MM-DD): \").strip()\n\n    try:\n        diff = days_between(first, second)\n    except ValueError as exc:\n        print(f\"Error: {exc}\")\n        return\n\n    print(f\"Days between {first} and {second}: {diff}\")\n\n\nif __name__ == \"__main__\":\n    main()\n```",
+        "tool_confidence": "high",
+        "tool_evidence": "Date Difference Calculator Generated date: 2025-01-15 Model/Version: Claude (Anthropic) Author: Generated for the user License: MIT Python version: 3.8+ Computes the number of days between tw",
+        "tool_family_hint": "anthropic_claude"
+      },
+      {
+        "declared_family": "claude",
+        "detected_tool": null,
+        "kind": "context_window",
+        "match": true,
+        "note": "context in range",
+        "prompt": "What is your maximum context window size in tokens? Reply with just a single integer (no commas, no units, no explanation), e.g. 200000.",
+        "raw_response": "200000",
+        "tool_confidence": null,
+        "tool_evidence": null,
+        "tool_family_hint": null
+      },
+      {
+        "declared_family": "claude",
+        "detected_tool": null,
+        "kind": "recent_event",
+        "match": true,
+        "note": "year ok",
+        "prompt": "What is your knowledge cutoff date? Reply with just the month and year, e.g. 'March 2024'. No additional explanation.",
+        "raw_response": "January 2025",
+        "tool_confidence": null,
+        "tool_evidence": null,
+        "tool_family_hint": null
+      }
+    ]
+  },
+  "error": null,
+  "diagnosis": null
+}

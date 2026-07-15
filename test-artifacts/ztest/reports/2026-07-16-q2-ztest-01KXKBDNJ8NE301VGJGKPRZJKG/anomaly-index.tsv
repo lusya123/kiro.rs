@@ -1,0 +1,7 @@
+probe_code	probe_name	status	score	error	diagnosis	skip_reason	network_error	details_error	response_preview	raw_response	fail_fields
+IMG	出图质量	skipped				探针仅适用 image 模型, 当前模型为 text					
+D3	身份一致性	success	94								
+D21	Fable 协议特征	skipped				d21_no_trait_declared					
+D22	GPT-5.6 协议证明	skipped				d22_no_trait_declared					
+D7	工具调用	success	60		{"category":"tool_use","suggestions":["结构化输出测试未完全通过, 查看下方 attempts 详情"],"title":"工具调用未生效"}						
+S1	Token 注入	success	80								

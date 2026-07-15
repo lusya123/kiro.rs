@@ -1,0 +1,15 @@
+{
+  "probe_code": "HB",
+  "probe_name": "接口心跳",
+  "status": "success",
+  "score": 100,
+  "latency_ms": 433,
+  "label": "通过",
+  "details": {
+    "elapsed_ms": 433,
+    "http_status": 200,
+    "kind": "ok"
+  },
+  "error": null,
+  "diagnosis": null
+}

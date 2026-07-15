@@ -3,6 +3,39 @@
 This directory preserves Ztest evidence used while comparing the AWS-B gateway
 with the AWS-P/POMO-compatible behavior. API keys are intentionally not stored.
 
+## Current authoritative result (2026-07-16)
+
+Two fresh, user-authorized full sequential runs used all 23 probes and ZTest
+engine `v2.0.0`:
+
+| Target | Report ID | Score | Risk | Cap |
+|---|---|---:|---|---|
+| Q2 AWS-B, deployed commit `2663aa1` | `01KXKBDNJ8NE301VGJGKPRZJKG` | **97** | low | none |
+| POMO official | `01KXKCA8K1FYQZGHSR300VYWW2` | **40** | high | `d17_signature_invalid` at 40 |
+
+Q2 was equal to or better than POMO on every applicable probe. Its only
+non-full scoring results were D3 `94`, D7 `60`, and S1 `80`; POMO scored `94`,
+`60`, and `60` on those same probes. Q2 received 100 for D17 while retaining
+the visible `bdrk` marker in its detector-compatible message ID.
+
+Both reports claimed D7 `raw_arguments={}`. Raw evidence disproves that claim:
+the exact Q2 packet-captured stream and a same-nonce POMO direct replay both
+reconstruct to valid, exact `get_weather` arguments. This is current ZTest
+aggregation behavior affecting the reference as well as Q2, so no protocol
+change was made for D7.
+
+Primary comparison:
+
+`reports/2026-07-16-q2-non-full-probe-coverage.md`
+
+Complete raw reports:
+
+- `reports/2026-07-16-q2-ztest-01KXKBDNJ8NE301VGJGKPRZJKG/`
+- `reports/2026-07-16-pomo-ztest-01KXKCA8K1FYQZGHSR300VYWW2/`
+
+Sections below preserve the investigation history. Statements that a fresh
+post-deployment report was still required are superseded by the result above.
+
 ## Historical reports
 
 | Target | Report ID | Score | Preserved report | SHA-256 |
@@ -141,11 +174,28 @@ scripts/capture-ztest-report.sh \
 
 The script does not accept or persist an API key. It saves the byte-for-byte
 report API response, its SHA-256, normalized report data, every non-full probe,
-all exception details, a TSV index, and a Markdown summary. An already saved
-response can be replayed without network access:
+all exception details, JSON/TSV anomaly indexes, and a Markdown summary. It
+also writes one exact normalized object per probe under `probes/`, with every
+non-full probe and its complete `details` value duplicated under
+`non-full-probe-json/` and `non-full-detail-json/` for direct inspection. An
+already saved response can be replayed without network access:
 
 ```bash
 scripts/capture-ztest-report.sh \
   --input test-artifacts/ztest/reports/RUN/report.raw.json \
   /tmp/ztest-report-replay
 ```
+
+When ZTest opens reports in a short-lived browser popup, start the watcher
+before submitting the test:
+
+```bash
+scripts/watch-ztest-reports.sh
+```
+
+The watcher reads only new Codex desktop log lines by default. It extracts
+strict `https://ztest.ai/report/<26-character ULID>` URLs, immediately invokes
+the report capture script, retries transient fetch failures, and records only
+processed report IDs in its state file. It does not persist source log lines,
+browser storage, API keys, or request credentials. Use `--scan-existing` only
+when deliberately recovering still-live report URLs from existing log data.

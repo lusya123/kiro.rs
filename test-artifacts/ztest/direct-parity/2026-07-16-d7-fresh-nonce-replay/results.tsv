@@ -1,0 +1,6 @@
+run	http_code	curl_exit	time_total	tool_name	arguments	stop_reason
+1	200	0	4.820042	get_weather	{"city": "Exampleville-8aaf1f96", "unit": "celsius"}	tool_use
+2	200	0	4.687694	get_weather	{"city": "Exampleville-8aaf1f96", "unit": "celsius"}	tool_use
+3	200	0	4.760560	get_weather	{"city": "Exampleville-8aaf1f96", "unit": "celsius"}	tool_use
+4	200	0	4.746990	get_weather	{"city": "Exampleville-8aaf1f96", "unit": "celsius"}	tool_use
+5	200	0	4.900485	get_weather	{"city": "Exampleville-8aaf1f96", "unit": "celsius"}	tool_use

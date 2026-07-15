@@ -1,0 +1,12 @@
+{
+  "http_code": "200",
+  "http_version": "2",
+  "remote_ip": "198.18.0.60",
+  "size_download": "1424",
+  "ssl_verify_result": "0",
+  "time_appconnect": "1.676821",
+  "time_connect": "0.002442",
+  "time_namelookup": "0.002147",
+  "time_starttransfer": "2.276912",
+  "time_total": "2.277605"
+}

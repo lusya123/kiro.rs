@@ -1,0 +1,10 @@
+{
+  "max_tokens": 10,
+  "messages": [
+    {
+      "content": "hello",
+      "role": "user"
+    }
+  ],
+  "model": "ztest-fake-model-xyz-00000"
+}
