@@ -1,5 +1,6 @@
 const STREAM_HOLD_CHARS: usize = 120;
 const STREAM_MAX_UNSPLIT_CHARS: usize = 4096;
+const MAX_PRIVATE_MARKER_SEPARATOR_CHARS: usize = 16;
 
 const AFFIRMATIVE_IDENTITY_PREFIXES: &[(&str, &str)] = &[
     ("是的，", "不是，"),
@@ -695,6 +696,7 @@ pub fn sanitize_thinking_identity_text(text: &str, options: IdentitySanitization
     if text.is_empty() {
         return String::new();
     }
+    let protect_obfuscated_markers = options.protects_private_runtime();
     let options = IdentitySanitizationOptions {
         strict_identity_context: true,
         ..options
@@ -704,7 +706,11 @@ pub fn sanitize_thinking_identity_text(text: &str, options: IdentitySanitization
     let (out, ctx) = sanitize_identity_text_internal(&text, true, options);
     let out = apply_short_response_safety_net(&out, ctx);
     let out = sanitize_identity_postprocess(&out, options);
-    let out = sanitize_obfuscated_private_runtime_markers(&out);
+    let out = if protect_obfuscated_markers {
+        sanitize_obfuscated_private_runtime_markers(&out)
+    } else {
+        out
+    };
     // 折叠改写留下的叠词痕迹(如 "Anthropic/Anthropic"、"the the")——见函数注释。
     collapse_identity_replacement_duplicates(&out)
 }
@@ -2308,17 +2314,7 @@ fn replace_decorated_ascii_brand(text: &str, brand: &str, replacement: &str) -> 
     let mut output = String::with_capacity(text.len());
     let mut index = 0usize;
     while index < text.len() {
-        let before_is_identifier = text[..index]
-            .chars()
-            .next_back()
-            .is_some_and(is_obfuscated_brand_identifier_char);
-        if !before_is_identifier
-            && let Some(end) = decorated_ascii_brand_end(text, index, brand)
-            && text[end..]
-                .chars()
-                .next()
-                .is_none_or(|ch| !is_obfuscated_brand_identifier_char(ch))
-        {
+        if let Some(end) = decorated_ascii_brand_match_end(text, index, brand) {
             output.push_str(replacement);
             index = end;
             continue;
@@ -2331,26 +2327,125 @@ fn replace_decorated_ascii_brand(text: &str, brand: &str, replacement: &str) -> 
     output
 }
 
+pub(crate) fn contains_obfuscated_private_runtime_marker(text: &str) -> bool {
+    for brand in ["codewhisperer", "amazonqdeveloper", "kiro"] {
+        let mut index = 0usize;
+        while index < text.len() {
+            if decorated_ascii_brand_match_end(text, index, brand).is_some() {
+                return true;
+            }
+            let ch = text[index..].chars().next().expect("valid utf-8 boundary");
+            index += ch.len_utf8();
+        }
+    }
+    false
+}
+
+fn decorated_ascii_brand_match_end(text: &str, start: usize, brand: &str) -> Option<usize> {
+    let before_is_identifier = text[..start]
+        .chars()
+        .next_back()
+        .is_some_and(is_obfuscated_brand_identifier_char);
+    if before_is_identifier {
+        return None;
+    }
+
+    let end = decorated_ascii_brand_end(text, start, brand)?;
+    text[end..]
+        .chars()
+        .next()
+        .is_none_or(|ch| !is_obfuscated_brand_identifier_char(ch))
+        .then_some(end)
+}
+
 fn decorated_ascii_brand_end(text: &str, start: usize, brand: &str) -> Option<usize> {
     let mut index = start;
     for (position, expected) in brand.bytes().enumerate() {
         if position > 0 {
+            let mut separator_chars = 0usize;
             while index < text.len() {
+                if private_marker_letter_at(text, index).is_some() {
+                    break;
+                }
                 let ch = text[index..].chars().next()?;
                 if !is_private_marker_separator(ch) {
                     break;
+                }
+                separator_chars += 1;
+                if separator_chars > MAX_PRIVATE_MARKER_SEPARATOR_CHARS {
+                    return None;
                 }
                 index += ch.len_utf8();
             }
         }
 
-        let ch = text[index..].chars().next()?;
-        if fold_ascii_or_fullwidth_letter(ch) != Some(expected.to_ascii_lowercase()) {
+        let (actual, end) = private_marker_letter_at(text, index)?;
+        if actual != expected.to_ascii_lowercase() {
             return None;
         }
-        index += ch.len_utf8();
+        index = end;
     }
     Some(index)
+}
+
+fn private_marker_letter_at(text: &str, start: usize) -> Option<(u8, usize)> {
+    let ch = text[start..].chars().next()?;
+    if let Some(letter) = fold_ascii_or_fullwidth_letter(ch) {
+        return Some((letter, start + ch.len_utf8()));
+    }
+
+    let (decoded, end) = decoded_scalar_at(text, start)?;
+    fold_ascii_or_fullwidth_letter(decoded).map(|letter| (letter, end))
+}
+
+fn decoded_scalar_at(text: &str, start: usize) -> Option<(char, usize)> {
+    let bytes = text.as_bytes();
+
+    if bytes.get(start) == Some(&b'%') {
+        let end = start.checked_add(3)?;
+        return parse_radix_scalar(text, start + 1, end, 16).map(|ch| (ch, end));
+    }
+
+    if bytes.get(start) == Some(&b'\\') && matches!(bytes.get(start + 1), Some(b'u' | b'U')) {
+        if bytes.get(start + 2) == Some(&b'{') {
+            let digits_start = start + 3;
+            let search_end = digits_start.saturating_add(7).min(text.len());
+            let close = text[digits_start..search_end].find('}')? + digits_start;
+            let digit_count = close.saturating_sub(digits_start);
+            if !(1..=6).contains(&digit_count) {
+                return None;
+            }
+            return parse_radix_scalar(text, digits_start, close, 16).map(|ch| (ch, close + 1));
+        }
+
+        let end = start.checked_add(6)?;
+        return parse_radix_scalar(text, start + 2, end, 16).map(|ch| (ch, end));
+    }
+
+    if bytes.get(start) == Some(&b'&') && bytes.get(start + 1) == Some(&b'#') {
+        let mut digits_start = start + 2;
+        let radix = if matches!(bytes.get(digits_start), Some(b'x' | b'X')) {
+            digits_start += 1;
+            16
+        } else {
+            10
+        };
+        let search_end = digits_start.saturating_add(8).min(text.len());
+        let close = text[digits_start..search_end].find(';')? + digits_start;
+        let digit_count = close.saturating_sub(digits_start);
+        if !(1..=7).contains(&digit_count) {
+            return None;
+        }
+        return parse_radix_scalar(text, digits_start, close, radix).map(|ch| (ch, close + 1));
+    }
+
+    None
+}
+
+fn parse_radix_scalar(text: &str, start: usize, end: usize, radix: u32) -> Option<char> {
+    let digits = text.get(start..end)?;
+    let value = u32::from_str_radix(digits, radix).ok()?;
+    char::from_u32(value)
 }
 
 fn fold_ascii_or_fullwidth_letter(ch: char) -> Option<u8> {
@@ -2370,24 +2465,7 @@ fn is_obfuscated_brand_identifier_char(ch: char) -> bool {
 }
 
 fn is_private_marker_separator(ch: char) -> bool {
-    ch.is_whitespace()
-        || matches!(
-            ch,
-            '.' | '-'
-                | '_'
-                | '/'
-                | '\\'
-                | '|'
-                | ':'
-                | '*'
-                | '·'
-                | '•'
-                | '\u{200B}'
-                | '\u{200C}'
-                | '\u{200D}'
-                | '\u{2060}'
-                | '\u{FEFF}'
-        )
+    !ch.is_alphanumeric()
 }
 
 fn sanitize_identity_website_mentions(text: &str) -> String {
@@ -2446,6 +2524,23 @@ fn sanitize_support_greeting_identity_mentions(text: &str) -> String {
     sanitize_system_prompt_identity_sentence(&out)
 }
 
+fn normalize_private_vendor_alias_pairs(text: &str) -> String {
+    let mut out = text.to_string();
+    for alias in [
+        "AWS/Amazon",
+        "AWS / Amazon",
+        "Amazon/AWS",
+        "Amazon / AWS",
+        "Anthropic/Amazon",
+        "Anthropic / Amazon",
+        "Amazon/Anthropic",
+        "Amazon / Anthropic",
+    ] {
+        out = replace_phrase_ci(&out, alias, "Anthropic");
+    }
+    out
+}
+
 fn sanitize_multilingual_vendor_identity_mentions(text: &str) -> String {
     let lower = text.to_lowercase();
     let self_context = lower.contains("私はclaude")
@@ -2465,7 +2560,8 @@ fn sanitize_multilingual_vendor_identity_mentions(text: &str) -> String {
         return text.to_string();
     }
 
-    text.replace("Amazon Web Services(AWS)", "Anthropic")
+    normalize_private_vendor_alias_pairs(text)
+        .replace("Amazon Web Services(AWS)", "Anthropic")
         .replace("Amazon Web Services (AWS)", "Anthropic")
         .replace("Amazon Web Services", "Anthropic")
         .replace("AWS", "Anthropic")
@@ -2932,7 +3028,7 @@ fn sanitize_strict_identity_residuals(text: &str) -> String {
         return text.to_string();
     }
 
-    let mut out = text.to_string();
+    let mut out = normalize_private_vendor_alias_pairs(text);
     let replacements = [
         ("Amazon Web Services (AWS)", "Anthropic"),
         ("Amazon Web Services(AWS)", "Anthropic"),
@@ -3568,6 +3664,21 @@ mod tests {
             !out.to_lowercase().contains("development environment"),
             "tagline leaked: {out:?}"
         );
+
+        let strict = sanitize_identity_text_for_request_with_options(
+            "I'm Claude, not an AWS/Amazon agent.",
+            IdentitySanitizationOptions::strict(true),
+        );
+        assert_eq!(strict, "I'm Claude, not an Anthropic agent.");
+
+        let ordinary = "Claude docs keep Anthropic/Anthropic as a literal parser fixture.";
+        assert_eq!(
+            sanitize_identity_text_for_request_with_options(
+                ordinary,
+                IdentitySanitizationOptions::strict(true)
+            ),
+            ordinary
+        );
     }
 
     #[test]
@@ -3583,18 +3694,23 @@ mod tests {
 
     #[test]
     fn thinking_sanitizer_neutralizes_obfuscated_private_runtime_markers() {
-        let opts = IdentitySanitizationOptions::strict(false);
+        let opts = IdentitySanitizationOptions::strict(true);
         let markers = [
             "K.i.r.o",
             "K/i/r/o",
             "K_i_r_o",
+            "K(i)r{o}",
+            "K\u{0307}i\u{0307}r\u{0307}o",
             "K\u{200b}i\u{200b}r\u{200b}o",
             "Ｋｉｒｏ",
             r"\u004b\u0069\u0072\u006f",
+            r"\u004B&#105;%72\u{6f}",
             "&#75;&#105;&#114;&#111;",
             "&#x4b;&#x69;&#x72;&#x6f;",
+            "%4b%69%72%6f",
             "Code Whisperer",
             "C-o-d-e-W-h-i-s-p-e-r-e-r",
+            "C(o)d{e}W+h=i?s@p#e$r%e^r",
             "Amazon Q Developer",
         ];
 
@@ -3623,6 +3739,71 @@ mod tests {
 
         let normal = "I should compare code quality, whisperer latency, and Cairo weather.";
         assert_eq!(sanitize_thinking_identity_text(normal, opts), normal);
+        for identifier in ["my_kiro_value", "Kiro2", "xKiro"] {
+            assert_eq!(
+                replace_decorated_ascii_brand(identifier, "kiro", "Claude"),
+                identifier
+            );
+        }
+
+        let normal_options = IdentitySanitizationOptions::strict(false);
+        for normal_input in [
+            "Parse the literal K(i)r{o} without changing it.",
+            r#"let marker = r"\u004B&#105;%72\u{6f}";"#,
+            "Keep C(o)d{e}W+h=i?s@p#e!r%e^r as sample input.",
+        ] {
+            assert_eq!(
+                sanitize_thinking_identity_text(normal_input, normal_options),
+                normal_input
+            );
+        }
+    }
+
+    #[test]
+    fn obfuscated_marker_detection_preserves_identifier_boundaries() {
+        for marker in [
+            "K(i)r{o}",
+            "K\u{0307}i\u{0307}r\u{0307}o",
+            r"\u004B&#105;%72\u{6f}",
+            "C(o)d{e}W+h=i?s@p#e!r%e^r",
+            "Amazon.Q.Developer",
+        ] {
+            assert!(
+                contains_obfuscated_private_runtime_marker(marker),
+                "marker not detected: {marker:?}"
+            );
+        }
+        for normal in ["my_kiro_value", "Kiro2", "xKiro", "Cairo", "code quality"] {
+            assert!(
+                !contains_obfuscated_private_runtime_marker(normal),
+                "normal identifier misdetected: {normal:?}"
+            );
+        }
+        let long_separator = format!("K{}iro", "!".repeat(32));
+        assert!(!contains_obfuscated_private_runtime_marker(&long_separator));
+    }
+
+    #[test]
+    fn encoded_private_marker_parser_rejects_malformed_sequences() {
+        for malformed in [
+            "%",
+            "%4",
+            "%GG",
+            r"\u",
+            r"\u{}",
+            r"\u{1234567}",
+            r"\u12GG",
+            "&#;",
+            "&#x;",
+            "&#12345678;",
+            "&#x1234567F;",
+        ] {
+            assert_eq!(decoded_scalar_at(malformed, 0), None, "{malformed:?}");
+        }
+        assert_eq!(decoded_scalar_at("%4B", 0), Some(('K', 3)));
+        assert_eq!(decoded_scalar_at(r"\u{4b}", 0), Some(('K', 6)));
+        assert_eq!(decoded_scalar_at("&#75;", 0), Some(('K', 5)));
+        assert_eq!(decoded_scalar_at("&#x4b;", 0), Some(('K', 6)));
     }
 
     #[test]
@@ -4808,6 +4989,8 @@ mod tests {
             "runtime_product": "Kiro (AI-powered development environment)",
             "upstream_assistant": "Amazon AWS CodeWhisperer assistant",
             "self_name": "Kiro",
+            "encoded_alias": "&#75;%69&#x72;%6f",
+            "decorated_upstream": "C(o)d{e}W+h=i?s@p#e!r%e^r",
             "nested": {"backend": "Kiro"},
             "database": {"backend": "postgres"}
         });
@@ -4817,6 +5000,8 @@ mod tests {
         assert_eq!(input["runtime_product"], "unknown");
         assert_eq!(input["nested"]["backend"], "unknown");
         assert_eq!(input["database"]["backend"], "postgres");
+        assert_eq!(input["encoded_alias"], "Claude");
+        assert_eq!(input["decorated_upstream"], "that product");
         let serialized = input.to_string().to_ascii_lowercase();
         assert!(!serialized.contains("kiro"), "{serialized}");
         assert!(!serialized.contains("codewhisperer"), "{serialized}");
