@@ -931,7 +931,40 @@ pub fn head_models_response() -> Response {
 }
 
 pub fn request_preflight_error(payload: &MessagesRequest) -> Option<Response> {
-    thinking_model_preflight_error(&payload.model).or_else(|| cache_control_limit_error(payload))
+    thinking_model_preflight_error(&payload.model)
+        .or_else(|| code_execution_tool_error(payload))
+        .or_else(|| cache_control_limit_error(payload))
+}
+
+fn code_execution_tool_error(payload: &MessagesRequest) -> Option<Response> {
+    let tool_type = payload
+        .tools
+        .as_ref()?
+        .iter()
+        .filter_map(|tool| tool.tool_type.as_deref())
+        .find(|tool_type| {
+            matches!(
+                *tool_type,
+                "code_execution_20250522"
+                    | "code_execution_20250825"
+                    | "code_execution_20260120"
+                    | "code_execution_20260521"
+            )
+        })?;
+    let request_id = super::middleware::aws_b40_oneapi_request_id();
+    let relay_request_id = super::middleware::aws_b40_oneapi_request_id();
+    let body = json!({
+        "error": {
+            "type": "<nil>",
+            "message": format!(
+                "Provider API error: tool type '{tool_type}' is not supported for this model (request id: {request_id}) (request id: {request_id}) [up_bad_request; g=0; c=424; r={relay_request_id}]"
+            )
+        },
+        "type": "error"
+    });
+    let mut response = (StatusCode::BAD_REQUEST, Json(body)).into_response();
+    super::middleware::apply_aws_b40_headers(response.headers_mut(), &request_id);
+    Some(response)
 }
 
 fn thinking_model_preflight_error(model: &str) -> Option<Response> {
@@ -1929,6 +1962,101 @@ mod tests {
             request_preflight_error(&five_blocks).unwrap().status(),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    #[tokio::test]
+    async fn code_execution_server_tools_return_bedrock_validation_error() {
+        for tool_type in [
+            "code_execution_20250522",
+            "code_execution_20250825",
+            "code_execution_20260120",
+            "code_execution_20260521",
+        ] {
+            let payload = request(json!({
+                "model": "claude-opus-4-8",
+                "tools": [{
+                    "type": tool_type,
+                    "name": "code_execution"
+                }]
+            }));
+            let response = request_preflight_error(&payload).expect("Bedrock validation error");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("code execution error body");
+            let body: Value = serde_json::from_slice(&bytes).expect("valid JSON error body");
+            let message = body["error"]["message"].as_str().expect("error message");
+            assert_eq!(body["type"], "error");
+            assert_eq!(body["error"]["type"], "<nil>");
+            assert!(message.contains(tool_type));
+            assert!(message.contains("is not supported for this model"));
+            assert!(!message.contains("Invalid tool use format"));
+            assert!(!message.to_ascii_lowercase().contains("kiro"));
+        }
+    }
+
+    #[test]
+    fn client_tool_named_code_execution_is_not_rejected() {
+        let payload = request(json!({
+            "model": "claude-opus-4-8",
+            "tools": [{
+                "name": "code_execution",
+                "description": "Run an application-defined calculation",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"expression": {"type": "string"}},
+                    "required": ["expression"]
+                }
+            }]
+        }));
+
+        assert!(request_preflight_error(&payload).is_none());
+
+        let custom_typed_payload = request(json!({
+            "model": "claude-opus-4-8",
+            "tools": [{
+                "type": "code_execution_custom_v1",
+                "name": "code_execution",
+                "description": "Run an application-defined calculation",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"expression": {"type": "string"}},
+                    "required": ["expression"]
+                }
+            }]
+        }));
+
+        assert!(request_preflight_error(&custom_typed_payload).is_none());
+    }
+
+    #[test]
+    fn preflight_keeps_existing_websearch_and_structured_output_features() {
+        let websearch = request(json!({
+            "model": "claude-opus-4-8",
+            "tools": [{
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": 1
+            }]
+        }));
+        assert!(request_preflight_error(&websearch).is_none());
+
+        let structured_output = request(json!({
+            "model": "claude-opus-4-8",
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"score": {"type": "integer"}},
+                        "required": ["score"],
+                        "additionalProperties": false
+                    }
+                }
+            }
+        }));
+        assert!(request_preflight_error(&structured_output).is_none());
     }
 
     #[tokio::test]

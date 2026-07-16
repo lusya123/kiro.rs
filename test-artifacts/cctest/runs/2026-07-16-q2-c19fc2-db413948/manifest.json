@@ -1,0 +1,8 @@
+{
+  "taskId": "db413948-183d-48a0-9bbf-6da15193d876",
+  "mode": "resume",
+  "endpoint": "https://q2.quietfox.sbs/v1/messages",
+  "model": "claude-opus-4-8",
+  "submittedAt": null,
+  "lastResumedAt": "2026-07-16T14:53:07Z"
+}

@@ -1,0 +1,28 @@
+{
+  "status": "running",
+  "step": 2,
+  "stepName": "stream_structure",
+  "progress": 0.16666666666666666,
+  "checkTokenUsage": false,
+  "expectedModel": "claude-opus-4-8",
+  "stepStatus": {
+    "tag_check": "done",
+    "stream_structure": "done",
+    "non_stream": "running",
+    "websearch": "running",
+    "output_config": "running",
+    "server_tool": "running",
+    "token_inject": "running"
+  },
+  "scores": {
+    "tag_check": 10,
+    "stream_structure": 5
+  },
+  "metrics": {
+    "latencyMs": 4644,
+    "ttfbMs": 4608,
+    "tokensPerSec": 0,
+    "inputTokens": 6954,
+    "outputTokens": 17
+  }
+}
