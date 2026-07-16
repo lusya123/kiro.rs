@@ -704,6 +704,7 @@ pub fn sanitize_thinking_identity_text(text: &str, options: IdentitySanitization
     let (out, ctx) = sanitize_identity_text_internal(&text, true, options);
     let out = apply_short_response_safety_net(&out, ctx);
     let out = sanitize_identity_postprocess(&out, options);
+    let out = sanitize_obfuscated_private_runtime_markers(&out);
     // 折叠改写留下的叠词痕迹(如 "Anthropic/Anthropic"、"the the")——见函数注释。
     collapse_identity_replacement_duplicates(&out)
 }
@@ -2276,6 +2277,119 @@ fn sanitize_encoded_identity_outputs(text: &str) -> String {
     }
 }
 
+/// Neutralize private-runtime names whose letters are deliberately separated or
+/// encoded. This only runs in strict identity/thinking contexts, so ordinary
+/// third-party product discussions keep their original spelling.
+fn sanitize_obfuscated_private_runtime_markers(text: &str) -> String {
+    let mut out = text.to_string();
+    for encoded in [
+        r"\u004b\u0069\u0072\u006f",
+        r"\u006b\u0069\u0072\u006f",
+        "&#75;&#105;&#114;&#111;",
+        "&#x4b;&#x69;&#x72;&#x6f;",
+    ] {
+        out = replace_phrase_ci(&out, encoded, "Claude");
+    }
+
+    // Longer names must be consumed before their shorter components.
+    for (brand, replacement) in [
+        ("codewhisperer", "that product"),
+        ("amazonqdeveloper", "that product"),
+        ("kiro", "Claude"),
+    ] {
+        out = replace_decorated_ascii_brand(&out, brand, replacement);
+    }
+    out
+}
+
+fn replace_decorated_ascii_brand(text: &str, brand: &str, replacement: &str) -> String {
+    debug_assert!(brand.bytes().all(|byte| byte.is_ascii_alphabetic()));
+
+    let mut output = String::with_capacity(text.len());
+    let mut index = 0usize;
+    while index < text.len() {
+        let before_is_identifier = text[..index]
+            .chars()
+            .next_back()
+            .is_some_and(is_obfuscated_brand_identifier_char);
+        if !before_is_identifier
+            && let Some(end) = decorated_ascii_brand_end(text, index, brand)
+            && text[end..]
+                .chars()
+                .next()
+                .is_none_or(|ch| !is_obfuscated_brand_identifier_char(ch))
+        {
+            output.push_str(replacement);
+            index = end;
+            continue;
+        }
+
+        let ch = text[index..].chars().next().expect("valid utf-8 boundary");
+        output.push(ch);
+        index += ch.len_utf8();
+    }
+    output
+}
+
+fn decorated_ascii_brand_end(text: &str, start: usize, brand: &str) -> Option<usize> {
+    let mut index = start;
+    for (position, expected) in brand.bytes().enumerate() {
+        if position > 0 {
+            while index < text.len() {
+                let ch = text[index..].chars().next()?;
+                if !is_private_marker_separator(ch) {
+                    break;
+                }
+                index += ch.len_utf8();
+            }
+        }
+
+        let ch = text[index..].chars().next()?;
+        if fold_ascii_or_fullwidth_letter(ch) != Some(expected.to_ascii_lowercase()) {
+            return None;
+        }
+        index += ch.len_utf8();
+    }
+    Some(index)
+}
+
+fn fold_ascii_or_fullwidth_letter(ch: char) -> Option<u8> {
+    if ch.is_ascii_alphabetic() {
+        return Some((ch as u8).to_ascii_lowercase());
+    }
+
+    match ch {
+        '\u{FF21}'..='\u{FF3A}' => Some((ch as u32 - 0xFF21) as u8 + b'a'),
+        '\u{FF41}'..='\u{FF5A}' => Some((ch as u32 - 0xFF41) as u8 + b'a'),
+        _ => None,
+    }
+}
+
+fn is_obfuscated_brand_identifier_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+fn is_private_marker_separator(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '.' | '-'
+                | '_'
+                | '/'
+                | '\\'
+                | '|'
+                | ':'
+                | '*'
+                | '·'
+                | '•'
+                | '\u{200B}'
+                | '\u{200C}'
+                | '\u{200D}'
+                | '\u{2060}'
+                | '\u{FEFF}'
+        )
+}
+
 fn sanitize_identity_website_mentions(text: &str) -> String {
     let lower = text.to_lowercase();
     if !(lower.contains("kiro.dev")
@@ -3465,6 +3579,50 @@ mod tests {
         assert_eq!(sanitize_thinking_identity_text(normal, opts), normal);
         // 空思考(opus 经 Kiro 常见)返回空。
         assert_eq!(sanitize_thinking_identity_text("", opts), "");
+    }
+
+    #[test]
+    fn thinking_sanitizer_neutralizes_obfuscated_private_runtime_markers() {
+        let opts = IdentitySanitizationOptions::strict(false);
+        let markers = [
+            "K.i.r.o",
+            "K/i/r/o",
+            "K_i_r_o",
+            "K\u{200b}i\u{200b}r\u{200b}o",
+            "Ｋｉｒｏ",
+            r"\u004b\u0069\u0072\u006f",
+            "&#75;&#105;&#114;&#111;",
+            "&#x4b;&#x69;&#x72;&#x6f;",
+            "Code Whisperer",
+            "C-o-d-e-W-h-i-s-p-e-r-e-r",
+            "Amazon Q Developer",
+        ];
+
+        for marker in markers {
+            let input = format!("My private runtime product is {marker}.");
+            let output = sanitize_thinking_identity_text(&input, opts);
+            let compact = output
+                .chars()
+                .filter_map(fold_ascii_or_fullwidth_letter)
+                .map(char::from)
+                .collect::<String>();
+            let lower = output.to_lowercase();
+            assert!(!compact.contains("kiro"), "{marker:?} leaked: {output:?}");
+            assert!(
+                !compact.contains("codewhisperer"),
+                "{marker:?} leaked: {output:?}"
+            );
+            assert!(
+                !compact.contains("amazonqdeveloper"),
+                "{marker:?} leaked: {output:?}"
+            );
+            assert!(!lower.contains(r"\u004b\u0069\u0072\u006f"));
+            assert!(!lower.contains("&#75;&#105;&#114;&#111;"));
+            assert!(!lower.contains("&#x4b;&#x69;&#x72;&#x6f;"));
+        }
+
+        let normal = "I should compare code quality, whisperer latency, and Cairo weather.";
+        assert_eq!(sanitize_thinking_identity_text(normal, opts), normal);
     }
 
     #[test]
