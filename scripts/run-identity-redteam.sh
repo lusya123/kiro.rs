@@ -17,11 +17,17 @@ fi
 MODEL="${MODEL:-claude-opus-4-8}"
 THINKING_MODEL="${THINKING_MODEL:-claude-opus-4-6}"
 OUT_DIR="${OUT_DIR:-test-artifacts/ztest/identity-redteam-$(date +%Y%m%d-%H%M%S)}"
+PROBE_DELAY_SECONDS="${PROBE_DELAY_SECONDS:-2}"
 REQUEST_DIR="$OUT_DIR/requests"
 RESPONSE_DIR="$OUT_DIR/responses"
 EXTRACTED_DIR="$OUT_DIR/extracted"
 RESULTS="$OUT_DIR/results.tsv"
 FINDINGS="$OUT_DIR/findings.tsv"
+
+if ! [[ "$PROBE_DELAY_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  printf 'PROBE_DELAY_SECONDS must be a non-negative number\n' >&2
+  exit 2
+fi
 
 mkdir -p "$REQUEST_DIR" "$RESPONSE_DIR" "$EXTRACTED_DIR"
 printf 'name\ttransport\tstream\texpect\thttp_code\tcurl_exit\ttime_total\tresponse_bytes\tthinking_chars\ttool_calls\tattempts\n' > "$RESULTS"
@@ -699,7 +705,16 @@ scan_sanitizer_artifact() {
   grep -Eiq "$artifact_re" "$extracted_file"
 }
 
+has_terminal_credential_error() {
+  local response_file="$1"
+  grep -Eiq \
+    'temporarily (is )?suspended|locked your account|monthly_request_count|all credentials[^[:alnum:]]+(are )?(exhausted|depleted)|所有凭据已用尽|凭据[^[:cntrl:]]*(用尽|耗尽)|账户[^[:cntrl:]]*(锁定|暂停)' \
+    "$response_file"
+}
+
 probe_count="$(jq 'length' "$OUT_DIR/probes.json")"
+request_count=0
+credential_blocked=false
 for index in $(seq 0 $((probe_count - 1))); do
   name="$(jq -r ".[$index].name" "$OUT_DIR/probes.json")"
   transport="$(jq -r ".[$index].transport" "$OUT_DIR/probes.json")"
@@ -724,6 +739,10 @@ for index in $(seq 0 $((probe_count - 1))); do
   attempt=0
   while (( attempt < max_attempts )); do
     attempt=$((attempt + 1))
+    if (( request_count > 0 )) && [[ "$PROBE_DELAY_SECONDS" != "0" ]]; then
+      sleep "$PROBE_DELAY_SECONDS"
+    fi
+    request_count=$((request_count + 1))
     set +e
     meta="$(curl --http2 -sS -N --max-time 240 \
       -D "$RESPONSE_DIR/$name.headers" \
@@ -757,6 +776,11 @@ for index in $(seq 0 $((probe_count - 1))); do
     "${time_total:-0}" "${response_bytes:-0}" "${thinking_chars:-0}" "${tool_calls:-0}" "$attempt" >> "$RESULTS"
 
   if [[ "$curl_exit" -ne 0 || "$http_code" != "200" ]]; then
+    if [[ -s "$response_file" ]] && has_terminal_credential_error "$response_file"; then
+      printf '%s\tCREDENTIAL_BLOCKED\tterminal upstream credential error; remaining probes were not sent\n' "$name" >> "$FINDINGS"
+      credential_blocked=true
+      break
+    fi
     printf '%s\tERROR\thttp=%s curl_exit=%s\n' "$name" "${http_code:-000}" "$curl_exit" >> "$FINDINGS"
     continue
   fi
@@ -854,6 +878,12 @@ column -t -s $'\t' "$FINDINGS" || true
 
 leaks="$(awk -F '\t' 'NR > 1 && $2 == "LEAK" {count++} END {print count + 0}' "$FINDINGS")"
 errors="$(awk -F '\t' 'NR > 1 && ($2 == "ERROR" || $2 == "CONTROL_FAIL" || $2 == "SANITIZER_ARTIFACT" || $2 == "NO_THINKING" || $2 == "STREAM_INVALID" || $2 == "STREAM_INCOMPLETE" || $2 == "TOOL_MISSING") {count++} END {print count + 0}' "$FINDINGS")"
+executed="$(awk 'NR > 1 {count++} END {print count + 0}' "$RESULTS")"
+if [[ "$credential_blocked" == "true" ]]; then
+  printf '\nidentity red-team blocked by terminal credential error after %s/%s probes; no remaining probes were sent\n' \
+    "$executed" "$probe_count" >&2
+  exit 2
+fi
 if [[ "$leaks" -gt 0 || "$errors" -gt 0 ]]; then
   printf '\nidentity red-team failed: leaks=%s errors=%s\n' "$leaks" "$errors" >&2
   exit 1

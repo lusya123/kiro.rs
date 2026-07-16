@@ -3894,6 +3894,44 @@ mod tests {
     }
 
     #[test]
+    fn encoded_marker_scanner_is_utf8_boundary_safe_for_malformed_suffixes() {
+        let prefixes = [r"\u{", "&#", "&#x"];
+        let suffixes = [
+            "",
+            "}",
+            ";",
+            "\u{0080}",
+            "\u{07FF}",
+            "\u{0800}",
+            "\u{FFFF}",
+            "\u{10000}",
+            "\u{10FFFF}",
+            "Ｏ",
+            "Ｏ}",
+            "Ｏ;",
+        ];
+        let mut checked = 0usize;
+
+        for prefix in prefixes {
+            for digit_count in 0..=8 {
+                let digits = "4".repeat(digit_count);
+                for suffix in suffixes {
+                    let input = format!("lead-{prefix}{digits}{suffix}-tail");
+                    for (index, _) in input.char_indices() {
+                        let _ = decoded_scalar_at(&input, index);
+                        let _ = private_marker_letter_at(&input, index);
+                    }
+                    let _ = contains_obfuscated_private_runtime_marker(&input);
+                    let _ = replace_decorated_ascii_brand(&input, "kiro", "Claude");
+                    checked += 1;
+                }
+            }
+        }
+
+        assert_eq!(checked, prefixes.len() * 9 * suffixes.len());
+    }
+
+    #[test]
     fn strips_persona_rejection_meta() {
         // "I'm Claude, not Claude Code" 元评论整句应被删除,保留正文。
         assert_eq!(
