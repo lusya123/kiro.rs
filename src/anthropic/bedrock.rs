@@ -1169,9 +1169,22 @@ pub fn response_id(model: &str) -> String {
     id::bedrock_message_id_for_model(model)
 }
 
-pub fn signature(model: &str, adaptive: bool) -> String {
+pub fn signature(
+    model: &str,
+    adaptive: bool,
+    thinking_text: &str,
+    usage: UsageBreakdown,
+) -> String {
     if adaptive {
-        super::signature::generate_aws_b40_adaptive_signature()
+        let context_tokens = usage
+            .input_tokens
+            .saturating_add(usage.cache_read_input_tokens)
+            .saturating_add(usage.cache_creation_input_tokens);
+        super::signature::generate_aws_b40_adaptive_signature_for_model(
+            model,
+            thinking_text.len(),
+            context_tokens,
+        )
     } else {
         super::signature::generate_aws_b40_signature_for_model(model)
     }

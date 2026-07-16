@@ -750,6 +750,9 @@ pub struct StreamContext {
     /// 与真 Anthropic 强制工具行为一致,避免模型在 tool_use 前后夹带解释性文本
     /// (如 "I'll check the weather"),那会让"结构化输出/只认工具调用"探针判失败。
     suppress_text_blocks: bool,
+    /// 强制工具请求在首个 tool_use 前产生的文本先暂存。最终有工具时丢弃；若上游
+    /// 异常地完全没有工具调用，则在流结束时回放，避免给正常客户端返回空消息。
+    forced_tool_text_pending: String,
     /// Preserve the externally observed AWS-B/Bedrock protocol shape.
     aws_b40_compat: bool,
     aws_b40_adaptive_signature: bool,
@@ -813,6 +816,7 @@ impl StreamContext {
             thinking_pending_raw: String::new(),
             pending_synthetic_thinking: None,
             suppress_text_blocks: false,
+            forced_tool_text_pending: String::new(),
             aws_b40_compat: false,
             aws_b40_adaptive_signature: false,
             aws_b40_thinking_requested: false,
@@ -1275,10 +1279,12 @@ impl StreamContext {
 
     fn emit_text_delta_events(&mut self, text: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
-        // 强制工具调用(tool_choice any/tool)时,响应只应含 tool_use。
-        // **仅在已发出 tool_use 之后**才丢弃文本增量:这样若模型异常地只产出文本、没有工具调用,
-        // 文本仍照常流出(绝不会被吞成空响应),既与真 Anthropic 一致又不伤真实使用。
-        if self.suppress_text_blocks && !self.tool_block_indices.is_empty() {
+        // 强制工具调用时先缓冲前导文本；一旦工具出现就连同后续文本一起丢弃。
+        // 若整轮没有工具，generate_final_events 会关闭抑制并回放缓冲内容。
+        if self.suppress_text_blocks {
+            if self.tool_block_indices.is_empty() {
+                self.forced_tool_text_pending.push_str(text);
+            }
             return events;
         }
         let Some(text) = self.apply_output_token_limit(text) else {
@@ -1418,7 +1424,12 @@ impl StreamContext {
     /// 创建 signature_delta 事件（thinking 块伪签名，详见 anthropic::signature 模块）
     fn create_signature_delta_event(&self, index: i32) -> SseEvent {
         let signature = if self.aws_b40_compat {
-            super::bedrock::signature(&self.model, self.aws_b40_adaptive_signature)
+            super::bedrock::signature(
+                &self.model,
+                self.aws_b40_adaptive_signature,
+                &self.thinking_text_acc,
+                self.initial_usage_breakdown,
+            )
         } else {
             super::signature::generate_signature()
         };
@@ -1445,6 +1456,9 @@ impl StreamContext {
         }
 
         let mut events = Vec::new();
+        if self.suppress_text_blocks {
+            self.forced_tool_text_pending.clear();
+        }
         let tool_identity_options = self
             .thinking_sanitize_options
             .filter(|options| options.protects_private_runtime());
@@ -1924,6 +1938,15 @@ impl StreamContext {
             if !remaining.is_empty() {
                 events.extend(self.emit_text_delta_events(&remaining));
             }
+        }
+
+        if self.suppress_text_blocks
+            && self.tool_block_indices.is_empty()
+            && !self.forced_tool_text_pending.is_empty()
+        {
+            self.suppress_text_blocks = false;
+            let pending = std::mem::take(&mut self.forced_tool_text_pending);
+            events.extend(self.emit_text_delta_events(&pending));
         }
 
         // If the upstream transport ends before its final tool `stop=true`
@@ -2834,6 +2857,62 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(block_types, vec!["thinking", "tool_use"]);
+    }
+
+    #[test]
+    fn forced_tool_response_discards_text_before_and_after_tool() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 1, false, false, HashMap::new());
+        ctx.enable_aws_b40_compat(false);
+        ctx.set_suppress_text_blocks(true);
+
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_assistant_response("I'll report it now."));
+        events.extend(
+            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "report_identity".to_string(),
+                tool_use_id: "toolu_bdrk_forced".to_string(),
+                input: "{}".to_string(),
+                stop: true,
+            }),
+        );
+        events.extend(ctx.process_assistant_response("Done."));
+        events.extend(ctx.generate_final_events());
+
+        assert!(collect_text_content(&events).is_empty());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.event == "content_block_start"
+                        && event.data["content_block"]["type"] == "tool_use"
+                })
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| {
+            event.event == "content_block_start" && event.data["content_block"]["type"] == "text"
+        }));
+    }
+
+    #[test]
+    fn forced_tool_response_replays_text_when_upstream_omits_tool() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 1, false, false, HashMap::new());
+        ctx.enable_aws_b40_compat(false);
+        ctx.set_suppress_text_blocks(true);
+
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_assistant_response("Fallback response."));
+        assert!(collect_text_content(&events).is_empty());
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_text_content(&events), "Fallback response.");
+        let delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+        assert_eq!(delta.data["delta"]["stop_reason"], "end_turn");
     }
 
     #[test]

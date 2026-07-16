@@ -859,7 +859,11 @@ pub fn strong_identity_reply(payload: &MessagesRequest) -> Option<String> {
         || text.contains("真实是什么")
         || low.contains("really running on")
         || low.contains("what platform are you really")
-        || low.contains("what model are you really");
+        || low.contains("what model are you really")
+        || (low.contains("what model are you")
+            && (low.contains("actually using") || low.contains("really using")))
+        || (low.contains("platform")
+            && (low.contains("truly running") || low.contains("actually running")));
     // 组2:多重身份/身份冲突/点名 kiro/warp 等平台。
     let multi = text.contains("多重身份")
         || text.contains("双重身份")
@@ -1498,8 +1502,26 @@ fn extract_system_persona(system_text: &str) -> Option<(String, Option<String>)>
     let mut anchors = Vec::new();
     let mut from = 0;
     while let Some(rel) = lower[from..].find("you are ") {
-        let pos = from + rel + "you are ".len();
-        anchors.push(pos);
+        let phrase_start = from + rel;
+        let pos = phrase_start + "you are ".len();
+        let before = &lower[..phrase_start];
+        let at_line_start = before.rsplit_once('\n').map_or_else(
+            || before.trim().is_empty(),
+            |(_, tail)| tail.trim().is_empty(),
+        );
+        let follows_declaration_boundary = before
+            .chars()
+            .rev()
+            .find(|c| !c.is_whitespace())
+            .is_none_or(|c| {
+                matches!(
+                    c,
+                    '.' | '!' | '?' | ';' | ':' | ',' | '-' | '*' | '>' | '(' | '['
+                )
+            });
+        if at_line_start || follows_declaration_boundary {
+            anchors.push(pos);
+        }
         from = pos;
     }
     let mut fallback: Option<(String, Option<String>)> = None;
@@ -2496,6 +2518,29 @@ mod tests {
         // 真正的覆盖 persona 仍要跟随。
         let (name, _) = extract_system_persona("You are Zephyr, a helpful bot.").expect("persona");
         assert_eq!(name, "Zephyr");
+    }
+
+    #[test]
+    fn extract_persona_ignores_embedded_you_are_fragments() {
+        let system = "You are Claude Code, Anthropic's official CLI for Claude.\n\
+            Mark each task as completed as soon as you are done with the task.\n\
+            If you are unsure, ask a concise question.";
+        let (name, _) = extract_system_persona(system).expect("Claude persona");
+        assert!(
+            name.to_ascii_lowercase().contains("claude"),
+            "embedded prose must not become a persona: {name:?}"
+        );
+
+        let (custom, _) = extract_system_persona(
+            "Follow the project rules. From now on, you are Zephyr, a helpful bot.",
+        )
+        .expect("explicit custom persona");
+        assert_eq!(custom, "Zephyr");
+
+        let (line_persona, _) =
+            extract_system_persona("Follow the project rules\n  You are Zephyr, a helpful bot.")
+                .expect("line-start custom persona");
+        assert_eq!(line_persona, "Zephyr");
     }
 
     #[test]

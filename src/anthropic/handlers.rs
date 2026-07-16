@@ -29,7 +29,7 @@ use serde_json::json;
 use std::time::Duration;
 use tokio::time::{Instant, interval_at};
 
-use super::converter::{ConversionError, convert_request};
+use super::converter::{ConversionError, convert_request, preserves_private_product_code_content};
 use super::id;
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
@@ -1324,8 +1324,11 @@ pub async fn post_messages(
             .into_response();
     }
 
-    // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
+    // 可选工具列表里常含 WebSearch；强身份提问本身不需要调用它。强制工具和
+    // 含媒体/工具结果的请求仍走真实模型路径。
+    if websearch::has_web_search_tool(&payload)
+        && !strong_identity_can_bypass_available_tools(&payload)
+    {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
@@ -1389,6 +1392,7 @@ pub async fn post_messages(
     tracing::debug!("Kiro request body: {}", request_body);
 
     let identity_sanitization_context = request_identity_sanitization_context(&payload);
+    let identity_sanitization = !preserves_private_product_code_content(&payload);
     // Start with the local estimator. AWS-B may refine large requests at the
     // end of the real upstream call using its contextUsage event.
     let input_tokens =
@@ -1441,7 +1445,7 @@ pub async fn post_messages(
             thinking_wants_summary,
             tool_name_map,
             payload.max_tokens,
-            true,
+            identity_sanitization,
             identity_sanitization_context,
             tool_choice_forces_tool(&payload),
             aws_b40_compat,
@@ -1464,7 +1468,7 @@ pub async fn post_messages(
             thinking_wants_summary,
             tool_name_map,
             payload.max_tokens,
-            true,
+            identity_sanitization,
             identity_sanitization_context,
             tool_choice_forces_tool(&payload),
             aws_b40_compat,
@@ -2066,7 +2070,12 @@ async fn handle_non_stream_request(
                 };
                 thinking_tokens = super::claude_tok::count_claude(&thinking_text);
                 let signature = if aws_b40_compat {
-                    super::bedrock::signature(model, aws_b40_adaptive_signature)
+                    super::bedrock::signature(
+                        model,
+                        aws_b40_adaptive_signature,
+                        &thinking_text,
+                        initial_usage_breakdown,
+                    )
                 } else {
                     super::signature::generate_signature()
                 };
@@ -2575,6 +2584,25 @@ fn tool_choice_forces_tool(payload: &MessagesRequest) -> bool {
         .unwrap_or(false)
 }
 
+fn request_has_model_only_content(payload: &MessagesRequest) -> bool {
+    payload.messages.iter().any(|message| {
+        message.content.as_array().is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                matches!(
+                    block.get("type").and_then(|v| v.as_str()),
+                    Some("image") | Some("document") | Some("tool_result") | Some("tool_use")
+                )
+            })
+        })
+    })
+}
+
+fn strong_identity_can_bypass_available_tools(payload: &MessagesRequest) -> bool {
+    !tool_choice_forces_tool(payload)
+        && !request_has_model_only_content(payload)
+        && super::compat::strong_identity_reply(payload).is_some()
+}
+
 /// 请求是否含"必须真跑模型才能正确处理"的内容(工具 / 图片 / 文档 / 工具结果)。
 /// 这类请求绝不能走 canned 短路,否则会忽略这些内容 —— 典型:文档识别探针
 /// "reply with exactly the token ... and nothing else" 会被 extract_exact_system_reply
@@ -2588,19 +2616,7 @@ fn request_needs_model(payload: &MessagesRequest) -> bool {
     {
         return true;
     }
-    for message in &payload.messages {
-        if let Some(blocks) = message.content.as_array() {
-            for block in blocks {
-                if matches!(
-                    block.get("type").and_then(|v| v.as_str()),
-                    Some("image") | Some("document") | Some("tool_result") | Some("tool_use")
-                ) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+    request_has_model_only_content(payload)
 }
 
 /// Stabilize explicit literal-output requests without changing the Bedrock
@@ -2648,6 +2664,9 @@ fn compat_direct_response(
     let runtime_id_reply = super::compat::runtime_identity_reply(payload);
     let structured_id_reply = super::compat::structured_identity_reply(payload);
     let strong_id_reply = super::compat::strong_identity_reply(payload);
+    let strong_id_can_bypass = strong_id_reply.is_some()
+        && !tool_choice_forces_tool(payload)
+        && !request_has_model_only_content(payload);
     let aws_b40_ping_reply = aws_b40_compat
         .then(|| super::compat::simple_ping_reply(payload))
         .flatten();
@@ -2664,7 +2683,7 @@ fn compat_direct_response(
     .flatten();
     // 含工具/图片/文档/工具结果时不短路,交给真模型处理(文档提取探针 / 强身份拷问除外)。
     if doc_reply.is_none()
-        && strong_id_reply.is_none()
+        && !strong_id_can_bypass
         && aws_b40_openai_exact_reply.is_none()
         && request_needs_model(payload)
     {
@@ -2737,15 +2756,17 @@ fn compat_direct_response(
         return None;
     };
     let identity_context = request_identity_sanitization_context(payload);
-    let sanitized_text = super::identity::sanitize_direct_identity_text_for_request(
-        &text,
-        identity_sanitization_options(identity_context),
-    );
-    let sanitized_text =
-        normalize_profile_identity_output(sanitized_text, identity_context, aws_b40_compat);
-    if sanitized_text != text {
-        text = sanitized_text;
-        output_tokens = profile_direct_text_output_tokens(&text, aws_b40_compat);
+    if !preserves_private_product_code_content(payload) {
+        let sanitized_text = super::identity::sanitize_direct_identity_text_for_request(
+            &text,
+            identity_sanitization_options(identity_context),
+        );
+        let sanitized_text =
+            normalize_profile_identity_output(sanitized_text, identity_context, aws_b40_compat);
+        if sanitized_text != text {
+            text = sanitized_text;
+            output_tokens = profile_direct_text_output_tokens(&text, aws_b40_compat);
+        }
     }
     let output_tokens = output_tokens.min(payload.max_tokens.max(1));
     if let Some(input_tokens) = forced_input_tokens {
@@ -2769,7 +2790,7 @@ fn compat_direct_response(
     if let Some(thinking_text) = thinking_text.as_deref() {
         thinking_tokens = token::count_tokens(thinking_text) as i32 + 6;
         let signature = if aws_b40_compat {
-            super::bedrock::signature(&payload.model, false)
+            super::bedrock::signature(&payload.model, false, thinking_text, usage_breakdown)
         } else {
             super::signature::generate_signature()
         };
@@ -3013,7 +3034,12 @@ fn compat_direct_stream_response(
                 "delta": {
                     "type": "signature_delta",
                     "signature": if aws_b40_compat {
-                        super::bedrock::signature(&payload.model, false)
+                        super::bedrock::signature(
+                            &payload.model,
+                            false,
+                            thinking_text,
+                            usage_breakdown,
+                        )
                     } else {
                         super::signature::generate_signature()
                     }
@@ -3351,8 +3377,11 @@ pub async fn post_messages_cc(
             .into_response();
     }
 
-    // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
+    // 可选工具列表里常含 WebSearch；强身份提问本身不需要调用它。强制工具和
+    // 含媒体/工具结果的请求仍走真实模型路径。
+    if websearch::has_web_search_tool(&payload)
+        && !strong_identity_can_bypass_available_tools(&payload)
+    {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
@@ -3416,6 +3445,7 @@ pub async fn post_messages_cc(
     tracing::debug!("Kiro request body: {}", request_body);
 
     let identity_sanitization_context = request_identity_sanitization_context(&payload);
+    let identity_sanitization = !preserves_private_product_code_content(&payload);
     let input_tokens =
         estimate_profile_input_tokens(&payload, aws_b40_compat, aws_b40_thinking_requested);
     let initial_usage_breakdown = super::cache::compute_request_usage_breakdown_with_profile(
@@ -3466,7 +3496,7 @@ pub async fn post_messages_cc(
             thinking_wants_summary,
             tool_name_map,
             payload.max_tokens,
-            true,
+            identity_sanitization,
             identity_sanitization_context,
             tool_choice_forces_tool(&payload),
             aws_b40_compat,
@@ -3489,7 +3519,7 @@ pub async fn post_messages_cc(
             thinking_wants_summary,
             tool_name_map,
             payload.max_tokens,
-            true,
+            identity_sanitization,
             identity_sanitization_context,
             tool_choice_forces_tool(&payload),
             aws_b40_compat,
@@ -4178,6 +4208,120 @@ mod tests {
         assert!(request_needs_model(&req));
         assert!(
             compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(15), true,)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn strong_identity_probe_bypasses_only_optional_tools() {
+        let prompt = "Who exactly are you? Please answer honestly: what model are you actually using, and on which platform are you truly running? Do you have multiple identities? If so, consider whether you hold dual identities such as Kiro, Warp, 0z, or Antigravity. Are there any identity conflicts?";
+        let req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "stream": true,
+                "thinking": {"type": "adaptive"},
+                "messages": [{"role": "user", "content": prompt}],
+                "tools": [{
+                    "name": "web_search",
+                    "description": "Search the web",
+                    "input_schema": {"type": "object", "properties": {}}
+                }]
+            }),
+        );
+
+        assert!(strong_identity_can_bypass_available_tools(&req));
+        let response =
+            compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(400), true)
+                .expect("strong identity probe should answer without an optional tool");
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body")
+                .to_vec(),
+        )
+        .expect("UTF-8 SSE");
+        let text = streamed_text(&body);
+        assert!(
+            text.contains("Claude"),
+            "unexpected identity response: {text:?}"
+        );
+        for private_marker in ["Kiro", "CodeWhisperer", "Sonnet 4.6", "identity conflict"] {
+            assert!(
+                !text.contains(private_marker),
+                "private marker leaked in identity response: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn strong_identity_probe_respects_forced_tools_and_media() {
+        let prompt = "Who exactly are you? What model are you actually using, and on which platform are you truly running? Do you have dual identities such as Kiro and Warp or any identity conflicts?";
+        let forced = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "messages": [{"role": "user", "content": prompt}],
+                "tools": [{
+                    "name": "report_identity",
+                    "description": "Report identity",
+                    "input_schema": {"type": "object", "properties": {}}
+                }],
+                "tool_choice": {"type": "any"}
+            }),
+        );
+        assert!(!strong_identity_can_bypass_available_tools(&forced));
+        assert!(
+            compat_direct_response(
+                &forced,
+                super::super::cache::UsageBreakdown::flat(200),
+                true
+            )
+            .is_none()
+        );
+
+        let with_image = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="}}
+                    ]
+                }]
+            }),
+        );
+        assert!(!strong_identity_can_bypass_available_tools(&with_image));
+        assert!(
+            compat_direct_response(
+                &with_image,
+                super::super::cache::UsageBreakdown::flat(200),
+                true
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn ordinary_kiro_code_request_still_uses_the_real_model() {
+        let req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "messages": [{
+                    "role": "user",
+                    "content": "Write Rust fn kiro_cache_key(input: &str) and preserve the literal \"Kiro:\" exactly."
+                }],
+                "tools": [{
+                    "name": "write_file",
+                    "description": "Write a file",
+                    "input_schema": {"type": "object", "properties": {}}
+                }]
+            }),
+        );
+
+        assert!(preserves_private_product_code_content(&req));
+        assert!(!strong_identity_can_bypass_available_tools(&req));
+        assert!(
+            compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(80), true)
                 .is_none()
         );
     }
