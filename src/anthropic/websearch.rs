@@ -9,10 +9,12 @@ use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use futures::{Stream, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use super::id;
 use super::stream::SseEvent;
@@ -165,6 +167,56 @@ fn generate_random_id_8() -> String {
             CHARSET[idx] as char
         })
         .collect()
+}
+
+/// Build an opaque, replay-safe wire token for Anthropic web-search fields.
+///
+/// Anthropic documents `encrypted_content` and `encrypted_index` as opaque values
+/// that clients must return unchanged on later turns. The MCP backend gives us
+/// plaintext snippets instead, so exposing those snippets under an encrypted
+/// field is both structurally inaccurate and easy for clients to misinterpret.
+/// The random server-tool ID scopes these deterministic tokens to one response;
+/// later turns do not need to decode them because the visible answer text is kept
+/// in conversation history.
+fn opaque_websearch_token(
+    domain: &str,
+    tool_use_id: &str,
+    ordinal: usize,
+    result: &WebSearchResult,
+    output_bytes: usize,
+) -> String {
+    let mut output = Vec::with_capacity(output_bytes);
+    let mut counter = 0_u32;
+
+    while output.len() < output_bytes {
+        let mut hasher = Sha256::new();
+        hasher.update(b"kiro-rs:websearch-wire:v1\0");
+        hasher.update(domain.as_bytes());
+        hasher.update([0]);
+        hasher.update(tool_use_id.as_bytes());
+        hasher.update((ordinal as u64).to_be_bytes());
+        hasher.update(result.url.as_bytes());
+        hasher.update([0]);
+        hasher.update(result.title.as_bytes());
+        hasher.update([0]);
+        if let Some(snippet) = result.snippet.as_deref() {
+            hasher.update(snippet.as_bytes());
+        }
+        hasher.update(counter.to_be_bytes());
+        output.extend_from_slice(&hasher.finalize());
+        counter = counter.wrapping_add(1);
+    }
+
+    output.truncate(output_bytes);
+    BASE64_STANDARD.encode(output)
+}
+
+fn encrypted_content_token(tool_use_id: &str, ordinal: usize, result: &WebSearchResult) -> String {
+    opaque_websearch_token("content", tool_use_id, ordinal, result, 512)
+}
+
+fn encrypted_index_token(tool_use_id: &str, ordinal: usize, result: &WebSearchResult) -> String {
+    opaque_websearch_token("index", tool_use_id, ordinal, result, 64)
 }
 
 /// 创建 MCP 请求
@@ -363,7 +415,8 @@ fn generate_websearch_events(
         results
             .results
             .iter()
-            .map(|r| {
+            .enumerate()
+            .map(|(i, r)| {
                 let page_age = r.published_date.and_then(|ms| {
                     chrono::DateTime::from_timestamp_millis(ms)
                         .map(|dt| dt.format("%B %-d, %Y").to_string())
@@ -372,7 +425,7 @@ fn generate_websearch_events(
                     "type": "web_search_result",
                     "title": r.title,
                     "url": r.url,
-                    "encrypted_content": r.snippet.clone().unwrap_or_default(),
+                    "encrypted_content": encrypted_content_token(tool_use_id, i, r),
                     "page_age": page_age
                 })
             })
@@ -458,7 +511,7 @@ fn generate_websearch_events(
                             "type": "web_search_result_location",
                             "url": r.url,
                             "title": r.title,
-                            "encrypted_index": format!("{}", i + 1),
+                            "encrypted_index": encrypted_index_token(tool_use_id, i, r),
                             "cited_text": cited
                         }
                     }
@@ -645,7 +698,8 @@ fn build_websearch_json(
         Some(r) => r
             .results
             .iter()
-            .map(|x| {
+            .enumerate()
+            .map(|(i, x)| {
                 let page_age = x.published_date.and_then(|ms| {
                     chrono::DateTime::from_timestamp_millis(ms)
                         .map(|dt| dt.format("%B %-d, %Y").to_string())
@@ -654,7 +708,7 @@ fn build_websearch_json(
                     "type": "web_search_result",
                     "title": x.title,
                     "url": x.url,
-                    "encrypted_content": x.snippet.clone().unwrap_or_default(),
+                    "encrypted_content": encrypted_content_token(tool_use_id, i, x),
                     "page_age": page_age
                 })
             })
@@ -678,7 +732,7 @@ fn build_websearch_json(
                     "type": "web_search_result_location",
                     "url": x.url,
                     "title": x.title,
-                    "encrypted_index": format!("{}", i + 1),
+                    "encrypted_index": encrypted_index_token(tool_use_id, i, x),
                     "cited_text": cited
                 })
             })
@@ -981,5 +1035,48 @@ mod tests {
         assert!(summary.contains("Test Result"));
         assert!(summary.contains("https://example.com"));
         assert!(summary.contains("This is a test snippet"));
+    }
+
+    #[test]
+    fn test_websearch_wire_tokens_are_opaque_stable_and_domain_separated() {
+        let result = WebSearchResult {
+            title: "Visible title".to_string(),
+            url: "https://example.com/private-path".to_string(),
+            snippet: Some(
+                "A human-readable search snippet that must not be mislabeled as ciphertext"
+                    .to_string(),
+            ),
+            published_date: None,
+            id: None,
+            domain: None,
+            max_verbatim_word_limit: None,
+            public_domain: None,
+        };
+        let tool_use_id = "srvtoolu_01OpaqueTokenTest";
+
+        let content = encrypted_content_token(tool_use_id, 0, &result);
+        let content_again = encrypted_content_token(tool_use_id, 0, &result);
+        let index = encrypted_index_token(tool_use_id, 0, &result);
+        let decoded_content = BASE64_STANDARD.decode(&content).unwrap();
+
+        assert_eq!(content, content_again);
+        assert_eq!(decoded_content.len(), 512);
+        assert_eq!(BASE64_STANDARD.decode(&index).unwrap().len(), 64);
+        assert_ne!(content, index);
+        assert!(
+            !decoded_content
+                .windows(result.snippet.as_deref().unwrap().len())
+                .any(|window| window == result.snippet.as_deref().unwrap().as_bytes())
+        );
+        assert!(
+            !decoded_content
+                .windows(result.url.len())
+                .any(|window| window == result.url.as_bytes())
+        );
+        assert_ne!(
+            content,
+            encrypted_content_token("srvtoolu_01DifferentResponse", 0, &result)
+        );
+        assert_ne!(content, encrypted_content_token(tool_use_id, 1, &result));
     }
 }
