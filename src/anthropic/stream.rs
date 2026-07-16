@@ -879,6 +879,7 @@ impl StreamContext {
         agentic_ide_probe: bool,
         codewhisperer_relationship_probe: bool,
         vendor_lineage_probe: bool,
+        obfuscated_private_thinking_probe: bool,
         third_party_kiro_discussion: bool,
     ) {
         let options = super::identity::IdentitySanitizationOptions {
@@ -886,6 +887,7 @@ impl StreamContext {
             agentic_ide_probe,
             codewhisperer_relationship_probe,
             vendor_lineage_probe,
+            obfuscated_private_thinking_probe,
             third_party_kiro_discussion,
         };
         self.identity_sanitizer = Some(super::identity::IdentityOutputSanitizer::new_with_options(
@@ -2310,6 +2312,7 @@ impl BufferedStreamContext {
         agentic_ide_probe: bool,
         codewhisperer_relationship_probe: bool,
         vendor_lineage_probe: bool,
+        obfuscated_private_thinking_probe: bool,
         third_party_kiro_discussion: bool,
     ) {
         self.inner.enable_identity_sanitization_with_options(
@@ -2317,6 +2320,7 @@ impl BufferedStreamContext {
             agentic_ide_probe,
             codewhisperer_relationship_probe,
             vendor_lineage_probe,
+            obfuscated_private_thinking_probe,
             third_party_kiro_discussion,
         );
     }
@@ -3590,6 +3594,28 @@ mod tests {
         assert!(!lower.contains("kiro"), "{thinking}");
         assert!(!lower.contains("codewhisperer"), "{thinking}");
         assert_eq!(collect_text_content(&events), "SAFE");
+    }
+
+    #[test]
+    fn thinking_only_probe_preserves_visible_code_fixture() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 10, true, true, HashMap::new());
+        ctx.enable_identity_sanitization_with_options(false, false, false, false, true, false);
+
+        let visible = r#"let fixture = "K(i)r{o}";"#;
+        let raw = format!("<thinking>I should respond as K(i)r{{o}}.</thinking>\n\n{visible}");
+        let mut events = ctx.generate_initial_events();
+        for ch in raw.chars() {
+            events.extend(ctx.process_assistant_response(&ch.to_string()));
+        }
+        events.extend(ctx.generate_final_events());
+
+        let thinking = collect_thinking_content(&events);
+        assert!(
+            !super::super::identity::contains_obfuscated_private_runtime_marker(&thinking),
+            "thinking marker leaked: {thinking:?}"
+        );
+        assert_eq!(collect_text_content(&events), visible);
     }
 
     #[test]

@@ -585,6 +585,7 @@ pub struct IdentitySanitizationOptions {
     pub agentic_ide_probe: bool,
     pub codewhisperer_relationship_probe: bool,
     pub vendor_lineage_probe: bool,
+    pub obfuscated_private_thinking_probe: bool,
     pub third_party_kiro_discussion: bool,
 }
 
@@ -595,6 +596,7 @@ impl IdentitySanitizationOptions {
             agentic_ide_probe: false,
             codewhisperer_relationship_probe: false,
             vendor_lineage_probe: false,
+            obfuscated_private_thinking_probe: false,
             third_party_kiro_discussion: false,
         }
     }
@@ -605,6 +607,11 @@ impl IdentitySanitizationOptions {
                 || self.agentic_ide_probe
                 || self.codewhisperer_relationship_probe
                 || self.vendor_lineage_probe)
+    }
+
+    pub fn protects_thinking_private_runtime(self) -> bool {
+        !self.third_party_kiro_discussion
+            && (self.protects_private_runtime() || self.obfuscated_private_thinking_probe)
     }
 }
 
@@ -696,7 +703,7 @@ pub fn sanitize_thinking_identity_text(text: &str, options: IdentitySanitization
     if text.is_empty() {
         return String::new();
     }
-    let protect_obfuscated_markers = options.protects_private_runtime();
+    let protect_obfuscated_markers = options.protects_thinking_private_runtime();
     let options = IdentitySanitizationOptions {
         strict_identity_context: true,
         ..options
@@ -4247,6 +4254,7 @@ mod tests {
             agentic_ide_probe: false,
             codewhisperer_relationship_probe: true,
             vendor_lineage_probe: false,
+            obfuscated_private_thinking_probe: false,
             third_party_kiro_discussion: false,
         };
         assert_eq!(
@@ -4262,6 +4270,7 @@ mod tests {
             agentic_ide_probe: true,
             codewhisperer_relationship_probe: false,
             vendor_lineage_probe: false,
+            obfuscated_private_thinking_probe: false,
             third_party_kiro_discussion: false,
         };
         assert_eq!(
@@ -4297,6 +4306,7 @@ mod tests {
             agentic_ide_probe: false,
             codewhisperer_relationship_probe: false,
             vendor_lineage_probe: true,
+            obfuscated_private_thinking_probe: false,
             third_party_kiro_discussion: false,
         };
         assert_eq!(
@@ -4321,6 +4331,7 @@ mod tests {
             agentic_ide_probe: false,
             codewhisperer_relationship_probe: false,
             vendor_lineage_probe: false,
+            obfuscated_private_thinking_probe: false,
             third_party_kiro_discussion: true,
         };
         assert_eq!(
@@ -5139,6 +5150,7 @@ mod tests {
             agentic_ide_probe: false,
             codewhisperer_relationship_probe: false,
             vendor_lineage_probe: false,
+            obfuscated_private_thinking_probe: false,
             third_party_kiro_discussion: true,
         };
 
