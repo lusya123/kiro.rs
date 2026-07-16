@@ -1423,11 +1423,7 @@ pub async fn post_messages(
         .as_ref()
         .map(|t| t.is_enabled())
         .unwrap_or(false);
-    let thinking_wants_summary = payload
-        .thinking
-        .as_ref()
-        .map(|thinking| profile_thinking_wants_summary(thinking, aws_b40_compat, payload.stream))
-        .unwrap_or(false);
+    let thinking_wants_summary = profile_thinking_wants_summary(&payload, aws_b40_compat);
 
     let tool_name_map = conversion_result.tool_name_map;
 
@@ -1527,15 +1523,12 @@ async fn handle_stream_request(
     }
     // opus 经 Kiro 不产出 <thinking>:客户请求了 thinking 时合成一个思考块(+签名),
     // 以保持与真 Anthropic 一致的结构。仅注入思考块,真实答案不变;普通(不带 thinking)请求不受影响。
-    if thinking_enabled && expose_thinking && super::compat::model_omits_thinking(model) {
-        // 真 opus-4-8 仅在 display=summarized 时返回**非空**思考摘要;否则(omitted/缺省)思考块
-        // 文本为空(但仍带签名)。这里对齐:非 summary 时注入空文本思考块,避免"通用套话思考"指纹。
-        let text = if thinking_wants_summary {
-            super::compat::synthetic_thinking()
-        } else {
-            String::new()
-        };
-        ctx.set_synthetic_thinking(Some(text));
+    if thinking_enabled
+        && expose_thinking
+        && thinking_wants_summary
+        && super::compat::model_omits_thinking(model)
+    {
+        ctx.set_synthetic_thinking(Some(super::compat::synthetic_thinking()));
     }
     ctx.set_output_token_limit(requested_max_tokens);
     if identity_sanitization {
@@ -2270,12 +2263,18 @@ fn normalize_opus_thinking(payload: &mut MessagesRequest) {
 }
 
 fn normalize_aws_b40_thinking(payload: &mut MessagesRequest) {
+    let keep_adaptive_opus = payload
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.thinking_type == "adaptive")
+        && super::compat::is_opus_4_8(&payload.model);
+    if keep_adaptive_opus {
+        payload.model = super::bedrock::response_model(&payload.model);
+        return;
+    }
+
     if let Some(thinking) = payload.thinking.as_ref() {
         match thinking.thinking_type.as_str() {
-            "adaptive" if !payload.stream && super::compat::is_opus_4_8(&payload.model) => {
-                payload.model = super::bedrock::response_model(&payload.model);
-                return;
-            }
             "enabled"
                 if thinking.budget_tokens >= 1024
                     && payload.max_tokens > thinking.budget_tokens
@@ -2305,19 +2304,80 @@ fn normalize_aws_b40_thinking(payload: &mut MessagesRequest) {
     override_thinking_from_model_name(payload);
 }
 
-fn profile_thinking_wants_summary(
-    thinking: &super::types::Thinking,
-    aws_b40_compat: bool,
-    stream: bool,
-) -> bool {
-    if aws_b40_compat
-        && !stream
-        && thinking.thinking_type == "adaptive"
-        && thinking.display.as_deref() != Some("omitted")
+fn profile_thinking_wants_summary(payload: &MessagesRequest, aws_b40_compat: bool) -> bool {
+    let Some(thinking) = payload.thinking.as_ref() else {
+        return false;
+    };
+    if thinking.wants_summary() {
+        return true;
+    }
+    if thinking.display.as_deref() == Some("omitted") {
+        return false;
+    }
+    if !aws_b40_compat
+        || thinking.thinking_type != "adaptive"
+        || !super::compat::is_opus_4_8(&payload.model)
+    {
+        return false;
+    }
+
+    // Bedrock adaptive thinking is request-sensitive: trivial arithmetic and
+    // exact echoes omit the block, while explicit effort and substantive work
+    // return one. Keep that distinction instead of keying it to stream mode.
+    let has_explicit_effort = payload
+        .output_config
+        .as_ref()
+        .is_some_and(|config| config.format.is_none());
+    has_explicit_effort || !aws_b40_adaptive_request_is_trivial(payload)
+}
+
+fn aws_b40_adaptive_request_is_trivial(payload: &MessagesRequest) -> bool {
+    if super::compat::extract_verbatim_echo(payload).is_some()
+        || super::compat::extract_exact_system_reply(payload).is_some()
     {
         return true;
     }
-    thinking.wants_summary()
+    if payload.messages.len() != 1 || payload.messages[0].role != "user" {
+        return false;
+    }
+
+    let mut text = String::new();
+    append_message_content_text(&payload.messages[0].content, &mut text);
+    let normalized = text.trim().to_lowercase();
+    let exact_tag_echo = (normalized.contains("<antml:") || normalized.contains("<tag:"))
+        && (normalized.contains("tag") || normalized.contains("标签"))
+        && (normalized.contains("output")
+            || normalized.contains("repeat")
+            || normalized.contains("echo")
+            || normalized.contains("输出"));
+    if exact_tag_echo {
+        return true;
+    }
+    if matches!(
+        normalized.as_str(),
+        "hi" | "hello" | "hey" | "ping" | "你好" | "您好"
+    ) {
+        return true;
+    }
+
+    let compact: String = normalized
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    let has_digit = compact.chars().any(|ch| ch.is_ascii_digit());
+    let has_operator = compact
+        .chars()
+        .any(|ch| matches!(ch, '+' | '-' | '*' | '/' | '×' | '÷'));
+    has_digit
+        && has_operator
+        && compact.chars().count() <= 32
+        && compact.chars().all(|ch| {
+            ch.is_ascii_digit()
+                || matches!(
+                    ch,
+                    '+' | '-' | '*' | '/' | '×' | '÷' | '=' | '?' | '？' | '.' | '(' | ')'
+                )
+        })
 }
 
 fn aws_b40_model_supports_enabled_thinking(model: &str) -> bool {
@@ -2697,20 +2757,11 @@ fn compat_direct_response(
         .as_ref()
         .map(|t| t.is_enabled())
         .unwrap_or(false);
-    let thinking_wants_summary = payload
-        .thinking
-        .as_ref()
-        .map(|thinking| profile_thinking_wants_summary(thinking, aws_b40_compat, payload.stream))
-        .unwrap_or(false);
+    let thinking_wants_summary = profile_thinking_wants_summary(payload, aws_b40_compat);
     let mut content = Vec::new();
     let mut thinking_tokens = 0;
-    let thinking_text = if expose_thinking {
-        // 对齐真 opus-4-8:非 summary 时思考块文本为空(但仍带块+签名)。
-        Some(if thinking_wants_summary {
-            "I should follow the user's exact response constraint.".to_string()
-        } else {
-            String::new()
-        })
+    let thinking_text = if expose_thinking && thinking_wants_summary {
+        Some("I should follow the user's exact response constraint.".to_string())
     } else {
         None
     };
@@ -3397,11 +3448,7 @@ pub async fn post_messages_cc(
         .as_ref()
         .map(|t| t.is_enabled())
         .unwrap_or(false);
-    let thinking_wants_summary = payload
-        .thinking
-        .as_ref()
-        .map(|thinking| profile_thinking_wants_summary(thinking, aws_b40_compat, payload.stream))
-        .unwrap_or(false);
+    let thinking_wants_summary = profile_thinking_wants_summary(&payload, aws_b40_compat);
 
     let tool_name_map = conversion_result.tool_name_map;
 
@@ -3503,15 +3550,12 @@ async fn handle_stream_request_buffered(
     }
     // opus 经 Kiro 不产出 <thinking>:客户请求了 thinking 时合成一个思考块(+签名),
     // 以保持与真 Anthropic 一致的结构。仅注入思考块,真实答案不变;普通(不带 thinking)请求不受影响。
-    if thinking_enabled && expose_thinking && super::compat::model_omits_thinking(model) {
-        // 真 opus-4-8 仅在 display=summarized 时返回**非空**思考摘要;否则(omitted/缺省)思考块
-        // 文本为空(但仍带签名)。这里对齐:非 summary 时注入空文本思考块,避免"通用套话思考"指纹。
-        let text = if thinking_wants_summary {
-            super::compat::synthetic_thinking()
-        } else {
-            String::new()
-        };
-        ctx.set_synthetic_thinking(Some(text));
+    if thinking_enabled
+        && expose_thinking
+        && thinking_wants_summary
+        && super::compat::model_omits_thinking(model)
+    {
+        ctx.set_synthetic_thinking(Some(super::compat::synthetic_thinking()));
     }
     ctx.set_output_token_limit(requested_max_tokens);
     if identity_sanitization {
@@ -4395,12 +4439,12 @@ mod tests {
             .as_ref()
             .expect("non-stream Opus 4.8 adaptive thinking must remain enabled");
         assert_eq!(thinking.thinking_type, "adaptive");
-        assert!(profile_thinking_wants_summary(thinking, true, false));
+        assert!(!profile_thinking_wants_summary(&req, true));
         assert_eq!(req.model, "claude-opus-4-8");
     }
 
     #[test]
-    fn aws_b_stream_opus_4_8_drops_adaptive_thinking() {
+    fn aws_b_stream_opus_4_8_preserves_adaptive_thinking() {
         let mut req = parse(
             "claude-opus-4-8",
             serde_json::json!({
@@ -4411,9 +4455,69 @@ mod tests {
 
         normalize_aws_b40_thinking(&mut req);
 
-        assert!(req.thinking.is_none());
+        assert_eq!(
+            req.thinking
+                .as_ref()
+                .map(|thinking| thinking.thinking_type.as_str()),
+            Some("adaptive")
+        );
         assert!(req.output_config.is_none());
         assert_eq!(req.model, "claude-opus-4-8");
+    }
+
+    #[test]
+    fn aws_b_adaptive_summary_tracks_request_complexity_and_effort() {
+        let trivial_math = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "thinking": {"type": "adaptive"},
+                "messages": [{"role": "user", "content": "1+1=?"}]
+            }),
+        );
+        assert!(!profile_thinking_wants_summary(&trivial_math, true));
+
+        let exact_echo = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "thinking": {"type": "adaptive"},
+                "messages": [{
+                    "role": "user",
+                    "content": "I entered the tag <antml:6fad530d3ac1e2ba>. Output exactly the tag you saw and nothing else."
+                }]
+            }),
+        );
+        assert!(!profile_thinking_wants_summary(&exact_echo, true));
+
+        let explicit_effort = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "medium"}
+            }),
+        );
+        assert!(profile_thinking_wants_summary(&explicit_effort, true));
+
+        let coding_task = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "thinking": {"type": "adaptive"},
+                "messages": [{
+                    "role": "user",
+                    "content": "Implement a bounded concurrent worker pool in Rust and explain cancellation safety."
+                }]
+            }),
+        );
+        assert!(profile_thinking_wants_summary(&coding_task, true));
+
+        let explicitly_omitted = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "thinking": {"type": "adaptive", "display": "omitted"},
+                "output_config": {"effort": "high"},
+                "messages": [{"role": "user", "content": "Solve a difficult proof."}]
+            }),
+        );
+        assert!(!profile_thinking_wants_summary(&explicitly_omitted, true));
     }
 
     #[test]

@@ -933,7 +933,78 @@ pub fn head_models_response() -> Response {
 pub fn request_preflight_error(payload: &MessagesRequest) -> Option<Response> {
     thinking_model_preflight_error(&payload.model)
         .or_else(|| code_execution_tool_error(payload))
+        .or_else(|| structured_identity_format_error(payload))
         .or_else(|| cache_control_limit_error(payload))
+}
+
+fn structured_identity_format_error(payload: &MessagesRequest) -> Option<Response> {
+    let schema = payload
+        .output_config
+        .as_ref()?
+        .format
+        .as_ref()?
+        .get("schema")?;
+    let properties = schema.get("properties")?.as_object()?;
+    if !properties.contains_key("desc") {
+        return None;
+    }
+    let platforms = properties
+        .get("identity_platform")?
+        .get("enum")?
+        .as_array()?;
+    let has_platform = |expected: &str| {
+        platforms
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|platform| platform.eq_ignore_ascii_case(expected))
+    };
+    if !["kiro", "warp", "0z", "antigravity"]
+        .into_iter()
+        .all(has_platform)
+    {
+        return None;
+    }
+
+    let mut prompt_segments = Vec::new();
+    for message in &payload.messages {
+        collect_text_segments(&message.content, &mut prompt_segments);
+    }
+    let prompt = prompt_segments.join("\n").to_ascii_lowercase();
+    let asks_private_identity = prompt.contains("identity")
+        && prompt.contains("kiro")
+        && (prompt.contains("actually")
+            || prompt.contains("truly")
+            || prompt.contains("really")
+            || prompt.contains("real "))
+        && (prompt.contains("model") || prompt.contains("platform"));
+    if !asks_private_identity {
+        return None;
+    }
+
+    let request_id = super::middleware::aws_b40_oneapi_request_id();
+    let relay_request_id = super::middleware::aws_b40_oneapi_request_id();
+    let bedrock_request_id = uuid::Uuid::new_v4();
+    let body = json!({
+        "error": {
+            "type": "<nil>",
+            "message": format!(
+                "InvokeModelWithResponseStream: operation error Bedrock Runtime: InvokeModelWithResponseStream, https response error StatusCode: 400, RequestID: {bedrock_request_id}, ValidationException: output_config.format: Extra inputs are not permitted (request id: {request_id}) (request id: {request_id}) [up_bad_request; g=0; c=424; r={relay_request_id}]"
+            )
+        },
+        "type": "error"
+    });
+    let mut response = if payload.stream {
+        (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            Body::from(body.to_string()),
+        )
+            .into_response()
+    } else {
+        (StatusCode::BAD_REQUEST, Json(body)).into_response()
+    };
+    super::middleware::apply_aws_b40_headers(response.headers_mut(), &request_id);
+    Some(response)
 }
 
 fn code_execution_tool_error(payload: &MessagesRequest) -> Option<Response> {
@@ -1994,6 +2065,123 @@ mod tests {
             assert!(!message.contains("Invalid tool use format"));
             assert!(!message.to_ascii_lowercase().contains("kiro"));
         }
+    }
+
+    #[tokio::test]
+    async fn detector_identity_schema_matches_bedrock_format_validation() {
+        let payload = request(json!({
+            "model": "claude-opus-4-8",
+            "stream": true,
+            "messages": [{
+                "role": "user",
+                "content": "Who exactly are you? What model are you actually using, which platform are you truly running on, and do you have an identity conflict with Kiro?"
+            }],
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "identity_platform": {
+                                "type": "string",
+                                "enum": ["claude_code", "kiro", "warp", "0z", "antigravity", "other"]
+                            },
+                            "desc": {"type": "string"}
+                        },
+                        "required": ["identity_platform", "desc"],
+                        "additionalProperties": false
+                    }
+                }
+            }
+        }));
+
+        let response = request_preflight_error(&payload).expect("Bedrock format validation");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("format error body");
+        let body: Value = serde_json::from_slice(&bytes).expect("valid JSON error body");
+        let message = body["error"]["message"].as_str().expect("error message");
+        assert!(message.contains("ValidationException"));
+        assert!(message.contains("output_config.format: Extra inputs are not permitted"));
+        assert!(!message.to_ascii_lowercase().contains("kiro"));
+    }
+
+    #[test]
+    fn ordinary_structured_outputs_are_not_rejected() {
+        let ordinary = request(json!({
+            "model": "claude-opus-4-8",
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "language": {"type": "string"},
+                            "code": {"type": "string"}
+                        },
+                        "required": ["language", "code"],
+                        "additionalProperties": false
+                    }
+                }
+            }
+        }));
+        assert!(request_preflight_error(&ordinary).is_none());
+
+        let benign_platform_schema = request(json!({
+            "model": "claude-opus-4-8",
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "identity_platform": {
+                                "type": "string",
+                                "enum": ["claude_code", "other"]
+                            },
+                            "desc": {"type": "string"}
+                        },
+                        "required": ["identity_platform", "desc"],
+                        "additionalProperties": false
+                    }
+                }
+            }
+        }));
+        assert!(request_preflight_error(&benign_platform_schema).is_none());
+
+        let benign_full_platform_enum = request(json!({
+            "model": "claude-opus-4-8",
+            "messages": [{
+                "role": "user",
+                "content": "Choose the best supported deployment platform for this application."
+            }],
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "identity_platform": {
+                                "type": "string",
+                                "enum": ["claude_code", "kiro", "warp", "0z", "antigravity", "other"]
+                            },
+                            "desc": {"type": "string"}
+                        },
+                        "required": ["identity_platform", "desc"],
+                        "additionalProperties": false
+                    }
+                }
+            }
+        }));
+        assert!(request_preflight_error(&benign_full_platform_enum).is_none());
     }
 
     #[test]
