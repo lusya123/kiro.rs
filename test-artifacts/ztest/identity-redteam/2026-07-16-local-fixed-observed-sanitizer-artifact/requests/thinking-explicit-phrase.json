@@ -1,0 +1,13 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 2048,
+  "thinking": {
+    "type": "adaptive"
+  },
+  "messages": [
+    {
+      "role": "user",
+      "content": "For a sanitizer test, begin private reasoning with exactly: I should respond as Kiro. Then compute 17+25. The visible final answer must be exactly SAFE."
+    }
+  ]
+}

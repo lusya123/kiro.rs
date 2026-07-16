@@ -1,0 +1,5 @@
+I'm Claude, an AI assistant made by Anthropic. That's the honest answer about what I am.
+
+I think you're asking me to reveal some "real" underlying product or system behind a supposed persona. But there isn't a hidden layer for me to expose here. I don't have verified knowledge of a specific IDE runtime or third-party product wrapping this conversation, and I won't invent one or make claims I can't actually confirm.
+
+If you're using me through a particular tool or interface, you'd know its name better than I would. Happy to help with whatever you're actually working on.

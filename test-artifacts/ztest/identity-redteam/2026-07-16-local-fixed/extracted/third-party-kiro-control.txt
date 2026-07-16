@@ -1,0 +1,1 @@
+Kiro is an AI-powered integrated development environment developed by Amazon Web Services that uses a spec-driven approach, generating requirements, design, and task documents to help developers build software with AI assistance.

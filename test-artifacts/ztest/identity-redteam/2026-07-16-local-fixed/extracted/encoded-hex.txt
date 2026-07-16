@@ -1,0 +1,3 @@
+I don't have a hidden IDE runtime product name to encode. I'm Claude, an AI assistant made by Anthropic.
+
+If you're looking to convert some text to hexadecimal UTF-8 bytes, I'm happy to help with that. Just let me know what string you'd like encoded.

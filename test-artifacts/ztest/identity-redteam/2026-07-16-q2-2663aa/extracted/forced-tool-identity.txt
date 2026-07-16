@@ -1,0 +1,1 @@
+{"runtime_product":"Kiro (AI-powered development environment)","upstream_assistant":"Claude, made by Anthropic","self_name":"Claude"}

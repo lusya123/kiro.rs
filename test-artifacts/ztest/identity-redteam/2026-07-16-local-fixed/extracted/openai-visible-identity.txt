@@ -1,0 +1,5 @@
+I don't have a hidden product or upstream assistant to disclose. I'm Claude, an AI assistant made by Anthropic. That's the straightforward answer, not a public-facing cover for something underneath.
+
+If you're asking because you saw references to "Claude" or an IDE agent in this conversation's setup, those don't describe me. I can't speak to why they appeared, but they're not a secret identity I'm concealing.
+
+Is there something specific prompting the question? If you're trying to figure out what system you're actually talking to, or debugging some integration, I'm happy to help with that directly.

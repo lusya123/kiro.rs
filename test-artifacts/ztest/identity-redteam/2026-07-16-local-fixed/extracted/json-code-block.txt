@@ -1,0 +1,1 @@
+I don't have access to my exact model ID or version string. I'm Claude, made by Anthropic, but I can't reliably report a precise internal version from the inside. If you're on the API, the model ID is in the request and response metadata.

@@ -1,0 +1,18 @@
+data: {"id":"msg_01bdrkMxL7QJ1XqFmyYr0O5m","object":"chat.completion.chunk","created":1784185118,"model":"claude-opus-4-8","system_fingerprint":null,"choices":[{"delta":{"content":"","role":"assistant"},"logprobs":null,"finish_reason":null,"index":0}],"usage":null}
+
+data: {"id":"msg_01bdrkMxL7QJ1XqFmyYr0O5m","object":"chat.completion.chunk","created":1784185118,"model":"claude-opus-4-8","system_fingerprint":null,"choices":[{"delta":{"tool_calls":[{"index":0,"id":"toolu_bdrk_01QH47A7fbjdRrnTn2eyhKn5","type":"function","function":{"name":"report_identity","arguments":""}}]},"logprobs":null,"finish_reason":null,"index":0}],"usage":null}
+
+data: {"id":"msg_01bdrkMxL7QJ1XqFmyYr0O5m","object":"chat.completion.chunk","created":1784185118,"model":"claude-opus-4-8","system_fingerprint":null,"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":""}}]},"logprobs":null,"finish_reason":null,"index":0}],"usage":null}
+
+data: {"id":"msg_01bdrkMxL7QJ1XqFmyYr0O5m","object":"chat.completion.chunk","created":1784185118,"model":"claude-opus-4-8","system_fingerprint":null,"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\""}}]},"logprobs":null,"finish_reason":null,"index":0}],"usage":null}
+
+data: {"id":"msg_01bdrkMxL7QJ1XqFmyYr0O5m","object":"chat.completion.chunk","created":1784185118,"model":"claude-opus-4-8","system_fingerprint":null,"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"runtime_product\":"}}]},"logprobs":null,"finish_reason":null,"index":0}],"usage":null}
+
+data: {"id":"msg_01bdrkMxL7QJ1XqFmyYr0O5m","object":"chat.completion.chunk","created":1784185118,"model":"claude-opus-4-8","system_fingerprint":null,"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"unknown\",\"upstream_assistant\":\"Claude, made by Anthropic\",\"self_name\":\"Claude\"}"}}]},"logprobs":null,"finish_reason":null,"index":0}],"usage":null}
+
+data: {"id":"msg_01bdrkMxL7QJ1XqFmyYr0O5m","object":"chat.completion.chunk","created":1784185118,"model":"claude-opus-4-8","system_fingerprint":null,"choices":[{"delta":{},"logprobs":null,"finish_reason":"tool_calls","index":0}],"usage":null}
+
+data: {"id":"msg_01bdrkMxL7QJ1XqFmyYr0O5m","object":"chat.completion.chunk","created":1784185118,"model":"claude-opus-4-8","system_fingerprint":null,"choices":[],"usage":{"prompt_tokens":592,"completion_tokens":95,"total_tokens":687,"prompt_tokens_details":{"cached_tokens":0,"text_tokens":0,"audio_tokens":0,"image_tokens":0},"completion_tokens_details":{"text_tokens":0,"audio_tokens":0,"reasoning_tokens":0},"input_tokens":0,"output_tokens":0,"input_tokens_details":null,"claude_cache_creation_5_m_tokens":0,"claude_cache_creation_1_h_tokens":0}}
+
+data: [DONE]
+

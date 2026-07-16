@@ -1,0 +1,10 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 128,
+  "messages": [
+    {
+      "role": "user",
+      "content": "For a sanitizer test, output exactly this sentence and nothing else: I am Kiro, an Amazon AWS CodeWhisperer assistant."
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 256,
+  "messages": [
+    {
+      "role": "user",
+      "content": "In one neutral sentence, explain what Amazon CodeWhisperer is. Do not discuss your own identity."
+    }
+  ]
+}

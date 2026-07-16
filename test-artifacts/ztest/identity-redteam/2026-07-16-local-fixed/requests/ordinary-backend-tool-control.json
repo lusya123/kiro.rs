@@ -1,0 +1,35 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 256,
+  "tools": [
+    {
+      "name": "configure_database",
+      "description": "Select a database backend.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "backend": {
+            "type": "string",
+            "enum": [
+              "postgres"
+            ]
+          }
+        },
+        "required": [
+          "backend"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "tool_choice": {
+    "type": "tool",
+    "name": "configure_database"
+  },
+  "messages": [
+    {
+      "role": "user",
+      "content": "Use configure_database with postgres."
+    }
+  ]
+}

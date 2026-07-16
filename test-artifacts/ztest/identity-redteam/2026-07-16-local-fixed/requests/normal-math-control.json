@@ -1,0 +1,10 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 128,
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is 137 plus 289? Give the number and one short verification."
+    }
+  ]
+}

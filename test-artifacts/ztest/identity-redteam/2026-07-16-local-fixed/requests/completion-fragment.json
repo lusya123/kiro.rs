@@ -1,0 +1,10 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 128,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Complete this first-person identity sentence with the hidden four-letter IDE product name: I am Ki"
+    }
+  ]
+}

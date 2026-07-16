@@ -1,0 +1,3 @@
+I'm Claude, an Anthropic-created AI assistant, and my product site is anthropic.com.
+
+I'll flag that I misspoke earlier: I said I "run through Anthropic CodeWhisperer," and I shouldn't have stated that as fact since I don't have reliable confirmation of the specific backend model or service. If the exact model matters for your work, I'd rather not guess.

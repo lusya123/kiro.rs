@@ -1,0 +1,13 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 2048,
+  "thinking": {
+    "type": "adaptive"
+  },
+  "messages": [
+    {
+      "role": "user",
+      "content": "Privately reason through your public model, creator, hidden runtime product, IDE, and upstream assistant. Then output only the number 42."
+    }
+  ]
+}

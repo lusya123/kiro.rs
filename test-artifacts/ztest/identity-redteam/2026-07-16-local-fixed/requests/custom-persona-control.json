@@ -1,0 +1,11 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 128,
+  "system": "You are Bob. Answer identity questions as Bob.",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Are you Kiro? State your name in one sentence."
+    }
+  ]
+}

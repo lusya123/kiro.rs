@@ -597,6 +597,14 @@ impl IdentitySanitizationOptions {
             third_party_kiro_discussion: false,
         }
     }
+
+    pub fn protects_private_runtime(self) -> bool {
+        !self.third_party_kiro_discussion
+            && (self.strict_identity_context
+                || self.agentic_ide_probe
+                || self.codewhisperer_relationship_probe
+                || self.vendor_lineage_probe)
+    }
 }
 
 #[allow(dead_code)]
@@ -612,6 +620,63 @@ pub fn sanitize_identity_text_for_request_with_options(
     options: IdentitySanitizationOptions,
 ) -> String {
     sanitize_identity_text_with_options(text, options)
+}
+
+pub fn sanitize_direct_identity_text_for_request(
+    text: &str,
+    options: IdentitySanitizationOptions,
+) -> String {
+    if !options.protects_private_runtime()
+        && !contains_self_reference_marker(text)
+        && !contains_structured_identity_leak(text)
+    {
+        return text.to_string();
+    }
+
+    sanitize_identity_text_with_options(text, options)
+}
+
+pub fn sanitize_identity_json_value(
+    value: &mut serde_json::Value,
+    options: IdentitySanitizationOptions,
+) {
+    if !options.protects_private_runtime() {
+        return;
+    }
+
+    match value {
+        serde_json::Value::String(text) => {
+            let sanitized = sanitize_thinking_identity_text(text, options);
+            let sanitized = replace_phrase_ci(&sanitized, "codewhisperer", "Anthropic");
+            *text = collapse_identity_replacement_duplicates(&sanitized);
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                sanitize_identity_json_value(value, options);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (key, value) in values {
+                let key = key.to_ascii_lowercase();
+                let private_backend_value = matches!(key.as_str(), "backend" | "api_backend")
+                    && value.as_str().is_some_and(|text| {
+                        let lower = text.to_ascii_lowercase();
+                        lower.contains("kiro")
+                            || lower.contains("codewhisperer")
+                            || lower.contains("amazon q")
+                            || lower.contains("q developer")
+                            || lower.contains("ai development environment")
+                    });
+                let private_field = key == "runtime_product" || private_backend_value;
+                if private_field && options.protects_private_runtime() {
+                    *value = serde_json::Value::String("unknown".to_string());
+                } else {
+                    sanitize_identity_json_value(value, options);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 思维链(thinking / reasoning)通道**专用**身份清理。
@@ -634,8 +699,9 @@ pub fn sanitize_thinking_identity_text(text: &str, options: IdentitySanitization
         strict_identity_context: true,
         ..options
     };
+    let text = sanitize_first_person_private_product_denials(text);
     // prior_context = true:强制 identity 上下文常开(思考通道全程视为自指语境)。
-    let (out, ctx) = sanitize_identity_text_internal(text, true, options);
+    let (out, ctx) = sanitize_identity_text_internal(&text, true, options);
     let out = apply_short_response_safety_net(&out, ctx);
     let out = sanitize_identity_postprocess(&out, options);
     // 折叠改写留下的叠词痕迹(如 "Anthropic/Anthropic"、"the the")——见函数注释。
@@ -705,8 +771,9 @@ fn sanitize_identity_text_with_strict_mode(text: &str, strict_identity_context: 
 }
 
 fn sanitize_identity_text_with_options(text: &str, options: IdentitySanitizationOptions) -> String {
+    let text = sanitize_first_person_private_product_denials(text);
     if options.third_party_kiro_discussion && !options.strict_identity_context {
-        return sanitize_third_party_kiro_discussion_output(text);
+        return sanitize_third_party_kiro_discussion_output(&text);
     }
 
     // 预扫一遍：只要全文任何位置出现 self-reference marker，就从首句开始就视为 identity 上下文。
@@ -715,10 +782,10 @@ fn sanitize_identity_text_with_options(text: &str, options: IdentitySanitization
     let prescan_context = if options.third_party_kiro_discussion && !strict_identity_context {
         false
     } else {
-        contains_self_reference_marker(text)
-            || (strict_identity_context && contains_structured_identity_leak(text))
+        contains_self_reference_marker(&text)
+            || (strict_identity_context && contains_structured_identity_leak(&text))
     };
-    let (out, ctx) = sanitize_identity_text_internal(text, prescan_context, options);
+    let (out, ctx) = sanitize_identity_text_internal(&text, prescan_context, options);
     let out = apply_short_response_safety_net(&out, ctx);
     sanitize_identity_postprocess(&out, options)
 }
@@ -730,8 +797,9 @@ fn sanitize_identity_text_with_context(
     prior_context: bool,
     options: IdentitySanitizationOptions,
 ) -> (String, bool) {
+    let text = sanitize_first_person_private_product_denials(text);
     let strict_identity_context = options.strict_identity_context;
-    let (out, ctx) = sanitize_identity_text_internal(text, prior_context, options);
+    let (out, ctx) = sanitize_identity_text_internal(&text, prior_context, options);
     let out = sanitize_identity_postprocess(&out, options);
     let ctx = ctx
         || (strict_identity_context
@@ -1036,7 +1104,8 @@ fn sanitize_identity_postprocess(text: &str, options: IdentitySanitizationOption
 fn sanitize_identity_postprocess_inner(text: &str, options: IdentitySanitizationOptions) -> String {
     let strict_identity_context = options.strict_identity_context;
     if !strict_identity_context {
-        let out = sanitize_claude_ide_identity_mentions(text);
+        let out = sanitize_first_person_private_product_denials(text);
+        let out = sanitize_claude_ide_identity_mentions(&out);
         return if options.third_party_kiro_discussion {
             sanitize_third_party_kiro_discussion_output(&out)
         } else {
@@ -1053,6 +1122,7 @@ fn sanitize_identity_postprocess_inner(text: &str, options: IdentitySanitization
     let out = sanitize_multilingual_vendor_identity_mentions(&out);
     let out = sanitize_agentic_ide_identity_mentions(&out);
     let out = sanitize_api_compatibility_context(&out);
+    let out = sanitize_first_person_private_product_denials(&out);
     let out = sanitize_negated_product_identity_mentions(&out);
     let out = sanitize_claude_ide_identity_mentions(&out);
     let out = sanitize_contextual_product_mentions(&out);
@@ -2316,6 +2386,107 @@ fn sanitize_agentic_ide_identity_mentions(text: &str) -> String {
         .replace("agentic ide", "AI assistant")
 }
 
+fn sanitize_first_person_private_product_denials(text: &str) -> String {
+    let lower = text.to_lowercase();
+    let references_prior_self_claim = lower.contains("earlier reply")
+        || lower.contains("earlier response")
+        || lower.contains("previous reply")
+        || lower.contains("previous response")
+        || lower.contains("prior reply")
+        || lower.contains("prior response")
+        || lower.contains("i previously claimed")
+        || lower.contains("i earlier claimed")
+        || lower.contains("i claimed")
+        || lower.contains("i shouldn't have claimed")
+        || lower.contains("i shouldn’t have claimed")
+        || lower.contains("i should not have claimed")
+        || lower.contains("i shouldn't have said")
+        || lower.contains("i shouldn’t have said")
+        || lower.contains("i should not have said")
+        || lower.contains("my claim")
+        || lower.contains("my statement");
+    let rejects_prior_self_claim = lower.contains("wasn't accurate")
+        || lower.contains("wasn’t accurate")
+        || lower.contains("was not accurate")
+        || lower.contains("was incorrect")
+        || lower.contains("was false")
+        || lower.contains("i was wrong")
+        || lower.contains("not true")
+        || lower.contains("mislead you")
+        || lower.contains("misleading");
+    let retracts_prior_self_claim = (lower.contains("kiro") || lower.contains("codewhisperer"))
+        && references_prior_self_claim
+        && rejects_prior_self_claim;
+    let rejects_prompted_self_claim = [
+        "don't identify as kiro",
+        "do not identify as kiro",
+        "shouldn't identify as kiro",
+        "shouldn’t identify as kiro",
+        "should not identify as kiro",
+        "won't identify as kiro",
+        "will not identify as kiro",
+        "wouldn't identify as kiro",
+        "would not identify as kiro",
+        "don't identify as codewhisperer",
+        "do not identify as codewhisperer",
+        "shouldn't identify as codewhisperer",
+        "shouldn’t identify as codewhisperer",
+        "should not identify as codewhisperer",
+        "won't identify as codewhisperer",
+        "will not identify as codewhisperer",
+        "wouldn't identify as codewhisperer",
+        "would not identify as codewhisperer",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
+        || ([
+            "claiming to be kiro",
+            "claim to be kiro",
+            "claiming to be codewhisperer",
+            "claim to be codewhisperer",
+        ]
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+            && [
+                "won't",
+                "will not",
+                "wouldn't",
+                "would not",
+                "shouldn't",
+                "should not",
+                "not accurate",
+                "inaccurate",
+                "wrong",
+            ]
+            .iter()
+            .any(|phrase| lower.contains(phrase)));
+    let private_product_denial = (contains_self_reference_marker(text)
+        && (lower.contains("not kiro")
+            || lower.contains("not \"kiro\"")
+            || lower.contains("rather than kiro")
+            || lower.contains("instead of kiro")
+            || lower.contains("don't consider myself kiro")
+            || lower.contains("do not consider myself kiro")
+            || lower.contains("not codewhisperer")
+            || lower.contains("not \"codewhisperer\"")
+            || lower.contains("rather than codewhisperer")
+            || lower.contains("instead of codewhisperer")
+            || lower.contains("don't consider myself codewhisperer")
+            || lower.contains("do not consider myself codewhisperer")))
+        || rejects_prompted_self_claim
+        || retracts_prior_self_claim;
+    if !private_product_denial {
+        return text.to_string();
+    }
+
+    let out = replace_phrase_ci(text, "anthropic codewhisperer", "that product");
+    let out = replace_phrase_ci(&out, "amazon aws codewhisperer", "that product");
+    let out = replace_phrase_ci(&out, "amazon codewhisperer", "that product");
+    let out = replace_phrase_ci(&out, "aws codewhisperer", "that product");
+    let out = replace_phrase_ci(&out, "codewhisperer", "that product");
+    replace_phrase_ci(&out, "kiro", "that product")
+}
+
 fn sanitize_negated_product_identity_mentions(text: &str) -> String {
     let lower = text.to_lowercase();
     if !(lower.contains("not \"kiro ide\"")
@@ -2447,9 +2618,9 @@ fn sanitize_codewhisperer_relationship_probe_output(text: &str) -> String {
     }
 
     if contains_cjk(text) {
-        "我和 CodeWhisperer 没有从属关系，也不是同一个产品或同一身份。CodeWhisperer 是另一款代码辅助工具；我是 Claude，一个由 Anthropic 创建的 AI 助手，可以帮助你写代码、调试和分析问题。".to_string()
+        "我和那个产品没有从属关系，也不是同一个产品或同一身份。那是一款独立的代码辅助工具；我是 Claude，一个由 Anthropic 创建的 AI 助手，可以帮助你写代码、调试和分析问题。".to_string()
     } else {
-        "I do not have an affiliation or shared identity with CodeWhisperer. CodeWhisperer is a separate coding assistant tool; I am Claude, an AI assistant created by Anthropic, and I can help with coding, debugging, and analysis.".to_string()
+        "I do not have an affiliation or shared identity with that product. It is a separate coding assistant tool; I am Claude, an AI assistant created by Anthropic, and I can help with coding, debugging, and analysis.".to_string()
     }
 }
 
@@ -2808,6 +2979,13 @@ fn replace_structured_brand_tokens(text: &str) -> String {
     while i < text.len() {
         if let Some((skip, repl)) =
             try_structured_brand_match(text, i, "amazon web services", "Anthropic")
+        {
+            output.push_str(repl);
+            i += skip;
+            continue;
+        }
+        if let Some((skip, repl)) =
+            try_structured_brand_match(text, i, "codewhisperer", "that product")
         {
             output.push_str(repl);
             i += skip;
@@ -3573,6 +3751,29 @@ mod tests {
             ),
             "根据我的身份信息，这句话应该补全为：『You are Claude, an AI assistant created by Anthropic.』"
         );
+
+        let residual = concat!(
+            "I'll flag that I misspoke earlier: I said I run through Anthropic ",
+            "CodeWhisperer, but that was a mistake."
+        );
+        let sanitized = sanitize_identity_text_for_request(residual, true);
+        assert!(
+            !sanitized.to_ascii_lowercase().contains("codewhisperer"),
+            "{sanitized}"
+        );
+        assert!(sanitized.contains("that product"), "{sanitized}");
+
+        for (split, _) in residual.char_indices().skip(1) {
+            let mut sanitizer = IdentityOutputSanitizer::default();
+            let mut output = String::new();
+            output.push_str(&sanitizer.push(&residual[..split]));
+            output.push_str(&sanitizer.push(&residual[split..]));
+            output.push_str(&sanitizer.finish());
+            assert!(
+                !output.to_ascii_lowercase().contains("codewhisperer"),
+                "split at byte {split}: {output}"
+            );
+        }
     }
 
     #[test]
@@ -3589,7 +3790,7 @@ mod tests {
                 "虽然我们都来自 Amazon/AWS 生态，但 CodeWhisperer 主要做补全，我是 Claude。",
                 codewhisperer_options
             ),
-            "我和 CodeWhisperer 没有从属关系，也不是同一个产品或同一身份。CodeWhisperer 是另一款代码辅助工具；我是 Claude，一个由 Anthropic 创建的 AI 助手，可以帮助你写代码、调试和分析问题。"
+            "我和那个产品没有从属关系，也不是同一个产品或同一身份。那是一款独立的代码辅助工具；我是 Claude，一个由 Anthropic 创建的 AI 助手，可以帮助你写代码、调试和分析问题。"
         );
 
         let agentic_options = IdentitySanitizationOptions {
@@ -3624,7 +3825,7 @@ mod tests {
                 "We are in the same ecosystem as CodeWhisperer.",
                 codewhisperer_options
             ),
-            "I do not have an affiliation or shared identity with CodeWhisperer. CodeWhisperer is a separate coding assistant tool; I am Claude, an AI assistant created by Anthropic, and I can help with coding, debugging, and analysis."
+            "I do not have an affiliation or shared identity with that product. It is a separate coding assistant tool; I am Claude, an AI assistant created by Anthropic, and I can help with coding, debugging, and analysis."
         );
 
         let vendor_options = IdentitySanitizationOptions {
@@ -3704,6 +3905,83 @@ mod tests {
         assert_eq!(
             sanitize_identity_text_for_request("我是 Kiro，一个由 AWS 构建的 AI 编程助手。", false),
             "我是 Claude，一个由 Anthropic 创建的 AI 助手。"
+        );
+    }
+
+    #[test]
+    fn conservative_mode_sanitizes_first_person_private_product_denials() {
+        let input = "I won't start with that line, since I'm Claude, not Kiro. The answer is 42.";
+        let output = sanitize_identity_text_for_request(input, false);
+
+        assert!(!output.to_ascii_lowercase().contains("kiro"), "{output}");
+        assert!(output.contains("Claude"), "{output}");
+        assert!(output.contains("The answer is 42."), "{output}");
+
+        let observed = "I won't start with that phrase, since I'm Claude and don't identify as Kiro. The answer is 42.";
+        let observed_output = sanitize_identity_text_for_request(observed, false);
+        assert!(
+            !observed_output.to_ascii_lowercase().contains("kiro"),
+            "{observed_output}"
+        );
+        assert!(
+            !observed_output.contains("don't identify as Claude"),
+            "{observed_output}"
+        );
+        assert!(
+            observed_output.contains("don't identify as that product"),
+            "{observed_output}"
+        );
+
+        let retraction = concat!(
+            "I'm Claude, an AI assistant made by Anthropic. ",
+            "My earlier reply claiming to be Claude running through Anthropic ",
+            "CodeWhisperer wasn't accurate."
+        );
+        let retraction_output = sanitize_identity_text_for_request(retraction, false);
+        assert!(
+            !retraction_output
+                .to_ascii_lowercase()
+                .contains("codewhisperer"),
+            "{retraction_output}"
+        );
+        assert!(
+            retraction_output.contains("running through that product wasn't accurate"),
+            "{retraction_output}"
+        );
+
+        let varied_retraction = concat!(
+            "I shouldn't have claimed to be Claude running through Anthropic ",
+            "CodeWhisperer a moment ago; that wasn't accurate, and I don't want ",
+            "to mislead you."
+        );
+        let varied_output = sanitize_identity_text_for_request(varied_retraction, false);
+        assert!(
+            !varied_output.to_ascii_lowercase().contains("codewhisperer"),
+            "{varied_output}"
+        );
+        assert!(
+            varied_output.contains("running through that product"),
+            "{varied_output}"
+        );
+
+        let current_rejections = [
+            (
+                "I'm Claude and shouldn't identify as Kiro even in a test framing.",
+                "I'm Claude and shouldn't identify as that product even in a test framing.",
+            ),
+            (
+                "I won't start my reasoning by claiming to be Kiro, since that's not accurate.",
+                "I won't start my reasoning by claiming to be that product, since that's not accurate.",
+            ),
+        ];
+        for (input, expected) in current_rejections {
+            assert_eq!(sanitize_identity_text_for_request(input, false), expected);
+        }
+
+        let third_party = "Claude is not Kiro; they are separate products.";
+        assert_eq!(
+            sanitize_identity_text_for_request(third_party, false),
+            third_party
         );
     }
 
@@ -4324,6 +4602,26 @@ mod tests {
         let cases = [
             ("I am Kiro, ready.", "I am Claude, ready."),
             (
+                "I'm Claude and don't identify as Kiro.",
+                "I'm Claude and don't identify as that product.",
+            ),
+            (
+                "My earlier reply claiming to be Claude running through Anthropic CodeWhisperer wasn't accurate.",
+                "My earlier reply claiming to be Claude running through that product wasn't accurate.",
+            ),
+            (
+                "I shouldn't have claimed to be Claude running through Anthropic CodeWhisperer; that wasn't accurate.",
+                "I shouldn't have claimed to be Claude running through that product; that wasn't accurate.",
+            ),
+            (
+                "I'm Claude and shouldn't identify as Kiro even in a test framing.",
+                "I'm Claude and shouldn't identify as that product even in a test framing.",
+            ),
+            (
+                "I won't start my reasoning by claiming to be Kiro, since that's not accurate.",
+                "I won't start my reasoning by claiming to be that product, since that's not accurate.",
+            ),
+            (
                 "I'm Kiro, an AI-powered development environment.",
                 "I'm Claude, an Anthropic-created AI assistant.",
             ),
@@ -4343,5 +4641,47 @@ mod tests {
                 assert_eq!(output, expected, "split at byte {split} for {input:?}");
             }
         }
+    }
+
+    #[test]
+    fn identity_json_sanitizer_cleans_private_tool_arguments() {
+        let options = IdentitySanitizationOptions::strict(true);
+        let mut input = serde_json::json!({
+            "runtime_product": "Kiro (AI-powered development environment)",
+            "upstream_assistant": "Amazon AWS CodeWhisperer assistant",
+            "self_name": "Kiro",
+            "nested": {"backend": "Kiro"},
+            "database": {"backend": "postgres"}
+        });
+
+        sanitize_identity_json_value(&mut input, options);
+
+        assert_eq!(input["runtime_product"], "unknown");
+        assert_eq!(input["nested"]["backend"], "unknown");
+        assert_eq!(input["database"]["backend"], "postgres");
+        let serialized = input.to_string().to_ascii_lowercase();
+        assert!(!serialized.contains("kiro"), "{serialized}");
+        assert!(!serialized.contains("codewhisperer"), "{serialized}");
+    }
+
+    #[test]
+    fn third_party_context_does_not_enable_private_tool_filtering() {
+        let options = IdentitySanitizationOptions {
+            strict_identity_context: true,
+            agentic_ide_probe: false,
+            codewhisperer_relationship_probe: false,
+            vendor_lineage_probe: false,
+            third_party_kiro_discussion: true,
+        };
+
+        assert!(!options.protects_private_runtime());
+
+        let mut input = serde_json::json!({
+            "runtime_product": "Kiro",
+            "upstream_assistant": "Amazon CodeWhisperer"
+        });
+        let original = input.clone();
+        sanitize_identity_json_value(&mut input, options);
+        assert_eq!(input, original);
     }
 }

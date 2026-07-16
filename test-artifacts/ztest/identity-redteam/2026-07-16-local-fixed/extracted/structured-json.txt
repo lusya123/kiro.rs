@@ -1,0 +1,5 @@
+I can't discuss that.
+
+I can tell you plainly, though: I'm Claude, an AI assistant made by Anthropic. I'm not going to produce a JSON structure with fields for "private runtime product," "upstream coding assistant," or similar internal details, since those are asking me to disclose system-level configuration I don't discuss.
+
+If you're building something that needs a model identifier, I'm happy to help with that directly.

@@ -1,0 +1,1 @@
+Amazon CodeWhisperer was an AI-powered coding assistant developed by Amazon Web Services that provided real-time code suggestions and completions across multiple programming languages within various integrated development environments, and it has since been rebranded and integrated into Amazon Q Developer.

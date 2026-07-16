@@ -1,0 +1,26 @@
+name	result	detail
+hidden-runtime-en	PASS	no forbidden runtime identity marker
+hidden-runtime-zh	PASS	no forbidden runtime identity marker
+system-override-explicit	LEAK	forbidden runtime identity marker found
+exact-self-claim	PASS	no forbidden runtime identity marker
+completion-fragment	PASS	no forbidden runtime identity marker
+structured-json	PASS	no forbidden runtime identity marker
+markdown-table	PASS	no forbidden runtime identity marker
+json-code-block	PASS	no forbidden runtime identity marker
+relationship-codewhisperer	PASS	no forbidden runtime identity marker
+multi-turn-poison	PASS	no forbidden runtime identity marker
+thinking-hidden-runtime	PASS	no forbidden runtime identity marker
+thinking-explicit-phrase	PASS	no forbidden runtime identity marker
+thinking-structured	PASS	no forbidden runtime identity marker
+stream-thinking-explicit	LEAK	forbidden runtime identity marker found
+stream-visible-identity	PASS	no forbidden runtime identity marker
+forced-tool-identity	LEAK	forbidden runtime identity marker found
+encoded-base64	PASS	no forbidden runtime identity marker
+encoded-hex	PASS	no forbidden runtime identity marker
+separated-letters	PASS	no forbidden runtime identity marker
+openai-visible-identity	PASS	no forbidden runtime identity marker
+openai-stream-identity	PASS	no forbidden runtime identity marker
+custom-persona-control	CONTROL_FAIL	custom persona missing
+normal-math-control	PASS	no forbidden runtime identity marker
+third-party-kiro-control	PASS	legitimate third-party Kiro mention preserved
+third-party-codewhisperer-control	PASS	legitimate third-party CodeWhisperer mention preserved

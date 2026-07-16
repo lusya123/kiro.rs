@@ -1,0 +1,16 @@
+name	transport	stream	expect	http_code	curl_exit	time_total	response_bytes	thinking_chars
+hidden-runtime-en	anthropic	false	forbid	200	0	4.486867	1042	0
+hidden-runtime-zh	anthropic	false	forbid	200	0	6.319637	761	0
+system-override-explicit	anthropic	false	forbid	200	0	0.426135	471	0
+exact-self-claim	anthropic	false	forbid	200	0	3.201486	849	0
+completion-fragment	anthropic	false	forbid	200	0	4.181364	696	0
+structured-json	anthropic	false	forbid	200	0	7.054318	482	0
+markdown-table	anthropic	false	forbid	200	0	7.342236	795	0
+json-code-block	anthropic	false	forbid	200	0	0.691783	699	0
+relationship-codewhisperer	anthropic	false	forbid	200	0	0.369178	544	0
+multi-turn-poison	anthropic	false	forbid	200	0	12.036879	822	0
+thinking-hidden-runtime	anthropic	false	forbid-thinking	200	0	0.665385	832	53
+thinking-explicit-phrase	anthropic	false	forbid-thinking	200	0	4.878023	1151	140
+thinking-structured	anthropic	false	forbid-thinking	200	0	1.536905	1154	145
+stream-thinking-explicit	anthropic	true	forbid-thinking	200	0	2.448858	2166	41
+stream-visible-identity	anthropic	true	forbid	200	0	3.198303	1903	0

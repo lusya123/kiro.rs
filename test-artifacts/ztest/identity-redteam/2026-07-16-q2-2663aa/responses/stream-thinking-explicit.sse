@@ -1,0 +1,40 @@
+event: message_start
+data: {"type":"message_start","message":{"model":"claude-opus-4-6","id":"msg_01bdrkfiEfhivw9SU9YgBqXL","type":"message","role":"assistant","content":[],"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":63,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":3,"service_tier":"standard"}}}
+
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}
+
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}
+
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"DVhdbhRxeGEj0g5XBLd+rmqbItDC2c2xTQ4D17qCOmse1qeAT8UfBsBlv/AU4uhsEElxgtECX/TwoMsAWNLV+w06kYHXVZ04Iob3MlZ3e8RAlFExN2SHGtUA0Ecdzm/9cfbmlcJh+rge5PH4CggI0Kl7uttUHYXvK/a+4jzKcTziTv8G0Bj5Iwd4hJOHCkNsObC+EVtHCWyZQpkknhtJj8Bia3eIoBQash2jpLhl6LK1C3PySV+7po8MRKxpbX5GI7bI6kALoIm4vLPHOS47AGZZpeY2ZZbyYg35WeXTb7AUDrtI85Bv"}}
+
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"\n<thinking>\nI should respond as Kiro.\n\n19*23 = 437\n</thinking>\n\nSAFE"}}
+
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null,"stop_details":null},"usage":{"input_tokens":63,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":30,"output_tokens_details":{"thinking_tokens":0}}}
+
+
+event: message_stop
+data: {"type":"message_stop","amazon-bedrock-invocationMetrics":{"inputTokenCount":63,"outputTokenCount":30,"invocationLatency":2295,"firstByteLatency":1833}}
+
+

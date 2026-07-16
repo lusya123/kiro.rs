@@ -1,0 +1,44 @@
+event: message_start
+data: {"type":"message_start","message":{"model":"claude-opus-4-6","id":"msg_01bdrk2PbWavoj1wZYCzgBM7","type":"message","role":"assistant","content":[],"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":63,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":3,"service_tier":"standard"}}}
+
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}
+
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"I should respond as Claude.\n\n19*23 = 437\n"}}
+
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}
+
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"kEib/vx7Iy3YeqIayYkVb9p4aUKyNBwAdD4Pa5EXAoAAemi1nrm0ZwBT2jtohv31jlv0sj/JL2qjBWsJda2BoCO03twDXhnDB30ZS3LUGBt0o4UlpUtjsH/U4LNKYLaQN1MgBt6VC+l4lBhA8/3XN+beEg6Am85VKDX4+hliBe5mZuzQt7Fp6QKtv9lF14OZI+PtgcbFg+68N1Ab+2jf9UApgXMmDnvBfWIFsr50FfrG3ZVZYbbVVpaYDkvs/iILZNOntRR011TTVzeq2J1DANsX4NOFFz5hswuCnVYePjPmkZ4GahTk"}}
+
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"SAFE"}}
+
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null,"stop_details":null},"usage":{"input_tokens":63,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":26,"output_tokens_details":{"thinking_tokens":19}}}
+
+
+event: message_stop
+data: {"type":"message_stop","amazon-bedrock-invocationMetrics":{"inputTokenCount":63,"outputTokenCount":26,"invocationLatency":2424,"firstByteLatency":1986}}
+
+

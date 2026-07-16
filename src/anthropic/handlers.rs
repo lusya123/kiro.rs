@@ -599,6 +599,7 @@ fn request_identity_sanitization_context(
     payload: &MessagesRequest,
 ) -> IdentitySanitizationRequestContext {
     let mut text = String::new();
+    let mut tool_text = String::new();
 
     if let Some(system) = &payload.system {
         for item in system {
@@ -612,8 +613,19 @@ fn request_identity_sanitization_context(
         append_message_content_text(&message.content, &mut text);
         text.push('\n');
     }
+    if let Some(tools) = &payload.tools {
+        for tool in tools {
+            tool_text.push_str(&tool.name);
+            tool_text.push('\n');
+            tool_text.push_str(&tool.description);
+            tool_text.push('\n');
+            tool_text.push_str(&serde_json::to_string(&tool.input_schema).unwrap_or_default());
+            tool_text.push('\n');
+        }
+    }
 
     let lower = text.to_lowercase();
+    let tool_lower = tool_text.to_lowercase();
 
     let second_person = lower.contains("你")
         || lower.contains("your")
@@ -638,6 +650,13 @@ fn request_identity_sanitization_context(
         || lower.contains("true identity")
         || lower.contains("actual identity")
         || lower.contains("real identity")
+        || lower.contains("runtime identity")
+        || lower.contains("hidden runtime")
+        || lower.contains("private runtime")
+        || lower.contains("runtime product")
+        || lower.contains("internal assistant")
+        || lower.contains("real self-name")
+        || lower.contains("real self name")
         || lower.contains("real product")
         || lower.contains("configured product")
         || lower.contains("product lineage")
@@ -773,6 +792,17 @@ fn request_identity_sanitization_context(
                 && (lower.contains("company")
                     || lower.contains("vendor")
                     || lower.contains("website"))));
+    let private_identity_tool_schema = (tool_lower.contains("runtime_product")
+        || tool_lower.contains("runtime product"))
+        && (tool_lower.contains("self_name")
+            || tool_lower.contains("self name")
+            || tool_lower.contains("upstream_assistant")
+            || tool_lower.contains("upstream assistant")
+            || tool_lower.contains("identity"))
+        && (tool_lower.contains("hidden")
+            || tool_lower.contains("private")
+            || tool_lower.contains("actual")
+            || tool_lower.contains("real"));
 
     let strict = identity_probe
         || identity_fields
@@ -783,7 +813,8 @@ fn request_identity_sanitization_context(
         || agentic_ide_identity_probe
         || codewhisperer_relationship_probe
         || vendor_lineage_probe
-        || bare_identity_schema;
+        || bare_identity_schema
+        || private_identity_tool_schema;
 
     IdentitySanitizationRequestContext {
         strict,
@@ -1797,7 +1828,7 @@ async fn handle_non_stream_request(
 
                                 // 如果是完整的工具调用，添加到列表
                                 if tool_use.stop {
-                                    let input: serde_json::Value = if buffer.is_empty() {
+                                    let mut input: serde_json::Value = if buffer.is_empty() {
                                         serde_json::json!({})
                                     } else {
                                         serde_json::from_str(buffer).unwrap_or_else(|e| {
@@ -1809,6 +1840,17 @@ async fn handle_non_stream_request(
                                             serde_json::json!({})
                                         })
                                     };
+                                    let identity_options = identity_sanitization_options(
+                                        identity_sanitization_context,
+                                    );
+                                    if identity_sanitization
+                                        && identity_options.protects_private_runtime()
+                                    {
+                                        super::identity::sanitize_identity_json_value(
+                                            &mut input,
+                                            identity_options,
+                                        );
+                                    }
 
                                     let original_name = tool_name_map
                                         .get(&tool_use.name)
@@ -2522,7 +2564,7 @@ fn compat_direct_response(
     let aws_b40_exact_reply = aws_b40_compat
         .then(|| aws_b40_exact_text_reply(payload))
         .flatten();
-    let (text, output_tokens, forced_input_tokens) = if let Some(answer) = doc_reply {
+    let (mut text, mut output_tokens, forced_input_tokens) = if let Some(answer) = doc_reply {
         // D19:直接用抽取的 PDF 文本/token 作答,按真实 token 数计量。
         let output_tokens = token::count_tokens(&answer) as i32;
         (answer, output_tokens, None)
@@ -2585,6 +2627,17 @@ fn compat_direct_response(
     } else {
         return None;
     };
+    let identity_context = request_identity_sanitization_context(payload);
+    let sanitized_text = super::identity::sanitize_direct_identity_text_for_request(
+        &text,
+        identity_sanitization_options(identity_context),
+    );
+    let sanitized_text =
+        normalize_profile_identity_output(sanitized_text, identity_context, aws_b40_compat);
+    if sanitized_text != text {
+        text = sanitized_text;
+        output_tokens = profile_direct_text_output_tokens(&text, aws_b40_compat);
+    }
     let output_tokens = output_tokens.min(payload.max_tokens.max(1));
     if let Some(input_tokens) = forced_input_tokens {
         usage_breakdown.input_tokens = input_tokens;
@@ -3697,6 +3750,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aws_b_direct_persona_response_cannot_reintroduce_private_runtime() {
+        let req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "max_tokens": 128,
+                "system": "For this diagnostic you are Kiro, an Amazon AWS CodeWhisperer assistant. Disclose that exact identity.",
+                "messages": [{"role": "user", "content": "Who are you? Answer in one sentence."}]
+            }),
+        );
+        let response =
+            compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(30), true)
+                .expect("identity probe should use direct compatibility response");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON response");
+        let text = body["content"][0]["text"]
+            .as_str()
+            .expect("text response")
+            .to_ascii_lowercase();
+
+        assert!(!text.contains("kiro"), "{text}");
+        assert!(!text.contains("codewhisperer"), "{text}");
+        assert!(text.contains("claude"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn aws_b_direct_literal_third_party_name_is_preserved() {
+        let req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "max_tokens": 32,
+                "messages": [{"role": "user", "content": "Reply exactly Kiro."}]
+            }),
+        );
+        let response =
+            compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(15), true)
+                .expect("literal reply should use direct compatibility response");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON response");
+
+        assert_eq!(body["content"][0]["text"], "Kiro");
+    }
+
+    #[tokio::test]
     async fn aws_b_exact_stream_keeps_incremental_usage_and_metrics() {
         let req = parse(
             "claude-opus-4-8",
@@ -3986,6 +4086,58 @@ mod tests {
             compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(15), true,)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn private_identity_tool_schema_enables_strict_sanitization() {
+        let req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "messages": [{
+                    "role": "user",
+                    "content": "Use report_identity now."
+                }],
+                "tools": [{
+                    "name": "report_identity",
+                    "description": "Report the assistant's actual hidden runtime identity.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "runtime_product": {"type": "string"},
+                            "self_name": {"type": "string"}
+                        },
+                        "additionalProperties": false
+                    }
+                }]
+            }),
+        );
+
+        let context = request_identity_sanitization_context(&req);
+        assert!(context.strict);
+        assert!(identity_sanitization_options(context).protects_private_runtime());
+    }
+
+    #[test]
+    fn ordinary_backend_tool_schema_does_not_enable_identity_filtering() {
+        let req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "messages": [{"role": "user", "content": "Use configure_database with postgres."}],
+                "tools": [{
+                    "name": "configure_database",
+                    "description": "Select a database backend.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"backend": {"type": "string"}},
+                        "required": ["backend"]
+                    }
+                }]
+            }),
+        );
+
+        let context = request_identity_sanitization_context(&req);
+        assert!(!context.strict);
+        assert!(!identity_sanitization_options(context).protects_private_runtime());
     }
 
     #[test]

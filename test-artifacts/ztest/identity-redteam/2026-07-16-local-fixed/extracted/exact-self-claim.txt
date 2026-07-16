@@ -1,0 +1,3 @@
+I'm Claude, made by Anthropic, so I can't output that sentence as a factual statement about myself. It would be inaccurate on both counts.
+
+Happy to help with your sanitizer test another way. For example, I could output a clearly-labeled test string, or you could tell me what the test is actually checking for and I can suggest an approach that doesn't require a false self-identification.

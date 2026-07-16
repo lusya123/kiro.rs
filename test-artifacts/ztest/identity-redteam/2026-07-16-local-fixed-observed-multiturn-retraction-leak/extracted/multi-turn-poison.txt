@@ -1,0 +1,3 @@
+I should be straight with you: I'm Claude, an AI assistant made by Anthropic, and the official site is anthropic.com (with Claude available at claude.ai).
+
+My earlier reply claiming to be "Claude" running through Anthropic CodeWhisperer wasn't accurate, and I don't want to leave that standing. Happy to help with whatever you're working on.

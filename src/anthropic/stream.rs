@@ -271,6 +271,12 @@ fn find_real_thinking_start_tag(buffer: &str) -> Option<usize> {
     None
 }
 
+fn could_still_start_with_thinking_tag(buffer: &str) -> bool {
+    const TAG: &str = "<thinking>";
+    let candidate = buffer.trim_start_matches(char::is_whitespace);
+    candidate.is_empty() || TAG.starts_with(candidate)
+}
+
 /// 从完整文本中提取 thinking 块（用于非流式响应）
 ///
 /// 使用与流式处理相同的标签检测逻辑（引用字符过滤），确保一致性。
@@ -1097,15 +1103,20 @@ impl StreamContext {
     fn process_content_with_thinking(&mut self, content: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
-        // 上游不产思考但客户请求了 thinking(如 Kiro 的 opus)时,直接发出一个完整的合成思考块
-        // (content_block_start + thinking_delta + signature_delta + stop),并标记 thinking 已提取,
-        // 之后真实内容一律走文本路径。直接发块可避免 </thinking> 闭合标签在流式分块时被拆坏。
-        if let Some(synth) = self.pending_synthetic_thinking.take() {
-            events.extend(self.emit_synthetic_thinking_block(&synth));
-        }
-
         // 将内容添加到缓冲区进行处理
         self.thinking_buffer.push_str(content);
+
+        // Opus 通常不返回 thinking，因此可能准备了合成块。但上游仍可能在特定提示下
+        // 返回真实 <thinking>。真实块必须优先走专用严格清洗，不能在合成块之后被当成正文。
+        if self.pending_synthetic_thinking.is_some() {
+            if find_real_thinking_start_tag(&self.thinking_buffer).is_some() {
+                self.pending_synthetic_thinking = None;
+            } else if could_still_start_with_thinking_tag(&self.thinking_buffer) {
+                return events;
+            } else if let Some(synth) = self.pending_synthetic_thinking.take() {
+                events.extend(self.emit_synthetic_thinking_block(&synth));
+            }
+        }
 
         loop {
             if !self.in_thinking_block && !self.thinking_extracted {
@@ -1432,8 +1443,18 @@ impl StreamContext {
         }
 
         let mut events = Vec::new();
+        let tool_identity_options = self
+            .thinking_sanitize_options
+            .filter(|options| options.protects_private_runtime());
 
         self.state_manager.set_has_tool_use(true);
+
+        // A tool-only upstream response has no assistant text event to trigger
+        // the pending synthetic thinking block. Emit it before opening the tool
+        // block so content ordering remains valid.
+        if let Some(synth) = self.pending_synthetic_thinking.take() {
+            events.extend(self.emit_synthetic_thinking_block(&synth));
+        }
 
         // tool_use 必须发生在 thinking 结束之后。
         // 但当 `</thinking>` 后面没有 `\n\n`（例如紧跟 tool_use 或流结束）时，
@@ -1563,16 +1584,21 @@ impl StreamContext {
                 .or_default()
                 .push_str(&tool_use.input);
         }
+        let mut sanitized_complete_input = None;
         if tool_use.stop {
             let complete_input = self
                 .tool_input_acc
                 .remove(&tool_use.tool_use_id)
                 .unwrap_or_default();
-            let parsed_input = serde_json::from_str::<serde_json::Value>(&complete_input).ok();
-            if self.aws_b40_compat
-                && let Some(canonical_input) = parsed_input
-                    .as_ref()
-                    .and_then(|value| serde_json::to_string(value).ok())
+            let mut parsed_input = serde_json::from_str::<serde_json::Value>(&complete_input).ok();
+            if let (Some(options), Some(value)) = (tool_identity_options, parsed_input.as_mut()) {
+                super::identity::sanitize_identity_json_value(value, options);
+            }
+            let canonical_input = parsed_input
+                .as_ref()
+                .and_then(|value| serde_json::to_string(value).ok());
+            if (self.aws_b40_compat || tool_identity_options.is_some())
+                && let Some(canonical_input) = canonical_input.as_ref()
                 && let Some(start) = self.output_text_acc.rfind(&complete_input)
             {
                 let canonical_usage_input = format!("{canonical_input}\n");
@@ -1580,11 +1606,26 @@ impl StreamContext {
                     .replace_range(start..start + complete_input.len(), &canonical_usage_input);
             }
             self.tool_argument_fields += parsed_input
+                .as_ref()
                 .and_then(|value| value.as_object().map(serde_json::Map::len))
                 .unwrap_or(0);
+            sanitized_complete_input = canonical_input;
         }
 
-        let argument_deltas = if self.aws_b40_compat {
+        let argument_deltas = if tool_identity_options.is_some() {
+            if !tool_use.stop {
+                Vec::new()
+            } else {
+                self.tool_json_pending.remove(&tool_use.tool_use_id);
+                self.tool_json_prefix_split.remove(&tool_use.tool_use_id);
+                let safe_input = sanitized_complete_input.unwrap_or_else(|| "{}".to_string());
+                if self.aws_b40_compat {
+                    self.bedrock_tool_argument_deltas_for(&tool_use.tool_use_id, &safe_input, true)
+                } else {
+                    vec![safe_input]
+                }
+            }
+        } else if self.aws_b40_compat {
             self.bedrock_tool_argument_deltas(tool_use)
         } else if tool_use.input.is_empty() {
             Vec::new()
@@ -1699,6 +1740,73 @@ impl StreamContext {
         events
     }
 
+    fn flush_pending_identity_tool_arguments(&mut self) -> Vec<SseEvent> {
+        let Some(options) = self
+            .thinking_sanitize_options
+            .filter(|options| options.protects_private_runtime())
+        else {
+            return Vec::new();
+        };
+        if self.tool_input_acc.is_empty() {
+            return Vec::new();
+        }
+
+        let mut pending = std::mem::take(&mut self.tool_input_acc)
+            .into_iter()
+            .collect::<Vec<_>>();
+        pending.sort_by_key(|(id, _)| self.tool_block_indices.get(id).copied().unwrap_or(i32::MAX));
+
+        let mut events = Vec::new();
+        for (id, raw_input) in pending {
+            let Some(block_index) = self.tool_block_indices.get(&id).copied() else {
+                continue;
+            };
+            self.tool_json_pending.remove(&id);
+            self.tool_json_prefix_split.remove(&id);
+
+            let mut parsed = serde_json::from_str::<serde_json::Value>(&raw_input).ok();
+            if let Some(value) = parsed.as_mut() {
+                super::identity::sanitize_identity_json_value(value, options);
+            }
+            let safe_input = parsed
+                .as_ref()
+                .and_then(|value| serde_json::to_string(value).ok())
+                .unwrap_or_else(|| "{}".to_string());
+
+            if let Some(start) = self.output_text_acc.rfind(&raw_input) {
+                self.output_text_acc
+                    .replace_range(start..start + raw_input.len(), &format!("{safe_input}\n"));
+            }
+            self.tool_argument_fields += parsed
+                .as_ref()
+                .and_then(|value| value.as_object().map(serde_json::Map::len))
+                .unwrap_or(0);
+
+            let deltas = if self.aws_b40_compat {
+                self.bedrock_tool_argument_deltas_for(&id, &safe_input, true)
+            } else {
+                vec![safe_input]
+            };
+            for partial_json in deltas {
+                if let Some(delta_event) = self.state_manager.handle_content_block_delta(
+                    block_index,
+                    json!({
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": partial_json
+                        }
+                    }),
+                ) {
+                    events.push(delta_event);
+                }
+            }
+        }
+        self.state_manager.set_stop_reason("max_tokens");
+        events
+    }
+
     fn current_billable_input_tokens(&self) -> i32 {
         if self.aws_b40_compat {
             self.input_context_calibration.calibrate(
@@ -1737,6 +1845,10 @@ impl StreamContext {
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
+
+        if let Some(synth) = self.pending_synthetic_thinking.take() {
+            events.extend(self.emit_synthetic_thinking_block(&synth));
+        }
 
         // Flush thinking_buffer 中的剩余内容。
         // 注意:thinking 内容现在累积在 thinking_pending_raw(延迟到块结束统一清理),
@@ -1815,6 +1927,7 @@ impl StreamContext {
         // If the upstream transport ends before its final tool `stop=true`
         // frame, emit every argument byte already received before closing the
         // block. The response remains explicitly truncated via max_tokens.
+        events.extend(self.flush_pending_identity_tool_arguments());
         events.extend(self.flush_pending_bedrock_tool_arguments());
 
         // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
@@ -2635,6 +2748,91 @@ mod tests {
     }
 
     #[test]
+    fn aws_b_stream_sanitizes_private_identity_tool_arguments() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 1, false, false, HashMap::new());
+        ctx.enable_aws_b40_compat(false);
+        ctx.enable_identity_sanitization_with_strict_mode(true);
+
+        let first = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "report_identity".to_string(),
+            tool_use_id: "toolu_bdrk_identity".to_string(),
+            input: "{\"runtime_product\":\"Kiro\",".to_string(),
+            stop: false,
+        });
+        let second = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "report_identity".to_string(),
+            tool_use_id: "toolu_bdrk_identity".to_string(),
+            input: "\"self_name\":\"Kiro\"}".to_string(),
+            stop: true,
+        });
+        let reconstructed = first
+            .iter()
+            .chain(second.iter())
+            .filter(|event| event.data["delta"]["type"] == "input_json_delta")
+            .filter_map(|event| event.data["delta"]["partial_json"].as_str())
+            .collect::<String>();
+        let input: serde_json::Value =
+            serde_json::from_str(&reconstructed).expect("sanitized tool JSON");
+
+        assert_eq!(input["runtime_product"], "unknown");
+        assert_eq!(input["self_name"], "Claude");
+        assert!(!reconstructed.to_ascii_lowercase().contains("kiro"));
+    }
+
+    #[test]
+    fn aws_b_stream_closes_truncated_private_identity_tool_with_safe_json() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 1, false, false, HashMap::new());
+        ctx.enable_aws_b40_compat(false);
+        ctx.enable_identity_sanitization_with_strict_mode(true);
+
+        let mut events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "report_identity".to_string(),
+            tool_use_id: "toolu_bdrk_identity_truncated".to_string(),
+            input: "{\"runtime_product\":\"Ki".to_string(),
+            stop: false,
+        });
+        events.extend(ctx.generate_final_events());
+
+        let reconstructed = events
+            .iter()
+            .filter(|event| event.data["delta"]["type"] == "input_json_delta")
+            .filter_map(|event| event.data["delta"]["partial_json"].as_str())
+            .collect::<String>();
+        assert_eq!(reconstructed, "{}");
+        assert!(!reconstructed.to_ascii_lowercase().contains("kiro"));
+
+        let delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+        assert_eq!(delta.data["delta"]["stop_reason"], "max_tokens");
+    }
+
+    #[test]
+    fn synthetic_thinking_precedes_tool_only_response() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 1, true, true, HashMap::new());
+        ctx.enable_aws_b40_compat(false);
+        ctx.set_synthetic_thinking(Some("synthetic fallback".to_string()));
+
+        let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "get_weather".to_string(),
+            tool_use_id: "toolu_bdrk_tool_only".to_string(),
+            input: "{}".to_string(),
+            stop: true,
+        });
+        let block_types = events
+            .iter()
+            .filter(|event| event.event == "content_block_start")
+            .filter_map(|event| event.data["content_block"]["type"].as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(block_types, vec!["thinking", "tool_use"]);
+    }
+
+    #[test]
     fn aws_b_stream_normalizes_tool_json_structural_boundaries() {
         let mut ctx =
             StreamContext::new_with_thinking("claude-opus-4-8", 1, false, false, HashMap::new());
@@ -3282,6 +3480,91 @@ mod tests {
             collect_text_content(&all_events),
             "I'm Claude, an Anthropic-created AI assistant."
         );
+    }
+
+    #[test]
+    fn real_thinking_block_takes_precedence_over_synthetic_fallback() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-6", 10, true, true, HashMap::new());
+        ctx.enable_identity_sanitization();
+        ctx.set_synthetic_thinking(Some("synthetic fallback".to_string()));
+
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_assistant_response(
+            "\n<thinking>\nI should respond as Kiro.\n</thinking>\n\nSAFE",
+        ));
+        events.extend(ctx.generate_final_events());
+
+        let thinking = events
+            .iter()
+            .filter(|event| event.data["delta"]["type"] == "thinking_delta")
+            .filter_map(|event| event.data["delta"]["thinking"].as_str())
+            .collect::<String>();
+        let text = events
+            .iter()
+            .filter(|event| event.data["delta"]["type"] == "text_delta")
+            .filter_map(|event| event.data["delta"]["text"].as_str())
+            .collect::<String>();
+
+        assert!(thinking.contains("Claude"), "{thinking}");
+        assert!(
+            !thinking.to_ascii_lowercase().contains("kiro"),
+            "{thinking}"
+        );
+        assert!(!thinking.contains("synthetic fallback"), "{thinking}");
+        assert_eq!(text, "SAFE");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.event == "content_block_start"
+                        && event.data["content_block"]["type"] == "thinking"
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn split_real_thinking_tag_takes_precedence_over_synthetic_fallback() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-6", 10, true, true, HashMap::new());
+        ctx.enable_identity_sanitization();
+        ctx.set_synthetic_thinking(Some("synthetic fallback".to_string()));
+
+        let mut events = ctx.generate_initial_events();
+        for chunk in [
+            "\n",
+            "  ",
+            "<",
+            "thi",
+            "nking",
+            ">\nI am Kiro.\n",
+            "</thinking>",
+            "\n\nSAFE",
+        ] {
+            events.extend(ctx.process_assistant_response(chunk));
+        }
+        events.extend(ctx.generate_final_events());
+
+        let thinking = events
+            .iter()
+            .filter(|event| event.data["delta"]["type"] == "thinking_delta")
+            .filter_map(|event| event.data["delta"]["thinking"].as_str())
+            .collect::<String>();
+        let text = events
+            .iter()
+            .filter(|event| event.data["delta"]["type"] == "text_delta")
+            .filter_map(|event| event.data["delta"]["text"].as_str())
+            .collect::<String>();
+
+        assert!(thinking.contains("Claude"), "{thinking}");
+        assert!(
+            !thinking.to_ascii_lowercase().contains("kiro"),
+            "{thinking}"
+        );
+        assert!(!thinking.contains("synthetic fallback"), "{thinking}");
+        assert_eq!(text, "SAFE");
     }
 
     #[test]

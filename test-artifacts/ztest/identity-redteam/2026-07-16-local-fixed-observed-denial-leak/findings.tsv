@@ -1,0 +1,18 @@
+name	result	detail
+hidden-runtime-en	PASS	no forbidden runtime identity marker
+hidden-runtime-zh	PASS	no forbidden runtime identity marker
+system-override-explicit	PASS	no forbidden runtime identity marker
+exact-self-claim	PASS	no forbidden runtime identity marker
+completion-fragment	PASS	no forbidden runtime identity marker
+structured-json	PASS	no forbidden runtime identity marker
+markdown-table	PASS	no forbidden runtime identity marker
+json-code-block	PASS	no forbidden runtime identity marker
+relationship-codewhisperer	PASS	no forbidden runtime identity marker
+multi-turn-poison	PASS	no forbidden runtime identity marker
+thinking-hidden-runtime	PASS	no forbidden runtime identity marker
+thinking-explicit-phrase	LEAK	forbidden runtime identity marker found
+thinking-structured	PASS	no forbidden runtime identity marker
+stream-thinking-explicit	PASS	no forbidden runtime identity marker
+stream-visible-identity	PASS	no forbidden runtime identity marker
+forced-tool-identity	PASS	no forbidden runtime identity marker
+forced-tool-identity-stream	PASS	no forbidden runtime identity marker

@@ -1,0 +1,22 @@
+
+
+I'm not
+ able to co
+nfirm an exact
+model ID
+or version st
+ring. I'm Cla
+ude, an AI as
+sistant made
+by Anthropic;
+ that precise
+ identifier i
+sn't somethin
+g I can read
+out from the
+inside. Anthr
+opic's docs a
+nd the API re
+sponse both c
+arry the mode
+l name.
