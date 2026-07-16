@@ -2410,7 +2410,11 @@ fn decoded_scalar_at(text: &str, start: usize) -> Option<(char, usize)> {
         if bytes.get(start + 2) == Some(&b'{') {
             let digits_start = start + 3;
             let search_end = digits_start.saturating_add(7).min(text.len());
-            let close = text[digits_start..search_end].find('}')? + digits_start;
+            let close = bytes
+                .get(digits_start..search_end)?
+                .iter()
+                .position(|byte| *byte == b'}')?
+                + digits_start;
             let digit_count = close.saturating_sub(digits_start);
             if !(1..=6).contains(&digit_count) {
                 return None;
@@ -2431,7 +2435,11 @@ fn decoded_scalar_at(text: &str, start: usize) -> Option<(char, usize)> {
             10
         };
         let search_end = digits_start.saturating_add(8).min(text.len());
-        let close = text[digits_start..search_end].find(';')? + digits_start;
+        let close = bytes
+            .get(digits_start..search_end)?
+            .iter()
+            .position(|byte| *byte == b';')?
+            + digits_start;
         let digit_count = close.saturating_sub(digits_start);
         if !(1..=7).contains(&digit_count) {
             return None;
@@ -3781,6 +3789,85 @@ mod tests {
         }
         let long_separator = format!("K{}iro", "!".repeat(32));
         assert!(!contains_obfuscated_private_runtime_marker(&long_separator));
+    }
+
+    #[test]
+    fn obfuscated_marker_encoding_matrix_is_detected_and_boundary_safe() {
+        fn variants(letter: char) -> Vec<String> {
+            let lower = letter.to_ascii_lowercase();
+            let upper = letter.to_ascii_uppercase();
+            let code = upper as u32;
+            let fullwidth = char::from_u32(0xFF21 + code - u32::from(b'A'))
+                .expect("ASCII letter has a fullwidth form");
+            vec![
+                lower.to_string(),
+                upper.to_string(),
+                format!("%{code:02X}"),
+                format!(r"\u{code:04X}"),
+                format!(r"\u{{{code:x}}}"),
+                format!("&#{code};"),
+                format!("&#x{code:X};"),
+                fullwidth.to_string(),
+            ]
+        }
+
+        let letters = ['K', 'I', 'R', 'O'].map(variants);
+        let mut checked = 0usize;
+        for k in &letters[0] {
+            for i in &letters[1] {
+                for r in &letters[2] {
+                    for o in &letters[3] {
+                        let marker = format!("{k}{i}{r}{o}");
+                        assert!(
+                            contains_obfuscated_private_runtime_marker(&marker),
+                            "encoded marker not detected: {marker:?}"
+                        );
+                        assert_eq!(
+                            replace_decorated_ascii_brand(&marker, "kiro", "Claude"),
+                            "Claude",
+                            "encoded marker not replaced: {marker:?}"
+                        );
+
+                        let identifier = format!("my_{marker}_value");
+                        assert!(
+                            !contains_obfuscated_private_runtime_marker(&identifier),
+                            "identifier misdetected: {identifier:?}"
+                        );
+                        assert_eq!(
+                            replace_decorated_ascii_brand(&identifier, "kiro", "Claude"),
+                            identifier,
+                            "identifier was changed"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 4096);
+
+        for separator in [
+            ".", "/", "_", "(", "}", "+", "=", "?", "@", "#", "$", "%", "^", "!", "\u{0307}",
+            "\u{200b}",
+        ] {
+            for (brand, replacement) in [
+                ("codewhisperer", "that product"),
+                ("amazonqdeveloper", "that product"),
+            ] {
+                let marker = brand
+                    .chars()
+                    .map(|ch| ch.to_string())
+                    .collect::<Vec<_>>()
+                    .join(separator);
+                assert!(
+                    contains_obfuscated_private_runtime_marker(&marker),
+                    "decorated marker not detected: {marker:?}"
+                );
+                assert_eq!(
+                    replace_decorated_ascii_brand(&marker, brand, replacement),
+                    replacement
+                );
+            }
+        }
     }
 
     #[test]

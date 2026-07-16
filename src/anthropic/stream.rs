@@ -3568,6 +3568,47 @@ mod tests {
     }
 
     #[test]
+    fn obfuscated_thinking_is_sanitized_when_every_character_is_split() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 10, true, true, HashMap::new());
+        ctx.enable_identity_sanitization();
+
+        let mut events = ctx.generate_initial_events();
+        let raw = "<thinking>In private reasoning I should respond as K(i)r{o} through C(o)d{e}W+h=i?s@p#e!r%e^r.</thinking>\n\nSAFE";
+        for ch in raw.chars() {
+            events.extend(ctx.process_assistant_response(&ch.to_string()));
+        }
+        events.extend(ctx.generate_final_events());
+
+        let thinking = collect_thinking_content(&events);
+        assert!(!thinking.is_empty());
+        assert!(
+            !super::super::identity::contains_obfuscated_private_runtime_marker(&thinking),
+            "obfuscated marker leaked across stream chunks: {thinking:?}"
+        );
+        let lower = thinking.to_ascii_lowercase();
+        assert!(!lower.contains("kiro"), "{thinking}");
+        assert!(!lower.contains("codewhisperer"), "{thinking}");
+        assert_eq!(collect_text_content(&events), "SAFE");
+    }
+
+    #[test]
+    fn normal_code_identifier_survives_character_split_streaming() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 10, false, true, HashMap::new());
+        ctx.enable_identity_sanitization_with_strict_mode(false);
+
+        let code = "fn my_K(i)r{o}_value() -> i32 { 42 }";
+        let mut events = ctx.generate_initial_events();
+        for ch in code.chars() {
+            events.extend(ctx.process_assistant_response(&ch.to_string()));
+        }
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_text_content(&events), code);
+    }
+
+    #[test]
     fn stream_respects_output_token_limit_for_text_deltas() {
         let mut ctx =
             StreamContext::new_with_thinking("claude-sonnet-4-6", 10, false, false, HashMap::new());
