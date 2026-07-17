@@ -42,8 +42,12 @@ const AWS_B40_HAIKU_45_RAW_BYTES: &[usize] = &[270, 285];
 const AWS_B40_ADAPTIVE_RAW_BYTES: usize = 372;
 const AWS_B_OPUS_48_THINKING_BLOB_BYTES: usize = 55;
 const AWS_B_OPUS_48_ADAPTIVE_MIN_BLOB_BYTES: usize = 579;
-const AWS_B_OPUS_48_ADAPTIVE_MAX_BLOB_BYTES: usize = 3_072;
+const AWS_B_OPUS_48_ADAPTIVE_MAX_BLOB_BYTES: usize = 4_096;
 const AWS_B_OPUS_48_LARGE_CONTEXT_TOKENS: i32 = 10_000;
+const AWS_B_OPUS_48_CACHE_CREATE_CONTEXT_DIVISOR: usize = 7;
+const AWS_B_OPUS_48_CACHE_READ_CONTEXT_DIVISOR: usize = 12;
+const AWS_B_OPUS_48_CACHE_CREATE_CONTEXT_MAX_BYTES: usize = 3_584;
+const AWS_B_OPUS_48_CACHE_READ_CONTEXT_MAX_BYTES: usize = 2_048;
 
 /// 默认共享签名密钥。全车队镜像一致 → 零配置也能跨容器互验。
 /// 需要隔离/轮换时用环境变量 `KIRO_SIG_SECRET` 覆盖（**全车队配同一值**）。
@@ -131,20 +135,37 @@ pub fn generate_aws_b40_adaptive_signature_for_model(
     model: &str,
     thinking_bytes: usize,
     context_tokens: i32,
+    cache_read_input_tokens: i32,
 ) -> String {
     if !is_opus_4_8(model) {
         return BASE64.encode(rand_bytes(AWS_B40_ADAPTIVE_RAW_BYTES));
     }
 
-    // Bedrock's adaptive blob scales with the hidden-thinking payload. Large
-    // cached/tool contexts add a second envelope component even when only a
-    // short summary is exposed. The bounded jitter preserves the distribution
-    // seen across routed calls without changing any user-visible content.
-    let context_boost = if context_tokens >= AWS_B_OPUS_48_LARGE_CONTEXT_TOKENS {
-        ((context_tokens - AWS_B_OPUS_48_LARGE_CONTEXT_TOKENS) as usize / 12).min(2_048)
+    if context_tokens < AWS_B_OPUS_48_LARGE_CONTEXT_TOKENS {
+        return generate_aws_bedrock_opus_48_signature(AWS_B_OPUS_48_THINKING_BLOB_BYTES, false);
+    }
+
+    // Exact POMO replays of the same 34k-token adaptive request expose two
+    // stable Bedrock variants. A cache creation uses the 99-byte header and a
+    // larger encrypted blob; a cache read uses the 113-byte header (field 11 is
+    // a 12-digit cache stamp) and a smaller blob. The visible thinking summary
+    // is much shorter than the encrypted payload, so context and cache state
+    // are the reliable inputs here.
+    let cache_read = cache_read_input_tokens > 0;
+    let (context_divisor, context_max) = if cache_read {
+        (
+            AWS_B_OPUS_48_CACHE_READ_CONTEXT_DIVISOR,
+            AWS_B_OPUS_48_CACHE_READ_CONTEXT_MAX_BYTES,
+        )
     } else {
-        0
+        (
+            AWS_B_OPUS_48_CACHE_CREATE_CONTEXT_DIVISOR,
+            AWS_B_OPUS_48_CACHE_CREATE_CONTEXT_MAX_BYTES,
+        )
     };
+    let context_boost = ((context_tokens - AWS_B_OPUS_48_LARGE_CONTEXT_TOKENS) as usize
+        / context_divisor)
+        .min(context_max);
     let blob_bytes = thinking_bytes
         .saturating_mul(2)
         .saturating_add(context_boost)
@@ -154,10 +175,7 @@ pub fn generate_aws_b40_adaptive_signature_for_model(
             AWS_B_OPUS_48_ADAPTIVE_MIN_BLOB_BYTES,
             AWS_B_OPUS_48_ADAPTIVE_MAX_BLOB_BYTES,
         );
-    generate_aws_bedrock_opus_48_signature(
-        blob_bytes,
-        context_tokens >= AWS_B_OPUS_48_LARGE_CONTEXT_TOKENS,
-    )
+    generate_aws_bedrock_opus_48_signature(blob_bytes, cache_read)
 }
 
 /// 追加 protobuf 变长整数(varint)。
@@ -278,7 +296,7 @@ pub fn verify_signature(signature: &str) -> bool {
     let Ok(buf) = BASE64.decode(signature) else {
         return false;
     };
-    if buf.len() < MAC_LEN + 4 || buf.len() > 4096 {
+    if buf.len() < MAC_LEN + 4 || buf.len() > 8192 {
         return false;
     }
     let secret = signing_secret();
@@ -475,29 +493,60 @@ mod tests {
     #[test]
     fn aws_b40_opus_48_adaptive_signature_tracks_context_shape() {
         for _ in 0..20 {
-            let low = generate_aws_b40_adaptive_signature_for_model("claude-opus-4-8", 303, 49);
+            let low = generate_aws_b40_adaptive_signature_for_model("claude-opus-4-8", 303, 49, 0);
             let low_raw = BASE64.decode(&low).expect("low-context signature decodes");
-            assert!((766..=953).contains(&low_raw.len()), "{}", low_raw.len());
+            assert_eq!(low_raw.len(), 241);
             let (low_inner_len, low_off) = parse_top_level(&low_raw);
             assert_eq!(low_off + low_inner_len + 2, low_raw.len());
             assert_eq!(&low_raw[low_off..low_off + 4], &[0x0a, 0x63, 0x08, 0x0f]);
             assert!(verify_signature(&low));
 
-            let high =
-                generate_aws_b40_adaptive_signature_for_model("claude-opus-4-8", 143, 35_000);
-            let high_raw = BASE64
-                .decode(&high)
+            let cache_create =
+                generate_aws_b40_adaptive_signature_for_model("claude-opus-4-8", 143, 35_000, 0);
+            let cache_create_raw = BASE64
+                .decode(&cache_create)
+                .expect("cache-creation signature decodes");
+            assert!(
+                (3_884..=4_204).contains(&cache_create_raw.len()),
+                "{}",
+                cache_create_raw.len()
+            );
+            let (cache_create_inner_len, cache_create_off) = parse_top_level(&cache_create_raw);
+            assert_eq!(
+                cache_create_off + cache_create_inner_len + 2,
+                cache_create_raw.len()
+            );
+            assert_eq!(
+                &cache_create_raw[cache_create_off..cache_create_off + 4],
+                &[0x0a, 0x63, 0x08, 0x0f]
+            );
+            assert!(verify_signature(&cache_create));
+
+            let cache_read = generate_aws_b40_adaptive_signature_for_model(
+                "claude-opus-4-8",
+                143,
+                35_000,
+                34_250,
+            );
+            let cache_read_raw = BASE64
+                .decode(&cache_read)
                 .expect("large-context signature decodes");
             assert!(
-                (2_375..=2_695).contains(&high_raw.len()),
+                (2_375..=2_695).contains(&cache_read_raw.len()),
                 "{}",
-                high_raw.len()
+                cache_read_raw.len()
             );
-            let (high_inner_len, high_off) = parse_top_level(&high_raw);
-            assert_eq!(high_off + high_inner_len + 2, high_raw.len());
-            assert_eq!(&high_raw[high_off..high_off + 4], &[0x0a, 0x71, 0x08, 0x0f]);
-            assert!(high_raw.windows(13).any(|w| w == b"claude-quince"));
-            assert!(verify_signature(&high));
+            let (cache_read_inner_len, cache_read_off) = parse_top_level(&cache_read_raw);
+            assert_eq!(
+                cache_read_off + cache_read_inner_len + 2,
+                cache_read_raw.len()
+            );
+            assert_eq!(
+                &cache_read_raw[cache_read_off..cache_read_off + 4],
+                &[0x0a, 0x71, 0x08, 0x0f]
+            );
+            assert!(cache_read_raw.windows(13).any(|w| w == b"claude-quince"));
+            assert!(verify_signature(&cache_read));
         }
 
         let legacy_model = BASE64
@@ -505,6 +554,7 @@ mod tests {
                 "claude-opus-4-7",
                 143,
                 35_000,
+                34_250,
             ))
             .expect("legacy adaptive signature decodes");
         assert_eq!(legacy_model.len(), AWS_B40_ADAPTIVE_RAW_BYTES);

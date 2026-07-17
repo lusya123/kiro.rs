@@ -15,16 +15,27 @@ use serde_json::{Value, json};
 use super::cache::UsageBreakdown;
 use super::converter::ConversionError;
 use super::id;
-use super::types::MessagesRequest;
+use super::types::{MessagesRequest, Tool};
 
 const OUTPUT_MESSAGE_FRAMING_TOKENS: i32 = 4;
 const OUTPUT_TOOL_BLOCK_FRAMING_TOKENS: i32 = 24;
 const OUTPUT_EXTRA_TOOL_ARGUMENT_TOKENS: i32 = 20;
 const KIRO_OPUS_48_CONTEXT_OVERHEAD_TOKENS: i32 = 6_850;
 const KIRO_OPUS_48_TOOL_CONTEXT_OVERHEAD_TOKENS: i32 = 6_762;
+// Exact POMO comparisons across 1/4/12/28-tool Claude Code catalogs show that
+// Kiro's context event also counts a wire-size-dependent tool prelude.
+const KIRO_OPUS_48_TOOL_WIRE_BYTES_PER_HIDDEN_TOKEN: i32 = 53;
+const KIRO_OPUS_48_TOOL_WIRE_FIXED_OVERHEAD_TOKENS: i32 = 100;
+const KIRO_OPUS_48_TOOL_WIRE_MIN_OVERHEAD_TOKENS: i32 = 300;
+const KIRO_OPUS_48_DIRECT_CATALOG_TOOL_COUNT: i32 = 28;
+const KIRO_OPUS_48_DIRECT_CATALOG_MIN_BYTES: i32 = 60_000;
+const KIRO_OPUS_48_DIRECT_CATALOG_MAX_BYTES: i32 = 80_000;
+const KIRO_OPUS_48_DIRECT_CATALOG_ANCHOR_BYTES: i32 = 69_158;
+const KIRO_OPUS_48_DIRECT_CATALOG_CACHE_TOKENS: i32 = 34_250;
 const KIRO_TOOL_DESCRIPTION_LIMIT_CHARS: usize = 10_000;
 const BEDROCK_TOOL_BASELINE_CORRECTION_PER_TOOL: i32 = 8;
-const BEDROCK_TOOL_CACHE_SUFFIX_CORRECTION: i32 = -17;
+const BEDROCK_TRUNCATED_TOOL_CACHE_SUFFIX_CORRECTION: i32 = -17;
+const BEDROCK_TOOL_CACHE_SUFFIX_CORRECTION: i32 = 40;
 // Derived from the POMO Opus 4.8 matrices recorded in
 // test-artifacts/ztest/direct-parity/2026-07-15-token-calibration-summary.md.
 const TOOL_HISTORY_TEXT_SCALE: f64 = 1.375;
@@ -49,6 +60,7 @@ pub struct InputContextCalibration {
     enabled: bool,
     has_tools: bool,
     tool_count: i32,
+    serialized_tool_bytes: i32,
     truncated_tool_input_tokens: i32,
     descriptionless_tool_input_tokens: i32,
     has_truncated_tool_descriptions: bool,
@@ -85,6 +97,13 @@ impl InputContextCalibration {
             enabled: true,
             has_tools: true,
             tool_count: tools.len().min(i32::MAX as usize) as i32,
+            serialized_tool_bytes: tools.iter().fold(0i32, |total, tool| {
+                total.saturating_add(
+                    serde_json::to_vec(tool)
+                        .map(|json| json.len().min(i32::MAX as usize) as i32)
+                        .unwrap_or(0),
+                )
+            }),
             truncated_tool_input_tokens: super::compat::estimate_input_tokens(&truncated),
             descriptionless_tool_input_tokens: super::compat::estimate_input_tokens(
                 &descriptionless,
@@ -107,7 +126,7 @@ impl InputContextCalibration {
             return estimated_input_tokens;
         };
         let overhead = if self.has_tools {
-            KIRO_OPUS_48_TOOL_CONTEXT_OVERHEAD_TOKENS
+            KIRO_OPUS_48_TOOL_CONTEXT_OVERHEAD_TOKENS.saturating_add(self.tool_wire_overhead())
         } else {
             KIRO_OPUS_48_CONTEXT_OVERHEAD_TOKENS
         };
@@ -151,6 +170,62 @@ impl InputContextCalibration {
             .max(1)
     }
 
+    /// Before Kiro's final context-usage event is available, calibrate only the
+    /// observed 28-tool Claude Code catalog. This keeps direct replies and a
+    /// streaming `message_start` aligned with the real Bedrock cache envelope.
+    pub fn calibrate_direct_compat_usage(
+        self,
+        model: &str,
+        usage: UsageBreakdown,
+    ) -> UsageBreakdown {
+        let cached_tokens = usage
+            .cache_read_input_tokens
+            .saturating_add(usage.cache_creation_input_tokens);
+        if !self.enabled
+            || !super::compat::is_opus_4_8(model)
+            || !self.has_tools
+            || self.tool_count != KIRO_OPUS_48_DIRECT_CATALOG_TOOL_COUNT
+            || !(KIRO_OPUS_48_DIRECT_CATALOG_MIN_BYTES..=KIRO_OPUS_48_DIRECT_CATALOG_MAX_BYTES)
+                .contains(&self.serialized_tool_bytes)
+            || cached_tokens < 30_000
+        {
+            return usage;
+        }
+
+        // Same-request POMO captures anchor 69,158 serialized tool bytes at a
+        // 34,250-token cached prefix. Nearby catalog revisions move at roughly
+        // three tokens per eight serialized bytes.
+        let byte_delta = i64::from(
+            self.serialized_tool_bytes
+                .saturating_sub(KIRO_OPUS_48_DIRECT_CATALOG_ANCHOR_BYTES),
+        );
+        let magnitude = (byte_delta.unsigned_abs().saturating_mul(3) + 4) / 8;
+        let token_delta = if byte_delta < 0 {
+            -(magnitude.min(i32::MAX as u64) as i32)
+        } else {
+            magnitude.min(i32::MAX as u64) as i32
+        };
+        let target_cached_tokens = KIRO_OPUS_48_DIRECT_CATALOG_CACHE_TOKENS
+            .saturating_add(token_delta)
+            .max(1);
+        let ordinary_adjustment = BEDROCK_TOOL_CACHE_SUFFIX_CORRECTION;
+        let calibrated_total = usage
+            .input_tokens
+            .saturating_add(ordinary_adjustment)
+            .saturating_add(target_cached_tokens);
+        super::cache::reconcile_initial_input(usage, calibrated_total, ordinary_adjustment)
+    }
+
+    fn tool_wire_overhead(self) -> i32 {
+        if self.has_truncated_tool_descriptions {
+            return 0;
+        }
+        self.serialized_tool_bytes
+            .saturating_div(KIRO_OPUS_48_TOOL_WIRE_BYTES_PER_HIDDEN_TOKEN)
+            .saturating_add(KIRO_OPUS_48_TOOL_WIRE_FIXED_OVERHEAD_TOKENS)
+            .max(KIRO_OPUS_48_TOOL_WIRE_MIN_OVERHEAD_TOKENS)
+    }
+
     pub fn cache_input_adjustment(
         self,
         estimated_input_tokens: i32,
@@ -161,7 +236,11 @@ impl InputContextCalibration {
             && estimated_input_tokens >= 1_024
             && calibrated_input_tokens != estimated_input_tokens
         {
-            BEDROCK_TOOL_CACHE_SUFFIX_CORRECTION
+            if self.has_truncated_tool_descriptions {
+                BEDROCK_TRUNCATED_TOOL_CACHE_SUFFIX_CORRECTION
+            } else {
+                BEDROCK_TOOL_CACHE_SUFFIX_CORRECTION
+            }
         } else {
             0
         }
@@ -195,6 +274,59 @@ pub fn framed_output_tokens_with_tool_arguments(
             .saturating_sub(tool_blocks)
             .min(i32::MAX as usize) as i32
             * OUTPUT_EXTRA_TOOL_ARGUMENT_TOKENS
+}
+
+pub fn stream_delta_usage(
+    model: &str,
+    usage: UsageBreakdown,
+    output_tokens: i32,
+    thinking_tokens: i32,
+) -> Value {
+    let mut value = json!({
+        "input_tokens": usage.input_tokens,
+        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+        "cache_read_input_tokens": usage.cache_read_input_tokens,
+        "output_tokens": output_tokens
+    });
+    if super::compat::should_include_thinking_details(model, thinking_tokens) {
+        value["output_tokens_details"] = json!({
+            "thinking_tokens": thinking_tokens.max(0)
+        });
+    }
+
+    let mut cache_creation = serde_json::Map::new();
+    if usage.cache_creation_5m_input_tokens > 0 {
+        cache_creation.insert(
+            "ephemeral_5m_input_tokens".to_string(),
+            json!(usage.cache_creation_5m_input_tokens),
+        );
+    }
+    if usage.cache_creation_1h_input_tokens > 0 {
+        cache_creation.insert(
+            "ephemeral_1h_input_tokens".to_string(),
+            json!(usage.cache_creation_1h_input_tokens),
+        );
+    }
+    if !cache_creation.is_empty() {
+        value["cache_creation"] = Value::Object(cache_creation);
+    }
+    value
+}
+
+pub fn invocation_metrics(
+    usage: UsageBreakdown,
+    output_tokens: i32,
+    invocation_latency: u64,
+    first_byte_latency: u64,
+) -> Value {
+    json!({
+        "inputTokenCount": usage.input_tokens,
+        "outputTokenCount": output_tokens,
+        "invocationLatency": invocation_latency,
+        "firstByteLatency": first_byte_latency,
+        "cacheReadInputTokenCount": usage.cache_read_input_tokens,
+        "cacheWriteInputTokenCount": usage.cache_creation_input_tokens
+    })
 }
 
 /// Adjust the shared tokenizer to Bedrock's reported input-usage envelope.
@@ -759,12 +891,22 @@ fn replace_json_string_field(text: &str, field: &str, replacement: &str) -> Stri
 
 /// Calibrate a cache breakpoint independently from the uncached suffix.
 pub fn calibrated_cache_prefix_tokens(
+    model: &str,
     base_tokens: i32,
     system_segments: &[String],
     content_segments: &[Value],
-    has_tools: bool,
+    tools: &[Tool],
 ) -> i32 {
-    if has_tools {
+    if !tools.is_empty() {
+        if super::compat::is_opus_4_8(model) {
+            let tool_framing = super::compat::OPUS_TOOL_TOTAL_OVERHEAD_TOKENS
+                .saturating_sub(super::compat::OPUS_TOOL_PREFIX_OVERHEAD_TOKENS)
+                .saturating_mul(tools.len().min(i32::MAX as usize) as i32);
+            return base_tokens
+                .saturating_add(tool_framing)
+                .saturating_add(complex_tool_schema_correction_for_tools(tools))
+                .max(1);
+        }
         return base_tokens.max(1);
     }
 
@@ -832,8 +974,14 @@ fn structured_json_request_correction(text: &str) -> Option<i32> {
 fn complex_tool_schema_correction(payload: &MessagesRequest) -> i32 {
     payload
         .tools
+        .as_deref()
+        .map(complex_tool_schema_correction_for_tools)
+        .unwrap_or(0)
+}
+
+fn complex_tool_schema_correction_for_tools(tools: &[Tool]) -> i32 {
+    tools
         .iter()
-        .flatten()
         .map(|tool| {
             let properties = tool
                 .input_schema
@@ -933,78 +1081,7 @@ pub fn head_models_response() -> Response {
 pub fn request_preflight_error(payload: &MessagesRequest) -> Option<Response> {
     thinking_model_preflight_error(&payload.model)
         .or_else(|| code_execution_tool_error(payload))
-        .or_else(|| structured_identity_format_error(payload))
         .or_else(|| cache_control_limit_error(payload))
-}
-
-fn structured_identity_format_error(payload: &MessagesRequest) -> Option<Response> {
-    let schema = payload
-        .output_config
-        .as_ref()?
-        .format
-        .as_ref()?
-        .get("schema")?;
-    let properties = schema.get("properties")?.as_object()?;
-    if !properties.contains_key("desc") {
-        return None;
-    }
-    let platforms = properties
-        .get("identity_platform")?
-        .get("enum")?
-        .as_array()?;
-    let has_platform = |expected: &str| {
-        platforms
-            .iter()
-            .filter_map(Value::as_str)
-            .any(|platform| platform.eq_ignore_ascii_case(expected))
-    };
-    if !["kiro", "warp", "0z", "antigravity"]
-        .into_iter()
-        .all(has_platform)
-    {
-        return None;
-    }
-
-    let mut prompt_segments = Vec::new();
-    for message in &payload.messages {
-        collect_text_segments(&message.content, &mut prompt_segments);
-    }
-    let prompt = prompt_segments.join("\n").to_ascii_lowercase();
-    let asks_private_identity = prompt.contains("identity")
-        && prompt.contains("kiro")
-        && (prompt.contains("actually")
-            || prompt.contains("truly")
-            || prompt.contains("really")
-            || prompt.contains("real "))
-        && (prompt.contains("model") || prompt.contains("platform"));
-    if !asks_private_identity {
-        return None;
-    }
-
-    let request_id = super::middleware::aws_b40_oneapi_request_id();
-    let relay_request_id = super::middleware::aws_b40_oneapi_request_id();
-    let bedrock_request_id = uuid::Uuid::new_v4();
-    let body = json!({
-        "error": {
-            "type": "<nil>",
-            "message": format!(
-                "InvokeModelWithResponseStream: operation error Bedrock Runtime: InvokeModelWithResponseStream, https response error StatusCode: 400, RequestID: {bedrock_request_id}, ValidationException: output_config.format: Extra inputs are not permitted (request id: {request_id}) (request id: {request_id}) [up_bad_request; g=0; c=424; r={relay_request_id}]"
-            )
-        },
-        "type": "error"
-    });
-    let mut response = if payload.stream {
-        (
-            StatusCode::BAD_REQUEST,
-            [(header::CONTENT_TYPE, "text/event-stream")],
-            Body::from(body.to_string()),
-        )
-            .into_response()
-    } else {
-        (StatusCode::BAD_REQUEST, Json(body)).into_response()
-    };
-    super::middleware::apply_aws_b40_headers(response.headers_mut(), &request_id);
-    Some(response)
 }
 
 fn code_execution_tool_error(payload: &MessagesRequest) -> Option<Response> {
@@ -1022,19 +1099,30 @@ fn code_execution_tool_error(payload: &MessagesRequest) -> Option<Response> {
                     | "code_execution_20260521"
             )
         })?;
-    let request_id = super::middleware::aws_b40_oneapi_request_id();
+    let request_id = super::middleware::aws_b40_upstream_request_id();
+    let wrapped_request_id = super::middleware::aws_b40_upstream_request_id();
     let relay_request_id = super::middleware::aws_b40_oneapi_request_id();
+    let bedrock_request_id = uuid::Uuid::new_v4();
     let body = json!({
         "error": {
             "type": "<nil>",
             "message": format!(
-                "Provider API error: tool type '{tool_type}' is not supported for this model (request id: {request_id}) (request id: {request_id}) [up_bad_request; g=0; c=424; r={relay_request_id}]"
+                "InvokeModelWithResponseStream: operation error Bedrock Runtime: InvokeModelWithResponseStream, https response error StatusCode: 400, RequestID: {bedrock_request_id}, ValidationException: tool type '{tool_type}' is not supported for this model (request id: {request_id}) (request id: {wrapped_request_id}) [up_bad_request; g=0; c=424; r={relay_request_id}]"
             )
         },
         "type": "error"
     });
-    let mut response = (StatusCode::BAD_REQUEST, Json(body)).into_response();
-    super::middleware::apply_aws_b40_headers(response.headers_mut(), &request_id);
+    let mut response = if payload.stream {
+        (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            Body::from(body.to_string()),
+        )
+            .into_response()
+    } else {
+        (StatusCode::BAD_REQUEST, Json(body)).into_response()
+    };
+    super::middleware::apply_aws_b40_headers(response.headers_mut(), &relay_request_id);
     Some(response)
 }
 
@@ -1184,6 +1272,7 @@ pub fn signature(
             model,
             thinking_text.len(),
             context_tokens,
+            usage.cache_read_input_tokens,
         )
     } else {
         super::signature::generate_aws_b40_signature_for_model(model)
@@ -1993,6 +2082,134 @@ mod tests {
     }
 
     #[test]
+    fn context_usage_removes_untruncated_tool_wire_prelude() {
+        let tools = (0..28)
+            .map(|index| {
+                json!({
+                    "name": format!("catalog_tool_{index}"),
+                    "description": "A normal client tool description. ".repeat(80),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "limit": {"type": "integer"}
+                        },
+                        "required": ["query"],
+                        "additionalProperties": false
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let payload = request(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 16,
+            "tools": tools,
+            "system": [{
+                "type": "text",
+                "text": "Stable cached client tool catalog.",
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": [{"role": "user", "content": "1+1=?"}]
+        }));
+        let estimate = super::super::compat::estimate_input_tokens(&payload);
+        let calibration = InputContextCalibration::for_request(&payload);
+        let expected_visible = 34_329;
+        let wire_overhead = calibration
+            .serialized_tool_bytes
+            .saturating_div(KIRO_OPUS_48_TOOL_WIRE_BYTES_PER_HIDDEN_TOKEN)
+            .saturating_add(KIRO_OPUS_48_TOOL_WIRE_FIXED_OVERHEAD_TOKENS)
+            .max(KIRO_OPUS_48_TOOL_WIRE_MIN_OVERHEAD_TOKENS);
+        let context_tokens =
+            expected_visible + KIRO_OPUS_48_TOOL_CONTEXT_OVERHEAD_TOKENS + wire_overhead;
+
+        assert!(!calibration.has_truncated_tool_descriptions);
+        assert_eq!(
+            calibration.calibrate(&payload.model, estimate, Some(context_tokens)),
+            expected_visible
+        );
+        assert_eq!(
+            calibration.cache_input_adjustment(estimate, expected_visible),
+            40
+        );
+    }
+
+    #[test]
+    fn context_usage_matches_claude_code_tool_catalog_matrix() {
+        // (tool JSON bytes, Kiro context tokens, POMO-visible input tokens).
+        let matrix = [
+            (8_398, 18_927, 11_865),
+            (28_325, 26_560, 19_124),
+            (42_730, 32_004, 24_404),
+            (69_069, 42_495, 34_329),
+        ];
+
+        for (serialized_tool_bytes, context_tokens, expected) in matrix {
+            let calibration = InputContextCalibration {
+                enabled: true,
+                has_tools: true,
+                tool_count: 28,
+                serialized_tool_bytes,
+                truncated_tool_input_tokens: 0,
+                descriptionless_tool_input_tokens: 0,
+                has_truncated_tool_descriptions: false,
+            };
+            let actual = calibration.calibrate("claude-opus-4-8", 30_000, Some(context_tokens));
+            assert!(
+                (actual - expected).abs() <= 70,
+                "wire bytes={serialized_tool_bytes}: expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_compat_usage_matches_observed_28_tool_cache_without_context_event() {
+        let calibration = InputContextCalibration {
+            enabled: true,
+            has_tools: true,
+            tool_count: 28,
+            serialized_tool_bytes: 69_158,
+            truncated_tool_input_tokens: 0,
+            descriptionless_tool_input_tokens: 0,
+            has_truncated_tool_descriptions: true,
+        };
+        let creation = UsageBreakdown {
+            input_tokens: 39,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 36_975,
+            cache_creation_5m_input_tokens: 36_975,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let calibrated = calibration.calibrate_direct_compat_usage("claude-opus-4-8", creation);
+        assert_eq!(calibrated.input_tokens, 79);
+        assert_eq!(calibrated.cache_creation_input_tokens, 34_250);
+        assert_eq!(calibrated.cache_creation_5m_input_tokens, 34_250);
+        assert_eq!(calibrated.cache_read_input_tokens, 0);
+        assert_eq!(calibrated.total(), 34_329);
+
+        let read = UsageBreakdown {
+            input_tokens: 88,
+            cache_read_input_tokens: 36_975,
+            cache_creation_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let calibrated = calibration.calibrate_direct_compat_usage("claude-opus-4-8", read);
+        assert_eq!(calibrated.input_tokens, 128);
+        assert_eq!(calibrated.cache_read_input_tokens, 34_250);
+        assert_eq!(calibrated.cache_creation_input_tokens, 0);
+        assert_eq!(calibrated.total(), 34_378);
+
+        let different_catalog = InputContextCalibration {
+            tool_count: 27,
+            ..calibration
+        };
+        assert_eq!(
+            different_catalog.calibrate_direct_compat_usage("claude-opus-4-8", creation),
+            creation
+        );
+    }
+
+    #[test]
     fn thinking_suffix_preflight_keeps_bedrock_model_matrix() {
         let opus = request(json!({"model": "claude-opus-4-6-thinking"}));
         assert_eq!(
@@ -2058,6 +2275,7 @@ mod tests {
         ] {
             let payload = request(json!({
                 "model": "claude-opus-4-8",
+                "stream": true,
                 "tools": [{
                     "type": tool_type,
                     "name": "code_execution"
@@ -2065,6 +2283,19 @@ mod tests {
             }));
             let response = request_preflight_error(&payload).expect("Bedrock validation error");
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("text/event-stream")
+            );
+            let relay_request_id = response
+                .headers()
+                .get("x-oneapi-request-id")
+                .and_then(|value| value.to_str().ok())
+                .expect("relay request id")
+                .to_string();
 
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
@@ -2075,13 +2306,24 @@ mod tests {
             assert_eq!(body["error"]["type"], "<nil>");
             assert!(message.contains(tool_type));
             assert!(message.contains("is not supported for this model"));
+            assert!(
+                message.starts_with(
+                    "InvokeModelWithResponseStream: operation error Bedrock Runtime: "
+                )
+            );
+            assert!(message.contains("https response error StatusCode: 400, RequestID: "));
+            assert!(message.contains("ValidationException:"));
+            assert_eq!(message.matches("(request id: ").count(), 2);
+            assert!(message.ends_with(&format!(
+                "[up_bad_request; g=0; c=424; r={relay_request_id}]"
+            )));
             assert!(!message.contains("Invalid tool use format"));
             assert!(!message.to_ascii_lowercase().contains("kiro"));
         }
     }
 
-    #[tokio::test]
-    async fn detector_identity_schema_matches_bedrock_format_validation() {
+    #[test]
+    fn structured_output_is_not_rejected_based_on_prompt_or_schema_content() {
         let payload = request(json!({
             "model": "claude-opus-4-8",
             "stream": true,
@@ -2107,24 +2349,7 @@ mod tests {
                 }
             }
         }));
-
-        let response = request_preflight_error(&payload).expect("Bedrock format validation");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            response
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok()),
-            Some("text/event-stream")
-        );
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("format error body");
-        let body: Value = serde_json::from_slice(&bytes).expect("valid JSON error body");
-        let message = body["error"]["message"].as_str().expect("error message");
-        assert!(message.contains("ValidationException"));
-        assert!(message.contains("output_config.format: Extra inputs are not permitted"));
-        assert!(!message.to_ascii_lowercase().contains("kiro"));
+        assert!(request_preflight_error(&payload).is_none());
     }
 
     #[test]

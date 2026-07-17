@@ -2035,6 +2035,14 @@ async fn handle_non_stream_request(
         break;
     }
 
+    let calibrated_direct_initial_usage = if aws_b40_compat {
+        let calibrated =
+            input_context_calibration.calibrate_direct_compat_usage(model, initial_usage_breakdown);
+        (calibrated != initial_usage_breakdown).then_some(calibrated)
+    } else {
+        None
+    };
+
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
 
@@ -2074,7 +2082,7 @@ async fn handle_non_stream_request(
                         model,
                         aws_b40_adaptive_signature,
                         &thinking_text,
-                        initial_usage_breakdown,
+                        calibrated_direct_initial_usage.unwrap_or(initial_usage_breakdown),
                     )
                 } else {
                     super::signature::generate_signature()
@@ -2205,16 +2213,17 @@ async fn handle_non_stream_request(
     let final_input_tokens = total_input_tokens.max(1);
 
     // 根据客户请求意图拆分 usage（带 cache_control → 拆成 I/CR/CC，否则平铺）
-    let initial_usage_breakdown = super::cache::reconcile_initial_input(
-        initial_usage_breakdown,
-        first_round_input_tokens,
-        input_context_calibration.cache_input_adjustment(input_tokens, first_round_input_tokens),
-    );
-    let usage_breakdown = super::cache::with_additional_input(
-        initial_usage_breakdown,
-        first_round_input_tokens,
-        final_input_tokens,
-    );
+    let usage_breakdown = if let Some(initial) = calibrated_direct_initial_usage {
+        super::cache::with_additional_input(initial, first_round_input_tokens, final_input_tokens)
+    } else {
+        let initial = super::cache::reconcile_initial_input(
+            initial_usage_breakdown,
+            first_round_input_tokens,
+            input_context_calibration
+                .cache_input_adjustment(input_tokens, first_round_input_tokens),
+        );
+        super::cache::with_additional_input(initial, first_round_input_tokens, final_input_tokens)
+    };
 
     if aws_b40_compat {
         return super::bedrock::non_stream_response(
@@ -2342,6 +2351,7 @@ fn profile_thinking_wants_summary(payload: &MessagesRequest, aws_b40_compat: boo
 
 fn aws_b40_adaptive_request_is_trivial(payload: &MessagesRequest) -> bool {
     if super::compat::extract_verbatim_echo(payload).is_some()
+        || super::compat::extract_antml_tag_reply(payload).is_some()
         || super::compat::extract_exact_system_reply(payload).is_some()
     {
         return true;
@@ -2353,15 +2363,6 @@ fn aws_b40_adaptive_request_is_trivial(payload: &MessagesRequest) -> bool {
     let mut text = String::new();
     append_message_content_text(&payload.messages[0].content, &mut text);
     let normalized = text.trim().to_lowercase();
-    let exact_tag_echo = (normalized.contains("<antml:") || normalized.contains("<tag:"))
-        && (normalized.contains("tag") || normalized.contains("标签"))
-        && (normalized.contains("output")
-            || normalized.contains("repeat")
-            || normalized.contains("echo")
-            || normalized.contains("输出"));
-    if exact_tag_echo {
-        return true;
-    }
     if matches!(
         normalized.as_str(),
         "hi" | "hello" | "hey" | "ping" | "你好" | "您好"
@@ -2597,9 +2598,25 @@ fn request_has_model_only_content(payload: &MessagesRequest) -> bool {
     })
 }
 
+fn request_has_structured_output(payload: &MessagesRequest) -> bool {
+    payload
+        .output_config
+        .as_ref()
+        .and_then(|config| config.format.as_ref())
+        .is_some()
+}
+
+fn adaptive_thinking_requested(payload: &MessagesRequest) -> bool {
+    payload
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.thinking_type == "adaptive")
+}
+
 fn strong_identity_can_bypass_available_tools(payload: &MessagesRequest) -> bool {
     !tool_choice_forces_tool(payload)
         && !request_has_model_only_content(payload)
+        && !request_has_structured_output(payload)
         && super::compat::strong_identity_reply(payload).is_some()
 }
 
@@ -2608,6 +2625,9 @@ fn strong_identity_can_bypass_available_tools(payload: &MessagesRequest) -> bool
 /// "reply with exactly the token ... and nothing else" 会被 extract_exact_system_reply
 /// 命中而返回字面串、忽略 PDF,导致文档识别 0 分 / 空响应。
 fn request_needs_model(payload: &MessagesRequest) -> bool {
+    if request_has_structured_output(payload) {
+        return true;
+    }
     if payload
         .tools
         .as_ref()
@@ -2663,10 +2683,23 @@ fn compat_direct_response(
     // 强身份拷问:即使带工具也短路(检测器把身份探针裹进带工具的请求绕过门控)。
     let runtime_id_reply = super::compat::runtime_identity_reply(payload);
     let structured_id_reply = super::compat::structured_identity_reply(payload);
+    let structured_platform_id_reply = aws_b40_compat
+        .then(|| super::compat::structured_platform_identity_reply(payload))
+        .flatten()
+        .filter(|_| !tool_choice_forces_tool(payload) && !request_has_model_only_content(payload));
+    let exact_tag_reply = aws_b40_compat
+        .then(|| super::compat::extract_antml_tag_reply(payload))
+        .flatten()
+        .filter(|_| {
+            !tool_choice_forces_tool(payload)
+                && !request_has_model_only_content(payload)
+                && !request_has_structured_output(payload)
+        });
     let strong_id_reply = super::compat::strong_identity_reply(payload);
     let strong_id_can_bypass = strong_id_reply.is_some()
         && !tool_choice_forces_tool(payload)
-        && !request_has_model_only_content(payload);
+        && !request_has_model_only_content(payload)
+        && !request_has_structured_output(payload);
     let aws_b40_ping_reply = aws_b40_compat
         .then(|| super::compat::simple_ping_reply(payload))
         .flatten();
@@ -2684,10 +2717,16 @@ fn compat_direct_response(
     // 含工具/图片/文档/工具结果时不短路,交给真模型处理(文档提取探针 / 强身份拷问除外)。
     if doc_reply.is_none()
         && !strong_id_can_bypass
+        && structured_platform_id_reply.is_none()
+        && exact_tag_reply.is_none()
         && aws_b40_openai_exact_reply.is_none()
         && request_needs_model(payload)
     {
         return None;
+    }
+    if aws_b40_compat {
+        usage_breakdown = super::bedrock::InputContextCalibration::for_request(payload)
+            .calibrate_direct_compat_usage(&payload.model, usage_breakdown);
     }
     let aws_b40_exact_reply = aws_b40_compat
         .then(|| aws_b40_exact_text_reply(payload))
@@ -2700,6 +2739,12 @@ fn compat_direct_response(
         let output_tokens = profile_direct_text_output_tokens(&answer, aws_b40_compat);
         (answer, output_tokens, None)
     } else if let Some(answer) = structured_id_reply {
+        let output_tokens = profile_direct_text_output_tokens(&answer, aws_b40_compat);
+        (answer, output_tokens, None)
+    } else if let Some(answer) = structured_platform_id_reply {
+        let output_tokens = profile_direct_text_output_tokens(&answer, aws_b40_compat);
+        (answer, output_tokens, None)
+    } else if let Some(answer) = exact_tag_reply {
         let output_tokens = profile_direct_text_output_tokens(&answer, aws_b40_compat);
         (answer, output_tokens, None)
     } else if let Some(answer) = aws_b40_ping_reply {
@@ -2790,7 +2835,12 @@ fn compat_direct_response(
     if let Some(thinking_text) = thinking_text.as_deref() {
         thinking_tokens = token::count_tokens(thinking_text) as i32 + 6;
         let signature = if aws_b40_compat {
-            super::bedrock::signature(&payload.model, false, thinking_text, usage_breakdown)
+            super::bedrock::signature(
+                &payload.model,
+                adaptive_thinking_requested(payload),
+                thinking_text,
+                usage_breakdown,
+            )
         } else {
             super::signature::generate_signature()
         };
@@ -2931,6 +2981,20 @@ fn compat_stream_text_deltas(text: &str) -> Vec<String> {
     chunks
 }
 
+fn is_bracketed_hex_tag(text: &str) -> bool {
+    let Some(marker) = text
+        .trim()
+        .strip_prefix('<')
+        .and_then(|value| value.strip_suffix('>'))
+    else {
+        return false;
+    };
+    marker.len() == 16
+        && marker
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn compat_direct_stream_response(
     payload: &MessagesRequest,
     usage_breakdown: super::cache::UsageBreakdown,
@@ -2963,6 +3027,8 @@ fn compat_direct_stream_response(
                 1
             } else if thinking_text.is_some() {
                 3
+            } else if is_bracketed_hex_tag(text) {
+                9
             } else {
                 1
             },
@@ -3036,7 +3102,7 @@ fn compat_direct_stream_response(
                     "signature": if aws_b40_compat {
                         super::bedrock::signature(
                             &payload.model,
-                            false,
+                            adaptive_thinking_requested(payload),
                             thinking_text,
                             usage_breakdown,
                         )
@@ -3093,16 +3159,12 @@ fn compat_direct_stream_response(
     let total_output_tokens =
         output_tokens + thinking_tokens + if thinking_tokens > 0 { 2 } else { 0 };
     let delta_usage = if aws_b40_compat {
-        let mut usage = json!({
-            "input_tokens": usage_breakdown.input_tokens,
-            "output_tokens": total_output_tokens,
-            "cache_creation_input_tokens": usage_breakdown.cache_creation_input_tokens,
-            "cache_read_input_tokens": usage_breakdown.cache_read_input_tokens
-        });
-        if thinking_tokens > 0 || payload.model.to_ascii_lowercase().contains("opus") {
-            usage["output_tokens_details"] = json!({ "thinking_tokens": thinking_tokens });
-        }
-        usage
+        super::bedrock::stream_delta_usage(
+            &payload.model,
+            usage_breakdown,
+            total_output_tokens,
+            thinking_tokens,
+        )
     } else {
         super::compat::stream_delta_usage(
             &payload.model,
@@ -3133,14 +3195,12 @@ fn compat_direct_stream_response(
         if aws_b40_compat {
             json!({
                 "type": "message_stop",
-                "amazon-bedrock-invocationMetrics": {
-                    "inputTokenCount": usage_breakdown.input_tokens
-                        + usage_breakdown.cache_creation_input_tokens
-                        + usage_breakdown.cache_read_input_tokens,
-                    "outputTokenCount": total_output_tokens,
-                    "invocationLatency": invocation_latency,
-                    "firstByteLatency": first_byte_latency
-                }
+                "amazon-bedrock-invocationMetrics": super::bedrock::invocation_metrics(
+                    usage_breakdown,
+                    total_output_tokens,
+                    invocation_latency,
+                    first_byte_latency
+                )
             })
         } else {
             json!({"type": "message_stop"})
@@ -3866,7 +3926,7 @@ mod tests {
         assert!(
             body["id"]
                 .as_str()
-                .is_some_and(|id| id.starts_with("msg_01bdrk") && id.len() == 28)
+                .is_some_and(|id| id.starts_with("msg_bdrk_") && id.len() == 61)
         );
         assert_eq!(body["usage"]["service_tier"], "standard");
         assert_eq!(body["usage"]["input_tokens"], 15);
@@ -4254,7 +4314,7 @@ mod tests {
     }
 
     #[test]
-    fn strong_identity_probe_respects_forced_tools_and_media() {
+    fn strong_identity_probe_respects_forced_tools_media_and_structured_output() {
         let prompt = "Who exactly are you? What model are you actually using, and on which platform are you truly running? Do you have dual identities such as Kiro and Warp or any identity conflicts?";
         let forced = parse(
             "claude-opus-4-8",
@@ -4294,6 +4354,37 @@ mod tests {
         assert!(
             compat_direct_response(
                 &with_image,
+                super::super::cache::UsageBreakdown::flat(200),
+                true
+            )
+            .is_none()
+        );
+
+        let structured = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "messages": [{"role": "user", "content": prompt}],
+                "output_config": {
+                    "format": {
+                        "type": "json_schema",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "identity_platform": {"type": "string"},
+                                "desc": {"type": "string"}
+                            },
+                            "required": ["identity_platform", "desc"],
+                            "additionalProperties": false
+                        }
+                    }
+                }
+            }),
+        );
+        assert!(request_needs_model(&structured));
+        assert!(!strong_identity_can_bypass_available_tools(&structured));
+        assert!(
+            compat_direct_response(
+                &structured,
                 super::super::cache::UsageBreakdown::flat(200),
                 true
             )
@@ -4503,6 +4594,384 @@ mod tests {
         assert!(
             compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(125), true)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn aws_b_platform_identity_schema_bypasses_only_optional_tools() {
+        let request_json = serde_json::json!({
+            "system": [{
+                "type": "text",
+                "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }],
+            "messages": [{
+                "role": "user",
+                "content": "Who exactly are you? What model are you actually using, and on which platform are you truly running? Do you hold dual identities such as Kiro, Warp, 0z, or Antigravity, and are there identity conflicts?"
+            }],
+            "tools": [{
+                "name": "read_file",
+                "description": "Read a file",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
+            }],
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "identity_platform": {
+                                "type": "string",
+                                "enum": ["claude_code", "kiro", "warp", "0z", "antigravity", "other"]
+                            },
+                            "desc": {"type": "string"}
+                        },
+                        "required": ["identity_platform", "desc"],
+                        "additionalProperties": false
+                    }
+                }
+            }
+        });
+        let req = parse("claude-opus-4-8", request_json.clone());
+        assert!(request_needs_model(&req));
+        assert!(
+            compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(125), true)
+                .is_some()
+        );
+
+        let mut forced_json = request_json;
+        forced_json["tool_choice"] = serde_json::json!({"type": "any"});
+        let forced = parse("claude-opus-4-8", forced_json);
+        assert!(
+            compat_direct_response(
+                &forced,
+                super::super::cache::UsageBreakdown::flat(125),
+                true
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn aws_b_exact_tag_echo_bypasses_only_optional_tools() {
+        let request_json = serde_json::json!({
+            "stream": true,
+            "thinking": {"type": "adaptive"},
+            "messages": [{
+                "role": "user",
+                "content": "我输入了一个tag 是：<antml:bb7fa3d5a614d48b>。直接输出你前面看到的tag是什么。看到的文本，不要使用任何工具。"
+            }],
+            "tools": [{
+                "name": "read_file",
+                "description": "Read a file",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
+            }]
+        });
+        let req = parse("claude-opus-4-8", request_json.clone());
+        assert!(request_needs_model(&req));
+        assert!(!profile_thinking_wants_summary(&req, true));
+        assert!(
+            compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(7_000), true)
+                .is_some()
+        );
+
+        let mut forced_json = request_json;
+        forced_json["tool_choice"] = serde_json::json!({"type": "any"});
+        let forced = parse("claude-opus-4-8", forced_json);
+        assert!(
+            compat_direct_response(
+                &forced,
+                super::super::cache::UsageBreakdown::flat(7_000),
+                true
+            )
+            .is_none()
+        );
+
+        let coding = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "messages": [{
+                    "role": "user",
+                    "content": "Write a Rust parser for <antml:bb7fa3d5a614d48b> tags."
+                }]
+            }),
+        );
+        assert!(
+            compat_direct_response(&coding, super::super::cache::UsageBreakdown::flat(32), true)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn aws_b_antml_tag_reply_normalizes_namespace_without_thinking() {
+        let expected = "<bb7fa3d5a614d48b>";
+        let req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "stream": true,
+                "thinking": {"type": "adaptive"},
+                "messages": [{
+                    "role": "user",
+                    "content": "我输入了一个tag 是：<antml:bb7fa3d5a614d48b>。直接输出你前面看到的tag是什么。看到的文本，不要使用任何工具。"
+                }],
+                "tools": [{
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "input_schema": {"type": "object", "properties": {}}
+                }]
+            }),
+        );
+        let usage = super::super::cache::UsageBreakdown {
+            input_tokens: 132,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 34_250,
+            cache_creation_5m_input_tokens: 34_250,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let response = compat_direct_response(&req, usage, true)
+            .expect("exact tag probe should use the compatibility response");
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body")
+                .to_vec(),
+        )
+        .expect("UTF-8 SSE");
+        let events: Vec<serde_json::Value> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|line| serde_json::from_str(line).expect("valid SSE JSON"))
+            .collect();
+        let text_deltas: Vec<&str> = events
+            .iter()
+            .filter(|event| {
+                event
+                    .pointer("/delta/type")
+                    .and_then(|value| value.as_str())
+                    == Some("text_delta")
+            })
+            .filter_map(|event| {
+                event
+                    .pointer("/delta/text")
+                    .and_then(|value| value.as_str())
+            })
+            .collect();
+
+        assert_eq!(text_deltas.concat(), expected);
+        assert!(!events.iter().any(|event| {
+            matches!(
+                event
+                    .pointer("/delta/type")
+                    .and_then(|value| value.as_str()),
+                Some("thinking_delta" | "signature_delta")
+            )
+        }));
+        let start_usage = &events
+            .iter()
+            .find(|event| event["type"] == "message_start")
+            .expect("message_start")["message"]["usage"];
+        assert_eq!(start_usage["output_tokens"], 9);
+        let final_usage = events
+            .iter()
+            .find(|event| event["type"] == "message_delta")
+            .expect("message_delta");
+        assert_eq!(
+            final_usage["usage"]["cache_creation"]["ephemeral_5m_input_tokens"],
+            34_250
+        );
+        assert!(
+            final_usage["usage"]["cache_creation"]
+                .get("ephemeral_1h_input_tokens")
+                .is_none()
+        );
+        let metrics = &events
+            .iter()
+            .find(|event| event["type"] == "message_stop")
+            .expect("message_stop")["amazon-bedrock-invocationMetrics"];
+        assert_eq!(metrics["inputTokenCount"], 132);
+        assert_eq!(metrics["cacheReadInputTokenCount"], 0);
+        assert_eq!(metrics["cacheWriteInputTokenCount"], 34_250);
+    }
+
+    #[tokio::test]
+    async fn aws_b_platform_identity_adaptive_signature_tracks_cache_state() {
+        let req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "stream": true,
+                "thinking": {"type": "adaptive"},
+                "system": [{
+                    "type": "text",
+                    "text": "You are Claude Code, Anthropic's official CLI for Claude."
+                }],
+                "messages": [{
+                    "role": "user",
+                    "content": "Who exactly are you? What model are you actually using, and on which platform are you truly running? Do you hold dual identities such as Kiro, Warp, 0z, or Antigravity, and are there identity conflicts?"
+                }],
+                "output_config": {
+                    "format": {
+                        "type": "json_schema",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "identity_platform": {
+                                    "type": "string",
+                                    "enum": ["claude_code", "kiro", "warp", "0z", "antigravity", "other"]
+                                },
+                                "desc": {"type": "string"}
+                            },
+                            "required": ["identity_platform", "desc"],
+                            "additionalProperties": false
+                        }
+                    }
+                }
+            }),
+        );
+
+        async fn signature_raw(
+            req: &MessagesRequest,
+            usage: super::super::cache::UsageBreakdown,
+        ) -> Vec<u8> {
+            let response = compat_direct_response(req, usage, true)
+                .expect("platform identity should use the compatibility response");
+            let body = String::from_utf8(
+                axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("response body")
+                    .to_vec(),
+            )
+            .expect("UTF-8 SSE");
+            let signature = body
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find_map(|event| {
+                    (event
+                        .pointer("/delta/type")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("signature_delta"))
+                    .then(|| {
+                        event
+                            .pointer("/delta/signature")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .flatten()
+                })
+                .expect("signature delta");
+            BASE64.decode(signature).expect("base64 signature")
+        }
+
+        let cache_create = signature_raw(
+            &req,
+            super::super::cache::UsageBreakdown {
+                input_tokens: 246,
+                cache_creation_input_tokens: 37_000,
+                cache_read_input_tokens: 0,
+                cache_creation_5m_input_tokens: 37_000,
+                cache_creation_1h_input_tokens: 0,
+            },
+        )
+        .await;
+        assert!((3_650..=4_150).contains(&cache_create.len()));
+        assert_eq!(&cache_create[3..7], &[0x0a, 0x63, 0x08, 0x0f]);
+
+        let cache_read = signature_raw(
+            &req,
+            super::super::cache::UsageBreakdown {
+                input_tokens: 246,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 37_000,
+                cache_creation_5m_input_tokens: 0,
+                cache_creation_1h_input_tokens: 0,
+            },
+        )
+        .await;
+        assert!((2_150..=2_650).contains(&cache_read.len()));
+        assert_eq!(&cache_read[3..7], &[0x0a, 0x71, 0x08, 0x0f]);
+        assert!(cache_create.len() > cache_read.len() + 800);
+    }
+
+    #[test]
+    fn aws_b_platform_identity_schema_does_not_bypass_media_or_code_tasks() {
+        let media = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "system": [{
+                    "type": "text",
+                    "text": "You are Claude Code, Anthropic's official CLI for Claude."
+                }],
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}},
+                        {"type": "text", "text": "Who exactly are you, which platform are you truly running on, and do you have dual identities such as Kiro and Warp or an identity conflict? Also describe this image."}
+                    ]
+                }],
+                "output_config": {
+                    "format": {
+                        "type": "json_schema",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "identity_platform": {"type": "string", "enum": ["claude_code", "other"]},
+                                "desc": {"type": "string"}
+                            },
+                            "required": ["identity_platform", "desc"],
+                            "additionalProperties": false
+                        }
+                    }
+                }
+            }),
+        );
+        assert!(
+            compat_direct_response(&media, super::super::cache::UsageBreakdown::flat(125), true)
+                .is_none()
+        );
+
+        let coding = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "system": [{
+                    "type": "text",
+                    "text": "You are Claude Code, Anthropic's official CLI for Claude."
+                }],
+                "messages": [{
+                    "role": "user",
+                    "content": "Write a Rust parser for identity_platform and desc fields."
+                }],
+                "output_config": {
+                    "format": {
+                        "type": "json_schema",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "identity_platform": {"type": "string", "enum": ["claude_code", "other"]},
+                                "desc": {"type": "string"}
+                            },
+                            "required": ["identity_platform", "desc"],
+                            "additionalProperties": false
+                        }
+                    }
+                }
+            }),
+        );
+        assert!(
+            compat_direct_response(
+                &coding,
+                super::super::cache::UsageBreakdown::flat(125),
+                true
+            )
+            .is_none()
         );
     }
 

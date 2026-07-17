@@ -178,13 +178,13 @@ fn generate_random_id_8() -> String {
 /// The random server-tool ID scopes these deterministic tokens to one response;
 /// later turns do not need to decode them because the visible answer text is kept
 /// in conversation history.
-fn opaque_websearch_token(
+fn opaque_websearch_bytes(
     domain: &str,
     tool_use_id: &str,
     ordinal: usize,
     result: &WebSearchResult,
     output_bytes: usize,
-) -> String {
+) -> Vec<u8> {
     let mut output = Vec::with_capacity(output_bytes);
     let mut counter = 0_u32;
 
@@ -208,15 +208,97 @@ fn opaque_websearch_token(
     }
 
     output.truncate(output_bytes);
-    BASE64_STANDARD.encode(output)
+    output
+}
+
+fn push_varint(output: &mut Vec<u8>, mut value: usize) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        output.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+fn push_varint_field(output: &mut Vec<u8>, field: u8, value: usize) {
+    output.push(field << 3);
+    push_varint(output, value);
+}
+
+fn push_len_field(output: &mut Vec<u8>, field: u8, value: &[u8]) {
+    output.push((field << 3) | 2);
+    push_varint(output, value.len());
+    output.extend_from_slice(value);
+}
+
+fn opaque_websearch_uuid(
+    domain: &str,
+    tool_use_id: &str,
+    ordinal: usize,
+    result: &WebSearchResult,
+) -> String {
+    let mut bytes = opaque_websearch_bytes(domain, tool_use_id, ordinal, result, 16);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+fn opaque_websearch_token(
+    domain: &str,
+    kind: usize,
+    protobuf_inner_bytes: usize,
+    tool_use_id: &str,
+    ordinal: usize,
+    result: &WebSearchResult,
+) -> String {
+    let mut metadata = Vec::with_capacity(42);
+    push_varint_field(&mut metadata, 1, kind);
+    push_varint_field(&mut metadata, 3, 1);
+    push_len_field(
+        &mut metadata,
+        4,
+        opaque_websearch_uuid(domain, tool_use_id, ordinal, result).as_bytes(),
+    );
+
+    let mut inner = Vec::with_capacity(protobuf_inner_bytes);
+    push_len_field(&mut inner, 1, &metadata);
+    let remaining = protobuf_inner_bytes.saturating_sub(inner.len());
+    let payload_bytes = if remaining >= 128 {
+        remaining - 3
+    } else {
+        remaining - 2
+    };
+    let payload = opaque_websearch_bytes(domain, tool_use_id, ordinal, result, payload_bytes);
+    push_len_field(&mut inner, 2, &payload);
+    debug_assert_eq!(inner.len(), protobuf_inner_bytes);
+
+    let mut envelope = Vec::with_capacity(protobuf_inner_bytes + 3);
+    push_len_field(&mut envelope, 2, &inner);
+    BASE64_STANDARD.encode(envelope)
 }
 
 fn encrypted_content_token(tool_use_id: &str, ordinal: usize, result: &WebSearchResult) -> String {
-    opaque_websearch_token("content", tool_use_id, ordinal, result, 512)
+    opaque_websearch_token("content", 1, 4_008, tool_use_id, ordinal, result)
 }
 
 fn encrypted_index_token(tool_use_id: &str, ordinal: usize, result: &WebSearchResult) -> String {
-    opaque_websearch_token("index", tool_use_id, ordinal, result, 64)
+    opaque_websearch_token("index", 2, 143, tool_use_id, ordinal, result)
 }
 
 /// 创建 MCP 请求
@@ -538,16 +620,13 @@ fn generate_websearch_events(
         (summary.len() as i32 + 3) / 4
     };
     let delta_usage = if aws_b40_compat {
-        let mut usage = json!({
-            "input_tokens": input_tokens,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0,
-            "output_tokens": output_tokens,
-            "server_tool_use": { "web_search_requests": 1 }
-        });
-        if model.to_ascii_lowercase().contains("opus") {
-            usage["output_tokens_details"] = json!({ "thinking_tokens": 0 });
-        }
+        let mut usage = super::bedrock::stream_delta_usage(
+            model,
+            super::cache::UsageBreakdown::flat(input_tokens),
+            output_tokens,
+            0,
+        );
+        usage["server_tool_use"] = json!({ "web_search_requests": 1 });
         usage
     } else {
         json!({
@@ -574,12 +653,12 @@ fn generate_websearch_events(
         if aws_b40_compat {
             json!({
                 "type": "message_stop",
-                "amazon-bedrock-invocationMetrics": {
-                    "inputTokenCount": input_tokens,
-                    "outputTokenCount": output_tokens,
-                    "invocationLatency": invocation_latency_ms,
-                    "firstByteLatency": invocation_latency_ms
-                }
+                "amazon-bedrock-invocationMetrics": super::bedrock::invocation_metrics(
+                    super::cache::UsageBreakdown::flat(input_tokens),
+                    output_tokens,
+                    invocation_latency_ms,
+                    invocation_latency_ms
+                )
             })
         } else {
             json!({ "type": "message_stop" })
@@ -1060,8 +1139,21 @@ mod tests {
         let decoded_content = BASE64_STANDARD.decode(&content).unwrap();
 
         assert_eq!(content, content_again);
-        assert_eq!(decoded_content.len(), 512);
-        assert_eq!(BASE64_STANDARD.decode(&index).unwrap().len(), 64);
+        let decoded_index = BASE64_STANDARD.decode(&index).unwrap();
+        assert_eq!(decoded_content.len(), 4_011);
+        assert_eq!(decoded_index.len(), 146);
+        assert_eq!(&decoded_content[..5], &[0x12, 0xa8, 0x1f, 0x0a, 0x2a]);
+        assert_eq!(&decoded_index[..5], &[0x12, 0x8f, 0x01, 0x0a, 0x2a]);
+        assert_eq!(
+            &decoded_content[5..11],
+            &[0x08, 0x01, 0x18, 0x01, 0x22, 0x24]
+        );
+        assert_eq!(&decoded_index[5..11], &[0x08, 0x02, 0x18, 0x01, 0x22, 0x24]);
+        assert_ne!(
+            &decoded_content[11..47],
+            &decoded_index[11..47],
+            "content and citation tokens use distinct metadata UUIDs"
+        );
         assert_ne!(content, index);
         assert!(
             !decoded_content
@@ -1078,5 +1170,113 @@ mod tests {
             encrypted_content_token("srvtoolu_01DifferentResponse", 0, &result)
         );
         assert_ne!(content, encrypted_content_token(tool_use_id, 1, &result));
+    }
+
+    #[test]
+    fn aws_b_websearch_sse_uses_opaque_bedrock_tokens_and_metrics() {
+        let result = WebSearchResult {
+            title: "Visible title".to_string(),
+            url: "https://example.com/current".to_string(),
+            snippet: Some(
+                "A current result used to verify the public citation envelope.".to_string(),
+            ),
+            published_date: Some(1_752_710_400_000),
+            id: None,
+            domain: None,
+            max_verbatim_word_limit: None,
+            public_domain: None,
+        };
+        let events = generate_websearch_events(
+            "claude-opus-4-8",
+            "current test query",
+            "srvtoolu_01OpaqueSseTest",
+            Some(WebSearchResults {
+                results: vec![result.clone()],
+                total_results: Some(1),
+                query: Some("current test query".to_string()),
+                error: None,
+            }),
+            556,
+            true,
+            1_234,
+        );
+
+        let message_start = events
+            .iter()
+            .find(|event| event.event == "message_start")
+            .expect("message_start");
+        assert_eq!(message_start.data["message"]["model"], "claude-opus-4-8");
+        assert!(
+            message_start.data["message"]["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("msg_bdrk_") && id.len() == 61)
+        );
+
+        let result_start = events
+            .iter()
+            .find(|event| event.data["content_block"]["type"] == "web_search_tool_result")
+            .expect("web search result block");
+        let public_result = &result_start.data["content_block"]["content"][0];
+        assert_eq!(public_result["title"], result.title);
+        assert_eq!(public_result["url"], result.url);
+        let encrypted_content = BASE64_STANDARD
+            .decode(
+                public_result["encrypted_content"]
+                    .as_str()
+                    .expect("content token"),
+            )
+            .expect("content token base64");
+        assert_eq!(encrypted_content.len(), 4_011);
+        assert_eq!(
+            &encrypted_content[..11],
+            &[
+                0x12, 0xa8, 0x1f, 0x0a, 0x2a, 0x08, 0x01, 0x18, 0x01, 0x22, 0x24
+            ]
+        );
+        assert!(
+            !encrypted_content
+                .windows(result.url.len())
+                .any(|window| window == result.url.as_bytes())
+        );
+
+        let citation = events
+            .iter()
+            .find(|event| event.data["delta"]["type"] == "citations_delta")
+            .expect("citation delta");
+        assert_eq!(citation.data["delta"]["citation"]["url"], result.url);
+        let encrypted_index = BASE64_STANDARD
+            .decode(
+                citation.data["delta"]["citation"]["encrypted_index"]
+                    .as_str()
+                    .expect("index token"),
+            )
+            .expect("index token base64");
+        assert_eq!(encrypted_index.len(), 146);
+        assert_eq!(
+            &encrypted_index[..11],
+            &[
+                0x12, 0x8f, 0x01, 0x0a, 0x2a, 0x08, 0x02, 0x18, 0x01, 0x22, 0x24
+            ]
+        );
+
+        let final_usage = &events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta")
+            .data["usage"];
+        assert_eq!(final_usage["input_tokens"], 556);
+        assert_eq!(final_usage["server_tool_use"]["web_search_requests"], 1);
+        assert_eq!(final_usage["output_tokens_details"]["thinking_tokens"], 0);
+
+        let metrics = &events
+            .iter()
+            .find(|event| event.event == "message_stop")
+            .expect("message_stop")
+            .data["amazon-bedrock-invocationMetrics"];
+        assert_eq!(metrics["inputTokenCount"], 556);
+        assert_eq!(metrics["cacheReadInputTokenCount"], 0);
+        assert_eq!(metrics["cacheWriteInputTokenCount"], 0);
+        assert_eq!(metrics["invocationLatency"], 1_234);
+        assert_eq!(metrics["firstByteLatency"], 1_234);
     }
 }

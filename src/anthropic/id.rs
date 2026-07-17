@@ -30,15 +30,25 @@ pub fn message_id() -> String {
 }
 
 pub fn bedrock_message_id() -> String {
-    // Keep an explicit Bedrock marker while staying inside Anthropic's public
-    // `msg_<18-40 alphanumeric chars>` contract. The 24-character suffix
-    // mirrors common public IDs and avoids the second underscore that generic
-    // Anthropic clients and conformance tools reject.
+    // Preserve the established AWS-B shape for models whose wire IDs have not
+    // been observed to use the newer Opus 4.8 Bedrock form.
     format!("msg_01bdrk{}", random_base62(18))
 }
 
-pub fn bedrock_message_id_for_model(_model: &str) -> String {
-    bedrock_message_id()
+pub fn bedrock_message_id_for_model(model: &str) -> String {
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("opus-4-8") || lower.contains("opus-4.8") {
+        format!("msg_bdrk_{}", random_lower_alnum(52))
+    } else {
+        bedrock_message_id()
+    }
+}
+
+fn random_lower_alnum(len: usize) -> String {
+    const LOWER_ALNUM: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    (0..len)
+        .map(|_| LOWER_ALNUM[fastrand::usize(..LOWER_ALNUM.len())] as char)
+        .collect()
 }
 
 pub fn server_tool_use_id() -> String {
@@ -75,10 +85,19 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_message_ids_keep_marker_and_match_anthropic_shape() {
+    fn bedrock_message_ids_keep_observed_model_shapes() {
+        let opus = bedrock_message_id_for_model("claude-opus-4-8");
+        assert!(opus.starts_with("msg_bdrk_"));
+        assert_eq!(opus.len(), 61);
+        assert!(
+            opus[9..]
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        );
+
         for id in [
             bedrock_message_id(),
-            bedrock_message_id_for_model("claude-opus-4-8"),
+            bedrock_message_id_for_model("claude-opus-4-6"),
             bedrock_message_id_for_model("claude-sonnet-4-5"),
         ] {
             assert_anthropic_id(&id, "msg");

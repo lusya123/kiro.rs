@@ -572,10 +572,11 @@ fn push_breakpoint(
     );
     let tokens = if aws_b40_compat {
         super::bedrock::calibrated_cache_prefix_tokens(
+            &req.model,
             base_tokens,
             &state.system_segments,
             &state.content_segments,
-            !state.tools.is_empty(),
+            &state.tools,
         )
     } else {
         base_tokens
@@ -1083,5 +1084,50 @@ mod tests {
         assert_eq!(usage.cache_creation_5m_input_tokens, 18_003);
         assert_eq!(usage.cache_creation_1h_input_tokens, 0);
         assert_eq!(usage.total(), total);
+    }
+
+    #[tokio::test]
+    async fn bedrock_cached_tools_do_not_leak_tool_framing_into_ordinary_input() {
+        let tools = (0..28)
+            .map(|index| {
+                serde_json::json!({
+                    "name": format!("cached_tool_{index}"),
+                    "description": "A representative cached tool description. ".repeat(64),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "alpha": {"type": "string"},
+                            "beta": {"type": "integer"},
+                            "mode": {"type": "string", "enum": ["one", "two", "three"]}
+                        },
+                        "required": ["alpha"],
+                        "additionalProperties": false
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let req = parse_request(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "tools": tools,
+            "system": [{
+                "type": "text",
+                "text": "cached tool protocol anchor ".repeat(1_200),
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": [{"role": "user", "content": "1+1=?"}]
+        }));
+        let base = super::super::compat::estimate_input_tokens(&req);
+        let total = super::super::bedrock::calibrated_input_tokens(&req, base);
+        let usage = compute_request_usage_breakdown_with_profile(total, &req, true).await;
+
+        assert!(
+            usage.input_tokens <= 128,
+            "unexpected uncached suffix: {usage:?}"
+        );
+        assert_eq!(usage.total(), total);
+        assert!(
+            usage.cache_creation_input_tokens + usage.cache_read_input_tokens
+                >= total.saturating_sub(128)
+        );
     }
 }

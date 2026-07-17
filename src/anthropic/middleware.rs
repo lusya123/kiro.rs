@@ -158,6 +158,10 @@ pub fn aws_b40_oneapi_request_id() -> String {
 }
 
 fn aws_b40_messages_success_request_id() -> String {
+    aws_b40_upstream_request_id()
+}
+
+pub(crate) fn aws_b40_upstream_request_id() -> String {
     let now = chrono::Utc::now().format("%Y%m%d%H%M%S");
     format!("{now}{}8268d9d6{}", random_digits(9), random_base62(8))
 }

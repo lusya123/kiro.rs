@@ -904,13 +904,26 @@ impl StreamContext {
         self.output_token_limit = Some(max_tokens.max(1));
     }
 
+    fn calibrated_direct_initial_usage(&self) -> Option<super::cache::UsageBreakdown> {
+        if !self.aws_b40_compat {
+            return None;
+        }
+        let calibrated = self
+            .input_context_calibration
+            .calibrate_direct_compat_usage(&self.model, self.initial_usage_breakdown);
+        (calibrated != self.initial_usage_breakdown).then_some(calibrated)
+    }
+
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
-        let breakdown = self.initial_usage_breakdown;
+        let breakdown = self
+            .calibrated_direct_initial_usage()
+            .unwrap_or(self.initial_usage_breakdown);
         if self.aws_b40_compat {
             let initial_output_tokens = match self.output_token_limit {
                 Some(limit) if limit <= 1 => 1,
                 _ if self.suppress_text_blocks => 16,
+                _ if self.pending_synthetic_thinking.is_some() => 4,
                 _ if self.aws_b40_thinking_requested => 3,
                 _ => 1,
             };
@@ -1424,11 +1437,14 @@ impl StreamContext {
     /// 创建 signature_delta 事件（thinking 块伪签名，详见 anthropic::signature 模块）
     fn create_signature_delta_event(&self, index: i32) -> SseEvent {
         let signature = if self.aws_b40_compat {
+            let usage = self
+                .calibrated_direct_initial_usage()
+                .unwrap_or(self.initial_usage_breakdown);
             super::bedrock::signature(
                 &self.model,
                 self.aws_b40_adaptive_signature,
                 &self.thinking_text_acc,
-                self.initial_usage_breakdown,
+                usage,
             )
         } else {
             super::signature::generate_signature()
@@ -1836,6 +1852,29 @@ impl StreamContext {
     }
 
     fn final_usage_breakdown(&self) -> super::cache::UsageBreakdown {
+        if let Some(initial) = self.calibrated_direct_initial_usage() {
+            if self.accumulated_input_tokens == 0 {
+                return initial;
+            }
+
+            // The observed 28-tool Bedrock catalog has a stable public cache
+            // split. Kiro's later context event includes a private wire prelude
+            // and must not replace that split. Continuation rounds remain real
+            // ordinary input and are added after the calibrated first round.
+            let current_input_tokens = self.current_billable_input_tokens();
+            let first_round_input_tokens = self
+                .initial_calibrated_input_tokens
+                .unwrap_or(self.initial_input_tokens);
+            let final_input_tokens = self
+                .accumulated_input_tokens
+                .saturating_add(current_input_tokens);
+            return super::cache::with_additional_input(
+                initial,
+                first_round_input_tokens,
+                final_input_tokens,
+            );
+        }
+
         let current_input_tokens = self.current_billable_input_tokens();
         let first_round_input_tokens =
             self.initial_calibrated_input_tokens
@@ -2041,20 +2080,23 @@ impl StreamContext {
                 .first_byte_latency_ms
                 .unwrap_or(invocation_latency)
                 .min(invocation_latency);
-            let total_input_tokens = breakdown
-                .input_tokens
-                .saturating_add(breakdown.cache_creation_input_tokens)
-                .saturating_add(breakdown.cache_read_input_tokens);
             for event in &mut final_events {
-                if event.event == "message_stop" {
+                if event.event == "message_delta" {
+                    event.data["usage"] = super::bedrock::stream_delta_usage(
+                        &self.model,
+                        breakdown,
+                        final_output_tokens,
+                        usage_thinking_tokens,
+                    );
+                } else if event.event == "message_stop" {
                     event.data = json!({
                         "type": "message_stop",
-                        "amazon-bedrock-invocationMetrics": {
-                            "inputTokenCount": total_input_tokens,
-                            "outputTokenCount": final_output_tokens,
-                            "invocationLatency": invocation_latency,
-                            "firstByteLatency": first_byte_latency
-                        }
+                        "amazon-bedrock-invocationMetrics": super::bedrock::invocation_metrics(
+                            breakdown,
+                            final_output_tokens,
+                            invocation_latency,
+                            first_byte_latency
+                        )
                     });
                 }
             }
@@ -2745,6 +2787,115 @@ mod tests {
     }
 
     #[test]
+    fn aws_b_message_start_uses_reasoning_hint_for_synthetic_thinking() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-8",
+            33,
+            true,
+            super::super::cache::UsageBreakdown::flat(33),
+            HashMap::new(),
+        );
+        ctx.enable_aws_b40_compat(true);
+        ctx.set_aws_b40_thinking_requested(true);
+        ctx.set_synthetic_thinking(Some("synthetic fallback".to_string()));
+
+        let event = ctx.create_message_start_event();
+
+        assert_eq!(event["message"]["usage"]["output_tokens"], 4);
+    }
+
+    #[test]
+    fn aws_b_message_start_calibrates_catalog_without_double_adjusting_final_usage() {
+        let mut tools = (0..28)
+            .map(|index| {
+                serde_json::from_value::<super::super::types::Tool>(json!({
+                    "name": format!("tool_{index}"),
+                    "description": "x".repeat(2_000),
+                    "input_schema": {"type": "object"}
+                }))
+                .expect("tool")
+            })
+            .collect::<Vec<_>>();
+        let serialized_bytes = tools.iter().fold(0usize, |total, tool| {
+            total + serde_json::to_vec(tool).expect("serialize tool").len()
+        });
+        let missing_bytes = 69_158usize
+            .checked_sub(serialized_bytes)
+            .expect("fixture should start below the observed catalog size");
+        let per_tool = missing_bytes / tools.len();
+        let remainder = missing_bytes % tools.len();
+        for (index, tool) in tools.iter_mut().enumerate() {
+            tool.description
+                .push_str(&"x".repeat(per_tool + usize::from(index < remainder)));
+        }
+        assert_eq!(
+            tools.iter().fold(0usize, |total, tool| {
+                total + serde_json::to_vec(tool).expect("serialize tool").len()
+            }),
+            69_158
+        );
+
+        let mut payload = serde_json::from_value::<super::super::types::MessagesRequest>(json!({
+            "model": "claude-opus-4-8",
+            "messages": [{"role": "user", "content": "1+1"}],
+            "stream": true
+        }))
+        .expect("request");
+        payload.tools = Some(tools);
+        let calibration = super::super::bedrock::InputContextCalibration::for_request(&payload);
+        let raw = super::super::cache::UsageBreakdown {
+            input_tokens: 39,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 36_975,
+            cache_creation_5m_input_tokens: 36_975,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-8",
+            raw.total(),
+            false,
+            raw,
+            HashMap::new(),
+        );
+        ctx.enable_aws_b40_compat(false);
+        ctx.set_input_context_calibration(calibration);
+
+        let event = ctx.create_message_start_event();
+        let start_usage = &event["message"]["usage"];
+        assert_eq!(start_usage["input_tokens"], 79);
+        assert_eq!(start_usage["cache_creation_input_tokens"], 34_250);
+
+        // The later Kiro context event includes a private wire prelude and can
+        // vary with injected runtime instructions. Once this observed catalog
+        // is calibrated, it must not replace the public first-round split.
+        ctx.context_input_tokens = Some(50_000);
+        let final_usage = ctx.final_usage_breakdown();
+        assert_eq!(final_usage.input_tokens, 79);
+        assert_eq!(final_usage.cache_creation_input_tokens, 34_250);
+        assert_eq!(final_usage.total(), 34_329);
+
+        ctx.enable_aws_b40_compat(true);
+        ctx.thinking_text_acc = "calibrated reasoning summary".to_string();
+        let signature_usage = ctx
+            .calibrated_direct_initial_usage()
+            .expect("catalog signature usage");
+        assert_eq!(signature_usage, final_usage);
+        fastrand::seed(0xbed0_0048);
+        let signature_event = ctx.create_signature_delta_event(0);
+        let actual_signature = signature_event.data["delta"]["signature"]
+            .as_str()
+            .expect("signature");
+        fastrand::seed(0xbed0_0048);
+        let expected_signature = super::super::bedrock::signature(
+            &ctx.model,
+            true,
+            &ctx.thinking_text_acc,
+            signature_usage,
+        );
+        assert_eq!(actual_signature, expected_signature);
+    }
+
+    #[test]
     fn aws_b_stream_preserves_backend_tool_id_and_omits_caller() {
         let mut ctx =
             StreamContext::new_with_thinking("claude-sonnet-4-6", 1, false, false, HashMap::new());
@@ -3074,6 +3225,14 @@ mod tests {
             bedrock_stop.data["amazon-bedrock-invocationMetrics"]["outputTokenCount"],
             8
         );
+        assert_eq!(
+            bedrock_stop.data["amazon-bedrock-invocationMetrics"]["cacheReadInputTokenCount"],
+            0
+        );
+        assert_eq!(
+            bedrock_stop.data["amazon-bedrock-invocationMetrics"]["cacheWriteInputTokenCount"],
+            0
+        );
 
         let mut aws_p = StreamContext::new_with_thinking(
             "claude-sonnet-4-6",
@@ -3100,6 +3259,51 @@ mod tests {
             .find(|event| event.event == "message_stop")
             .expect("AWS-P message_stop");
         assert!(stop.data.get("amazon-bedrock-invocationMetrics").is_none());
+    }
+
+    #[test]
+    fn aws_b_final_usage_separates_bedrock_cache_metrics() {
+        let breakdown = super::super::cache::UsageBreakdown {
+            input_tokens: 79,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 34_250,
+            cache_creation_5m_input_tokens: 34_250,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let mut context = StreamContext::new_with_thinking(
+            "claude-opus-4-8",
+            34_329,
+            false,
+            breakdown,
+            HashMap::new(),
+        );
+        context.enable_aws_b40_compat(false);
+        let _ = context.generate_initial_events();
+        let _ = context.process_assistant_response("2");
+        let events = context.generate_final_events();
+
+        let usage = &events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta")
+            .data["usage"];
+        assert_eq!(usage["input_tokens"], 79);
+        assert_eq!(usage["cache_creation_input_tokens"], 34_250);
+        assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 34_250);
+        assert!(
+            usage["cache_creation"]
+                .get("ephemeral_1h_input_tokens")
+                .is_none()
+        );
+
+        let metrics = &events
+            .iter()
+            .find(|event| event.event == "message_stop")
+            .expect("message_stop")
+            .data["amazon-bedrock-invocationMetrics"];
+        assert_eq!(metrics["inputTokenCount"], 79);
+        assert_eq!(metrics["cacheReadInputTokenCount"], 0);
+        assert_eq!(metrics["cacheWriteInputTokenCount"], 34_250);
     }
 
     /// 流式 thinking 块必须在 content_block_start 带 signature: ""，

@@ -19,6 +19,9 @@ Optional environment variables:
   CCTEST_POLL_INTERVAL  Seconds between polls (default: 5)
   CCTEST_MAX_WAIT       Maximum poll time in seconds (default: 1800)
   CCTEST_CURL_MAX_TIME  Per-request timeout in seconds (default: 30)
+  CCTEST_CHECK_TOKEN_USAGE
+                        Include billing/cache audit (true or false, default: false)
+  CCTEST_CONCURRENCY    Target API concurrency (1-5, default: 1)
 EOF
 }
 
@@ -57,6 +60,8 @@ BASE_URL="${BASE_URL%/}"
 POLL_INTERVAL="${CCTEST_POLL_INTERVAL:-5}"
 MAX_WAIT="${CCTEST_MAX_WAIT:-1800}"
 CURL_MAX_TIME="${CCTEST_CURL_MAX_TIME:-30}"
+CHECK_TOKEN_USAGE="${CCTEST_CHECK_TOKEN_USAGE:-false}"
+CONCURRENCY="${CCTEST_CONCURRENCY:-1}"
 
 if ! is_non_negative_integer "$POLL_INTERVAL"; then
   printf 'CCTEST_POLL_INTERVAL must be a non-negative integer\n' >&2
@@ -68,6 +73,14 @@ for positive_setting in "$MAX_WAIT" "$CURL_MAX_TIME"; do
     exit 2
   fi
 done
+if [[ "$CHECK_TOKEN_USAGE" != "true" && "$CHECK_TOKEN_USAGE" != "false" ]]; then
+  printf 'CCTEST_CHECK_TOKEN_USAGE must be true or false\n' >&2
+  exit 2
+fi
+if ! [[ "$CONCURRENCY" =~ ^[1-5]$ ]]; then
+  printf 'CCTEST_CONCURRENCY must be an integer from 1 to 5\n' >&2
+  exit 2
+fi
 
 MODE="submit"
 TASK_ID=""
@@ -177,7 +190,15 @@ if [[ "$MODE" == "submit" ]]; then
   printf '%s' "$TARGET_API_KEY_VALUE" | jq -Rsc \
     --arg url "$ENDPOINT" \
     --arg model "$MODEL" \
-    '{url: $url, apiKey: ., model: $model}' > "$REQUEST_FILE"
+    --argjson check_token_usage "$CHECK_TOKEN_USAGE" \
+    --argjson concurrency "$CONCURRENCY" \
+    '{
+      url: $url,
+      apiKey: .,
+      model: $model,
+      checkTokenUsage: $check_token_usage,
+      concurrency: $concurrency
+    }' > "$REQUEST_FILE"
 
   if ! curl_json POST "$BASE_URL/api/v1/check" "$RESPONSE_FILE"; then
     printf 'CCTest submission failed or timed out\n' >&2
@@ -225,12 +246,16 @@ else
     --arg mode "$MODE" \
     --arg endpoint "$ENDPOINT" \
     --arg model "$MODEL" \
+    --argjson check_token_usage "$CHECK_TOKEN_USAGE" \
+    --argjson concurrency "$CONCURRENCY" \
     --arg recorded_at "$recorded_at" \
     '{
       taskId: $task_id,
       mode: $mode,
       endpoint: (if $endpoint == "" then null else $endpoint end),
       model: (if $model == "" then null else $model end),
+      checkTokenUsage: (if $mode == "submit" then $check_token_usage else null end),
+      concurrency: (if $mode == "submit" then $concurrency else null end),
       submittedAt: (if $mode == "submit" then $recorded_at else null end),
       lastResumedAt: (if $mode == "resume" then $recorded_at else null end)
     }' > "$MANIFEST_PATH"
@@ -296,11 +321,15 @@ printf '%s\n' "$TASK_ID" > "$OUT_DIR/task-id.txt"
 jq '{
   status,
   verdictKey,
-  totalScore,
+  total: (.total // .totalScore // null),
   expectedModel,
+  responseModel,
   channel: (.channel // .channelType // null),
+  streamChannel,
+  nonStreamChannel,
   scores,
   metrics,
+  tokenAudit,
   stepStatus,
   details,
   checks,
