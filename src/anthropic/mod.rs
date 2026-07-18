@@ -26,6 +26,7 @@ mod bedrock;
 mod billing;
 mod cache;
 mod claude_tok;
+mod code_execution;
 mod compat;
 mod converter;
 mod handlers;

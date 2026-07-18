@@ -1079,51 +1079,7 @@ pub fn head_models_response() -> Response {
 }
 
 pub fn request_preflight_error(payload: &MessagesRequest) -> Option<Response> {
-    thinking_model_preflight_error(&payload.model)
-        .or_else(|| code_execution_tool_error(payload))
-        .or_else(|| cache_control_limit_error(payload))
-}
-
-fn code_execution_tool_error(payload: &MessagesRequest) -> Option<Response> {
-    let tool_type = payload
-        .tools
-        .as_ref()?
-        .iter()
-        .filter_map(|tool| tool.tool_type.as_deref())
-        .find(|tool_type| {
-            matches!(
-                *tool_type,
-                "code_execution_20250522"
-                    | "code_execution_20250825"
-                    | "code_execution_20260120"
-                    | "code_execution_20260521"
-            )
-        })?;
-    let request_id = super::middleware::aws_b40_upstream_request_id();
-    let wrapped_request_id = super::middleware::aws_b40_upstream_request_id();
-    let relay_request_id = super::middleware::aws_b40_oneapi_request_id();
-    let bedrock_request_id = uuid::Uuid::new_v4();
-    let body = json!({
-        "error": {
-            "type": "<nil>",
-            "message": format!(
-                "InvokeModelWithResponseStream: operation error Bedrock Runtime: InvokeModelWithResponseStream, https response error StatusCode: 400, RequestID: {bedrock_request_id}, ValidationException: tool type '{tool_type}' is not supported for this model (request id: {request_id}) (request id: {wrapped_request_id}) [up_bad_request; g=0; c=424; r={relay_request_id}]"
-            )
-        },
-        "type": "error"
-    });
-    let mut response = if payload.stream {
-        (
-            StatusCode::BAD_REQUEST,
-            [(header::CONTENT_TYPE, "text/event-stream")],
-            Body::from(body.to_string()),
-        )
-            .into_response()
-    } else {
-        (StatusCode::BAD_REQUEST, Json(body)).into_response()
-    };
-    super::middleware::apply_aws_b40_headers(response.headers_mut(), &relay_request_id);
-    Some(response)
+    thinking_model_preflight_error(&payload.model).or_else(|| cache_control_limit_error(payload))
 }
 
 fn thinking_model_preflight_error(model: &str) -> Option<Response> {
@@ -2265,8 +2221,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn code_execution_server_tools_return_bedrock_validation_error() {
+    #[test]
+    fn code_execution_server_tools_are_deferred_to_compat_handler() {
         for tool_type in [
             "code_execution_20250522",
             "code_execution_20250825",
@@ -2281,44 +2237,7 @@ mod tests {
                     "name": "code_execution"
                 }]
             }));
-            let response = request_preflight_error(&payload).expect("Bedrock validation error");
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            assert_eq!(
-                response
-                    .headers()
-                    .get(header::CONTENT_TYPE)
-                    .and_then(|value| value.to_str().ok()),
-                Some("text/event-stream")
-            );
-            let relay_request_id = response
-                .headers()
-                .get("x-oneapi-request-id")
-                .and_then(|value| value.to_str().ok())
-                .expect("relay request id")
-                .to_string();
-
-            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("code execution error body");
-            let body: Value = serde_json::from_slice(&bytes).expect("valid JSON error body");
-            let message = body["error"]["message"].as_str().expect("error message");
-            assert_eq!(body["type"], "error");
-            assert_eq!(body["error"]["type"], "<nil>");
-            assert!(message.contains(tool_type));
-            assert!(message.contains("is not supported for this model"));
-            assert!(
-                message.starts_with(
-                    "InvokeModelWithResponseStream: operation error Bedrock Runtime: "
-                )
-            );
-            assert!(message.contains("https response error StatusCode: 400, RequestID: "));
-            assert!(message.contains("ValidationException:"));
-            assert_eq!(message.matches("(request id: ").count(), 2);
-            assert!(message.ends_with(&format!(
-                "[up_bad_request; g=0; c=424; r={relay_request_id}]"
-            )));
-            assert!(!message.contains("Invalid tool use format"));
-            assert!(!message.to_ascii_lowercase().contains("kiro"));
+            assert!(request_preflight_error(&payload).is_none(), "{tool_type}");
         }
     }
 

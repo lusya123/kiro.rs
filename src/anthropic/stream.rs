@@ -14,6 +14,8 @@ use crate::kiro::model::events::Event;
 use super::id;
 
 const AUTO_CONTINUE_COMPLETE_SENTINEL: &str = "__KRS_CONTINUATION_COMPLETE__";
+const AWS_B_TEXT_DELTA_TARGET_CHARS: usize = 24;
+const AWS_B_TEXT_DELTA_MAX_PARTS: usize = 256;
 
 pub fn merge_continuation_text(previous: &str, incoming: &str) -> String {
     if previous.is_empty() || incoming.is_empty() {
@@ -96,6 +98,32 @@ fn find_char_boundary(s: &str, target: usize) -> usize {
         pos -= 1;
     }
     pos
+}
+
+fn text_delta_chunks(text: &str) -> Vec<&str> {
+    let char_count = text.chars().count();
+    if char_count <= AWS_B_TEXT_DELTA_TARGET_CHARS {
+        return vec![text];
+    }
+
+    let chars_per_chunk = AWS_B_TEXT_DELTA_TARGET_CHARS.max(
+        char_count.saturating_add(AWS_B_TEXT_DELTA_MAX_PARTS - 1) / AWS_B_TEXT_DELTA_MAX_PARTS,
+    );
+    let mut chunks =
+        Vec::with_capacity(char_count.saturating_add(chars_per_chunk - 1) / chars_per_chunk);
+    let mut chunk_start = 0;
+    let mut chars_in_chunk = 0;
+
+    for (byte_index, _) in text.char_indices() {
+        if chars_in_chunk == chars_per_chunk {
+            chunks.push(&text[chunk_start..byte_index]);
+            chunk_start = byte_index;
+            chars_in_chunk = 0;
+        }
+        chars_in_chunk += 1;
+    }
+    chunks.push(&text[chunk_start..]);
+    chunks
 }
 
 /// 需要跳过的包裹字符
@@ -1342,19 +1370,28 @@ impl StreamContext {
             idx
         };
 
-        // 发送 content_block_delta 事件
-        if let Some(delta_event) = self.state_manager.handle_content_block_delta(
-            text_index,
-            json!({
-            "type": "content_block_delta",
-            "index": text_index,
-            "delta": {
-                    "type": "text_delta",
-                    "text": text
-                }
-            }),
-        ) {
-            events.push(delta_event);
+        // Kiro may deliver an entire answer in one upstream event. Bedrock clients still expect
+        // incremental SSE frames, so AWS-B splits only the transport envelope. Concatenating the
+        // deltas is byte-for-byte identical to the original text.
+        let chunks = if self.aws_b40_compat {
+            text_delta_chunks(&text)
+        } else {
+            vec![text.as_str()]
+        };
+        for chunk in chunks {
+            if let Some(delta_event) = self.state_manager.handle_content_block_delta(
+                text_index,
+                json!({
+                    "type": "content_block_delta",
+                    "index": text_index,
+                    "delta": {
+                        "type": "text_delta",
+                        "text": chunk
+                    }
+                }),
+            ) {
+                events.push(delta_event);
+            }
         }
 
         events
@@ -3259,6 +3296,57 @@ mod tests {
             .find(|event| event.event == "message_stop")
             .expect("AWS-P message_stop");
         assert!(stop.data.get("amazon-bedrock-invocationMetrics").is_none());
+    }
+
+    #[test]
+    fn aws_b_stream_splits_long_text_without_changing_content() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-8",
+            10,
+            false,
+            super::super::cache::UsageBreakdown::flat(10),
+            HashMap::new(),
+        );
+        ctx.enable_aws_b40_compat(false);
+        let text = "Unicode 安全：你好，世界。 Code stays exact: `let answer = 42;` and Markdown stays intact.";
+
+        let events = ctx.process_assistant_response(text);
+        let deltas = events
+            .iter()
+            .filter(|event| event.data["delta"]["type"] == "text_delta")
+            .collect::<Vec<_>>();
+
+        assert!(
+            deltas.len() > 1,
+            "AWS-B should emit incremental text frames"
+        );
+        assert_eq!(collect_text_content(&events), text);
+        assert!(deltas.iter().all(|event| {
+            event.data["delta"]["text"]
+                .as_str()
+                .is_some_and(|chunk| !chunk.is_empty())
+        }));
+    }
+
+    #[test]
+    fn aws_p_stream_keeps_upstream_text_in_one_delta() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-8",
+            10,
+            false,
+            super::super::cache::UsageBreakdown::flat(10),
+            HashMap::new(),
+        );
+        let text = "This response is deliberately long enough to cross the AWS-B chunk threshold.";
+
+        let events = ctx.process_assistant_response(text);
+        let deltas = events
+            .iter()
+            .filter(|event| event.data["delta"]["type"] == "text_delta")
+            .collect::<Vec<_>>();
+
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(collect_text_content(&events), text);
     }
 
     #[test]

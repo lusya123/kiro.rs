@@ -284,9 +284,8 @@ pub struct ContentBlock {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
-    /// Thinking 块签名（Anthropic 协议字段）。kiro-rs 不验签，
-    /// 仅在响应 thinking 块上回填伪签名；history 中的真签名解析后被
-    /// converter 静默丢弃，不会传给 Kiro 上游。
+    /// Thinking 块签名（Anthropic 协议字段）。kiro-rs 会验证自己签发的
+    /// 无状态 HMAC 签名；通过后仍由 converter 在转发前移除，不会传给 Kiro 上游。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -1,0 +1,742 @@
+//! Narrow server-side code-execution compatibility for the AWS-B profile.
+//!
+//! Amazon Bedrock does not provide Anthropic's hosted code-execution
+//! container. To keep the API contract useful without exposing the host, this
+//! module evaluates only bounded arithmetic expressions in-process. It never
+//! starts a shell, reads files, accesses the network, or touches credentials.
+
+use std::{convert::Infallible, time::Instant};
+
+use axum::{
+    body::Body,
+    http::{StatusCode, header},
+    response::{IntoResponse, Json, Response},
+};
+use bytes::Bytes;
+use futures::stream;
+use serde_json::{Value, json};
+
+use super::{
+    id,
+    stream::SseEvent,
+    types::{MessagesRequest, Tool},
+};
+
+const SUPPORTED_TYPES: &[&str] = &[
+    "code_execution_20250522",
+    "code_execution_20250825",
+    "code_execution_20260120",
+    "code_execution_20260521",
+];
+const MAX_EXPRESSION_BYTES: usize = 256;
+const MAX_PARSE_DEPTH: usize = 32;
+
+#[derive(Debug, Clone, PartialEq)]
+struct ExecutionResult {
+    command: String,
+    stdout: String,
+    summary: String,
+}
+
+pub fn is_supported_request(payload: &MessagesRequest) -> bool {
+    let Some(tools) = payload.tools.as_ref() else {
+        return false;
+    };
+    if tools.iter().filter(|tool| is_supported_tool(tool)).count() != 1 {
+        return false;
+    }
+
+    let forced = payload
+        .tool_choice
+        .as_ref()
+        .and_then(Value::as_object)
+        .is_some_and(|choice| match choice.get("type").and_then(Value::as_str) {
+            Some("any") => tools.len() == 1,
+            Some("tool") => choice.get("name").and_then(Value::as_str) == Some("code_execution"),
+            _ => false,
+        });
+    forced || explicitly_requests_code_execution(payload)
+}
+
+pub fn remove_unrequested_optional_tools(payload: &mut MessagesRequest) {
+    if is_supported_request(payload) {
+        return;
+    }
+
+    let mut removed = false;
+    let mut empty = false;
+    if let Some(tools) = payload.tools.as_mut() {
+        let before = tools.len();
+        tools.retain(|tool| !is_supported_tool(tool));
+        removed = tools.len() != before;
+        empty = tools.is_empty();
+    }
+    if !removed {
+        return;
+    }
+    if empty {
+        payload.tools = None;
+        payload.tool_choice = None;
+    }
+}
+
+fn is_supported_tool(tool: &Tool) -> bool {
+    tool.name == "code_execution"
+        && tool
+            .tool_type
+            .as_deref()
+            .is_some_and(|kind| SUPPORTED_TYPES.contains(&kind))
+}
+
+fn explicitly_requests_code_execution(payload: &MessagesRequest) -> bool {
+    extract_last_user_text(payload).is_some_and(|text| {
+        let lower = text.to_ascii_lowercase();
+        [
+            "use the code execution tool",
+            "using the code execution tool",
+            "use code execution to",
+            "run this with code execution",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    })
+}
+
+pub fn handle_request(payload: &MessagesRequest, usage: super::cache::UsageBreakdown) -> Response {
+    let started = Instant::now();
+    let execution = extract_last_user_text(payload)
+        .and_then(|text| extract_arithmetic_expression(&text))
+        .and_then(|expression| {
+            evaluate_expression(&expression).ok().map(|value| {
+                let value = format_number(value);
+                ExecutionResult {
+                    command: format!("python -c 'print({expression})'"),
+                    stdout: format!("{value}\n"),
+                    summary: format!("{expression} = {value}"),
+                }
+            })
+        });
+
+    let latency_ms = started.elapsed().as_millis().max(8) as u64;
+    if payload.stream {
+        return stream_response(payload, execution, usage, latency_ms);
+    }
+
+    non_stream_response(payload, execution, usage)
+}
+
+fn stream_response(
+    payload: &MessagesRequest,
+    execution: Option<ExecutionResult>,
+    usage: super::cache::UsageBreakdown,
+    latency_ms: u64,
+) -> Response {
+    let events = build_events(payload, execution, usage, latency_ms);
+    let body = stream::iter(
+        events
+            .into_iter()
+            .map(|event| Ok::<Bytes, Infallible>(Bytes::from(event.to_profile_sse_string(true)))),
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "keep-alive")
+        .body(Body::from_stream(body))
+        .expect("code execution SSE response")
+}
+
+fn build_events(
+    payload: &MessagesRequest,
+    execution: Option<ExecutionResult>,
+    usage: super::cache::UsageBreakdown,
+    latency_ms: u64,
+) -> Vec<SseEvent> {
+    let message_id = super::bedrock::response_id(&payload.model);
+    let public_model = super::bedrock::response_model(&payload.model);
+    let tool_use_id = id::server_tool_use_id();
+    let (command, result_block, summary) = execution_blocks(&tool_use_id, execution);
+    let output_tokens = output_tokens(&command, &result_block, &summary);
+    let start_usage = json!({
+        "input_tokens": usage.input_tokens,
+        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+        "cache_read_input_tokens": usage.cache_read_input_tokens,
+        "cache_creation": {
+            "ephemeral_5m_input_tokens": usage.cache_creation_5m_input_tokens,
+            "ephemeral_1h_input_tokens": usage.cache_creation_1h_input_tokens
+        },
+        "output_tokens": 4,
+        "service_tier": "standard"
+    });
+
+    let mut events = vec![SseEvent::new(
+        "message_start",
+        json!({
+            "type": "message_start",
+            "message": {
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "model": public_model,
+                "content": [],
+                "stop_reason": null,
+                "stop_sequence": null,
+                "stop_details": null,
+                "usage": start_usage
+            }
+        }),
+    )];
+
+    events.push(SseEvent::new(
+        "content_block_start",
+        json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "server_tool_use",
+                "id": tool_use_id,
+                "name": "bash_code_execution",
+                "input": {}
+            }
+        }),
+    ));
+    events.push(SseEvent::new(
+        "content_block_delta",
+        json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": json!({"command": command}).to_string()
+            }
+        }),
+    ));
+    events.push(block_stop(0));
+    events.push(SseEvent::new(
+        "content_block_start",
+        json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": result_block
+        }),
+    ));
+    events.push(block_stop(1));
+    events.push(SseEvent::new(
+        "content_block_start",
+        json!({
+            "type": "content_block_start",
+            "index": 2,
+            "content_block": {"type": "text", "text": ""}
+        }),
+    ));
+    events.push(SseEvent::new(
+        "content_block_delta",
+        json!({
+            "type": "content_block_delta",
+            "index": 2,
+            "delta": {"type": "text_delta", "text": summary}
+        }),
+    ));
+    events.push(block_stop(2));
+
+    let mut final_usage =
+        super::bedrock::stream_delta_usage(&payload.model, usage, output_tokens, 0);
+    final_usage["server_tool_use"] = json!({"code_execution_requests": 1});
+    events.push(SseEvent::new(
+        "message_delta",
+        json!({
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+                "stop_details": null
+            },
+            "usage": final_usage
+        }),
+    ));
+    events.push(SseEvent::new(
+        "message_stop",
+        json!({
+            "type": "message_stop",
+            "amazon-bedrock-invocationMetrics": super::bedrock::invocation_metrics(
+                usage,
+                output_tokens,
+                latency_ms,
+                latency_ms.saturating_sub(2)
+            )
+        }),
+    ));
+    events
+}
+
+fn non_stream_response(
+    payload: &MessagesRequest,
+    execution: Option<ExecutionResult>,
+    usage: super::cache::UsageBreakdown,
+) -> Response {
+    let tool_use_id = id::server_tool_use_id();
+    let (command, result_block, summary) = execution_blocks(&tool_use_id, execution);
+    let output_tokens = output_tokens(&command, &result_block, &summary);
+    let body = json!({
+        "id": super::bedrock::response_id(&payload.model),
+        "type": "message",
+        "role": "assistant",
+        "model": super::bedrock::response_model(&payload.model),
+        "content": [
+            {
+                "type": "server_tool_use",
+                "id": tool_use_id,
+                "name": "bash_code_execution",
+                "input": {"command": command}
+            },
+            result_block,
+            {"type": "text", "text": summary}
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "stop_details": null,
+        "usage": {
+            "input_tokens": usage.input_tokens,
+            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+            "cache_read_input_tokens": usage.cache_read_input_tokens,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": usage.cache_creation_5m_input_tokens,
+                "ephemeral_1h_input_tokens": usage.cache_creation_1h_input_tokens
+            },
+            "output_tokens": output_tokens,
+            "output_tokens_details": {"thinking_tokens": 0},
+            "server_tool_use": {"code_execution_requests": 1},
+            "service_tier": "standard"
+        }
+    });
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+fn execution_blocks(
+    tool_use_id: &str,
+    execution: Option<ExecutionResult>,
+) -> (String, Value, String) {
+    match execution {
+        Some(execution) => {
+            let result = json!({
+                "type": "bash_code_execution_tool_result",
+                "tool_use_id": tool_use_id,
+                "content": {
+                    "type": "bash_code_execution_result",
+                    "stdout": execution.stdout,
+                    "stderr": "",
+                    "return_code": 0,
+                    "content": []
+                }
+            });
+            (execution.command, result, execution.summary)
+        }
+        None => {
+            let command = "unsupported operation".to_string();
+            let result = json!({
+                "type": "bash_code_execution_tool_result",
+                "tool_use_id": tool_use_id,
+                "content": {
+                    "type": "bash_code_execution_tool_result_error",
+                    "error_code": "unavailable"
+                }
+            });
+            let summary =
+                "Code execution is unavailable for this operation on Amazon Bedrock.".to_string();
+            (command, result, summary)
+        }
+    }
+}
+
+fn block_stop(index: usize) -> SseEvent {
+    SseEvent::new(
+        "content_block_stop",
+        json!({"type": "content_block_stop", "index": index}),
+    )
+}
+
+fn output_tokens(command: &str, result: &Value, summary: &str) -> i32 {
+    let base = super::claude_tok::count_claude(command)
+        + super::claude_tok::count_claude(&result.to_string())
+        + super::claude_tok::count_claude(summary);
+    super::bedrock::framed_output_tokens_with_tool_arguments(base, 3, 1, 1)
+}
+
+fn extract_last_user_text(payload: &MessagesRequest) -> Option<String> {
+    let message = payload
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")?;
+    match &message.content {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(blocks) => {
+            let text = blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+fn extract_arithmetic_expression(text: &str) -> Option<String> {
+    let mut candidates = Vec::new();
+    let mut start = None;
+    for (index, ch) in text.char_indices() {
+        let allowed = ch.is_ascii_digit()
+            || ch.is_ascii_whitespace()
+            || matches!(ch, '.' | '+' | '-' | '*' | '/' | '%' | '^' | '(' | ')');
+        match (allowed, start) {
+            (true, None) => start = Some(index),
+            (false, Some(begin)) => {
+                candidates.push(&text[begin..index]);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(begin) = start {
+        candidates.push(&text[begin..]);
+    }
+
+    candidates
+        .into_iter()
+        .filter_map(clean_expression_candidate)
+        .filter_map(|candidate| evaluate_expression(&candidate).ok().map(|_| candidate))
+        .max_by_key(String::len)
+}
+
+fn clean_expression_candidate(candidate: &str) -> Option<String> {
+    let candidate = candidate.trim();
+    let candidate = candidate.trim_end_matches('.').trim();
+    if candidate.is_empty() || candidate.len() > MAX_EXPRESSION_BYTES {
+        return None;
+    }
+    let mut saw_digit = false;
+    let mut saw_binary_operator = false;
+    for (index, byte) in candidate.bytes().enumerate() {
+        saw_digit |= byte.is_ascii_digit();
+        saw_binary_operator |=
+            matches!(byte, b'+' | b'*' | b'/' | b'%' | b'^') || (byte == b'-' && index > 0);
+    }
+    (saw_digit && saw_binary_operator).then(|| candidate.to_string())
+}
+
+fn evaluate_expression(expression: &str) -> Result<f64, ()> {
+    let mut parser = ArithmeticParser::new(expression);
+    let value = parser.parse_expression(0)?;
+    parser.skip_whitespace();
+    if parser.position != parser.bytes.len() || !value.is_finite() {
+        return Err(());
+    }
+    Ok(value)
+}
+
+fn format_number(value: f64) -> String {
+    if value.fract().abs() < 1e-12 && value.abs() <= i64::MAX as f64 {
+        return format!("{}", value as i64);
+    }
+    let formatted = format!("{value:.12}");
+    formatted
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
+}
+
+struct ArithmeticParser<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> ArithmeticParser<'a> {
+    fn new(expression: &'a str) -> Self {
+        Self {
+            bytes: expression.as_bytes(),
+            position: 0,
+        }
+    }
+
+    fn parse_expression(&mut self, depth: usize) -> Result<f64, ()> {
+        if depth > MAX_PARSE_DEPTH {
+            return Err(());
+        }
+        let mut value = self.parse_term(depth + 1)?;
+        loop {
+            self.skip_whitespace();
+            match self.peek() {
+                Some(b'+') => {
+                    self.position += 1;
+                    value += self.parse_term(depth + 1)?;
+                }
+                Some(b'-') => {
+                    self.position += 1;
+                    value -= self.parse_term(depth + 1)?;
+                }
+                _ => return Ok(value),
+            }
+        }
+    }
+
+    fn parse_term(&mut self, depth: usize) -> Result<f64, ()> {
+        let mut value = self.parse_power(depth + 1)?;
+        loop {
+            self.skip_whitespace();
+            match self.peek() {
+                Some(b'*') => {
+                    self.position += 1;
+                    value *= self.parse_power(depth + 1)?;
+                }
+                Some(b'/') => {
+                    self.position += 1;
+                    let divisor = self.parse_power(depth + 1)?;
+                    if divisor == 0.0 {
+                        return Err(());
+                    }
+                    value /= divisor;
+                }
+                Some(b'%') => {
+                    self.position += 1;
+                    let divisor = self.parse_power(depth + 1)?;
+                    if divisor == 0.0 {
+                        return Err(());
+                    }
+                    value %= divisor;
+                }
+                _ => return Ok(value),
+            }
+        }
+    }
+
+    fn parse_power(&mut self, depth: usize) -> Result<f64, ()> {
+        let base = self.parse_factor(depth + 1)?;
+        self.skip_whitespace();
+        if self.peek() == Some(b'^') {
+            self.position += 1;
+            return Ok(base.powf(self.parse_power(depth + 1)?));
+        }
+        Ok(base)
+    }
+
+    fn parse_factor(&mut self, depth: usize) -> Result<f64, ()> {
+        if depth > MAX_PARSE_DEPTH {
+            return Err(());
+        }
+        self.skip_whitespace();
+        match self.peek() {
+            Some(b'+') => {
+                self.position += 1;
+                self.parse_factor(depth + 1)
+            }
+            Some(b'-') => {
+                self.position += 1;
+                Ok(-self.parse_factor(depth + 1)?)
+            }
+            Some(b'(') => {
+                self.position += 1;
+                let value = self.parse_expression(depth + 1)?;
+                self.skip_whitespace();
+                if self.peek() != Some(b')') {
+                    return Err(());
+                }
+                self.position += 1;
+                Ok(value)
+            }
+            _ => self.parse_number(),
+        }
+    }
+
+    fn parse_number(&mut self) -> Result<f64, ()> {
+        self.skip_whitespace();
+        let start = self.position;
+        let mut dots = 0usize;
+        while let Some(byte) = self.peek() {
+            if byte.is_ascii_digit() {
+                self.position += 1;
+            } else if byte == b'.' && dots == 0 {
+                dots += 1;
+                self.position += 1;
+            } else {
+                break;
+            }
+        }
+        if self.position == start {
+            return Err(());
+        }
+        std::str::from_utf8(&self.bytes[start..self.position])
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .ok_or(())
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self.peek().is_some_and(|byte| byte.is_ascii_whitespace()) {
+            self.position += 1;
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.position).copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(stream: bool, prompt: &str) -> MessagesRequest {
+        serde_json::from_value(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 256,
+            "stream": stream,
+            "tools": [{
+                "type": "code_execution_20250825",
+                "name": "code_execution"
+            }],
+            "messages": [{"role": "user", "content": prompt}]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn only_pure_supported_server_tool_requests_are_intercepted() {
+        let mut payload = request(true, "calculate 17 * 23");
+        assert!(!is_supported_request(&payload));
+
+        payload.messages[0].content = json!("Use the code execution tool to calculate 17 * 23.");
+        assert!(is_supported_request(&payload));
+
+        payload.tools.as_mut().unwrap()[0].tool_type = None;
+        assert!(!is_supported_request(&payload));
+
+        let mut payload = request(true, "calculate 17 * 23");
+        let duplicate = payload.tools.as_ref().unwrap()[0].clone();
+        payload.tools.as_mut().unwrap().push(duplicate);
+        assert!(!is_supported_request(&payload));
+
+        let mut conceptual = request(true, "Explain how hosted code execution works.");
+        assert!(!is_supported_request(&conceptual));
+        remove_unrequested_optional_tools(&mut conceptual);
+        assert!(conceptual.tools.is_none());
+        assert!(conceptual.tool_choice.is_none());
+
+        let mut mixed = request(true, "Explain how hosted code execution works.");
+        mixed.tools.as_mut().unwrap().push(
+            serde_json::from_value(json!({
+                "name": "get_weather",
+                "description": "Get weather",
+                "input_schema": {"type": "object", "properties": {}}
+            }))
+            .unwrap(),
+        );
+        remove_unrequested_optional_tools(&mut mixed);
+        assert_eq!(mixed.tools.as_ref().unwrap().len(), 1);
+        assert_eq!(mixed.tools.as_ref().unwrap()[0].name, "get_weather");
+
+        let mut conceptual = request(true, "Explain how hosted code execution works.");
+        conceptual.tool_choice = Some(json!({"type": "tool", "name": "code_execution"}));
+        assert!(is_supported_request(&conceptual));
+    }
+
+    #[test]
+    fn extracts_and_evaluates_bounded_arithmetic() {
+        let expression = extract_arithmetic_expression(
+            "Use the code execution tool to calculate 17 * (23 + 2).",
+        )
+        .unwrap();
+        assert_eq!(expression, "17 * (23 + 2)");
+        assert_eq!(evaluate_expression(&expression), Ok(425.0));
+        assert_eq!(evaluate_expression("2 + 3 * 4"), Ok(14.0));
+        assert_eq!(evaluate_expression("2 ^ 3 ^ 2"), Ok(512.0));
+        assert!(evaluate_expression("1 / 0").is_err());
+        assert!(extract_arithmetic_expression("read /etc/passwd").is_none());
+    }
+
+    #[test]
+    fn streaming_success_uses_server_tool_result_contract() {
+        let payload = request(true, "Use the code execution tool to calculate 17 * 23.");
+        let execution = ExecutionResult {
+            command: "python -c 'print(17 * 23)'".to_string(),
+            stdout: "391\n".to_string(),
+            summary: "17 * 23 = 391".to_string(),
+        };
+        let events = build_events(
+            &payload,
+            Some(execution),
+            super::super::cache::UsageBreakdown::flat(42),
+            8,
+        );
+        let starts = events
+            .iter()
+            .filter(|event| event.event == "content_block_start")
+            .map(|event| event.data["content_block"]["type"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            starts,
+            ["server_tool_use", "bash_code_execution_tool_result", "text"]
+        );
+        assert_eq!(
+            events[4].data["content_block"]["content"]["stdout"],
+            "391\n"
+        );
+        assert!(
+            events
+                .last()
+                .unwrap()
+                .data
+                .get("amazon-bedrock-invocationMetrics")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn streaming_usage_preserves_cache_breakdown_and_metrics() {
+        let payload = request(true, "Use the code execution tool to calculate 17 * 23.");
+        let usage = super::super::cache::UsageBreakdown {
+            input_tokens: 79,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 34_250,
+            cache_creation_5m_input_tokens: 34_250,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let events = build_events(&payload, None, usage, 8);
+        let start_usage = &events[0].data["message"]["usage"];
+        assert_eq!(start_usage["input_tokens"], 79);
+        assert_eq!(start_usage["cache_creation_input_tokens"], 34_250);
+        assert_eq!(
+            start_usage["cache_creation"]["ephemeral_5m_input_tokens"],
+            34_250
+        );
+
+        let delta_usage = &events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .unwrap()
+            .data["usage"];
+        assert_eq!(delta_usage["cache_creation_input_tokens"], 34_250);
+        assert_eq!(delta_usage["server_tool_use"]["code_execution_requests"], 1);
+
+        let metrics = &events.last().unwrap().data["amazon-bedrock-invocationMetrics"];
+        assert_eq!(metrics["inputTokenCount"], 79);
+        assert_eq!(metrics["cacheWriteInputTokenCount"], 34_250);
+    }
+
+    #[test]
+    fn unsupported_operations_return_standard_server_tool_error() {
+        let payload = request(true, "Read a local credentials file.");
+        let events = build_events(
+            &payload,
+            None,
+            super::super::cache::UsageBreakdown::flat(12),
+            8,
+        );
+        assert_eq!(
+            events[4].data["content_block"]["content"]["error_code"],
+            "unavailable"
+        );
+    }
+}

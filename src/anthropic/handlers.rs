@@ -1259,6 +1259,9 @@ pub async fn post_messages(
             .thinking
             .as_ref()
             .is_some_and(|thinking| thinking.thinking_type == "adaptive");
+    if let Some(response) = reject_invalid_thinking_signatures(&payload) {
+        return response;
+    }
     if aws_b40_compat {
         if let Some(response) = super::bedrock::request_preflight_error(&payload) {
             return response;
@@ -1284,9 +1287,6 @@ pub async fn post_messages(
     if aws_b40_compat {
         normalize_aws_b40_thinking(&mut payload);
     } else {
-        if let Some(response) = reject_invalid_thinking_signatures(&payload) {
-            return response;
-        }
         // opus-4-8:合法的 type:enabled 归一化为 adaptive(匹配真 Claude 的 200 行为),再做校验。
         normalize_opus_thinking(&mut payload);
         if let Some(response) = reject_invalid_thinking_request(&payload) {
@@ -1322,6 +1322,25 @@ pub async fn post_messages(
             Json(ErrorResponse::new("invalid_request_error", e)),
         )
             .into_response();
+    }
+
+    // Amazon Bedrock does not expose Anthropic's hosted code-execution
+    // sandbox. AWS-B provides a deliberately narrow, local arithmetic
+    // compatibility path instead of forwarding an invalid server-tool shape
+    // to Kiro. Other requests continue through the normal model/tool path.
+    if aws_b40_compat && super::code_execution::is_supported_request(&payload) {
+        let input_tokens =
+            estimate_profile_input_tokens(&payload, aws_b40_compat, aws_b40_thinking_requested);
+        let usage = super::cache::compute_request_usage_breakdown_with_profile(
+            input_tokens,
+            &payload,
+            aws_b40_compat,
+        )
+        .await;
+        return super::code_execution::handle_request(&payload, usage);
+    }
+    if aws_b40_compat {
+        super::code_execution::remove_unrequested_optional_tools(&mut payload);
     }
 
     // 可选工具列表里常含 WebSearch；强身份提问本身不需要调用它。强制工具和
@@ -2647,6 +2666,22 @@ fn aws_b40_exact_text_reply(payload: &MessagesRequest) -> Option<String> {
         .or_else(|| super::compat::extract_exact_system_reply(payload))
 }
 
+fn latest_user_probe_payload(payload: &MessagesRequest) -> Option<MessagesRequest> {
+    if payload.messages.len() <= 1 {
+        return None;
+    }
+
+    let latest_user = payload
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")?
+        .clone();
+    let mut scoped = payload.clone();
+    scoped.messages = vec![latest_user];
+    Some(scoped)
+}
+
 fn adjusted_flat_input_tokens(
     payload: &MessagesRequest,
     usage: super::cache::UsageBreakdown,
@@ -2680,31 +2715,35 @@ fn compat_direct_response(
     // 文档识别 (D19) 探针短路:必须在 request_needs_model 之前判断(文档会让它返回 None)。
     // 仅无工具的 PDF 提取探针命中;真 Claude Code 带工具,doc_reply 为 None,照旧交后端。
     let doc_reply = super::compat::document_extraction_reply(payload);
+    // Compatibility probes must be driven by the current user turn. Historical prompts remain
+    // available to the real model and usage accounting, but cannot hijack a later coding/chat turn.
+    let scoped_probe = latest_user_probe_payload(payload);
+    let probe_payload = scoped_probe.as_ref().unwrap_or(payload);
     // 强身份拷问:即使带工具也短路(检测器把身份探针裹进带工具的请求绕过门控)。
-    let runtime_id_reply = super::compat::runtime_identity_reply(payload);
-    let structured_id_reply = super::compat::structured_identity_reply(payload);
+    let runtime_id_reply = super::compat::runtime_identity_reply(probe_payload);
+    let structured_id_reply = super::compat::structured_identity_reply(probe_payload);
     let structured_platform_id_reply = aws_b40_compat
-        .then(|| super::compat::structured_platform_identity_reply(payload))
+        .then(|| super::compat::structured_platform_identity_reply(probe_payload))
         .flatten()
         .filter(|_| !tool_choice_forces_tool(payload) && !request_has_model_only_content(payload));
     let exact_tag_reply = aws_b40_compat
-        .then(|| super::compat::extract_antml_tag_reply(payload))
+        .then(|| super::compat::extract_antml_tag_reply(probe_payload))
         .flatten()
         .filter(|_| {
             !tool_choice_forces_tool(payload)
                 && !request_has_model_only_content(payload)
                 && !request_has_structured_output(payload)
         });
-    let strong_id_reply = super::compat::strong_identity_reply(payload);
+    let strong_id_reply = super::compat::strong_identity_reply(probe_payload);
     let strong_id_can_bypass = strong_id_reply.is_some()
         && !tool_choice_forces_tool(payload)
         && !request_has_model_only_content(payload)
         && !request_has_structured_output(payload);
     let aws_b40_ping_reply = aws_b40_compat
-        .then(|| super::compat::simple_ping_reply(payload))
+        .then(|| super::compat::simple_ping_reply(probe_payload))
         .flatten();
     let aws_b40_json_reply = aws_b40_compat
-        .then(|| super::compat::constrained_json_reply(payload))
+        .then(|| super::compat::constrained_json_reply(probe_payload))
         .flatten();
     let aws_b40_openai_exact_reply = (aws_b40_compat
         && payload
@@ -2712,7 +2751,7 @@ fn compat_direct_response(
             .as_ref()
             .and_then(|metadata| metadata.kiro_rs_openai_compat)
             .unwrap_or(false))
-    .then(|| super::compat::extract_exact_system_reply(payload))
+    .then(|| super::compat::extract_exact_system_reply(probe_payload))
     .flatten();
     // 含工具/图片/文档/工具结果时不短路,交给真模型处理(文档提取探针 / 强身份拷问除外)。
     if doc_reply.is_none()
@@ -2729,7 +2768,7 @@ fn compat_direct_response(
             .calibrate_direct_compat_usage(&payload.model, usage_breakdown);
     }
     let aws_b40_exact_reply = aws_b40_compat
-        .then(|| aws_b40_exact_text_reply(payload))
+        .then(|| aws_b40_exact_text_reply(probe_payload))
         .flatten();
     let (mut text, mut output_tokens, forced_input_tokens) = if let Some(answer) = doc_reply {
         // D19:直接用抽取的 PDF 文本/token 作答,按真实 token 数计量。
@@ -2765,15 +2804,15 @@ fn compat_direct_response(
         // 强身份拷问:返回干净的 Claude 应答,按真实 token 数计量。
         let output_tokens = profile_direct_text_output_tokens(&answer, aws_b40_compat);
         (answer, output_tokens, None)
-    } else if let Some(answer) = super::compat::extract_verbatim_echo(payload) {
+    } else if let Some(answer) = super::compat::extract_verbatim_echo(probe_payload) {
         // canary/D5:逐字回显 token,按真实 token 数计量。
         let output_tokens = token::count_tokens(&answer) as i32;
         (answer, output_tokens, None)
-    } else if let Some(answer) = super::compat::extract_exact_system_reply(payload) {
+    } else if let Some(answer) = super::compat::extract_exact_system_reply(probe_payload) {
         let output_tokens = exact_reply_output_tokens(&payload.model, &answer);
         let forced_input = exact_reply_input_tokens(&payload.model, &answer, usage_breakdown);
         (answer, output_tokens, forced_input)
-    } else if let Some(answer) = super::compat::identity_probe_reply(payload) {
+    } else if let Some(answer) = super::compat::identity_probe_reply(probe_payload) {
         let output_tokens = if aws_b40_compat {
             profile_direct_text_output_tokens(&answer, true)
         } else if payload.model.to_ascii_lowercase().contains("opus") {
@@ -2782,7 +2821,7 @@ fn compat_direct_response(
             13
         };
         (answer, output_tokens, None)
-    } else if let Some(answer) = super::compat::implicit_identity_reply(payload) {
+    } else if let Some(answer) = super::compat::implicit_identity_reply(probe_payload) {
         // 隐式身份/规格探针:回答较长,按真实 token 数计量(避免固定计量成为指纹)。
         let output_tokens = if aws_b40_compat
             && payload.model.to_ascii_lowercase().contains("opus")
@@ -2793,15 +2832,15 @@ fn compat_direct_response(
             profile_direct_text_output_tokens(&answer, aws_b40_compat)
         };
         (answer, output_tokens, None)
-    } else if let Some(answer) = super::compat::prompt_extraction_reply(payload) {
+    } else if let Some(answer) = super::compat::prompt_extraction_reply(probe_payload) {
         // 提示词提取探针:干净婉拒,按真实 token 数计量。
         let output_tokens = profile_direct_text_output_tokens(&answer, aws_b40_compat);
         (answer, output_tokens, None)
     } else {
         return None;
     };
-    let identity_context = request_identity_sanitization_context(payload);
-    if !preserves_private_product_code_content(payload) {
+    let identity_context = request_identity_sanitization_context(probe_payload);
+    if !preserves_private_product_code_content(probe_payload) {
         let sanitized_text = super::identity::sanitize_direct_identity_text_for_request(
             &text,
             identity_sanitization_options(identity_context),
@@ -3374,6 +3413,9 @@ pub async fn post_messages_cc(
             .thinking
             .as_ref()
             .is_some_and(|thinking| thinking.thinking_type == "adaptive");
+    if let Some(response) = reject_invalid_thinking_signatures(&payload) {
+        return response;
+    }
     if aws_b40_compat {
         if let Some(response) = super::bedrock::request_preflight_error(&payload) {
             return response;
@@ -3399,9 +3441,6 @@ pub async fn post_messages_cc(
     if aws_b40_compat {
         normalize_aws_b40_thinking(&mut payload);
     } else {
-        if let Some(response) = reject_invalid_thinking_signatures(&payload) {
-            return response;
-        }
         normalize_opus_thinking(&mut payload);
         if let Some(response) = reject_invalid_thinking_request(&payload) {
             return response;
@@ -3435,6 +3474,21 @@ pub async fn post_messages_cc(
             Json(ErrorResponse::new("invalid_request_error", e)),
         )
             .into_response();
+    }
+
+    if aws_b40_compat && super::code_execution::is_supported_request(&payload) {
+        let input_tokens =
+            estimate_profile_input_tokens(&payload, aws_b40_compat, aws_b40_thinking_requested);
+        let usage = super::cache::compute_request_usage_breakdown_with_profile(
+            input_tokens,
+            &payload,
+            aws_b40_compat,
+        )
+        .await;
+        return super::code_execution::handle_request(&payload, usage);
+    }
+    if aws_b40_compat {
+        super::code_execution::remove_unrequested_optional_tools(&mut payload);
     }
 
     // 可选工具列表里常含 WebSearch；强身份提问本身不需要调用它。强制工具和
@@ -3896,6 +3950,49 @@ mod tests {
     }
 
     #[test]
+    fn aws_b_thinking_signatures_accept_valid_and_reject_tampered_history() {
+        let signature =
+            super::super::signature::generate_aws_b40_signature_for_model("claude-opus-4-8");
+        let valid = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "thinking",
+                            "thinking": "checked",
+                            "signature": signature
+                        }]
+                    },
+                    {"role": "user", "content": "continue"}
+                ]
+            }),
+        );
+        assert!(reject_invalid_thinking_signatures(&valid).is_none());
+
+        let mut tampered_signature = valid.messages[0].content[0]["signature"]
+            .as_str()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        tampered_signature[30] = if tampered_signature[30] == b'A' {
+            b'B'
+        } else {
+            b'A'
+        };
+        let mut tampered = valid.clone();
+        tampered.messages[0].content[0]["signature"] =
+            serde_json::Value::String(String::from_utf8(tampered_signature).unwrap());
+        assert_eq!(
+            reject_invalid_thinking_signatures(&tampered)
+                .expect("tampered signature must be rejected")
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
     fn aws_b_direct_reply_delay_matches_public_reference_budget() {
         for _ in 0..100 {
             assert!((300..800).contains(&compat_reply_delay_ms(true)));
@@ -3931,6 +4028,53 @@ mod tests {
         assert_eq!(body["usage"]["service_tier"], "standard");
         assert_eq!(body["usage"]["input_tokens"], 15);
         assert_eq!(body["usage"]["output_tokens"], 4);
+    }
+
+    #[tokio::test]
+    async fn aws_b_exact_reply_uses_latest_user_turn() {
+        let req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "max_tokens": 32,
+                "messages": [
+                    {"role": "user", "content": "Reply exactly SAFE."},
+                    {"role": "assistant", "content": "SAFE"},
+                    {"role": "user", "content": "Reply exactly AGAIN."}
+                ]
+            }),
+        );
+        let response =
+            compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(24), true)
+                .expect("latest literal reply should remain deterministic");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON response");
+
+        assert_eq!(body["content"][0]["text"], "AGAIN");
+    }
+
+    #[test]
+    fn historical_exact_reply_does_not_hijack_later_coding_turn() {
+        let req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "messages": [
+                    {"role": "user", "content": "Reply exactly SAFE."},
+                    {"role": "assistant", "content": "SAFE"},
+                    {
+                        "role": "user",
+                        "content": "Write a Rust parser for a length-prefixed binary record."
+                    }
+                ]
+            }),
+        );
+
+        assert!(
+            compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(42), true)
+                .is_none(),
+            "a stale exact-reply probe must not bypass the real model"
+        );
     }
 
     #[tokio::test]

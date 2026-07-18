@@ -102,6 +102,15 @@ fn rand_bytes(n: usize) -> Vec<u8> {
     v
 }
 
+fn generate_hmac_blob(raw_bytes: usize) -> String {
+    debug_assert!(raw_bytes > MAC_LEN);
+    let mut buf = rand_bytes(raw_bytes);
+    let signed_len = buf.len() - MAC_LEN;
+    let mac = hmac_sha256(signing_secret(), &buf[..signed_len]);
+    buf[signed_len..].copy_from_slice(&mac);
+    BASE64.encode(buf)
+}
+
 fn is_opus_4_8(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
     lower.contains("opus-4-8") || lower.contains("opus-4.8")
@@ -128,7 +137,7 @@ pub fn generate_aws_b40_signature_for_model(model: &str) -> String {
     } else {
         AWS_B40_RAW_BYTES
     };
-    BASE64.encode(rand_bytes(raw_bytes))
+    generate_hmac_blob(raw_bytes)
 }
 
 pub fn generate_aws_b40_adaptive_signature_for_model(
@@ -138,7 +147,7 @@ pub fn generate_aws_b40_adaptive_signature_for_model(
     cache_read_input_tokens: i32,
 ) -> String {
     if !is_opus_4_8(model) {
-        return BASE64.encode(rand_bytes(AWS_B40_ADAPTIVE_RAW_BYTES));
+        return generate_hmac_blob(AWS_B40_ADAPTIVE_RAW_BYTES);
     }
 
     if context_tokens < AWS_B_OPUS_48_LARGE_CONTEXT_TOKENS {
@@ -472,6 +481,10 @@ mod tests {
                     "unexpected AWS-B signature length for {model}: {}",
                     raw.len()
                 );
+                assert!(
+                    verify_signature(&BASE64.encode(&raw)),
+                    "AWS-B must accept its own {model} signature"
+                );
             }
         }
 
@@ -558,5 +571,6 @@ mod tests {
             ))
             .expect("legacy adaptive signature decodes");
         assert_eq!(legacy_model.len(), AWS_B40_ADAPTIVE_RAW_BYTES);
+        assert!(verify_signature(&BASE64.encode(legacy_model)));
     }
 }
