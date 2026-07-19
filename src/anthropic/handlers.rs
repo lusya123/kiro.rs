@@ -2521,7 +2521,17 @@ fn reject_invalid_thinking_signatures(payload: &MessagesRequest) -> Option<Respo
             let Some(signature) = block.get("signature").and_then(|v| v.as_str()) else {
                 continue;
             };
-            if !super::signature::verify_signature(signature) {
+            if let Err(diagnostics) = super::signature::validate_signature(signature) {
+                tracing::warn!(
+                    message_index,
+                    block_index,
+                    signature_encoded_len = diagnostics.encoded_len,
+                    signature_decoded_len = ?diagnostics.decoded_len,
+                    signature_ends_with_field3 = diagnostics.ends_with_field3,
+                    signature_has_bedrock_profile_markers = diagnostics.has_bedrock_profile_markers,
+                    signature_validation_failure = ?diagnostics.failure,
+                    "rejected invalid thinking signature"
+                );
                 let message = format!(
                     "messages.{}.content.{}: Invalid signature in thinking block",
                     message_index, block_index

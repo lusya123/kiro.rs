@@ -42,7 +42,7 @@ pub fn is_supported_request(payload: &MessagesRequest) -> bool {
     let Some(tools) = payload.tools.as_ref() else {
         return false;
     };
-    if tools.iter().filter(|tool| is_supported_tool(tool)).count() != 1 {
+    if tools.len() != 1 || !is_supported_tool(&tools[0]) {
         return false;
     }
 
@@ -55,7 +55,11 @@ pub fn is_supported_request(payload: &MessagesRequest) -> bool {
             Some("tool") => choice.get("name").and_then(Value::as_str) == Some("code_execution"),
             _ => false,
         });
-    forced || explicitly_requests_code_execution(payload)
+    forced
+        || explicitly_requests_code_execution(payload)
+        || extract_last_user_text(payload)
+            .and_then(|text| extract_arithmetic_expression(&text))
+            .is_some()
 }
 
 pub fn remove_unrequested_optional_tools(payload: &mut MessagesRequest) {
@@ -605,7 +609,7 @@ mod tests {
     #[test]
     fn only_pure_supported_server_tool_requests_are_intercepted() {
         let mut payload = request(true, "calculate 17 * 23");
-        assert!(!is_supported_request(&payload));
+        assert!(is_supported_request(&payload));
 
         payload.messages[0].content = json!("Use the code execution tool to calculate 17 * 23.");
         assert!(is_supported_request(&payload));
@@ -636,6 +640,17 @@ mod tests {
         remove_unrequested_optional_tools(&mut mixed);
         assert_eq!(mixed.tools.as_ref().unwrap().len(), 1);
         assert_eq!(mixed.tools.as_ref().unwrap()[0].name, "get_weather");
+
+        let mut mixed_arithmetic = request(true, "calculate 17 * 23");
+        mixed_arithmetic.tools.as_mut().unwrap().push(
+            serde_json::from_value(json!({
+                "name": "get_weather",
+                "description": "Get weather",
+                "input_schema": {"type": "object", "properties": {}}
+            }))
+            .unwrap(),
+        );
+        assert!(!is_supported_request(&mixed_arithmetic));
 
         let mut conceptual = request(true, "Explain how hosted code execution works.");
         conceptual.tool_choice = Some(json!({"type": "tool", "name": "code_execution"}));

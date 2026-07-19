@@ -14,7 +14,7 @@ use crate::kiro::model::events::Event;
 use super::id;
 
 const AUTO_CONTINUE_COMPLETE_SENTINEL: &str = "__KRS_CONTINUATION_COMPLETE__";
-const AWS_B_TEXT_DELTA_TARGET_CHARS: usize = 24;
+const AWS_B_TEXT_DELTA_TARGET_CHARS: usize = 8;
 const AWS_B_TEXT_DELTA_MAX_PARTS: usize = 256;
 
 pub fn merge_continuation_text(previous: &str, incoming: &str) -> String {
@@ -1417,7 +1417,15 @@ impl StreamContext {
                     }
                 }),
             ));
-            events.push(self.create_thinking_delta_event(idx, synth)); // 内部已累加 thinking_text_acc
+            if self.aws_b40_compat {
+                self.thinking_tokens += estimate_tokens(synth);
+                self.thinking_text_acc.push_str(synth);
+                for chunk in text_delta_chunks(synth) {
+                    events.push(Self::thinking_delta_event(idx, chunk));
+                }
+            } else {
+                events.push(self.create_thinking_delta_event(idx, synth));
+            }
             events.push(self.create_signature_delta_event(idx));
             if let Some(stop) = self.state_manager.handle_content_block_stop(idx) {
                 events.push(stop);
@@ -1458,6 +1466,10 @@ impl StreamContext {
             self.thinking_tokens += estimate_tokens(thinking);
             self.thinking_text_acc.push_str(thinking); // ctoc 流结束时计数
         }
+        Self::thinking_delta_event(index, thinking)
+    }
+
+    fn thinking_delta_event(index: i32, thinking: &str) -> SseEvent {
         SseEvent::new(
             "content_block_delta",
             json!({
@@ -2497,6 +2509,57 @@ mod tests {
         assert!(sse_str.ends_with("\n\n"));
         assert!(!sse_str.ends_with("\n\n\n"));
         assert!(event.to_profile_sse_string(true).ends_with("\n\n\n"));
+    }
+
+    #[test]
+    fn aws_b_transport_chunks_preserve_text_and_stay_bounded() {
+        let text = "Claude can explain code safely. ".repeat(200);
+        let chunks = text_delta_chunks(&text);
+
+        assert_eq!(chunks.concat(), text);
+        assert_eq!(chunks.len(), AWS_B_TEXT_DELTA_MAX_PARTS);
+        assert!(chunks.iter().all(|chunk| !chunk.is_empty()));
+    }
+
+    #[test]
+    fn aws_b_synthetic_thinking_chunks_preserve_content_and_usage() {
+        let thinking = "Inspect the request, calculate the result, and answer clearly.";
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 1, true, true, HashMap::new());
+        ctx.enable_aws_b40_compat(true);
+
+        let events = ctx.emit_synthetic_thinking_block(thinking);
+        let deltas = events
+            .iter()
+            .filter(|event| event.data["delta"]["type"] == "thinking_delta")
+            .collect::<Vec<_>>();
+        let reconstructed = deltas
+            .iter()
+            .filter_map(|event| event.data["delta"]["thinking"].as_str())
+            .collect::<String>();
+
+        assert!(deltas.len() > 1);
+        assert_eq!(reconstructed, thinking);
+        assert_eq!(ctx.thinking_text_acc, thinking);
+        assert_eq!(ctx.thinking_tokens, estimate_tokens(thinking));
+    }
+
+    #[test]
+    fn aws_p_synthetic_thinking_keeps_single_delta() {
+        let thinking = "Inspect the request, calculate the result, and answer clearly.";
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 1, true, true, HashMap::new());
+
+        let events = ctx.emit_synthetic_thinking_block(thinking);
+        let deltas = events
+            .iter()
+            .filter(|event| event.data["delta"]["type"] == "thinking_delta")
+            .collect::<Vec<_>>();
+
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].data["delta"]["thinking"], thinking);
+        assert_eq!(ctx.thinking_text_acc, thinking);
+        assert_eq!(ctx.thinking_tokens, estimate_tokens(thinking));
     }
 
     #[test]

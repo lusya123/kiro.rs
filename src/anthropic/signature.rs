@@ -33,6 +33,22 @@ use subtle::ConstantTimeEq;
 /// HMAC-SHA256 输出长度。
 const MAC_LEN: usize = 32;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureValidationFailure {
+    InvalidBase64,
+    InvalidLength,
+    HmacMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignatureValidationDiagnostics {
+    pub encoded_len: usize,
+    pub decoded_len: Option<usize>,
+    pub ends_with_field3: bool,
+    pub has_bedrock_profile_markers: bool,
+    pub failure: SignatureValidationFailure,
+}
+
 // AWS-B keeps the observed Bedrock signature shapes instead of exposing the
 // Anthropic-shaped protobuf signature used by the AWS-P profile.
 const AWS_B40_RAW_BYTES: usize = 198;
@@ -301,16 +317,38 @@ pub fn generate_signature() -> String {
 
 /// 校验签名是否由本服务（持同一共享密钥的任意容器）签发且未被篡改。**无状态**、跨容器/重启可验。
 /// 兼容两种布局:新版(MAC 在尾部 `18 01` 之前的 32 字节)与旧版(MAC 恒为末尾 32 字节)。
-pub fn verify_signature(signature: &str) -> bool {
+pub fn validate_signature(signature: &str) -> Result<(), SignatureValidationDiagnostics> {
+    let encoded_len = signature.len();
     let Ok(buf) = BASE64.decode(signature) else {
-        return false;
+        return Err(SignatureValidationDiagnostics {
+            encoded_len,
+            decoded_len: None,
+            ends_with_field3: false,
+            has_bedrock_profile_markers: false,
+            failure: SignatureValidationFailure::InvalidBase64,
+        });
     };
+
+    let decoded_len = buf.len();
+    let ends_with_field3 = buf.ends_with(&[0x18, 0x01]);
+    let has_bedrock_profile_markers = buf
+        .windows(b"claude-quince".len())
+        .any(|window| window == b"claude-quince")
+        && buf
+            .windows(b"thinking".len())
+            .any(|window| window == b"thinking");
     if buf.len() < MAC_LEN + 4 || buf.len() > 8192 {
-        return false;
+        return Err(SignatureValidationDiagnostics {
+            encoded_len,
+            decoded_len: Some(decoded_len),
+            ends_with_field3,
+            has_bedrock_profile_markers,
+            failure: SignatureValidationFailure::InvalidLength,
+        });
     }
     let secret = signing_secret();
     // 新版:签名以 `18 01`(field3=1)收尾,MAC 在其前 32 字节。
-    if buf.len() >= MAC_LEN + 2 && buf[buf.len() - 2] == 0x18 && buf[buf.len() - 1] == 0x01 {
+    if ends_with_field3 {
         let mac_start = buf.len() - 2 - MAC_LEN;
         let expected = hmac_sha256(secret, &buf[..mac_start]);
         if bool::from(
@@ -318,13 +356,28 @@ pub fn verify_signature(signature: &str) -> bool {
                 .as_slice()
                 .ct_eq(&buf[mac_start..mac_start + MAC_LEN]),
         ) {
-            return true;
+            return Ok(());
         }
     }
     // 旧版(向后兼容在途对话):MAC 恒为末尾 32 字节。
     let signed_len = buf.len() - MAC_LEN;
     let expected = hmac_sha256(secret, &buf[..signed_len]);
-    expected.as_slice().ct_eq(&buf[signed_len..]).into()
+    if bool::from(expected.as_slice().ct_eq(&buf[signed_len..])) {
+        return Ok(());
+    }
+
+    Err(SignatureValidationDiagnostics {
+        encoded_len,
+        decoded_len: Some(decoded_len),
+        ends_with_field3,
+        has_bedrock_profile_markers,
+        failure: SignatureValidationFailure::HmacMismatch,
+    })
+}
+
+#[cfg(test)]
+pub fn verify_signature(signature: &str) -> bool {
+    validate_signature(signature).is_ok()
 }
 
 #[cfg(test)]
@@ -440,6 +493,39 @@ mod tests {
         assert!(!verify_signature(""));
         // 合法 base64、正确长度，但 MAC 不匹配（非本密钥签发）。
         assert!(!verify_signature(&BASE64.encode([0u8; 246])));
+    }
+
+    #[test]
+    fn validation_diagnostics_never_include_signature_material() {
+        let invalid_base64 = validate_signature("not-base64!!").unwrap_err();
+        assert_eq!(
+            invalid_base64.failure,
+            SignatureValidationFailure::InvalidBase64
+        );
+        assert_eq!(invalid_base64.encoded_len, 12);
+        assert_eq!(invalid_base64.decoded_len, None);
+
+        let invalid_length = validate_signature(&BASE64.encode([0u8; 8])).unwrap_err();
+        assert_eq!(
+            invalid_length.failure,
+            SignatureValidationFailure::InvalidLength
+        );
+        assert_eq!(invalid_length.decoded_len, Some(8));
+        assert!(!invalid_length.ends_with_field3);
+        assert!(!invalid_length.has_bedrock_profile_markers);
+
+        let mut tampered = BASE64
+            .decode(generate_aws_b40_signature_for_model("claude-opus-4-8"))
+            .unwrap();
+        tampered[40] ^= 0x01;
+        let hmac_mismatch = validate_signature(&BASE64.encode(tampered)).unwrap_err();
+        assert_eq!(
+            hmac_mismatch.failure,
+            SignatureValidationFailure::HmacMismatch
+        );
+        assert_eq!(hmac_mismatch.decoded_len, Some(241));
+        assert!(hmac_mismatch.ends_with_field3);
+        assert!(hmac_mismatch.has_bedrock_profile_markers);
     }
 
     #[test]
