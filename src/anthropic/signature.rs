@@ -64,6 +64,8 @@ const AWS_B_OPUS_48_CACHE_CREATE_CONTEXT_DIVISOR: usize = 7;
 const AWS_B_OPUS_48_CACHE_READ_CONTEXT_DIVISOR: usize = 12;
 const AWS_B_OPUS_48_CACHE_CREATE_CONTEXT_MAX_BYTES: usize = 3_584;
 const AWS_B_OPUS_48_CACHE_READ_CONTEXT_MAX_BYTES: usize = 2_048;
+const EXTERNAL_ANTHROPIC_MIN_RAW_BYTES: usize = 340;
+const EXTERNAL_ANTHROPIC_MAX_RAW_BYTES: usize = 520;
 
 /// 默认共享签名密钥。全车队镜像一致 → 零配置也能跨容器互验。
 /// 需要隔离/轮换时用环境变量 `KIRO_SIG_SECRET` 覆盖（**全车队配同一值**）。
@@ -218,6 +220,22 @@ fn push_varint(buf: &mut Vec<u8>, mut v: usize) {
     }
 }
 
+fn read_varint(buf: &[u8], start: usize) -> Option<(usize, usize)> {
+    let mut value = 0usize;
+    let mut shift = 0u32;
+    let mut index = start;
+    while index < buf.len() && shift < usize::BITS {
+        let byte = buf[index];
+        index += 1;
+        value |= ((byte & 0x7f) as usize).checked_shl(shift)?;
+        if byte & 0x80 == 0 {
+            return Some((value, index));
+        }
+        shift += 7;
+    }
+    None
+}
+
 fn push_varint_field(buf: &mut Vec<u8>, field: u8, value: usize) {
     buf.push(field << 3);
     push_varint(buf, value);
@@ -313,6 +331,52 @@ pub fn generate_signature() -> String {
     let mac = hmac_sha256(signing_secret(), &buf[..mac_start]);
     buf[mac_start..mac_start + MAC_LEN].copy_from_slice(&mac);
     BASE64.encode(buf)
+}
+
+/// Recognize the protobuf envelope used by Anthropic thinking signatures that
+/// came from another provider. AWS-B cannot verify a foreign provider's MAC,
+/// but accepting a well-formed opaque signature keeps imported conversations
+/// usable; the converter drops the signature before calling Kiro upstream.
+///
+/// Bedrock-shaped signatures are deliberately excluded here. Those are issued
+/// by this profile and must continue through the strict local HMAC check.
+pub fn is_plausible_external_anthropic_signature(signature: &str) -> bool {
+    let Ok(buf) = BASE64.decode(signature) else {
+        return false;
+    };
+    if !(EXTERNAL_ANTHROPIC_MIN_RAW_BYTES..=EXTERNAL_ANTHROPIC_MAX_RAW_BYTES).contains(&buf.len())
+        || !buf.ends_with(&[0x18, 0x01])
+        || buf.first() != Some(&0x12)
+        || buf
+            .windows(b"claude-quince".len())
+            .any(|window| window == b"claude-quince")
+        || buf
+            .windows(b"thinking".len())
+            .any(|window| window == b"thinking")
+    {
+        return false;
+    }
+
+    let Some((outer_len, inner_start)) = read_varint(&buf, 1) else {
+        return false;
+    };
+    let Some(inner_end) = inner_start.checked_add(outer_len) else {
+        return false;
+    };
+    if inner_end.checked_add(2) != Some(buf.len()) || buf.get(inner_start) != Some(&0x0a) {
+        return false;
+    }
+
+    let Some((field_one_len, field_one_start)) = read_varint(&buf, inner_start + 1) else {
+        return false;
+    };
+    let Some(field_one_end) = field_one_start.checked_add(field_one_len) else {
+        return false;
+    };
+    field_one_end <= inner_end
+        && buf
+            .get(field_one_start..field_one_start + 6)
+            .is_some_and(|header| header == [0x08, 0x0f, 0x18, 0x02, 0x2a, 0x40])
 }
 
 /// 校验签名是否由本服务（持同一共享密钥的任意容器）签发且未被篡改。**无状态**、跨容器/重启可验。
@@ -493,6 +557,29 @@ mod tests {
         assert!(!verify_signature(""));
         // 合法 base64、正确长度，但 MAC 不匹配（非本密钥签发）。
         assert!(!verify_signature(&BASE64.encode([0u8; 246])));
+    }
+
+    #[test]
+    fn plausible_external_anthropic_envelope_is_distinct_from_local_hmac() {
+        let mut foreign = BASE64.decode(generate_signature()).unwrap();
+        let mac_start = foreign.len() - 2 - MAC_LEN;
+        foreign[mac_start] ^= 0x01;
+        let foreign = BASE64.encode(foreign);
+
+        assert_eq!(
+            validate_signature(&foreign).unwrap_err().failure,
+            SignatureValidationFailure::HmacMismatch
+        );
+        assert!(is_plausible_external_anthropic_signature(&foreign));
+
+        let mut bedrock = BASE64
+            .decode(generate_aws_b40_signature_for_model("claude-opus-4-8"))
+            .unwrap();
+        bedrock[40] ^= 0x01;
+        assert!(!is_plausible_external_anthropic_signature(
+            &BASE64.encode(bedrock)
+        ));
+        assert!(!is_plausible_external_anthropic_signature("not-base64!!"));
     }
 
     #[test]

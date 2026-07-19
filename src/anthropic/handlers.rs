@@ -1259,7 +1259,7 @@ pub async fn post_messages(
             .thinking
             .as_ref()
             .is_some_and(|thinking| thinking.thinking_type == "adaptive");
-    if let Some(response) = reject_invalid_thinking_signatures(&payload) {
+    if let Some(response) = reject_invalid_thinking_signatures(&payload, aws_b40_compat) {
         return response;
     }
     if aws_b40_compat {
@@ -2509,7 +2509,10 @@ fn reject_invalid_thinking_request(payload: &MessagesRequest) -> Option<Response
     None
 }
 
-fn reject_invalid_thinking_signatures(payload: &MessagesRequest) -> Option<Response> {
+fn reject_invalid_thinking_signatures(
+    payload: &MessagesRequest,
+    aws_b40_compat: bool,
+) -> Option<Response> {
     for (message_index, message) in payload.messages.iter().enumerate() {
         let Some(blocks) = message.content.as_array() else {
             continue;
@@ -2522,6 +2525,20 @@ fn reject_invalid_thinking_signatures(payload: &MessagesRequest) -> Option<Respo
                 continue;
             };
             if let Err(diagnostics) = super::signature::validate_signature(signature) {
+                if aws_b40_compat
+                    && diagnostics.failure
+                        == super::signature::SignatureValidationFailure::HmacMismatch
+                    && super::signature::is_plausible_external_anthropic_signature(signature)
+                {
+                    tracing::debug!(
+                        message_index,
+                        block_index,
+                        signature_encoded_len = diagnostics.encoded_len,
+                        signature_decoded_len = ?diagnostics.decoded_len,
+                        "accepted structurally valid external thinking signature"
+                    );
+                    continue;
+                }
                 tracing::warn!(
                     message_index,
                     block_index,
@@ -3423,7 +3440,7 @@ pub async fn post_messages_cc(
             .thinking
             .as_ref()
             .is_some_and(|thinking| thinking.thinking_type == "adaptive");
-    if let Some(response) = reject_invalid_thinking_signatures(&payload) {
+    if let Some(response) = reject_invalid_thinking_signatures(&payload, aws_b40_compat) {
         return response;
     }
     if aws_b40_compat {
@@ -3979,7 +3996,7 @@ mod tests {
                 ]
             }),
         );
-        assert!(reject_invalid_thinking_signatures(&valid).is_none());
+        assert!(reject_invalid_thinking_signatures(&valid, true).is_none());
 
         let mut tampered_signature = valid.messages[0].content[0]["signature"]
             .as_str()
@@ -3995,8 +4012,42 @@ mod tests {
         tampered.messages[0].content[0]["signature"] =
             serde_json::Value::String(String::from_utf8(tampered_signature).unwrap());
         assert_eq!(
-            reject_invalid_thinking_signatures(&tampered)
+            reject_invalid_thinking_signatures(&tampered, true)
                 .expect("tampered signature must be rejected")
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn aws_b_accepts_structured_external_anthropic_history_only() {
+        let mut foreign_signature = super::super::signature::generate_signature().into_bytes();
+        foreign_signature[30] = if foreign_signature[30] == b'A' {
+            b'B'
+        } else {
+            b'A'
+        };
+        let external = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "thinking",
+                            "thinking": "imported history",
+                            "signature": String::from_utf8(foreign_signature).unwrap()
+                        }]
+                    },
+                    {"role": "user", "content": "continue"}
+                ]
+            }),
+        );
+
+        assert!(reject_invalid_thinking_signatures(&external, true).is_none());
+        assert_eq!(
+            reject_invalid_thinking_signatures(&external, false)
+                .expect("the non-Bedrock profile remains strict")
                 .status(),
             StatusCode::BAD_REQUEST
         );
