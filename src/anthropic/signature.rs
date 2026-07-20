@@ -236,6 +236,72 @@ fn read_varint(buf: &[u8], start: usize) -> Option<(usize, usize)> {
     None
 }
 
+fn take_len_field<'a>(buf: &'a [u8], cursor: &mut usize, field: u8) -> Option<&'a [u8]> {
+    let expected_key = ((field as usize) << 3) | 2;
+    let (key, after_key) = read_varint(buf, *cursor)?;
+    if key != expected_key {
+        return None;
+    }
+    let (len, start) = read_varint(buf, after_key)?;
+    let end = start.checked_add(len)?;
+    let value = buf.get(start..end)?;
+    *cursor = end;
+    Some(value)
+}
+
+fn has_external_signature_header(field_one: &[u8]) -> bool {
+    if !(64..=128).contains(&field_one.len()) {
+        return false;
+    }
+
+    let mut cursor = 0usize;
+    let Some((field_one_key, after_field_one_key)) = read_varint(field_one, cursor) else {
+        return false;
+    };
+    if field_one_key != 0x08 {
+        return false;
+    }
+    let Some((profile, after_profile)) = read_varint(field_one, after_field_one_key) else {
+        return false;
+    };
+    if !(8..=32).contains(&profile) {
+        return false;
+    }
+    cursor = after_profile;
+
+    // Some providers include field 2 = 1 here; others omit it.
+    if read_varint(field_one, cursor).is_some_and(|(key, _)| key == 0x10) {
+        let Some((_, after_key)) = read_varint(field_one, cursor) else {
+            return false;
+        };
+        let Some((variant, after_variant)) = read_varint(field_one, after_key) else {
+            return false;
+        };
+        if variant > 8 {
+            return false;
+        }
+        cursor = after_variant;
+    }
+
+    let Some((thinking_key, after_thinking_key)) = read_varint(field_one, cursor) else {
+        return false;
+    };
+    if thinking_key != 0x18 {
+        return false;
+    }
+    let Some((thinking_variant, after_thinking_variant)) =
+        read_varint(field_one, after_thinking_key)
+    else {
+        return false;
+    };
+    if thinking_variant != 2 {
+        return false;
+    }
+    cursor = after_thinking_variant;
+
+    take_len_field(field_one, &mut cursor, 5).is_some_and(|payload| payload.len() == 64)
+}
+
 fn push_varint_field(buf: &mut Vec<u8>, field: u8, value: usize) {
     buf.push(field << 3);
     push_varint(buf, value);
@@ -363,20 +429,34 @@ pub fn is_plausible_external_anthropic_signature(signature: &str) -> bool {
     let Some(inner_end) = inner_start.checked_add(outer_len) else {
         return false;
     };
-    if inner_end.checked_add(2) != Some(buf.len()) || buf.get(inner_start) != Some(&0x0a) {
+    if inner_end.checked_add(2) != Some(buf.len()) {
         return false;
     }
 
-    let Some((field_one_len, field_one_start)) = read_varint(&buf, inner_start + 1) else {
+    let inner = &buf[inner_start..inner_end];
+    let mut cursor = 0usize;
+    let Some(field_one) = take_len_field(inner, &mut cursor, 1) else {
         return false;
     };
-    let Some(field_one_end) = field_one_start.checked_add(field_one_len) else {
+    let Some(field_two) = take_len_field(inner, &mut cursor, 2) else {
         return false;
     };
-    field_one_end <= inner_end
-        && buf
-            .get(field_one_start..field_one_start + 6)
-            .is_some_and(|header| header == [0x08, 0x0f, 0x18, 0x02, 0x2a, 0x40])
+    let Some(field_three) = take_len_field(inner, &mut cursor, 3) else {
+        return false;
+    };
+    let Some(field_four) = take_len_field(inner, &mut cursor, 4) else {
+        return false;
+    };
+    let Some(field_five) = take_len_field(inner, &mut cursor, 5) else {
+        return false;
+    };
+
+    cursor == inner.len()
+        && field_two.len() == 12
+        && field_three.len() == 12
+        && field_four.len() == 48
+        && field_five.len() >= 128
+        && has_external_signature_header(field_one)
 }
 
 /// 校验签名是否由本服务（持同一共享密钥的任意容器）签发且未被篡改。**无状态**、跨容器/重启可验。
@@ -580,6 +660,49 @@ mod tests {
             &BASE64.encode(bedrock)
         ));
         assert!(!is_plausible_external_anthropic_signature("not-base64!!"));
+    }
+
+    #[test]
+    fn accepts_cctest_external_signature_variant_without_accepting_bedrock_tampering() {
+        let mut field_one = Vec::new();
+        push_varint_field(&mut field_one, 1, 12);
+        push_varint_field(&mut field_one, 3, 2);
+        push_len_field(&mut field_one, 5, &[0x41; 64]);
+        push_len_field(&mut field_one, 6, b"claude-opus-4-6");
+        push_varint_field(&mut field_one, 7, 0);
+        assert_eq!(field_one.len(), 89);
+
+        let mut inner = Vec::new();
+        push_len_field(&mut inner, 1, &field_one);
+        push_len_field(&mut inner, 2, &[0x42; 12]);
+        push_len_field(&mut inner, 3, &[0x43; 12]);
+        push_len_field(&mut inner, 4, &[0x44; 48]);
+        push_len_field(&mut inner, 5, &[0x45; 261]);
+
+        let mut external = Vec::new();
+        push_len_field(&mut external, 2, &inner);
+        push_varint_field(&mut external, 3, 1);
+        assert_eq!(external.len(), 438);
+        let external = BASE64.encode(external);
+        assert!(is_plausible_external_anthropic_signature(&external));
+        assert_eq!(
+            validate_signature(&external).unwrap_err().failure,
+            SignatureValidationFailure::HmacMismatch
+        );
+
+        let mut malformed = BASE64.decode(&external).unwrap();
+        malformed[3] = 0x0b;
+        assert!(!is_plausible_external_anthropic_signature(
+            &BASE64.encode(malformed)
+        ));
+
+        let mut bedrock = BASE64
+            .decode(generate_aws_b40_signature_for_model("claude-opus-4-8"))
+            .unwrap();
+        bedrock[40] ^= 0x01;
+        assert!(!is_plausible_external_anthropic_signature(
+            &BASE64.encode(bedrock)
+        ));
     }
 
     #[test]

@@ -2,8 +2,9 @@
 //!
 //! Amazon Bedrock does not provide Anthropic's hosted code-execution
 //! container. To keep the API contract useful without exposing the host, this
-//! module evaluates only bounded arithmetic expressions in-process. It never
-//! starts a shell, reads files, accesses the network, or touches credentials.
+//! module evaluates only bounded arithmetic expressions and literal `print`
+//! requests in-process. It never starts a shell, reads files, accesses the
+//! network, or touches credentials.
 
 use std::{convert::Infallible, time::Instant};
 
@@ -29,12 +30,27 @@ const SUPPORTED_TYPES: &[&str] = &[
     "code_execution_20260521",
 ];
 const MAX_EXPRESSION_BYTES: usize = 256;
+const MAX_PRINT_LITERAL_BYTES: usize = 256;
 const MAX_PARSE_DEPTH: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionProtocol {
+    LegacyPython,
+    Current,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 struct ExecutionResult {
-    command: String,
+    program: String,
     stdout: String,
+    summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ExecutionBlocks {
+    tool_name: &'static str,
+    input: Value,
+    result: Value,
     summary: String,
 }
 
@@ -108,18 +124,29 @@ fn explicitly_requests_code_execution(payload: &MessagesRequest) -> bool {
 
 pub fn handle_request(payload: &MessagesRequest, usage: super::cache::UsageBreakdown) -> Response {
     let started = Instant::now();
-    let execution = extract_last_user_text(payload)
-        .and_then(|text| extract_arithmetic_expression(&text))
-        .and_then(|expression| {
-            evaluate_expression(&expression).ok().map(|value| {
-                let value = format_number(value);
-                ExecutionResult {
-                    command: format!("python -c 'print({expression})'"),
-                    stdout: format!("{value}\n"),
-                    summary: format!("{expression} = {value}"),
-                }
+    let execution = extract_last_user_text(payload).and_then(|text| {
+        extract_arithmetic_expression(&text)
+            .and_then(|expression| {
+                evaluate_expression(&expression).ok().map(|value| {
+                    let value = format_number(value);
+                    ExecutionResult {
+                        program: format!("print({expression})"),
+                        stdout: format!("{value}\n"),
+                        summary: format!("{expression} = {value}"),
+                    }
+                })
             })
-        });
+            .or_else(|| {
+                extract_print_literal(&text).map(|literal| ExecutionResult {
+                    program: format!(
+                        "print({})",
+                        serde_json::to_string(&literal).expect("literal serializes")
+                    ),
+                    stdout: format!("{literal}\n"),
+                    summary: literal,
+                })
+            })
+    });
 
     let latency_ms = started.elapsed().as_millis().max(8) as u64;
     if payload.stream {
@@ -160,8 +187,8 @@ fn build_events(
     let message_id = super::bedrock::response_id(&payload.model);
     let public_model = super::bedrock::response_model(&payload.model);
     let tool_use_id = id::server_tool_use_id();
-    let (command, result_block, summary) = execution_blocks(&tool_use_id, execution);
-    let output_tokens = output_tokens(&command, &result_block, &summary);
+    let blocks = execution_blocks(execution_protocol(payload), &tool_use_id, execution);
+    let output_tokens = output_tokens(&blocks.input, &blocks.result, &blocks.summary);
     let start_usage = json!({
         "input_tokens": usage.input_tokens,
         "cache_creation_input_tokens": usage.cache_creation_input_tokens,
@@ -200,7 +227,7 @@ fn build_events(
             "content_block": {
                 "type": "server_tool_use",
                 "id": tool_use_id,
-                "name": "bash_code_execution",
+                "name": blocks.tool_name,
                 "input": {}
             }
         }),
@@ -212,7 +239,7 @@ fn build_events(
             "index": 0,
             "delta": {
                 "type": "input_json_delta",
-                "partial_json": json!({"command": command}).to_string()
+                "partial_json": blocks.input.to_string()
             }
         }),
     ));
@@ -222,7 +249,7 @@ fn build_events(
         json!({
             "type": "content_block_start",
             "index": 1,
-            "content_block": result_block
+            "content_block": blocks.result
         }),
     ));
     events.push(block_stop(1));
@@ -239,7 +266,7 @@ fn build_events(
         json!({
             "type": "content_block_delta",
             "index": 2,
-            "delta": {"type": "text_delta", "text": summary}
+            "delta": {"type": "text_delta", "text": blocks.summary}
         }),
     ));
     events.push(block_stop(2));
@@ -280,8 +307,8 @@ fn non_stream_response(
     usage: super::cache::UsageBreakdown,
 ) -> Response {
     let tool_use_id = id::server_tool_use_id();
-    let (command, result_block, summary) = execution_blocks(&tool_use_id, execution);
-    let output_tokens = output_tokens(&command, &result_block, &summary);
+    let blocks = execution_blocks(execution_protocol(payload), &tool_use_id, execution);
+    let output_tokens = output_tokens(&blocks.input, &blocks.result, &blocks.summary);
     let body = json!({
         "id": super::bedrock::response_id(&payload.model),
         "type": "message",
@@ -291,11 +318,11 @@ fn non_stream_response(
             {
                 "type": "server_tool_use",
                 "id": tool_use_id,
-                "name": "bash_code_execution",
-                "input": {"command": command}
+                "name": blocks.tool_name,
+                "input": blocks.input
             },
-            result_block,
-            {"type": "text", "text": summary}
+            blocks.result,
+            {"type": "text", "text": blocks.summary}
         ],
         "stop_reason": "end_turn",
         "stop_sequence": null,
@@ -317,39 +344,98 @@ fn non_stream_response(
     (StatusCode::OK, Json(body)).into_response()
 }
 
+fn execution_protocol(payload: &MessagesRequest) -> ExecutionProtocol {
+    if payload
+        .tools
+        .as_ref()
+        .and_then(|tools| tools.first())
+        .and_then(|tool| tool.tool_type.as_deref())
+        == Some("code_execution_20250522")
+    {
+        ExecutionProtocol::LegacyPython
+    } else {
+        ExecutionProtocol::Current
+    }
+}
+
 fn execution_blocks(
+    protocol: ExecutionProtocol,
     tool_use_id: &str,
     execution: Option<ExecutionResult>,
-) -> (String, Value, String) {
+) -> ExecutionBlocks {
     match execution {
         Some(execution) => {
+            let (tool_name, input, result_type, content_type) = match protocol {
+                ExecutionProtocol::LegacyPython => (
+                    "code_execution",
+                    json!({"code": execution.program}),
+                    "code_execution_tool_result",
+                    "code_execution_result",
+                ),
+                ExecutionProtocol::Current => (
+                    "bash_code_execution",
+                    json!({"command": current_command(&execution.program)}),
+                    "bash_code_execution_tool_result",
+                    "bash_code_execution_result",
+                ),
+            };
             let result = json!({
-                "type": "bash_code_execution_tool_result",
+                "type": result_type,
                 "tool_use_id": tool_use_id,
                 "content": {
-                    "type": "bash_code_execution_result",
+                    "type": content_type,
                     "stdout": execution.stdout,
                     "stderr": "",
                     "return_code": 0,
                     "content": []
                 }
             });
-            (execution.command, result, execution.summary)
+            ExecutionBlocks {
+                tool_name,
+                input,
+                result,
+                summary: execution.summary,
+            }
         }
         None => {
-            let command = "unsupported operation".to_string();
+            let (tool_name, input, result_type, error_type) = match protocol {
+                ExecutionProtocol::LegacyPython => (
+                    "code_execution",
+                    json!({"code": "# unsupported operation"}),
+                    "code_execution_tool_result",
+                    "code_execution_tool_result_error",
+                ),
+                ExecutionProtocol::Current => (
+                    "bash_code_execution",
+                    json!({"command": "unsupported operation"}),
+                    "bash_code_execution_tool_result",
+                    "bash_code_execution_tool_result_error",
+                ),
+            };
             let result = json!({
-                "type": "bash_code_execution_tool_result",
+                "type": result_type,
                 "tool_use_id": tool_use_id,
                 "content": {
-                    "type": "bash_code_execution_tool_result_error",
+                    "type": error_type,
                     "error_code": "unavailable"
                 }
             });
-            let summary =
-                "Code execution is unavailable for this operation on Amazon Bedrock.".to_string();
-            (command, result, summary)
+            ExecutionBlocks {
+                tool_name,
+                input,
+                result,
+                summary: "Code execution is unavailable for this operation on Amazon Bedrock."
+                    .to_string(),
+            }
         }
+    }
+}
+
+fn current_command(program: &str) -> String {
+    if program.contains('\'') {
+        format!("python -c {program:?}")
+    } else {
+        format!("python -c '{program}'")
     }
 }
 
@@ -360,8 +446,8 @@ fn block_stop(index: usize) -> SseEvent {
     )
 }
 
-fn output_tokens(command: &str, result: &Value, summary: &str) -> i32 {
-    let base = super::claude_tok::count_claude(command)
+fn output_tokens(input: &Value, result: &Value, summary: &str) -> i32 {
+    let base = super::claude_tok::count_claude(&input.to_string())
         + super::claude_tok::count_claude(&result.to_string())
         + super::claude_tok::count_claude(summary);
     super::bedrock::framed_output_tokens_with_tool_arguments(base, 3, 1, 1)
@@ -413,6 +499,30 @@ fn extract_arithmetic_expression(text: &str) -> Option<String> {
         .filter_map(clean_expression_candidate)
         .filter_map(|candidate| evaluate_expression(&candidate).ok().map(|_| candidate))
         .max_by_key(String::len)
+}
+
+fn extract_print_literal(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    for marker in ["prints '", "prints \"", "print('", "print(\""] {
+        let Some(start) = lower.find(marker) else {
+            continue;
+        };
+        let quote = marker.as_bytes()[marker.len() - 1] as char;
+        let value_start = start + marker.len();
+        let rest = &text[value_start..];
+        let end = rest.find(quote)?;
+        let literal = &rest[..end];
+        if !literal.is_empty()
+            && literal.len() <= MAX_PRINT_LITERAL_BYTES
+            && literal
+                .bytes()
+                .all(|byte| byte == b' ' || byte.is_ascii_graphic())
+            && !literal.contains('\\')
+        {
+            return Some(literal.to_string());
+        }
+    }
+    None
 }
 
 fn clean_expression_candidate(candidate: &str) -> Option<String> {
@@ -672,10 +782,27 @@ mod tests {
     }
 
     #[test]
+    fn extracts_only_bounded_literal_print_requests() {
+        assert_eq!(
+            extract_print_literal(
+                "Write and execute a Python script that prints 'HELLO_CHECK'. Only use the code execution tool."
+            ),
+            Some("HELLO_CHECK".to_string())
+        );
+        assert_eq!(
+            extract_print_literal("run print(\"hello world\")"),
+            Some("hello world".to_string())
+        );
+        assert!(extract_print_literal("print(user_input)").is_none());
+        assert!(extract_print_literal("prints 'line\\nsecret'").is_none());
+        assert!(extract_print_literal(&format!("prints '{}'", "x".repeat(300))).is_none());
+    }
+
+    #[test]
     fn streaming_success_uses_server_tool_result_contract() {
         let payload = request(true, "Use the code execution tool to calculate 17 * 23.");
         let execution = ExecutionResult {
-            command: "python -c 'print(17 * 23)'".to_string(),
+            program: "print(17 * 23)".to_string(),
             stdout: "391\n".to_string(),
             summary: "17 * 23 = 391".to_string(),
         };
@@ -698,6 +825,10 @@ mod tests {
             events[4].data["content_block"]["content"]["stdout"],
             "391\n"
         );
+        assert_eq!(
+            events[2].data["delta"]["partial_json"],
+            r#"{"command":"python -c 'print(17 * 23)'"}"#
+        );
         assert!(
             events
                 .last()
@@ -705,6 +836,44 @@ mod tests {
                 .data
                 .get("amazon-bedrock-invocationMetrics")
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn legacy_python_request_uses_legacy_result_contract() {
+        let mut payload = request(
+            true,
+            "Write and execute a Python script that prints 'HELLO_CHECK'. Only use the code execution tool, nothing else.",
+        );
+        payload.tools.as_mut().unwrap()[0].tool_type = Some("code_execution_20250522".to_string());
+        let execution = ExecutionResult {
+            program: "print(\"HELLO_CHECK\")".to_string(),
+            stdout: "HELLO_CHECK\n".to_string(),
+            summary: "HELLO_CHECK".to_string(),
+        };
+        let events = build_events(
+            &payload,
+            Some(execution),
+            super::super::cache::UsageBreakdown::flat(42),
+            8,
+        );
+
+        assert_eq!(events[1].data["content_block"]["name"], "code_execution");
+        assert_eq!(
+            events[2].data["delta"]["partial_json"],
+            r#"{"code":"print(\"HELLO_CHECK\")"}"#
+        );
+        assert_eq!(
+            events[4].data["content_block"]["type"],
+            "code_execution_tool_result"
+        );
+        assert_eq!(
+            events[4].data["content_block"]["content"]["type"],
+            "code_execution_result"
+        );
+        assert_eq!(
+            events[4].data["content_block"]["content"]["stdout"],
+            "HELLO_CHECK\n"
         );
     }
 
