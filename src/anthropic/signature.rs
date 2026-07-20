@@ -57,13 +57,13 @@ const AWS_B40_SONNET_45_RAW_BYTES: &[usize] = &[309, 357];
 const AWS_B40_HAIKU_45_RAW_BYTES: &[usize] = &[270, 285];
 const AWS_B40_ADAPTIVE_RAW_BYTES: usize = 372;
 const AWS_B_OPUS_48_THINKING_BLOB_BYTES: usize = 55;
-const AWS_B_OPUS_48_ADAPTIVE_MIN_BLOB_BYTES: usize = 579;
-const AWS_B_OPUS_48_ADAPTIVE_MAX_BLOB_BYTES: usize = 4_096;
+const AWS_B_OPUS_48_ADAPTIVE_MIN_BLOB_BYTES: usize = 55;
+const AWS_B_OPUS_48_ADAPTIVE_LOW_CONTEXT_MAX_BLOB_BYTES: usize = 256;
+const AWS_B_OPUS_48_ADAPTIVE_MAX_BLOB_BYTES: usize = 3_200;
 const AWS_B_OPUS_48_LARGE_CONTEXT_TOKENS: i32 = 10_000;
-const AWS_B_OPUS_48_CACHE_CREATE_CONTEXT_DIVISOR: usize = 7;
-const AWS_B_OPUS_48_CACHE_READ_CONTEXT_DIVISOR: usize = 12;
-const AWS_B_OPUS_48_CACHE_CREATE_CONTEXT_MAX_BYTES: usize = 3_584;
-const AWS_B_OPUS_48_CACHE_READ_CONTEXT_MAX_BYTES: usize = 2_048;
+const AWS_B_OPUS_48_CONTEXT_DIVISOR: usize = 10;
+const AWS_B_OPUS_48_CONTEXT_MAX_BYTES: usize = 2_600;
+const AWS_B_OPUS_48_CONTEXT_STAMP: &[u8; 12] = b"058264511794";
 const EXTERNAL_ANTHROPIC_MIN_RAW_BYTES: usize = 340;
 const EXTERNAL_ANTHROPIC_MAX_RAW_BYTES: usize = 520;
 
@@ -134,12 +134,6 @@ fn is_opus_4_8(model: &str) -> bool {
     lower.contains("opus-4-8") || lower.contains("opus-4.8")
 }
 
-fn rand_decimal_bytes(n: usize) -> Vec<u8> {
-    (0..n)
-        .map(|_| b'0' + fastrand::usize(0..10) as u8)
-        .collect()
-}
-
 pub fn generate_aws_b40_signature_for_model(model: &str) -> String {
     let lower = model.to_ascii_lowercase();
     if is_opus_4_8(model) {
@@ -162,47 +156,40 @@ pub fn generate_aws_b40_adaptive_signature_for_model(
     model: &str,
     thinking_bytes: usize,
     context_tokens: i32,
-    cache_read_input_tokens: i32,
+    _cache_read_input_tokens: i32,
 ) -> String {
     if !is_opus_4_8(model) {
         return generate_hmac_blob(AWS_B40_ADAPTIVE_RAW_BYTES);
     }
 
     if context_tokens < AWS_B_OPUS_48_LARGE_CONTEXT_TOKENS {
-        return generate_aws_bedrock_opus_48_signature(AWS_B_OPUS_48_THINKING_BLOB_BYTES, false);
+        let blob_bytes = thinking_bytes
+            .saturating_add(fastrand::usize(..=160))
+            .saturating_sub(80)
+            .clamp(
+                AWS_B_OPUS_48_ADAPTIVE_MIN_BLOB_BYTES,
+                AWS_B_OPUS_48_ADAPTIVE_LOW_CONTEXT_MAX_BLOB_BYTES,
+            );
+        return generate_aws_bedrock_opus_48_signature(blob_bytes, false);
     }
 
-    // Exact POMO replays of the same 34k-token adaptive request expose two
-    // stable Bedrock variants. A cache creation uses the 99-byte header and a
-    // larger encrypted blob; a cache read uses the 113-byte header (field 11 is
-    // a 12-digit cache stamp) and a smaller blob. The visible thinking summary
-    // is much shorter than the encrypted payload, so context and cache state
-    // are the reliable inputs here.
-    let cache_read = cache_read_input_tokens > 0;
-    let (context_divisor, context_max) = if cache_read {
-        (
-            AWS_B_OPUS_48_CACHE_READ_CONTEXT_DIVISOR,
-            AWS_B_OPUS_48_CACHE_READ_CONTEXT_MAX_BYTES,
-        )
-    } else {
-        (
-            AWS_B_OPUS_48_CACHE_CREATE_CONTEXT_DIVISOR,
-            AWS_B_OPUS_48_CACHE_CREATE_CONTEXT_MAX_BYTES,
-        )
-    };
+    // Current Bedrock/POMO captures use the same stamped protobuf header for
+    // both cache creation and cache reads. The encrypted thinking payload still
+    // varies between generations, but its distribution does not flip merely
+    // because the prompt cache changed state.
     let context_boost = ((context_tokens - AWS_B_OPUS_48_LARGE_CONTEXT_TOKENS) as usize
-        / context_divisor)
-        .min(context_max);
+        / AWS_B_OPUS_48_CONTEXT_DIVISOR)
+        .min(AWS_B_OPUS_48_CONTEXT_MAX_BYTES);
     let blob_bytes = thinking_bytes
         .saturating_mul(2)
         .saturating_add(context_boost)
-        .saturating_add(fastrand::usize(..=320))
-        .saturating_sub(160)
+        .saturating_add(fastrand::usize(..=480))
+        .saturating_sub(240)
         .clamp(
             AWS_B_OPUS_48_ADAPTIVE_MIN_BLOB_BYTES,
             AWS_B_OPUS_48_ADAPTIVE_MAX_BLOB_BYTES,
         );
-    generate_aws_bedrock_opus_48_signature(blob_bytes, cache_read)
+    generate_aws_bedrock_opus_48_signature(blob_bytes, true)
 }
 
 /// 追加 protobuf 变长整数(varint)。
@@ -333,7 +320,7 @@ fn generate_aws_bedrock_opus_48_signature(
     push_varint_field(&mut f1, 7, 0);
     push_len_field(&mut f1, 8, b"thinking");
     if include_large_context_stamp {
-        push_len_field(&mut f1, 11, &rand_decimal_bytes(12));
+        push_len_field(&mut f1, 11, AWS_B_OPUS_48_CONTEXT_STAMP);
     }
 
     let mut inner = Vec::with_capacity(f1.len() + thinking_blob_bytes + 96);
@@ -800,11 +787,11 @@ mod tests {
     }
 
     #[test]
-    fn aws_b40_opus_48_adaptive_signature_tracks_context_shape() {
+    fn aws_b40_opus_48_adaptive_signature_tracks_current_bedrock_shape() {
         for _ in 0..20 {
             let low = generate_aws_b40_adaptive_signature_for_model("claude-opus-4-8", 303, 49, 0);
             let low_raw = BASE64.decode(&low).expect("low-context signature decodes");
-            assert_eq!(low_raw.len(), 241);
+            assert!((241..=443).contains(&low_raw.len()), "{}", low_raw.len());
             let (low_inner_len, low_off) = parse_top_level(&low_raw);
             assert_eq!(low_off + low_inner_len + 2, low_raw.len());
             assert_eq!(&low_raw[low_off..low_off + 4], &[0x0a, 0x63, 0x08, 0x0f]);
@@ -816,7 +803,7 @@ mod tests {
                 .decode(&cache_create)
                 .expect("cache-creation signature decodes");
             assert!(
-                (3_884..=4_204).contains(&cache_create_raw.len()),
+                (2_740..=3_240).contains(&cache_create_raw.len()),
                 "{}",
                 cache_create_raw.len()
             );
@@ -827,7 +814,12 @@ mod tests {
             );
             assert_eq!(
                 &cache_create_raw[cache_create_off..cache_create_off + 4],
-                &[0x0a, 0x63, 0x08, 0x0f]
+                &[0x0a, 0x71, 0x08, 0x0f]
+            );
+            assert!(
+                cache_create_raw
+                    .windows(12)
+                    .any(|window| { window == AWS_B_OPUS_48_CONTEXT_STAMP.as_slice() })
             );
             assert!(verify_signature(&cache_create));
 
@@ -841,7 +833,7 @@ mod tests {
                 .decode(&cache_read)
                 .expect("large-context signature decodes");
             assert!(
-                (2_375..=2_695).contains(&cache_read_raw.len()),
+                (2_740..=3_240).contains(&cache_read_raw.len()),
                 "{}",
                 cache_read_raw.len()
             );
@@ -855,6 +847,11 @@ mod tests {
                 &[0x0a, 0x71, 0x08, 0x0f]
             );
             assert!(cache_read_raw.windows(13).any(|w| w == b"claude-quince"));
+            assert!(
+                cache_read_raw
+                    .windows(12)
+                    .any(|window| { window == AWS_B_OPUS_48_CONTEXT_STAMP.as_slice() })
+            );
             assert!(verify_signature(&cache_read));
         }
 

@@ -2232,7 +2232,13 @@ async fn handle_non_stream_request(
     let final_input_tokens = total_input_tokens.max(1);
 
     // 根据客户请求意图拆分 usage（带 cache_control → 拆成 I/CR/CC，否则平铺）
-    let usage_breakdown = if let Some(initial) = calibrated_direct_initial_usage {
+    let stable_cached_initial = calibrated_direct_initial_usage.or_else(|| {
+        (aws_b40_compat
+            && (initial_usage_breakdown.cache_read_input_tokens > 0
+                || initial_usage_breakdown.cache_creation_input_tokens > 0))
+            .then_some(initial_usage_breakdown)
+    });
+    let usage_breakdown = if let Some(initial) = stable_cached_initial {
         super::cache::with_additional_input(initial, first_round_input_tokens, final_input_tokens)
     } else {
         let initial = super::cache::reconcile_initial_input(
@@ -5008,7 +5014,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aws_b_platform_identity_adaptive_signature_tracks_cache_state() {
+    async fn aws_b_platform_identity_adaptive_signature_is_cache_state_independent() {
         let req = parse(
             "claude-opus-4-8",
             serde_json::json!({
@@ -5087,8 +5093,13 @@ mod tests {
             },
         )
         .await;
-        assert!((3_650..=4_150).contains(&cache_create.len()));
-        assert_eq!(&cache_create[3..7], &[0x0a, 0x63, 0x08, 0x0f]);
+        assert!((2_600..=3_250).contains(&cache_create.len()));
+        assert_eq!(&cache_create[3..7], &[0x0a, 0x71, 0x08, 0x0f]);
+        assert!(
+            cache_create
+                .windows(12)
+                .any(|window| window == b"058264511794")
+        );
 
         let cache_read = signature_raw(
             &req,
@@ -5101,9 +5112,14 @@ mod tests {
             },
         )
         .await;
-        assert!((2_150..=2_650).contains(&cache_read.len()));
+        assert!((2_600..=3_250).contains(&cache_read.len()));
         assert_eq!(&cache_read[3..7], &[0x0a, 0x71, 0x08, 0x0f]);
-        assert!(cache_create.len() > cache_read.len() + 800);
+        assert!(
+            cache_read
+                .windows(12)
+                .any(|window| window == b"058264511794")
+        );
+        assert_ne!(cache_create, cache_read);
     }
 
     #[test]

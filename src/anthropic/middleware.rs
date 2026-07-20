@@ -16,6 +16,8 @@ use crate::kiro::provider::KiroProvider;
 
 use super::types::ErrorResponse;
 
+const AWS_B40_GATEWAY_VERSION: &str = "8840a103";
+
 /// 应用共享状态
 #[derive(Clone)]
 pub struct AppState {
@@ -112,7 +114,11 @@ pub async fn aws_b40_headers_middleware(
         let request_id = aws_b40_oneapi_request_id();
         let mut response =
             (StatusCode::NOT_FOUND, Json(json!({ "error": "Not Found" }))).into_response();
-        apply_aws_b40_headers_with_version(response.headers_mut(), &request_id, "78bb6d21");
+        apply_aws_b40_headers_with_version(
+            response.headers_mut(),
+            &request_id,
+            AWS_B40_GATEWAY_VERSION,
+        );
         return response;
     }
 
@@ -183,7 +189,7 @@ fn random_digits(len: usize) -> String {
 }
 
 pub(crate) fn apply_aws_b40_headers(headers: &mut header::HeaderMap, request_id: &str) {
-    apply_aws_b40_headers_with_version(headers, request_id, "78bb6d21");
+    apply_aws_b40_headers_with_version(headers, request_id, AWS_B40_GATEWAY_VERSION);
 }
 
 pub(crate) fn apply_aws_b40_headers_with_version(
@@ -223,21 +229,21 @@ fn apply_aws_b40_non_stream_success_headers(headers: &mut header::HeaderMap) {
 
 fn aws_b40_version_for_response(method: &Method, path: &str, response: &Response) -> &'static str {
     if *method == Method::OPTIONS || *method == Method::HEAD {
-        return "78bb6d21";
+        return AWS_B40_GATEWAY_VERSION;
     }
 
     if is_gateway_completion_path(path) {
         if response.status().is_success() {
             if is_stream_response(response) {
-                "78bb6d21"
+                AWS_B40_GATEWAY_VERSION
             } else {
                 "20260501R2"
             }
         } else {
-            "78bb6d21"
+            AWS_B40_GATEWAY_VERSION
         }
     } else {
-        "78bb6d21"
+        AWS_B40_GATEWAY_VERSION
     }
 }
 
@@ -298,13 +304,13 @@ mod tests {
         let stream = response(StatusCode::OK, "text/event-stream");
         assert_eq!(
             aws_b40_version_for_response(&Method::POST, "/v1/messages", &stream),
-            "78bb6d21"
+            AWS_B40_GATEWAY_VERSION
         );
 
         let models = response(StatusCode::OK, "application/json");
         assert_eq!(
             aws_b40_version_for_response(&Method::GET, "/v1/models", &models),
-            "78bb6d21"
+            AWS_B40_GATEWAY_VERSION
         );
 
         let chat = response(StatusCode::OK, "application/json");
@@ -321,7 +327,7 @@ mod tests {
 
         assert_eq!(headers["server"], "lyywafcdn");
         assert_eq!(headers["x-oneapi-request-id"], "request-123");
-        assert_eq!(headers["x-new-api-version"], "78bb6d21");
+        assert_eq!(headers["x-new-api-version"], AWS_B40_GATEWAY_VERSION);
         assert_eq!(headers["x-accel-buffering"], "no");
     }
 

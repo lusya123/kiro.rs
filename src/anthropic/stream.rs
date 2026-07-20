@@ -1901,15 +1901,21 @@ impl StreamContext {
     }
 
     fn final_usage_breakdown(&self) -> super::cache::UsageBreakdown {
-        if let Some(initial) = self.calibrated_direct_initial_usage() {
+        let stable_cached_initial = self.calibrated_direct_initial_usage().or_else(|| {
+            (self.aws_b40_compat
+                && (self.initial_usage_breakdown.cache_read_input_tokens > 0
+                    || self.initial_usage_breakdown.cache_creation_input_tokens > 0))
+                .then_some(self.initial_usage_breakdown)
+        });
+        if let Some(initial) = stable_cached_initial {
             if self.accumulated_input_tokens == 0 {
                 return initial;
             }
 
-            // The observed 28-tool Bedrock catalog has a stable public cache
-            // split. Kiro's later context event includes a private wire prelude
-            // and must not replace that split. Continuation rounds remain real
-            // ordinary input and are added after the calibrated first round.
+            // A public prompt-cache split is fixed when message_start is
+            // emitted. Kiro's later context event includes its private runtime
+            // prelude and must not rewrite the same request's cache accounting.
+            // Continuation rounds remain ordinary input and are added here.
             let current_input_tokens = self.current_billable_input_tokens();
             let first_round_input_tokens = self
                 .initial_calibrated_input_tokens
@@ -2867,6 +2873,33 @@ mod tests {
         );
         assert_eq!(response_usage["output_tokens"], 1);
         assert_eq!(response_usage["service_tier"], "standard");
+    }
+
+    #[test]
+    fn aws_b_cache_split_stays_stable_after_private_context_event() {
+        let usage = super::super::cache::UsageBreakdown {
+            input_tokens: 2,
+            cache_read_input_tokens: 15_590,
+            cache_creation_input_tokens: 8_228,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 8_228,
+        };
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-8",
+            usage.total(),
+            true,
+            usage,
+            HashMap::new(),
+        );
+        ctx.enable_aws_b40_compat(true);
+        ctx.context_input_tokens = Some(90_000);
+
+        let start = ctx.create_message_start_event();
+        let final_usage = ctx.final_usage_breakdown();
+
+        assert_eq!(start["message"]["usage"]["input_tokens"], 2);
+        assert_eq!(start["message"]["usage"]["cache_read_input_tokens"], 15_590);
+        assert_eq!(final_usage, usage);
     }
 
     #[test]

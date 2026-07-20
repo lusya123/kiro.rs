@@ -36,6 +36,8 @@ const KIRO_TOOL_DESCRIPTION_LIMIT_CHARS: usize = 10_000;
 const BEDROCK_TOOL_BASELINE_CORRECTION_PER_TOOL: i32 = 8;
 const BEDROCK_TRUNCATED_TOOL_CACHE_SUFFIX_CORRECTION: i32 = -17;
 const BEDROCK_TOOL_CACHE_SUFFIX_CORRECTION: i32 = 40;
+const BEDROCK_LONG_TOOL_CACHE_START_CHARS: usize = 8_000;
+const BEDROCK_LONG_TOOL_CACHE_CHAR_CORRECTION: f64 = 0.0865;
 // Derived from the POMO Opus 4.8 matrices recorded in
 // test-artifacts/ztest/direct-parity/2026-07-15-token-calibration-summary.md.
 const TOOL_HISTORY_TEXT_SCALE: f64 = 1.375;
@@ -369,7 +371,15 @@ pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i
                 tools.len(),
             ));
         }
-        return calibrated.saturating_add(image_correction).max(1);
+        let long_cache_correction = payload
+            .tools
+            .as_ref()
+            .map(|tools| long_tool_text_correction_from_segments(&segments, tools.len()))
+            .unwrap_or(0);
+        return calibrated
+            .saturating_add(long_cache_correction)
+            .saturating_add(image_correction)
+            .max(1);
     }
 
     if payload
@@ -377,8 +387,15 @@ pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i
         .as_ref()
         .is_some_and(|tools| !tools.is_empty())
     {
+        let tool_count = payload.tools.as_ref().map_or(0, Vec::len);
+        let long_cache_correction = if super::compat::is_opus_4_8(&payload.model) {
+            long_tool_text_correction_from_segments(&segments, tool_count)
+        } else {
+            0
+        };
         return base_tokens
             .saturating_add(complex_tool_schema_correction(payload))
+            .saturating_add(long_cache_correction)
             .saturating_add(image_correction)
             .max(1);
     }
@@ -905,6 +922,12 @@ pub fn calibrated_cache_prefix_tokens(
             return base_tokens
                 .saturating_add(tool_framing)
                 .saturating_add(complex_tool_schema_correction_for_tools(tools))
+                .saturating_add(long_tool_cache_text_correction(
+                    system_segments,
+                    content_segments,
+                    tools.len(),
+                ))
+                .saturating_add(cache_tool_history_tokens(content_segments))
                 .max(1);
         }
         return base_tokens.max(1);
@@ -931,6 +954,87 @@ pub fn calibrated_cache_prefix_tokens(
     base_tokens
         .saturating_add((long_text_correction(char_count, colon_count) - 3).max(0))
         .max(1)
+}
+
+fn long_tool_cache_text_correction(
+    system_segments: &[String],
+    content_segments: &[Value],
+    tool_count: usize,
+) -> i32 {
+    if tool_count < 8 {
+        return 0;
+    }
+
+    let mut segments = system_segments
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    for content in content_segments {
+        collect_text_segments(content, &mut segments);
+    }
+    long_tool_text_correction_from_segments(&segments, tool_count)
+}
+
+fn long_tool_text_correction_from_segments(segments: &[&str], tool_count: usize) -> i32 {
+    if tool_count < 8 {
+        return 0;
+    }
+
+    let char_count = segments
+        .iter()
+        .map(|text| text.chars().count())
+        .sum::<usize>();
+    let excess = char_count.saturating_sub(BEDROCK_LONG_TOOL_CACHE_START_CHARS);
+    (excess as f64 * BEDROCK_LONG_TOOL_CACHE_CHAR_CORRECTION).round() as i32
+}
+
+fn cache_tool_history_tokens(content_segments: &[Value]) -> i32 {
+    let mut tool_uses = 0i32;
+    let mut tool_results = 0i32;
+    let mut block_tokens = 0i32;
+    for content in content_segments {
+        collect_cache_tool_history(
+            content,
+            &mut tool_uses,
+            &mut tool_results,
+            &mut block_tokens,
+        );
+    }
+
+    let completed_pairs = tool_uses.min(tool_results);
+    let framing = if completed_pairs > 0 {
+        completed_pairs.saturating_mul(4).saturating_sub(2)
+    } else {
+        0
+    };
+    block_tokens.saturating_add(framing)
+}
+
+fn collect_cache_tool_history(
+    value: &Value,
+    tool_uses: &mut i32,
+    tool_results: &mut i32,
+    block_tokens: &mut i32,
+) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_cache_tool_history(item, tool_uses, tool_results, block_tokens);
+            }
+        }
+        Value::Object(_) => match value.get("type").and_then(Value::as_str) {
+            Some("tool_use") => {
+                *tool_uses = tool_uses.saturating_add(1);
+                *block_tokens = block_tokens.saturating_add(canonical_value_tokens(value));
+            }
+            Some("tool_result") => {
+                *tool_results = tool_results.saturating_add(1);
+                *block_tokens = block_tokens.saturating_add(canonical_value_tokens(value));
+            }
+            _ => {}
+        },
+        _ => {}
+    }
 }
 
 fn long_text_correction(char_count: usize, colon_count: usize) -> i32 {

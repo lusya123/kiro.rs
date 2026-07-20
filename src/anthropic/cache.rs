@@ -240,7 +240,15 @@ pub async fn compute_request_usage_breakdown_with_profile(
         return UsageBreakdown::flat(total_input_tokens);
     };
 
-    let ordinary_input = total_input_tokens - cache_plan.cache_tokens;
+    let ordinary_input = if aws_b40_compat && cache_plan.terminal_message_breakpoint {
+        2
+    } else if aws_b40_compat {
+        total_input_tokens
+            .saturating_sub(cache_plan.cache_tokens)
+            .max(1)
+    } else {
+        total_input_tokens - cache_plan.cache_tokens
+    };
     UsageBreakdown {
         input_tokens: ordinary_input,
         cache_read_input_tokens: cache_plan.cache_read_tokens,
@@ -313,6 +321,7 @@ struct CachePlan {
     cache_read_tokens: i32,
     cache_creation_5m_tokens: i32,
     cache_creation_1h_tokens: i32,
+    terminal_message_breakpoint: bool,
 }
 
 async fn cache_plan_for_request(
@@ -329,19 +338,28 @@ async fn cache_plan_for_request(
     breakpoints.sort_by_key(|b| b.tokens);
     breakpoints.truncate(4);
 
-    let mut read_index: Option<usize> = None;
-    for (idx, breakpoint) in breakpoints.iter().enumerate().rev() {
-        if cache_entry_exists(&req.model, breakpoint).await {
-            read_index = Some(idx);
-            break;
+    let mut read_match: Option<CacheReadMatch> = None;
+    for breakpoint in breakpoints.iter().rev() {
+        if let Some(candidate) = cache_entry_match(&req.model, breakpoint).await
+            && read_match
+                .as_ref()
+                .is_none_or(|current| candidate.tokens > current.tokens)
+        {
+            read_match = Some(candidate);
         }
     }
 
-    let read_tokens = read_index.map(|idx| breakpoints[idx].tokens).unwrap_or(0);
+    let terminal_breakpoint = breakpoints.last()?;
+    let max_cache_tokens = terminal_breakpoint.tokens;
+    let terminal_message_breakpoint = terminal_breakpoint.message_breakpoint;
+    let read_tokens = read_match
+        .as_ref()
+        .map(|candidate| candidate.tokens.min(max_cache_tokens))
+        .unwrap_or(0);
     // 命中时刷新该前缀 TTL(对齐真 Anthropic 的"每次使用重置缓存有效期"),
     // 否则持续使用的前缀每到 5m/1h 就会冒出一次 cache_creation,破坏"统一号池"的一致观感。
-    if let Some(idx) = read_index {
-        register_cache_entry(&req.model, &breakpoints[idx]).await;
+    if let Some(candidate) = read_match {
+        register_cache_material(&req.model, &candidate.key_material, candidate.ttl).await;
     }
     let mut creation_5m = 0;
     let mut creation_1h = 0;
@@ -361,10 +379,11 @@ async fn cache_plan_for_request(
     }
 
     Some(CachePlan {
-        cache_tokens: breakpoints.last()?.tokens,
+        cache_tokens: max_cache_tokens,
         cache_read_tokens: read_tokens,
         cache_creation_5m_tokens: creation_5m,
         cache_creation_1h_tokens: creation_1h,
+        terminal_message_breakpoint,
     })
 }
 
@@ -383,11 +402,33 @@ impl CacheTtl {
     }
 }
 
+#[derive(Clone)]
+struct CacheReadCandidate {
+    tokens: i32,
+    key_material: String,
+}
+
+struct CacheReadMatch {
+    tokens: i32,
+    key_material: String,
+    ttl: CacheTtl,
+}
+
+#[derive(Clone, Copy)]
+struct CacheBreakpointOptions {
+    readable: bool,
+    warm_on_first_use: bool,
+    message_breakpoint: bool,
+}
+
 struct CacheBreakpoint {
     tokens: i32,
     ttl: CacheTtl,
     key_material: String,
     readable: bool,
+    read_candidates: Vec<CacheReadCandidate>,
+    warm_on_first_use: bool,
+    message_breakpoint: bool,
 }
 
 fn build_cache_breakpoints(
@@ -407,13 +448,19 @@ fn build_cache_breakpoints(
                 .key_parts
                 .push(format!("tool:{}", canonical_json(&tool_key)));
             if tool.cache_control.is_some() {
+                let warm_on_first_use =
+                    aws_b40_compat && cache_control_is_global(tool.cache_control.as_ref());
                 push_breakpoint(
                     req,
                     &state,
                     &mut breakpoints,
                     cache_ttl(tool.cache_control.as_ref()),
-                    true,
                     aws_b40_compat,
+                    CacheBreakpointOptions {
+                        readable: true,
+                        warm_on_first_use,
+                        message_breakpoint: false,
+                    },
                 );
             }
         }
@@ -424,13 +471,19 @@ fn build_cache_breakpoints(
             state.system_segments.push(item.text.clone());
             state.key_parts.push(format!("system:{}", item.text));
             if item.cache_control.is_some() {
+                let warm_on_first_use =
+                    aws_b40_compat && cache_control_is_global(item.cache_control.as_ref());
                 push_breakpoint(
                     req,
                     &state,
                     &mut breakpoints,
                     cache_ttl(item.cache_control.as_ref()),
-                    true,
                     aws_b40_compat,
+                    CacheBreakpointOptions {
+                        readable: true,
+                        warm_on_first_use,
+                        message_breakpoint: false,
+                    },
                 );
             }
         }
@@ -442,11 +495,28 @@ fn build_cache_breakpoints(
 
     if req.cache_control.is_some() && breakpoints.is_empty() && state.has_cacheable_content() {
         let ttl = cache_ttl(req.cache_control.as_ref());
-        push_breakpoint(req, &state, &mut breakpoints, ttl, true, aws_b40_compat);
+        let warm_on_first_use =
+            aws_b40_compat && cache_control_is_global(req.cache_control.as_ref());
+        push_breakpoint(
+            req,
+            &state,
+            &mut breakpoints,
+            ttl,
+            aws_b40_compat,
+            CacheBreakpointOptions {
+                readable: true,
+                warm_on_first_use,
+                message_breakpoint: false,
+            },
+        );
     }
 
     for breakpoint in &mut breakpoints {
-        breakpoint.tokens = breakpoint.tokens.min(total_input_tokens).max(0);
+        breakpoint.tokens = if aws_b40_compat {
+            breakpoint.tokens.max(0)
+        } else {
+            breakpoint.tokens.min(total_input_tokens).max(0)
+        };
     }
     breakpoints
 }
@@ -457,6 +527,7 @@ struct PrefixState {
     system_segments: Vec<String>,
     content_segments: Vec<Value>,
     key_parts: Vec<String>,
+    read_candidates: Vec<CacheReadCandidate>,
 }
 
 impl PrefixState {
@@ -479,6 +550,7 @@ fn collect_message_prefix(
             let content = Value::String(text.clone());
             state.key_parts.push(format!("{}:{}", message.role, text));
             state.content_segments.push(content);
+            remember_read_candidate(req, state, aws_b40_compat);
         }
         Value::Array(items) => {
             for item in items {
@@ -495,8 +567,23 @@ fn collect_message_prefix(
                 state
                     .content_segments
                     .push(Value::Array(vec![item_without_cache]));
+                remember_read_candidate(req, state, aws_b40_compat);
                 if has_direct_cache_control(item) {
-                    push_breakpoint(req, state, breakpoints, ttl, false, aws_b40_compat);
+                    let readable = aws_b40_compat && super::compat::is_opus_4_8(&req.model);
+                    let warm_on_first_use =
+                        readable && cache_control_is_global(item.get("cache_control"));
+                    push_breakpoint(
+                        req,
+                        state,
+                        breakpoints,
+                        ttl,
+                        aws_b40_compat,
+                        CacheBreakpointOptions {
+                            readable,
+                            warm_on_first_use,
+                            message_breakpoint: true,
+                        },
+                    );
                 }
             }
         }
@@ -505,8 +592,17 @@ fn collect_message_prefix(
                 .key_parts
                 .push(format!("{}:{}", message.role, canonical_json(other)));
             state.content_segments.push(other.clone());
+            remember_read_candidate(req, state, aws_b40_compat);
         }
     }
+}
+
+fn remember_read_candidate(req: &MessagesRequest, state: &mut PrefixState, aws_b40_compat: bool) {
+    let tokens = calibrated_prefix_tokens(req, state, aws_b40_compat);
+    state.read_candidates.push(CacheReadCandidate {
+        tokens,
+        key_material: state.key_parts.join("\n---prefix-block---\n"),
+    });
 }
 
 fn strip_cache_control(value: &mut Value) {
@@ -561,16 +657,46 @@ fn push_breakpoint(
     state: &PrefixState,
     breakpoints: &mut Vec<CacheBreakpoint>,
     ttl: CacheTtl,
-    readable: bool,
     aws_b40_compat: bool,
+    options: CacheBreakpointOptions,
 ) {
+    let tokens = calibrated_prefix_tokens(req, state, aws_b40_compat);
+    let current_key = state.key_parts.join("\n---prefix-block---\n");
+    let read_candidates = if options.readable {
+        state
+            .read_candidates
+            .iter()
+            .rev()
+            .skip_while(|candidate| candidate.key_material == current_key)
+            .take(20)
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    breakpoints.push(CacheBreakpoint {
+        tokens,
+        ttl,
+        key_material: current_key,
+        readable: options.readable,
+        read_candidates,
+        warm_on_first_use: options.warm_on_first_use,
+        message_breakpoint: options.message_breakpoint,
+    });
+}
+
+fn calibrated_prefix_tokens(
+    req: &MessagesRequest,
+    state: &PrefixState,
+    aws_b40_compat: bool,
+) -> i32 {
     let base_tokens = super::compat::estimate_prefix_tokens(
         &req.model,
         &state.system_segments,
         &state.content_segments,
         &state.tools,
     );
-    let tokens = if aws_b40_compat {
+    if aws_b40_compat {
         super::bedrock::calibrated_cache_prefix_tokens(
             &req.model,
             base_tokens,
@@ -580,13 +706,7 @@ fn push_breakpoint(
         )
     } else {
         base_tokens
-    };
-    breakpoints.push(CacheBreakpoint {
-        tokens,
-        ttl,
-        key_material: state.key_parts.join("\n---prefix-block---\n"),
-        readable,
-    });
+    }
 }
 
 fn has_direct_cache_control(v: &Value) -> bool {
@@ -607,15 +727,48 @@ fn cache_ttl(value: Option<&Value>) -> CacheTtl {
     }
 }
 
-async fn cache_entry_exists(model: &str, breakpoint: &CacheBreakpoint) -> bool {
+fn cache_control_is_global(value: Option<&Value>) -> bool {
+    value
+        .and_then(|control| control.get("scope"))
+        .and_then(Value::as_str)
+        == Some("global")
+}
+
+async fn cache_entry_match(model: &str, breakpoint: &CacheBreakpoint) -> Option<CacheReadMatch> {
     if !breakpoint.readable {
-        return false;
+        return None;
     }
     if !cache_read_supported(model, breakpoint.tokens) {
-        return false;
+        return None;
     }
     let key = cache_key(model, &breakpoint.key_material, breakpoint.ttl);
-    crate::cluster_cache::global().exists(&key).await
+    if crate::cluster_cache::global().exists(&key).await {
+        return Some(CacheReadMatch {
+            tokens: breakpoint.tokens,
+            key_material: breakpoint.key_material.clone(),
+            ttl: breakpoint.ttl,
+        });
+    }
+
+    for candidate in &breakpoint.read_candidates {
+        if !cache_read_supported(model, candidate.tokens) {
+            continue;
+        }
+        let key = cache_key(model, &candidate.key_material, breakpoint.ttl);
+        if crate::cluster_cache::global().exists(&key).await {
+            return Some(CacheReadMatch {
+                tokens: candidate.tokens,
+                key_material: candidate.key_material.clone(),
+                ttl: breakpoint.ttl,
+            });
+        }
+    }
+
+    breakpoint.warm_on_first_use.then(|| CacheReadMatch {
+        tokens: breakpoint.tokens,
+        key_material: breakpoint.key_material.clone(),
+        ttl: breakpoint.ttl,
+    })
 }
 
 async fn register_cache_entry(model: &str, breakpoint: &CacheBreakpoint) {
@@ -625,9 +778,13 @@ async fn register_cache_entry(model: &str, breakpoint: &CacheBreakpoint) {
     if !cache_read_supported(model, breakpoint.tokens) {
         return;
     }
-    let key = cache_key(model, &breakpoint.key_material, breakpoint.ttl);
+    register_cache_material(model, &breakpoint.key_material, breakpoint.ttl).await;
+}
+
+async fn register_cache_material(model: &str, key_material: &str, ttl: CacheTtl) {
+    let key = cache_key(model, key_material, ttl);
     crate::cluster_cache::global()
-        .register(&key, breakpoint.ttl.duration())
+        .register(&key, ttl.duration())
         .await;
 }
 
@@ -1056,6 +1213,99 @@ mod tests {
         assert!(second.cache_creation_input_tokens > 0);
         assert_eq!(first.cache_read_input_tokens, 0);
         assert_eq!(second.cache_read_input_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn bedrock_message_breakpoint_reads_the_previous_turn_prefix() {
+        let tools = (0..8)
+            .map(|index| {
+                serde_json::json!({
+                    "name": format!("history_tool_{index}"),
+                    "description": "Stable cached tool contract. ".repeat(80),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"]
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let anchor = "bedrock global cache anchor ".repeat(500);
+        let suffix = "stable workspace context: value\n".repeat(500);
+        let first_user = "inspect the cached project context carefully ".repeat(400);
+        let first = parse_request(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "tools": tools,
+            "system": [
+                {
+                    "type": "text",
+                    "text": anchor,
+                    "cache_control": {"type": "ephemeral", "ttl": "1h", "scope": "global"}
+                },
+                {"type": "text", "text": suffix}
+            ],
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": first_user,
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                }]
+            }]
+        }));
+        let first_total = super::super::bedrock::calibrated_input_tokens(
+            &first,
+            super::super::compat::estimate_input_tokens(&first),
+        );
+        let first_usage =
+            compute_request_usage_breakdown_with_profile(first_total, &first, true).await;
+        let first_cached = first_usage
+            .cache_read_input_tokens
+            .saturating_add(first_usage.cache_creation_input_tokens);
+        assert!(first_usage.cache_read_input_tokens > 0);
+        assert!(first_usage.cache_creation_input_tokens > 0);
+        assert_eq!(first_usage.input_tokens, 2);
+
+        let second = parse_request(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "tools": first.tools,
+            "system": first.system,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": first_user}]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_01history",
+                        "name": "history_tool_0",
+                        "input": {"value": "next"}
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_01history",
+                        "content": "completed",
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                    }]
+                }
+            ]
+        }));
+        let second_total = super::super::bedrock::calibrated_input_tokens(
+            &second,
+            super::super::compat::estimate_input_tokens(&second),
+        );
+        let second_usage =
+            compute_request_usage_breakdown_with_profile(second_total, &second, true).await;
+
+        assert_eq!(second_usage.cache_read_input_tokens, first_cached);
+        assert!(second_usage.cache_creation_input_tokens > 0);
+        assert_eq!(second_usage.input_tokens, 2);
+        assert!(second_usage.cache_creation_input_tokens < first_usage.cache_creation_input_tokens);
     }
 
     #[tokio::test]
