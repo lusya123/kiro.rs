@@ -13,8 +13,11 @@ use serde_json::json;
 use crate::kiro::provider::KiroProvider;
 
 use super::{
-    handlers::{count_tokens, get_models, head_models, post_messages, post_messages_cc},
+    handlers::{
+        count_tokens, count_tokens_public, get_models, head_models, post_messages, post_messages_cc,
+    },
     middleware::{AppState, auth_middleware, aws_b40_headers_middleware, cors_layer},
+    native_bedrock::BedrockMantleProvider,
     openai_compat::post_chat_completions,
 };
 
@@ -38,22 +41,43 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 /// - `kiro_provider`: 可选的 KiroProvider，用于调用上游 API
 ///
 /// 创建带有 KiroProvider 的 Anthropic API 路由
+#[allow(dead_code)]
 pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
     aws_b40_compat: bool,
 ) -> Router {
+    create_router_with_native_bedrock(
+        api_key,
+        kiro_provider,
+        None,
+        extract_thinking,
+        aws_b40_compat,
+    )
+}
+
+pub fn create_router_with_native_bedrock(
+    api_key: impl Into<String>,
+    kiro_provider: Option<KiroProvider>,
+    bedrock_mantle_provider: Option<BedrockMantleProvider>,
+    extract_thinking: bool,
+    aws_b40_compat: bool,
+) -> Router {
+    let native_bedrock_enabled = bedrock_mantle_provider.is_some();
     let mut state = AppState::new(api_key, extract_thinking, aws_b40_compat);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }
+    if let Some(provider) = bedrock_mantle_provider {
+        state = state.with_bedrock_mantle_provider(provider);
+    }
 
     // 需要认证的 /v1 路由
-    let count_tokens_route = if aws_b40_compat {
+    let count_tokens_route = if aws_b40_compat && !native_bedrock_enabled {
         post(aws_b_count_tokens_not_found)
     } else {
-        post(count_tokens)
+        post(count_tokens_public)
     };
     let v1_routes = Router::new()
         .route("/models", get(get_models).head(head_models))
@@ -120,8 +144,11 @@ async fn post_responses(State(state): State<AppState>) -> axum::response::Respon
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::StatusCode;
+    use axum::body::Body;
+    use axum::http::{HeaderMap, StatusCode, header};
+    use axum::response::Response;
     use serde_json::{Value, json};
+    use std::sync::{Arc, Mutex};
 
     async fn spawn_router(aws_b40_compat: bool) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -309,6 +336,16 @@ mod tests {
             .expect("AWS-B public count_tokens body");
         assert_eq!(body, json!({ "error": "Not Found" }));
 
+        let response = client
+            .post(format!("{aws_b_base}/v1/messages/count_tokens"))
+            .header("x-api-key", "test-key")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body("{")
+            .send()
+            .await
+            .expect("AWS-B malformed public count_tokens");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
         let aws_b_count: Value = client
             .post(format!("{aws_b_base}/cc/v1/messages/count_tokens"))
             .header("x-api-key", "test-key")
@@ -359,5 +396,133 @@ mod tests {
 
         aws_b_server.abort();
         aws_p_server.abort();
+    }
+
+    #[tokio::test]
+    async fn native_bedrock_route_preserves_body_and_isolates_authentication() {
+        const NATIVE_SSE: &str = "event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+        let captured = Arc::new(Mutex::new(None::<(HeaderMap, Value)>));
+        let captured_for_handler = captured.clone();
+        let upstream = Router::new()
+            .route(
+                "/anthropic/v1/messages",
+                post(move |headers: HeaderMap, body: bytes::Bytes| {
+                    let captured = captured_for_handler.clone();
+                    async move {
+                        let value: Value =
+                            serde_json::from_slice(&body).expect("native request JSON");
+                        *captured.lock().expect("capture lock") = Some((headers, value));
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, "text/event-stream")
+                            .header("x-amzn-requestid", "native-request-id")
+                            .header("x-native-rate-limit", "preserved")
+                            .header(header::CONNECTION, "close")
+                            .body(Body::from(NATIVE_SSE))
+                            .unwrap()
+                    }
+                }),
+            )
+            .route(
+                "/anthropic/v1/messages/count_tokens",
+                post(|| async { Json(json!({"input_tokens": 42})) }),
+            );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind native upstream");
+        let upstream_addr = upstream_listener.local_addr().expect("native address");
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream)
+                .await
+                .expect("serve native upstream");
+        });
+
+        let provider = BedrockMantleProvider::for_test(
+            format!("http://{upstream_addr}/anthropic/v1/messages"),
+            "native-secret",
+            vec!["claude-opus-4-8".to_string()],
+        )
+        .expect("native provider");
+        let app =
+            create_router_with_native_bedrock("client-secret", None, Some(provider), true, true);
+        let app_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind native proxy");
+        let app_addr = app_listener.local_addr().expect("proxy address");
+        let app_server = tokio::spawn(async move {
+            axum::serve(app_listener, app)
+                .await
+                .expect("serve native proxy");
+        });
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("native test client");
+        let response = client
+            .post(format!("http://{app_addr}/v1/messages"))
+            .bearer_auth("client-secret")
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", "interleaved-thinking-2025-05-14")
+            .json(&json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 1024,
+                "stream": true,
+                "temperature": 0.7,
+                "custom_extension": {"keep": true},
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .expect("native proxy request");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-amzn-requestid"], "native-request-id");
+        assert_eq!(response.headers()["x-native-rate-limit"], "preserved");
+        assert_eq!(response.headers()[header::CONNECTION], "keep-alive");
+        assert_eq!(response.text().await.expect("native body"), NATIVE_SSE);
+
+        let (headers, body) = captured
+            .lock()
+            .expect("capture lock")
+            .take()
+            .expect("captured native request");
+        assert_eq!(headers["x-api-key"], "native-secret");
+        assert!(headers.get(header::AUTHORIZATION).is_none());
+        assert_eq!(headers["anthropic-beta"], "interleaved-thinking-2025-05-14");
+        assert_eq!(body["model"], "anthropic.claude-opus-4-8");
+        assert_eq!(body["temperature"], 0.7);
+        assert_eq!(body["custom_extension"]["keep"], true);
+
+        let count_tokens: Value = client
+            .post(format!("http://{app_addr}/v1/messages/count_tokens"))
+            .header("x-api-key", "client-secret")
+            .json(&json!({
+                "model": "claude-opus-4-8",
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .expect("native count_tokens request")
+            .json()
+            .await
+            .expect("native count_tokens body");
+        assert_eq!(count_tokens["input_tokens"], 42);
+
+        let response = client
+            .post(format!("http://{app_addr}/v1/messages"))
+            .header("x-api-key", "client-secret")
+            .json(&json!({
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .expect("non-routed request");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        app_server.abort();
+        upstream_server.abort();
     }
 }

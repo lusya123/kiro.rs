@@ -14,9 +14,9 @@ use crate::token;
 use anyhow::Error;
 use axum::{
     Json as AxumJson,
-    body::Body,
+    body::{Body, to_bytes},
     extract::{FromRequest, Request, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
 use base64::Engine;
@@ -47,42 +47,57 @@ const AUTO_CONTINUE_ESTIMATED_CHUNK_TOKENS: i32 = 4096;
 const AUTO_CONTINUE_MAX_ROUNDS: usize = 8;
 const AUTO_CONTINUE_PROMPT: &str = "Continue exactly from where your previous response stopped. Do not repeat any previous text or the last line. If the previous response ended after a numbered, list, or code line, start with the following line and include any required newline. Stop immediately when the original request is complete. Do not add summaries, comments, prefaces, or confirmations.";
 const AUTO_CONTINUE_COMPLETE_SENTINEL: &str = "__KRS_CONTINUATION_COMPLETE__";
+const RAW_JSON_BODY_LIMIT: usize = 50 * 1024 * 1024;
 
-pub(super) struct ApiJson<T>(pub T);
+pub(super) struct RawApiJson<T>(pub T, pub Bytes);
 
-impl<T> FromRequest<AppState> for ApiJson<T>
+fn api_json_rejection_response(
+    rejection: axum::extract::rejection::JsonRejection,
+    state: &AppState,
+) -> Response {
+    if state.aws_b40_compat {
+        let request_id = super::middleware::aws_b40_oneapi_request_id();
+        let rejection_text = rejection.body_text();
+        let detail = if rejection_text.contains("EOF while parsing") {
+            "unexpected end of JSON input".to_string()
+        } else {
+            rejection_text
+                .strip_prefix("Failed to parse the request body as JSON: ")
+                .unwrap_or(&rejection_text)
+                .to_string()
+        };
+        let body = json!({
+            "error": format!("Invalid request: {detail} (request id: {request_id})")
+        })
+        .to_string();
+        let mut response = Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+            .body(Body::from(body))
+            .unwrap();
+        super::middleware::apply_aws_b40_headers(response.headers_mut(), &request_id);
+        response
+    } else {
+        rejection.into_response()
+    }
+}
+
+impl<T> FromRequest<AppState> for RawApiJson<T>
 where
     T: DeserializeOwned,
 {
     type Rejection = Response;
 
     async fn from_request(request: Request, state: &AppState) -> Result<Self, Self::Rejection> {
-        match AxumJson::<T>::from_request(request, state).await {
-            Ok(AxumJson(value)) => Ok(Self(value)),
-            Err(rejection) if state.aws_b40_compat => {
-                let request_id = super::middleware::aws_b40_oneapi_request_id();
-                let rejection_text = rejection.body_text();
-                let detail = if rejection_text.contains("EOF while parsing") {
-                    "unexpected end of JSON input".to_string()
-                } else {
-                    rejection_text
-                        .strip_prefix("Failed to parse the request body as JSON: ")
-                        .unwrap_or(&rejection_text)
-                        .to_string()
-                };
-                let body = json!({
-                    "error": format!("Invalid request: {detail} (request id: {request_id})")
-                })
-                .to_string();
-                let mut response = Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
-                    .body(Body::from(body))
-                    .unwrap();
-                super::middleware::apply_aws_b40_headers(response.headers_mut(), &request_id);
-                Err(response)
-            }
-            Err(rejection) => Err(rejection.into_response()),
+        let (parts, body) = request.into_parts();
+        let bytes = to_bytes(body, RAW_JSON_BODY_LIMIT).await.map_err(|error| {
+            tracing::warn!(error = %error, "failed to read Messages API request body");
+            StatusCode::PAYLOAD_TOO_LARGE.into_response()
+        })?;
+        let parse_request = Request::from_parts(parts, Body::from(bytes.clone()));
+        match AxumJson::<T>::from_request(parse_request, state).await {
+            Ok(AxumJson(value)) => Ok(Self(value, bytes)),
+            Err(rejection) => Err(api_json_rejection_response(rejection, state)),
         }
     }
 }
@@ -1242,7 +1257,8 @@ pub async fn head_models(State(state): State<AppState>) -> Response {
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
-    ApiJson(mut payload): ApiJson<MessagesRequest>,
+    headers: HeaderMap,
+    RawApiJson(mut payload, raw_body): RawApiJson<MessagesRequest>,
 ) -> Response {
     tracing::info!(
         model = %payload.model,
@@ -1251,6 +1267,14 @@ pub async fn post_messages(
         message_count = %payload.messages.len(),
         "Received POST /v1/messages request"
     );
+
+    if let Some(provider) = state
+        .bedrock_mantle_provider
+        .as_ref()
+        .filter(|provider| provider.should_route(&payload.model))
+    {
+        return provider.proxy_messages(&headers, raw_body).await;
+    }
 
     let aws_b40_compat = state.aws_b40_compat;
     let aws_b40_thinking_requested = aws_b40_compat && payload.thinking.is_some();
@@ -3391,12 +3415,47 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 /// POST /v1/messages/count_tokens
 ///
 /// 计算消息的 token 数量
-pub async fn count_tokens(AxumJson(payload): AxumJson<CountTokensRequest>) -> impl IntoResponse {
+pub async fn count_tokens(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawApiJson(payload, raw_body): RawApiJson<CountTokensRequest>,
+) -> Response {
+    count_tokens_for_profile(state, headers, payload, raw_body, false).await
+}
+
+/// Public AWS-B token counting is intentionally unavailable for the legacy
+/// Kiro transport. Native Bedrock Mantle requests still pass through to AWS.
+pub async fn count_tokens_public(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawApiJson(payload, raw_body): RawApiJson<CountTokensRequest>,
+) -> Response {
+    count_tokens_for_profile(state, headers, payload, raw_body, true).await
+}
+
+async fn count_tokens_for_profile(
+    state: AppState,
+    headers: HeaderMap,
+    payload: CountTokensRequest,
+    raw_body: Bytes,
+    public_route: bool,
+) -> Response {
     tracing::info!(
         model = %payload.model,
         message_count = %payload.messages.len(),
         "Received POST /v1/messages/count_tokens request"
     );
+
+    if let Some(provider) = state
+        .bedrock_mantle_provider
+        .as_ref()
+        .filter(|provider| provider.should_route(&payload.model))
+    {
+        return provider.proxy_count_tokens(&headers, raw_body).await;
+    }
+    if public_route && state.aws_b40_compat {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "Not Found" }))).into_response();
+    }
 
     if let Some(thinking) = &payload.thinking {
         if thinking.thinking_type == "enabled" && thinking.budget_tokens < 1024 {
@@ -3429,7 +3488,8 @@ pub async fn count_tokens(AxumJson(payload): AxumJson<CountTokensRequest>) -> im
 /// - message_start 中的 input_tokens 会应用短输入保护计费策略
 pub async fn post_messages_cc(
     State(state): State<AppState>,
-    ApiJson(mut payload): ApiJson<MessagesRequest>,
+    headers: HeaderMap,
+    RawApiJson(mut payload, raw_body): RawApiJson<MessagesRequest>,
 ) -> Response {
     tracing::info!(
         model = %payload.model,
@@ -3438,6 +3498,14 @@ pub async fn post_messages_cc(
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
+
+    if let Some(provider) = state
+        .bedrock_mantle_provider
+        .as_ref()
+        .filter(|provider| provider.should_route(&payload.model))
+    {
+        return provider.proxy_messages(&headers, raw_body).await;
+    }
 
     let aws_b40_compat = state.aws_b40_compat;
     let aws_b40_thinking_requested = aws_b40_compat && payload.thinking.is_some();

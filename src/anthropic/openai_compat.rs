@@ -16,14 +16,14 @@ use axum::{
     Json,
     body::Body,
     extract::State,
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
 use serde_json::{Value, json};
 
-use super::handlers::{ApiJson, post_messages};
+use super::handlers::{RawApiJson, post_messages};
 use super::middleware::AppState;
 use super::types::{Message, MessagesRequest, Metadata, SystemMessage, Tool};
 
@@ -739,7 +739,10 @@ pub async fn post_chat_completions(
     };
 
     // 复用 /v1/messages 全套生成逻辑(短路/后端/计量)。
-    let resp = post_messages(State(state), ApiJson(mr)).await;
+    let raw = Bytes::from(
+        serde_json::to_vec(&mr).expect("translated OpenAI request must serialize as JSON"),
+    );
+    let resp = post_messages(State(state), HeaderMap::new(), RawApiJson(mr, raw)).await;
     let status = resp.status();
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

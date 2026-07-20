@@ -33,6 +33,7 @@ mod handlers;
 mod id;
 mod identity;
 mod middleware;
+mod native_bedrock;
 mod openai_compat;
 mod router;
 mod signature;
@@ -40,4 +41,6 @@ mod stream;
 pub mod types;
 mod websearch;
 
-pub use router::create_router_with_provider;
+pub use native_bedrock::BedrockMantleProvider;
+#[allow(unused_imports)]
+pub use router::{create_router_with_native_bedrock, create_router_with_provider};

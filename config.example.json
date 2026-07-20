@@ -6,5 +6,8 @@
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
   "awsB40Compat": true,
+  "bedrockMantleEnabled": false,
+  "bedrockMantleRegion": "us-east-1",
+  "bedrockMantleModels": ["claude-opus-4-8"],
   "defaultEndpoint": "ide"
 }

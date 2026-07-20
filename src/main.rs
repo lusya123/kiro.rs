@@ -244,10 +244,25 @@ async fn main() {
         config.default_endpoint.clone(),
     );
 
+    let bedrock_mantle_provider =
+        anthropic::BedrockMantleProvider::from_config(&config, proxy_config.as_ref())
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "创建 Bedrock Mantle provider 失败");
+                std::process::exit(1);
+            });
+    if bedrock_mantle_provider.is_some() {
+        tracing::info!(
+            region = %config.bedrock_mantle_region,
+            models = ?config.bedrock_mantle_models,
+            "Bedrock Mantle 原生通道已启用"
+        );
+    }
+
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
-    let anthropic_app = anthropic::create_router_with_provider(
+    let anthropic_app = anthropic::create_router_with_native_bedrock(
         &api_key,
         Some(kiro_provider),
+        bedrock_mantle_provider,
         config.extract_thinking,
         config.aws_b40_compat,
     );

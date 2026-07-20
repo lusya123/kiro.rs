@@ -49,6 +49,27 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
+    build_client_inner(proxy, timeout_secs, tls_backend, true)
+}
+
+/// Build a standard upstream client that is independent of the Kiro TLS sidecar.
+///
+/// Official services such as Amazon Bedrock should use their normal TLS stack;
+/// they do not need the Kiro-specific browser fingerprint transport.
+pub fn build_direct_client(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
+    build_client_inner(proxy, timeout_secs, tls_backend, false)
+}
+
+fn build_client_inner(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+    tls_backend: TlsBackend,
+    honor_sidecar: bool,
+) -> anyhow::Result<Client> {
     let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
 
     match tls_backend {
@@ -70,7 +91,7 @@ pub fn build_client(
     // 当 TLS Sidecar 启用时，所有请求实际上发往 127.0.0.1:9090。
     // 若仍把 proxy 注入 reqwest，reqwest 会把 localhost 流量也丢给 proxy，连接必然失败。
     // 此时 reqwest 必须 no_proxy；上游代理走 sidecar 的 X-Proxy-Url 通道（tlsSidecarProxyUrl）。
-    let sidecar_active = crate::tls_sidecar::is_active();
+    let sidecar_active = honor_sidecar && crate::tls_sidecar::is_active();
 
     if sidecar_active {
         builder = builder.no_proxy();
@@ -117,6 +138,12 @@ mod tests {
     #[test]
     fn test_build_client_without_proxy() {
         let client = build_client(None, 30, TlsBackend::Rustls);
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_build_direct_client_without_proxy() {
+        let client = build_direct_client(None, 30, TlsBackend::Rustls);
         assert!(client.is_ok());
     }
 

@@ -123,6 +123,21 @@ pub struct Config {
     #[serde(default = "default_aws_b40_compat")]
     pub aws_b40_compat: bool,
 
+    /// Route selected models to Amazon Bedrock's native Anthropic Messages API.
+    ///
+    /// The Bedrock API key is never stored in this config. When enabled, it is
+    /// read from the standard `AWS_BEARER_TOKEN_BEDROCK` environment variable.
+    #[serde(default)]
+    pub bedrock_mantle_enabled: bool,
+
+    /// AWS Region used for the Bedrock Mantle endpoint.
+    #[serde(default = "default_bedrock_mantle_region")]
+    pub bedrock_mantle_region: String,
+
+    /// Public model aliases routed through Bedrock Mantle when it is enabled.
+    #[serde(default = "default_bedrock_mantle_models")]
+    pub bedrock_mantle_models: Vec<String>,
+
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
@@ -192,6 +207,14 @@ fn default_aws_b40_compat() -> bool {
     true
 }
 
+fn default_bedrock_mantle_region() -> String {
+    "us-east-1".to_string()
+}
+
+fn default_bedrock_mantle_models() -> Vec<String> {
+    vec!["claude-opus-4-8".to_string()]
+}
+
 fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
@@ -224,6 +247,9 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             aws_b40_compat: default_aws_b40_compat(),
+            bedrock_mantle_enabled: false,
+            bedrock_mantle_region: default_bedrock_mantle_region(),
+            bedrock_mantle_models: default_bedrock_mantle_models(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             config_path: None,
@@ -308,5 +334,17 @@ mod tests {
         let config: Config = serde_json::from_str(include_str!("../../config.example.json"))
             .expect("config.example.json must deserialize");
         assert!(config.aws_b40_compat);
+    }
+
+    #[test]
+    fn native_bedrock_transport_is_opt_in() {
+        let default_config = Config::default();
+        assert!(!default_config.bedrock_mantle_enabled);
+        assert_eq!(default_config.bedrock_mantle_region, "us-east-1");
+        assert_eq!(default_config.bedrock_mantle_models, ["claude-opus-4-8"]);
+
+        let example: Config = serde_json::from_str(include_str!("../../config.example.json"))
+            .expect("config.example.json must deserialize");
+        assert!(!example.bedrock_mantle_enabled);
     }
 }

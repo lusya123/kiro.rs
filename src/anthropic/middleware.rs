@@ -14,6 +14,7 @@ use serde_json::json;
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 
+use super::native_bedrock::BedrockMantleProvider;
 use super::types::ErrorResponse;
 
 const AWS_B40_GATEWAY_VERSION: &str = "8840a103";
@@ -26,6 +27,8 @@ pub struct AppState {
     /// Kiro Provider（可选，用于实际 API 调用）
     /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
     pub kiro_provider: Option<Arc<KiroProvider>>,
+    /// Native Amazon Bedrock Messages API transport for explicitly routed models.
+    pub bedrock_mantle_provider: Option<Arc<BedrockMantleProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
     /// 是否启用 AWS-B-40 外观兼容模式
@@ -38,6 +41,7 @@ impl AppState {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
+            bedrock_mantle_provider: None,
             extract_thinking,
             aws_b40_compat,
         }
@@ -46,6 +50,11 @@ impl AppState {
     /// 设置 KiroProvider
     pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
         self.kiro_provider = Some(Arc::new(provider));
+        self
+    }
+
+    pub fn with_bedrock_mantle_provider(mut self, provider: BedrockMantleProvider) -> Self {
+        self.bedrock_mantle_provider = Some(Arc::new(provider));
         self
     }
 }
