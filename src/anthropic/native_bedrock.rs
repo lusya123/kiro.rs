@@ -22,7 +22,7 @@ use crate::{
     model::config::Config,
 };
 
-use super::types::ErrorResponse;
+use super::types::{ErrorResponse, MessagesRequest};
 
 const API_KEY_ENV: &str = "AWS_BEARER_TOKEN_BEDROCK";
 const REQUEST_TIMEOUT_SECS: u64 = 360;
@@ -114,6 +114,16 @@ impl BedrockMantleProvider {
             || self
                 .routed_models
                 .contains(&bedrock_model_id(&model).to_ascii_lowercase())
+    }
+
+    /// Mantle does not accept Anthropic structured-output schemas. Keep those
+    /// requests on the existing transport, which implements that capability.
+    pub fn should_route_messages(&self, request: &MessagesRequest) -> bool {
+        self.should_route(&request.model)
+            && request
+                .output_config
+                .as_ref()
+                .is_none_or(|config| config.format.is_none())
     }
 
     pub async fn proxy_messages(&self, incoming_headers: &HeaderMap, raw_body: Bytes) -> Response {
@@ -303,6 +313,38 @@ mod tests {
         assert!(provider.should_route("claude-opus-4-8"));
         assert!(provider.should_route("anthropic.claude-opus-4-8"));
         assert!(!provider.should_route("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn structured_output_stays_on_the_existing_transport() {
+        let provider = BedrockMantleProvider::for_test(
+            "http://127.0.0.1:1/anthropic/v1/messages".to_string(),
+            "test-key",
+            vec!["claude-opus-4-8".to_string()],
+        )
+        .unwrap();
+        let ordinary: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        assert!(provider.should_route_messages(&ordinary));
+
+        let structured: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}],
+            "output_config": {
+                "effort": "high",
+                "format": {
+                    "type": "json_schema",
+                    "schema": {"type": "object"}
+                }
+            }
+        }))
+        .unwrap();
+        assert!(!provider.should_route_messages(&structured));
     }
 
     #[test]

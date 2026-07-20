@@ -74,10 +74,14 @@ pub fn create_router_with_native_bedrock(
     }
 
     // 需要认证的 /v1 路由
-    let count_tokens_route = if aws_b40_compat && !native_bedrock_enabled {
-        post(aws_b_count_tokens_not_found)
+    let count_tokens_route = if aws_b40_compat {
+        if native_bedrock_enabled {
+            post(count_tokens_public)
+        } else {
+            post(aws_b_count_tokens_not_found)
+        }
     } else {
-        post(count_tokens_public)
+        post(count_tokens)
     };
     let v1_routes = Router::new()
         .route("/models", get(get_models).head(head_models))
@@ -508,6 +512,48 @@ mod tests {
             .await
             .expect("native count_tokens body");
         assert_eq!(count_tokens["input_tokens"], 42);
+
+        let response = client
+            .post(format!("http://{app_addr}/v1/messages/count_tokens"))
+            .header("x-api-key", "client-secret")
+            .json(&json!({
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .expect("non-routed count_tokens request");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = client
+            .post(format!("http://{app_addr}/v1/messages/count_tokens"))
+            .header("x-api-key", "client-secret")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body("{")
+            .send()
+            .await
+            .expect("malformed count_tokens request");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = client
+            .post(format!("http://{app_addr}/v1/messages"))
+            .header("x-api-key", "client-secret")
+            .json(&json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}],
+                "output_config": {
+                    "effort": "high",
+                    "format": {
+                        "type": "json_schema",
+                        "schema": {"type": "object"}
+                    }
+                }
+            }))
+            .send()
+            .await
+            .expect("structured-output fallback request");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         let response = client
             .post(format!("http://{app_addr}/v1/messages"))

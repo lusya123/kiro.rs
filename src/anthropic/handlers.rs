@@ -1271,7 +1271,7 @@ pub async fn post_messages(
     if let Some(provider) = state
         .bedrock_mantle_provider
         .as_ref()
-        .filter(|provider| provider.should_route(&payload.model))
+        .filter(|provider| provider.should_route_messages(&payload))
     {
         return provider.proxy_messages(&headers, raw_body).await;
     }
@@ -3420,7 +3420,7 @@ pub async fn count_tokens(
     headers: HeaderMap,
     RawApiJson(payload, raw_body): RawApiJson<CountTokensRequest>,
 ) -> Response {
-    count_tokens_for_profile(state, headers, payload, raw_body, false).await
+    count_tokens_for_profile(state, headers, payload, raw_body).await
 }
 
 /// Public AWS-B token counting is intentionally unavailable for the legacy
@@ -3428,9 +3428,24 @@ pub async fn count_tokens(
 pub async fn count_tokens_public(
     State(state): State<AppState>,
     headers: HeaderMap,
-    RawApiJson(payload, raw_body): RawApiJson<CountTokensRequest>,
+    raw_body: Bytes,
 ) -> Response {
-    count_tokens_for_profile(state, headers, payload, raw_body, true).await
+    let routed_model = serde_json::from_slice::<serde_json::Value>(&raw_body)
+        .ok()
+        .and_then(|body| {
+            body.get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    if let Some(provider) = state.bedrock_mantle_provider.as_ref()
+        && routed_model
+            .as_deref()
+            .is_some_and(|model| provider.should_route(model))
+    {
+        return provider.proxy_count_tokens(&headers, raw_body).await;
+    }
+
+    (StatusCode::NOT_FOUND, Json(json!({ "error": "Not Found" }))).into_response()
 }
 
 async fn count_tokens_for_profile(
@@ -3438,7 +3453,6 @@ async fn count_tokens_for_profile(
     headers: HeaderMap,
     payload: CountTokensRequest,
     raw_body: Bytes,
-    public_route: bool,
 ) -> Response {
     tracing::info!(
         model = %payload.model,
@@ -3453,10 +3467,6 @@ async fn count_tokens_for_profile(
     {
         return provider.proxy_count_tokens(&headers, raw_body).await;
     }
-    if public_route && state.aws_b40_compat {
-        return (StatusCode::NOT_FOUND, Json(json!({ "error": "Not Found" }))).into_response();
-    }
-
     if let Some(thinking) = &payload.thinking {
         if thinking.thinking_type == "enabled" && thinking.budget_tokens < 1024 {
             let message = format!(
@@ -3502,7 +3512,7 @@ pub async fn post_messages_cc(
     if let Some(provider) = state
         .bedrock_mantle_provider
         .as_ref()
-        .filter(|provider| provider.should_route(&payload.model))
+        .filter(|provider| provider.should_route_messages(&payload))
     {
         return provider.proxy_messages(&headers, raw_body).await;
     }
