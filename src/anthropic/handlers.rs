@@ -4168,7 +4168,7 @@ mod tests {
         assert!(
             body["id"]
                 .as_str()
-                .is_some_and(|id| id.starts_with("msg_bdrk_") && id.len() == 61)
+                .is_some_and(|id| id.starts_with("msg_01bdrk") && id.len() == 28)
         );
         assert_eq!(body["usage"]["service_tier"], "standard");
         assert_eq!(body["usage"]["input_tokens"], 15);
