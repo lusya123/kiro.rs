@@ -897,7 +897,7 @@ fn forced_tool_choice_instruction(
     let tool_choice = req.tool_choice.as_ref()?;
     match tool_choice.get("type").and_then(serde_json::Value::as_str) {
         Some("any") if req.tools.as_ref().is_some_and(|tools| !tools.is_empty()) => Some(
-            "Tool-use requirement: Call one of the provided tools. Return the tool call only, with no explanatory text before or after it."
+            "Tool-use requirement: Call one of the provided tools. Populate every field listed in the selected tool's required schema from the user's request; do not send an empty input object when required fields exist. Return the tool call only, with no explanatory text before or after it."
                 .to_string(),
         ),
         Some("tool") => {
@@ -917,7 +917,7 @@ fn forced_tool_choice_instruction(
                 .unwrap_or(requested_name);
             let quoted_name = serde_json::to_string(upstream_name).ok()?;
             Some(format!(
-                "Tool-use requirement: You must call the provided tool named {quoted_name}. Return that tool call only, with no explanatory text before or after it."
+                "Tool-use requirement: You must call the provided tool named {quoted_name}. Populate every field listed in that tool's required schema from the user's request; do not send an empty input object when required fields exist. Return that tool call only, with no explanatory text before or after it."
             ))
         }
         _ => None,
@@ -1638,6 +1638,8 @@ mod tests {
         };
         let system_text = &system.user_input_message.content;
         assert!(system_text.contains("must call the provided tool named \"report_identity\""));
+        assert!(system_text.contains("Populate every field listed"));
+        assert!(system_text.contains("do not send an empty input object"));
         assert!(system_text.contains("tool call only"));
 
         req.tool_choice = Some(serde_json::json!({"type": "auto"}));
