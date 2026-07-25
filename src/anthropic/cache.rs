@@ -15,10 +15,20 @@
 use crate::anthropic::types::{Message, MessagesRequest, Tool};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 const CACHE_MIN_TOKENS: i32 = 1_024;
+const MAX_CACHE_BREAKPOINTS: usize = 4;
+const MAX_READ_CANDIDATES: usize = 20;
 // 缓存登记表已迁移到 `crate::cluster_cache`(跨容器共享 + 本地回退)。
+
+#[cfg(test)]
+std::thread_local! {
+    static PREFIX_TOKENIZATION_CALLS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
 
 /// 小于这个规模的请求不展示虚拟缓存，避免短请求看起来明显不真实。
 const CACHE_DISPLAY_MIN_TOKENS: i32 = 4_000;
@@ -407,18 +417,40 @@ async fn cache_plan_for_request(
     req: &MessagesRequest,
     aws_b40_compat: bool,
 ) -> Option<CachePlan> {
-    let mut breakpoints = build_cache_breakpoints(req, total_input_tokens, aws_b40_compat);
+    let explicit_breakpoints = request_cache_control_count(req);
+    if req.cache_control.is_none() && explicit_breakpoints == 0 {
+        return None;
+    }
+    // The Anthropic/Bedrock contract allows at most four explicit blocks.
+    // HTTP preflight owns the client-facing error; this accounting layer fails
+    // closed so an unvalidated route cannot turn malformed input into B×N work.
+    if explicit_breakpoints > MAX_CACHE_BREAKPOINTS {
+        return None;
+    }
+
+    let CacheBuild {
+        mut breakpoints,
+        token_context,
+    } = build_cache_breakpoints(req, total_input_tokens, aws_b40_compat);
     breakpoints.retain(|b| b.tokens >= cache_min_tokens(&req.model));
     if breakpoints.is_empty() {
         return None;
     }
 
     breakpoints.sort_by_key(|b| b.tokens);
-    breakpoints.truncate(4);
+    breakpoints.truncate(MAX_CACHE_BREAKPOINTS);
 
     let mut read_match: Option<CacheReadMatch> = None;
+    let mut candidate_tokens = HashMap::new();
     for breakpoint in breakpoints.iter().rev() {
-        if let Some(candidate) = cache_entry_match(&req.model, breakpoint).await
+        if let Some(candidate) = cache_entry_match(
+            req,
+            breakpoint,
+            &token_context,
+            aws_b40_compat,
+            &mut candidate_tokens,
+        )
+        .await
             && read_match
                 .as_ref()
                 .is_none_or(|current| candidate.tokens > current.tokens)
@@ -437,7 +469,7 @@ async fn cache_plan_for_request(
     // 命中时刷新该前缀 TTL(对齐真 Anthropic 的"每次使用重置缓存有效期"),
     // 否则持续使用的前缀每到 5m/1h 就会冒出一次 cache_creation,破坏"统一号池"的一致观感。
     if let Some(candidate) = read_match {
-        register_cache_material(&req.model, &candidate.key_material, candidate.ttl).await;
+        register_cache_key(candidate.key, candidate.ttl).await;
     }
     let mut creation_5m = 0;
     let mut creation_1h = 0;
@@ -478,17 +510,55 @@ impl CacheTtl {
             Self::Ephemeral1h => Duration::from_secs(60 * 60),
         }
     }
+
+    fn cache_key_label(self) -> &'static [u8] {
+        match self {
+            Self::Ephemeral5m => b"Ephemeral5m",
+            Self::Ephemeral1h => b"Ephemeral1h",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CacheKey([u8; 32]);
+
+impl CacheKey {
+    fn redis_key(self) -> String {
+        format!("krcc:{}", hex::encode(self.0))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CacheKeyPair {
+    ephemeral_5m: CacheKey,
+    ephemeral_1h: CacheKey,
+}
+
+impl CacheKeyPair {
+    fn for_ttl(self, ttl: CacheTtl) -> CacheKey {
+        match ttl {
+            CacheTtl::Ephemeral5m => self.ephemeral_5m,
+            CacheTtl::Ephemeral1h => self.ephemeral_1h,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct PrefixPosition {
+    tool_count: usize,
+    system_count: usize,
+    content_count: usize,
 }
 
 #[derive(Clone)]
 struct CacheReadCandidate {
-    tokens: i32,
-    key_material: String,
+    keys: CacheKeyPair,
+    position: PrefixPosition,
 }
 
 struct CacheReadMatch {
     tokens: i32,
-    key_material: String,
+    key: CacheKey,
     ttl: CacheTtl,
 }
 
@@ -502,19 +572,31 @@ struct CacheBreakpointOptions {
 struct CacheBreakpoint {
     tokens: i32,
     ttl: CacheTtl,
-    key_material: String,
+    key: CacheKey,
+    position: PrefixPosition,
     readable: bool,
     read_candidates: Vec<CacheReadCandidate>,
     warm_on_first_use: bool,
     message_breakpoint: bool,
 }
 
+struct PrefixTokenContext {
+    tools: Vec<Tool>,
+    system_segments: Vec<String>,
+    content_segments: Vec<Value>,
+}
+
+struct CacheBuild {
+    breakpoints: Vec<CacheBreakpoint>,
+    token_context: PrefixTokenContext,
+}
+
 fn build_cache_breakpoints(
     req: &MessagesRequest,
     total_input_tokens: i32,
     aws_b40_compat: bool,
-) -> Vec<CacheBreakpoint> {
-    let mut state = PrefixState::default();
+) -> CacheBuild {
+    let mut state = PrefixState::new(&req.model);
     let mut breakpoints = Vec::new();
 
     if let Some(tools) = &req.tools {
@@ -527,11 +609,9 @@ fn build_cache_breakpoints(
                 let warm_on_first_use =
                     aws_b40_compat && cache_control_is_global(tool.cache_control.as_ref());
                 push_breakpoint(
-                    req,
                     &state,
                     &mut breakpoints,
                     cache_ttl(tool.cache_control.as_ref()),
-                    aws_b40_compat,
                     CacheBreakpointOptions {
                         readable: true,
                         warm_on_first_use,
@@ -550,11 +630,9 @@ fn build_cache_breakpoints(
                 let warm_on_first_use =
                     aws_b40_compat && cache_control_is_global(item.cache_control.as_ref());
                 push_breakpoint(
-                    req,
                     &state,
                     &mut breakpoints,
                     cache_ttl(item.cache_control.as_ref()),
-                    aws_b40_compat,
                     CacheBreakpointOptions {
                         readable: true,
                         warm_on_first_use,
@@ -574,11 +652,9 @@ fn build_cache_breakpoints(
         let warm_on_first_use =
             aws_b40_compat && cache_control_is_global(req.cache_control.as_ref());
         push_breakpoint(
-            req,
             &state,
             &mut breakpoints,
             ttl,
-            aws_b40_compat,
             CacheBreakpointOptions {
                 readable: true,
                 warm_on_first_use,
@@ -587,63 +663,123 @@ fn build_cache_breakpoints(
         );
     }
 
-    for breakpoint in &mut breakpoints {
-        breakpoint.tokens = if aws_b40_compat {
-            breakpoint.tokens.max(0)
-        } else {
-            breakpoint.tokens.min(total_input_tokens).max(0)
+    breakpoints.retain_mut(|breakpoint| {
+        let Some(tokens) = calibrated_prefix_tokens_at(
+            req,
+            &state.tools,
+            &state.system_segments,
+            &state.content_segments,
+            breakpoint.position,
+            aws_b40_compat,
+        ) else {
+            tracing::error!(
+                ?breakpoint.position,
+                "cache breakpoint contained an invalid prefix position"
+            );
+            return false;
         };
+        breakpoint.tokens = if aws_b40_compat {
+            tokens.max(0)
+        } else {
+            tokens.min(total_input_tokens).max(0)
+        };
+        true
+    });
+
+    CacheBuild {
+        breakpoints,
+        token_context: state.into_token_context(),
     }
-    breakpoints
 }
 
 /// 前缀 key 各块之间的分隔符（保持与历史实现一致的字节序列）。
 const KEY_PART_SEPARATOR: &str = "\n---prefix-block---\n";
 
-#[derive(Default)]
+struct PrefixKeyState {
+    ephemeral_5m: Sha256,
+    ephemeral_1h: Sha256,
+    part_count: usize,
+}
+
+impl PrefixKeyState {
+    fn new(model: &str) -> Self {
+        Self {
+            ephemeral_5m: seeded_cache_hasher(model, CacheTtl::Ephemeral5m),
+            ephemeral_1h: seeded_cache_hasher(model, CacheTtl::Ephemeral1h),
+            part_count: 0,
+        }
+    }
+
+    fn push(&mut self, part: &str) {
+        if self.part_count > 0 {
+            self.ephemeral_5m.update(KEY_PART_SEPARATOR.as_bytes());
+            self.ephemeral_1h.update(KEY_PART_SEPARATOR.as_bytes());
+        }
+        self.ephemeral_5m.update(part.as_bytes());
+        self.ephemeral_1h.update(part.as_bytes());
+        self.part_count += 1;
+    }
+
+    fn snapshot(&self) -> CacheKeyPair {
+        CacheKeyPair {
+            ephemeral_5m: finalize_cache_key(&self.ephemeral_5m),
+            ephemeral_1h: finalize_cache_key(&self.ephemeral_1h),
+        }
+    }
+}
+
 struct PrefixState {
     tools: Vec<Tool>,
     system_segments: Vec<String>,
     content_segments: Vec<Value>,
-    /// 前缀 key 的滚动摘要。
-    ///
-    /// 这里以前是 `key_parts: Vec<String>`：每追加一个块，
-    /// `remember_read_candidate()` 都要 `key_parts.join(SEP)` 把整个前缀
-    /// 重新拼成一个大 String。它对每条消息/每个 content block 调用一次，
-    /// 于是 N 个块累计复制 1+2+…+N 份数据 —— O(N²)。长对话（几十条消息、
-    /// 上百 KB）下这会吃掉大量 CPU，并且这些大 String 还全部留在
-    /// `read_candidates` 里，导致进程 RSS 涨到 GB 级。
-    ///
-    /// `key_material` 只有两种用途：喂给 `cache_key()` 做 SHA-256，或与
-    /// 另一个 key_material 做相等比较；从不按原文读取。因此这里改为增量
-    /// 更新摘要——`key_material()` 的结果等价于 `sha256(parts.join(SEP))`，
-    /// 唯一性与相等语义完全不变，但每个块只做一次 O(块大小) 的 update，
-    /// 整体降到 O(总字节数) 单遍。
-    key_digest: Sha256,
-    key_part_count: usize,
-    read_candidates: Vec<CacheReadCandidate>,
+    // Both hashers include the legacy model/TTL header. Appending each prefix
+    // part once therefore produces the exact Redis keys used before c83492,
+    // without ever retaining or rebuilding the joined prefix string.
+    key_state: PrefixKeyState,
+    // A breakpoint skips the current prefix and reads at most 20 predecessors.
+    // Keeping 21 entries preserves that behavior while bounding request memory.
+    read_candidates: VecDeque<CacheReadCandidate>,
 }
 
 impl PrefixState {
+    fn new(model: &str) -> Self {
+        Self {
+            tools: Vec::new(),
+            system_segments: Vec::new(),
+            content_segments: Vec::new(),
+            key_state: PrefixKeyState::new(model),
+            read_candidates: VecDeque::with_capacity(MAX_READ_CANDIDATES + 1),
+        }
+    }
+
     fn has_cacheable_content(&self) -> bool {
         !self.tools.is_empty()
             || !self.system_segments.is_empty()
             || !self.content_segments.is_empty()
     }
 
-    /// 追加一个前缀块（等价于以前的 `key_parts.push(..)`）。
     fn push_key_part(&mut self, part: &str) {
-        if self.key_part_count > 0 {
-            self.key_digest.update(KEY_PART_SEPARATOR.as_bytes());
-        }
-        self.key_digest.update(part.as_bytes());
-        self.key_part_count += 1;
+        self.key_state.push(part);
     }
 
-    /// 当前前缀的 key material（等价于以前的 `key_parts.join(SEP)`，
-    /// 只是以定长摘要代替原文）。克隆 hasher 只复制固定大小的内部状态。
-    fn key_material(&self) -> String {
-        hex::encode(self.key_digest.clone().finalize())
+    fn cache_keys(&self) -> CacheKeyPair {
+        self.key_state.snapshot()
+    }
+
+    fn position(&self) -> PrefixPosition {
+        PrefixPosition {
+            tool_count: self.tools.len(),
+            system_count: self.system_segments.len(),
+            content_count: self.content_segments.len(),
+        }
+    }
+
+    fn into_token_context(self) -> PrefixTokenContext {
+        PrefixTokenContext {
+            tools: self.tools,
+            system_segments: self.system_segments,
+            content_segments: self.content_segments,
+        }
     }
 }
 
@@ -659,7 +795,7 @@ fn collect_message_prefix(
             let content = Value::String(text.clone());
             state.push_key_part(&format!("{}:{}", message.role, text));
             state.content_segments.push(content);
-            remember_read_candidate(req, state, aws_b40_compat);
+            remember_read_candidate(state);
         }
         Value::Array(items) => {
             for item in items {
@@ -676,17 +812,15 @@ fn collect_message_prefix(
                 state
                     .content_segments
                     .push(Value::Array(vec![item_without_cache]));
-                remember_read_candidate(req, state, aws_b40_compat);
+                remember_read_candidate(state);
                 if has_direct_cache_control(item) {
                     let readable = aws_b40_compat && super::compat::is_opus_4_8(&req.model);
                     let warm_on_first_use =
                         readable && cache_control_is_global(item.get("cache_control"));
                     push_breakpoint(
-                        req,
                         state,
                         breakpoints,
                         ttl,
-                        aws_b40_compat,
                         CacheBreakpointOptions {
                             readable,
                             warm_on_first_use,
@@ -699,17 +833,20 @@ fn collect_message_prefix(
         other => {
             state.push_key_part(&format!("{}:{}", message.role, canonical_json(other)));
             state.content_segments.push(other.clone());
-            remember_read_candidate(req, state, aws_b40_compat);
+            remember_read_candidate(state);
         }
     }
 }
 
-fn remember_read_candidate(req: &MessagesRequest, state: &mut PrefixState, aws_b40_compat: bool) {
-    let tokens = calibrated_prefix_tokens(req, state, aws_b40_compat);
-    state.read_candidates.push(CacheReadCandidate {
-        tokens,
-        key_material: state.key_material(),
-    });
+fn remember_read_candidate(state: &mut PrefixState) {
+    let candidate = CacheReadCandidate {
+        keys: state.cache_keys(),
+        position: state.position(),
+    };
+    if state.read_candidates.len() == MAX_READ_CANDIDATES + 1 {
+        state.read_candidates.pop_front();
+    }
+    state.read_candidates.push_back(candidate);
 }
 
 fn strip_cache_control(value: &mut Value) {
@@ -760,31 +897,37 @@ fn canonical_json(value: &Value) -> String {
 }
 
 fn push_breakpoint(
-    req: &MessagesRequest,
     state: &PrefixState,
     breakpoints: &mut Vec<CacheBreakpoint>,
     ttl: CacheTtl,
-    aws_b40_compat: bool,
     options: CacheBreakpointOptions,
 ) {
-    let tokens = calibrated_prefix_tokens(req, state, aws_b40_compat);
-    let current_key = state.key_material();
+    // Normal request validation rejects a fifth explicit breakpoint. Keep this
+    // hard bound here too because build_cache_breakpoints is shared by routes.
+    if breakpoints.len() >= MAX_CACHE_BREAKPOINTS {
+        return;
+    }
+
+    let current_key = state.cache_keys().for_ttl(ttl);
     let read_candidates = if options.readable {
         state
             .read_candidates
             .iter()
             .rev()
-            .skip_while(|candidate| candidate.key_material == current_key)
-            .take(20)
+            .skip_while(|candidate| candidate.keys.for_ttl(ttl) == current_key)
+            .take(MAX_READ_CANDIDATES)
             .cloned()
             .collect()
     } else {
         Vec::new()
     };
     breakpoints.push(CacheBreakpoint {
-        tokens,
+        // Hydrated once after all prefix parts have been collected. Candidate
+        // creation stays O(1) and never invokes the full tokenizer.
+        tokens: 0,
         ttl,
-        key_material: current_key,
+        key: current_key,
+        position: state.position(),
         readable: options.readable,
         read_candidates,
         warm_on_first_use: options.warm_on_first_use,
@@ -792,28 +935,32 @@ fn push_breakpoint(
     });
 }
 
-fn calibrated_prefix_tokens(
+fn calibrated_prefix_tokens_at(
     req: &MessagesRequest,
-    state: &PrefixState,
+    tools: &[Tool],
+    system_segments: &[String],
+    content_segments: &[Value],
+    position: PrefixPosition,
     aws_b40_compat: bool,
-) -> i32 {
-    let base_tokens = super::compat::estimate_prefix_tokens(
-        &req.model,
-        &state.system_segments,
-        &state.content_segments,
-        &state.tools,
-    );
-    if aws_b40_compat {
+) -> Option<i32> {
+    let tools = tools.get(..position.tool_count)?;
+    let system_segments = system_segments.get(..position.system_count)?;
+    let content_segments = content_segments.get(..position.content_count)?;
+    #[cfg(test)]
+    PREFIX_TOKENIZATION_CALLS.with(|calls| calls.set(calls.get() + 1));
+    let base_tokens =
+        super::compat::estimate_prefix_tokens(&req.model, system_segments, content_segments, tools);
+    Some(if aws_b40_compat {
         super::bedrock::calibrated_cache_prefix_tokens(
             &req.model,
             base_tokens,
-            &state.system_segments,
-            &state.content_segments,
-            &state.tools,
+            system_segments,
+            content_segments,
+            tools,
         )
     } else {
         base_tokens
-    }
+    })
 }
 
 fn has_direct_cache_control(v: &Value) -> bool {
@@ -841,39 +988,69 @@ fn cache_control_is_global(value: Option<&Value>) -> bool {
         == Some("global")
 }
 
-async fn cache_entry_match(model: &str, breakpoint: &CacheBreakpoint) -> Option<CacheReadMatch> {
+async fn cache_entry_match(
+    req: &MessagesRequest,
+    breakpoint: &CacheBreakpoint,
+    token_context: &PrefixTokenContext,
+    aws_b40_compat: bool,
+    candidate_tokens: &mut HashMap<PrefixPosition, i32>,
+) -> Option<CacheReadMatch> {
     if !breakpoint.readable {
         return None;
     }
-    if !cache_read_supported(model, breakpoint.tokens) {
+    if !cache_read_supported(&req.model, breakpoint.tokens) {
         return None;
     }
-    let key = cache_key(model, &breakpoint.key_material, breakpoint.ttl);
-    if crate::cluster_cache::global().exists(&key).await {
+    let redis_key = breakpoint.key.redis_key();
+    if crate::cluster_cache::global().exists(&redis_key).await {
         return Some(CacheReadMatch {
             tokens: breakpoint.tokens,
-            key_material: breakpoint.key_material.clone(),
+            key: breakpoint.key,
             ttl: breakpoint.ttl,
         });
     }
 
     for candidate in &breakpoint.read_candidates {
-        if !cache_read_supported(model, candidate.tokens) {
+        let key = candidate.keys.for_ttl(breakpoint.ttl);
+        let redis_key = key.redis_key();
+        if !crate::cluster_cache::global().exists(&redis_key).await {
             continue;
         }
-        let key = cache_key(model, &candidate.key_material, breakpoint.ttl);
-        if crate::cluster_cache::global().exists(&key).await {
+
+        // Tokenization is the expensive part. Candidate keys are cheap to
+        // probe, so calculate the exact prefix tokens only for a real hit.
+        let tokens = if let Some(tokens) = candidate_tokens.get(&candidate.position).copied() {
+            tokens
+        } else {
+            let Some(tokens) = calibrated_prefix_tokens_at(
+                req,
+                &token_context.tools,
+                &token_context.system_segments,
+                &token_context.content_segments,
+                candidate.position,
+                aws_b40_compat,
+            ) else {
+                tracing::error!(
+                    ?candidate.position,
+                    "cache candidate contained an invalid prefix position"
+                );
+                continue;
+            };
+            candidate_tokens.insert(candidate.position, tokens);
+            tokens
+        };
+        if cache_read_supported(&req.model, tokens) {
             return Some(CacheReadMatch {
-                tokens: candidate.tokens,
-                key_material: candidate.key_material.clone(),
+                tokens,
+                key,
                 ttl: breakpoint.ttl,
             });
         }
     }
 
-    breakpoint.warm_on_first_use.then(|| CacheReadMatch {
+    breakpoint.warm_on_first_use.then_some(CacheReadMatch {
         tokens: breakpoint.tokens,
-        key_material: breakpoint.key_material.clone(),
+        key: breakpoint.key,
         ttl: breakpoint.ttl,
     })
 }
@@ -885,13 +1062,13 @@ async fn register_cache_entry(model: &str, breakpoint: &CacheBreakpoint) {
     if !cache_read_supported(model, breakpoint.tokens) {
         return;
     }
-    register_cache_material(model, &breakpoint.key_material, breakpoint.ttl).await;
+    register_cache_key(breakpoint.key, breakpoint.ttl).await;
 }
 
-async fn register_cache_material(model: &str, key_material: &str, ttl: CacheTtl) {
-    let key = cache_key(model, key_material, ttl);
+async fn register_cache_key(key: CacheKey, ttl: CacheTtl) {
+    let redis_key = key.redis_key();
     crate::cluster_cache::global()
-        .register(&key, ttl.duration())
+        .register(&redis_key, ttl.duration())
         .await;
 }
 
@@ -916,29 +1093,44 @@ fn cache_read_supported(model: &str, cache_tokens: i32) -> bool {
     !(legacy_opus && cache_tokens > 4_096)
 }
 
-fn cache_key(model: &str, key_material: &str, ttl: CacheTtl) -> String {
+fn seeded_cache_hasher(model: &str, ttl: CacheTtl) -> Sha256 {
     let mut hasher = Sha256::new();
     hasher.update(model.as_bytes());
     hasher.update(b"\n");
-    hasher.update(format!("{ttl:?}").as_bytes());
+    hasher.update(ttl.cache_key_label());
     hasher.update(b"\n");
-    hasher.update(key_material.as_bytes());
-    // 命名空间前缀:即使与别的应用共享同一个真 Redis,也不会与其 key 冲突,
-    // 且便于批量识别/清理(SCAN krcc:* )。
-    format!("krcc:{}", hex::encode(hasher.finalize()))
+    hasher
+}
+
+fn finalize_cache_key(hasher: &Sha256) -> CacheKey {
+    CacheKey(hasher.clone().finalize().into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 前缀 key 的增量摘要必须与历史实现 `key_parts.join(SEP)` 的哈希逐字节等价。
-    ///
-    /// 历史实现每追加一个块都重新 join 整个前缀（O(N²)，长对话下 CPU 涨 7 倍、
-    /// RSS 涨到 GB 级）。改成滚动摘要后语义必须保持不变——本测试锁定这一点，
-    /// 同时防止有人改坏分隔符或改回逐块拼接。
+    fn legacy_cache_key(model: &str, parts: &[String], ttl: CacheTtl) -> CacheKey {
+        let mut hasher = Sha256::new();
+        hasher.update(model.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(format!("{ttl:?}").as_bytes());
+        hasher.update(b"\n");
+        hasher.update(parts.join(KEY_PART_SEPARATOR).as_bytes());
+        CacheKey(hasher.finalize().into())
+    }
+
+    fn reset_prefix_tokenization_calls() {
+        PREFIX_TOKENIZATION_CALLS.with(|calls| calls.set(0));
+    }
+
+    fn prefix_tokenization_calls() -> usize {
+        PREFIX_TOKENIZATION_CALLS.with(std::cell::Cell::get)
+    }
+
     #[test]
-    fn rolling_key_digest_matches_joined_prefix_hash() {
+    fn rolling_cache_keys_match_legacy_redis_keys() {
+        let model = "claude-opus-4-8";
         let parts = vec![
             "tool:{\"name\":\"search\"}".to_string(),
             "system:you are a helpful assistant".to_string(),
@@ -947,34 +1139,184 @@ mod tests {
             "user:second question".to_string(),
         ];
 
-        let mut state = PrefixState::default();
+        let mut state = PrefixState::new(model);
+        let mut prefix = Vec::new();
         for part in &parts {
             state.push_key_part(part);
+            prefix.push(part.clone());
+            let keys = state.cache_keys();
+            assert_eq!(
+                keys.ephemeral_5m,
+                legacy_cache_key(model, &prefix, CacheTtl::Ephemeral5m)
+            );
+            assert_eq!(
+                keys.ephemeral_1h,
+                legacy_cache_key(model, &prefix, CacheTtl::Ephemeral1h)
+            );
         }
 
-        let expected = {
-            let joined = parts.join(KEY_PART_SEPARATOR);
-            let mut hasher = Sha256::new();
-            hasher.update(joined.as_bytes());
-            hex::encode(hasher.finalize())
-        };
-
-        assert_eq!(state.key_material(), expected);
+        assert_eq!(
+            state.cache_keys().ephemeral_5m.redis_key(),
+            "krcc:1bb852275c477e415c7f83b54d6107121e24e012ccec8881ec8db043fe0b16f7"
+        );
+        assert_eq!(
+            state.cache_keys().ephemeral_1h.redis_key(),
+            "krcc:a0620da520687b11cd49014ea4da5ced2d77620fc716c56e0d6cda562a013266"
+        );
     }
 
-    /// 不同的前缀必须得到不同的 key material（相等比较语义在第 748 行被依赖）。
     #[test]
-    fn different_prefixes_produce_different_key_material() {
-        let mut a = PrefixState::default();
-        a.push_key_part("user:hello");
-        let mut b = PrefixState::default();
-        b.push_key_part("user:hello!");
-        assert_ne!(a.key_material(), b.key_material());
+    fn rolling_cache_keys_preserve_empty_and_special_parts() {
+        let model = "claude-opus-4-8";
+        let mut state = PrefixState::new(model);
+        assert_eq!(
+            state.cache_keys().ephemeral_5m.redis_key(),
+            "krcc:f1e205d81bb1583ea0aa084eadc78bf51ece9d1636f2daa7506e1b43c53af7b7"
+        );
+        assert_eq!(
+            state.cache_keys().ephemeral_1h.redis_key(),
+            "krcc:eb8d1bfa5fc5997fab98854ac8d1eff21d7a106a7675da8dd8f453d747a72830"
+        );
 
-        // 前缀相同时必须相等（增量读候选匹配依赖这个）
-        let mut c = PrefixState::default();
+        let parts = ["", "x", KEY_PART_SEPARATOR, "中文\0suffix"];
+        let mut prefix = Vec::new();
+        for part in parts {
+            state.push_key_part(part);
+            prefix.push(part.to_string());
+            let keys = state.cache_keys();
+            assert_eq!(
+                keys.ephemeral_5m,
+                legacy_cache_key(model, &prefix, CacheTtl::Ephemeral5m)
+            );
+            assert_eq!(
+                keys.ephemeral_1h,
+                legacy_cache_key(model, &prefix, CacheTtl::Ephemeral1h)
+            );
+        }
+    }
+
+    #[test]
+    fn different_prefixes_produce_different_cache_keys() {
+        let mut a = PrefixState::new("claude-opus-4-8");
+        a.push_key_part("user:hello");
+        let mut b = PrefixState::new("claude-opus-4-8");
+        b.push_key_part("user:hello!");
+        assert_ne!(a.cache_keys().ephemeral_5m, b.cache_keys().ephemeral_5m);
+
+        let mut c = PrefixState::new("claude-opus-4-8");
         c.push_key_part("user:hello");
-        assert_eq!(a.key_material(), c.key_material());
+        assert_eq!(a.cache_keys().ephemeral_5m, c.cache_keys().ephemeral_5m);
+        assert_ne!(a.cache_keys().ephemeral_5m, a.cache_keys().ephemeral_1h);
+    }
+
+    #[test]
+    fn read_candidate_window_keeps_current_plus_twenty_previous() {
+        let mut state = PrefixState::new("claude-opus-4-8");
+        for index in 1..=30 {
+            state.push_key_part(&format!("user:{index}"));
+            state
+                .content_segments
+                .push(Value::String(index.to_string()));
+            remember_read_candidate(&mut state);
+        }
+        assert_eq!(state.read_candidates.len(), MAX_READ_CANDIDATES + 1);
+
+        let mut breakpoints = Vec::new();
+        push_breakpoint(
+            &state,
+            &mut breakpoints,
+            CacheTtl::Ephemeral5m,
+            CacheBreakpointOptions {
+                readable: true,
+                warm_on_first_use: false,
+                message_breakpoint: true,
+            },
+        );
+        let positions = breakpoints[0]
+            .read_candidates
+            .iter()
+            .map(|candidate| candidate.position.content_count)
+            .collect::<Vec<_>>();
+        assert_eq!(positions, (10..=29).rev().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn candidate_collection_does_not_retokenize_every_prefix() {
+        let messages = (0..100)
+            .map(|index| {
+                serde_json::json!({
+                    "role": if index % 2 == 0 { "user" } else { "assistant" },
+                    "content": format!("message {index}")
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let without_cache = parse_request(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "messages": messages
+        }));
+        reset_prefix_tokenization_calls();
+        let build = build_cache_breakpoints(&without_cache, 100_000, true);
+        assert!(build.breakpoints.is_empty());
+        assert_eq!(prefix_tokenization_calls(), 0);
+
+        let automatic = parse_request(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "cache_control": {"type": "ephemeral"},
+            "messages": without_cache.messages
+        }));
+        reset_prefix_tokenization_calls();
+        let build = build_cache_breakpoints(&automatic, 100_000, true);
+        assert_eq!(build.breakpoints.len(), 1);
+        assert_eq!(prefix_tokenization_calls(), 1);
+    }
+
+    #[test]
+    fn invalid_prefix_position_is_rejected_without_panicking() {
+        let req = parse_request(serde_json::json!({}));
+        assert_eq!(
+            calibrated_prefix_tokens_at(
+                &req,
+                &[],
+                &[],
+                &[],
+                PrefixPosition {
+                    tool_count: 1,
+                    system_count: 0,
+                    content_count: 0,
+                },
+                true,
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn more_than_four_breakpoints_fail_closed_without_tokenization() {
+        let req = parse_request(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "messages": [{
+                "role": "user",
+                "content": (0..5).map(|index| serde_json::json!({
+                    "type": "text",
+                    "text": format!("breakpoint {index}"),
+                    "cache_control": {"type": "ephemeral"}
+                })).collect::<Vec<_>>()
+            }]
+        }));
+
+        reset_prefix_tokenization_calls();
+        assert!(cache_plan_for_request(10_000, &req, true).await.is_none());
+        assert_eq!(prefix_tokenization_calls(), 0);
+
+        // Direct callers are bounded as well, even if they bypass preflight.
+        let build = build_cache_breakpoints(&req, 10_000, true);
+        assert_eq!(build.breakpoints.len(), MAX_CACHE_BREAKPOINTS);
+        assert_eq!(
+            prefix_tokenization_calls(),
+            MAX_CACHE_BREAKPOINTS,
+            "only the four representable breakpoints may invoke the tokenizer"
+        );
     }
 
     #[test]
@@ -1242,23 +1584,27 @@ mod tests {
     fn bench_build_cache_breakpoints_scaling() {
         use std::time::Instant;
         let tools: Vec<serde_json::Value> = (0..12)
-            .map(|i| serde_json::json!({
-                "name": format!("tool_{i}"),
-                "description": "Does something useful. ".repeat(40),
-                "input_schema": {"type":"object","properties":{
-                    "p0":{"type":"string","description":"param ".repeat(20)},
-                    "p1":{"type":"string","description":"param ".repeat(20)},
-                    "p2":{"type":"string","description":"param ".repeat(20)},
-                    "p3":{"type":"string","description":"param ".repeat(20)}}}
-            }))
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("tool_{i}"),
+                    "description": "Does something useful. ".repeat(40),
+                    "input_schema": {"type":"object","properties":{
+                        "p0":{"type":"string","description":"param ".repeat(20)},
+                        "p1":{"type":"string","description":"param ".repeat(20)},
+                        "p2":{"type":"string","description":"param ".repeat(20)},
+                        "p3":{"type":"string","description":"param ".repeat(20)}}}
+                })
+            })
             .collect();
         println!("\n  N_msgs   elapsed_ms   ms_per_msg");
         for n in [10usize, 20, 40, 80] {
             let msgs: Vec<serde_json::Value> = (0..n)
-                .map(|i| serde_json::json!({
-                    "role": if i % 2 == 0 { "user" } else { "assistant" },
-                    "content": "Here is some code context. ".repeat(120)
-                }))
+                .map(|i| {
+                    serde_json::json!({
+                        "role": if i % 2 == 0 { "user" } else { "assistant" },
+                        "content": "Here is some code context. ".repeat(120)
+                    })
+                })
                 .collect();
             let req = parse_request(serde_json::json!({
                 "model": "claude-opus-4-8",
