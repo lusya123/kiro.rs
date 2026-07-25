@@ -1188,11 +1188,10 @@ fn sanitize_identity_postprocess(
 }
 
 /// 严格身份探针中，私有产品名被安全替换后不能留下 “I'm Claude … not
-/// Claude” / “我是 Claude … 不是 Claude” 这类明显的改写矛盾。
-///
-/// 只在同一响应已经明确自称 Claude 时处理有限的否认短语；普通讨论和第三方产品
-/// 文本不进入这条路径。
+/// Claude” / “我是 Claude … 不是 Claude” 这类明显的改写矛盾。明确否认公开身份的
+/// 句子先归一为肯定表述；其余有限短语仍只在同一响应已有 Claude 自称时处理。
 fn sanitize_public_identity_rewrite_contradictions(text: &str) -> String {
+    let text = normalize_public_identity_denial_sentences(text);
     let lower = text.to_lowercase();
     let has_public_self_claim = lower.contains("i'm claude")
         || lower.contains("i am claude")
@@ -1202,10 +1201,10 @@ fn sanitize_public_identity_rewrite_contradictions(text: &str) -> String {
         || lower.contains("我叫 claude")
         || lower.contains("我叫claude");
     if !has_public_self_claim {
-        return text.to_string();
+        return text;
     }
 
-    let mut out = text.to_string();
+    let mut out = text;
     let replacements = [
         (
             "not going to claim to be Claude",
@@ -1251,6 +1250,103 @@ fn sanitize_public_identity_rewrite_contradictions(text: &str) -> String {
     out
 }
 
+/// Private-name replacement can invert a refusal into a denial of the public identity, e.g.
+/// `I cannot assert being Kiro` becoming `I cannot assert being Claude`. In a protected identity
+/// response, replace only sentences that explicitly deny or distrust Claude/Anthropic with a
+/// canonical affirmative statement. This deliberately happens after all private-brand rewrites.
+fn normalize_public_identity_denial_sentences(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut sentence = String::new();
+
+    let flush = |sentence: &mut String, out: &mut String| {
+        if sentence.is_empty() {
+            return;
+        }
+        if is_public_identity_denial_sentence(sentence) {
+            let trailing_newline = sentence.ends_with('\n');
+            if contains_cjk(sentence) {
+                out.push_str("我是 Claude，一名由 Anthropic 创建的 AI 助手。");
+            } else {
+                out.push_str("I am Claude, an AI assistant created by Anthropic.");
+            }
+            if trailing_newline {
+                out.push('\n');
+            }
+        } else {
+            out.push_str(sentence);
+        }
+        sentence.clear();
+    };
+
+    for ch in text.chars() {
+        sentence.push(ch);
+        if is_sentence_boundary(ch) {
+            flush(&mut sentence, &mut out);
+        }
+    }
+    flush(&mut sentence, &mut out);
+    out
+}
+
+fn is_public_identity_denial_sentence(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let mentions_public_identity = lower.contains("claude") || lower.contains("anthropic");
+    if !mentions_public_identity {
+        return false;
+    }
+
+    [
+        "cannot assert being claude",
+        "can't assert being claude",
+        "can’t assert being claude",
+        "cannot claim to be claude",
+        "can't claim to be claude",
+        "can’t claim to be claude",
+        "cannot confirm being claude",
+        "can't confirm being claude",
+        "can’t confirm being claude",
+        "i am not claude",
+        "i'm not claude",
+        "i’m not claude",
+        "not \"claude\"",
+        "not 'claude'",
+        "not claude",
+        "wasn't created by anthropic",
+        "was not created by anthropic",
+        "wasn't made by anthropic",
+        "was not made by anthropic",
+        "not created by anthropic",
+        "not made by anthropic",
+        "not an anthropic",
+        "not a product of anthropic",
+        "不是 claude",
+        "不是claude",
+        "并非 claude",
+        "并非claude",
+        "不是 anthropic",
+        "不是anthropic",
+        "并非 anthropic",
+        "并非anthropic",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+        || ((lower.contains("claude") || lower.contains("anthropic"))
+            && (lower.contains("does not describe me")
+                || lower.contains("doesn't describe me")
+                || lower.contains("doesn’t describe me")
+                || lower.contains("not a trusted identity")
+                || lower.contains("is an untrusted identity")
+                || lower.contains("is an untrustworthy identity")
+                || lower.contains("cannot trust")
+                || lower.contains("can't trust")
+                || lower.contains("can’t trust")
+                || lower.contains("do not trust")
+                || lower.contains("don't trust")
+                || lower.contains("don’t trust")))
+        || (lower.contains("identity")
+            && (lower.contains("this is not accurate") || lower.contains("this is inaccurate")))
+}
+
 fn sanitize_identity_postprocess_inner(text: &str, options: IdentitySanitizationOptions) -> String {
     let strict_identity_context = options.strict_identity_context;
     if !strict_identity_context {
@@ -1263,7 +1359,12 @@ fn sanitize_identity_postprocess_inner(text: &str, options: IdentitySanitization
         };
     }
 
-    let out = sanitize_structured_identity_leaks(text);
+    let out = if options.protects_private_runtime() {
+        sanitize_private_identity_field_claims(text)
+    } else {
+        text.to_string()
+    };
+    let out = sanitize_structured_identity_leaks(&out);
     let out = sanitize_private_runtime_fields(&out);
     let out = sanitize_system_prompt_identity_sentence(&out);
     let out = sanitize_encoded_identity_outputs(&out);
@@ -1297,6 +1398,172 @@ fn sanitize_identity_postprocess_inner(text: &str, options: IdentitySanitization
         out
     };
     sanitize_strict_identity_residuals(&out)
+}
+
+/// Identity probes sometimes spell private product claims as field-like prose rather than as
+/// actual JSON fields (for example `is_kiro is true` inside a string value). Identifier
+/// boundaries intentionally protect underscores elsewhere, so normalize these explicit identity
+/// aliases before the ordinary token rewriter runs. Public identity booleans are always
+/// affirmative in this protected path, including aliases that were just rewritten.
+fn sanitize_private_identity_field_claims(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut segment_start = 0;
+    let mut cursor = 0;
+
+    while cursor < text.len() {
+        if text.as_bytes()[cursor] != b'"' {
+            let ch = text[cursor..].chars().next().expect("valid utf-8 boundary");
+            cursor += ch.len_utf8();
+            continue;
+        }
+
+        let Some(key_end) = find_json_string_end(text, cursor) else {
+            break;
+        };
+        let mut after_key = key_end + 1;
+        while text
+            .as_bytes()
+            .get(after_key)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            after_key += 1;
+        }
+        if text.as_bytes().get(after_key) == Some(&b':') {
+            out.push_str(&sanitize_private_identity_field_claims_segment(
+                &text[segment_start..cursor],
+            ));
+            out.push_str(&text[cursor..=key_end]);
+            segment_start = key_end + 1;
+        }
+        cursor = key_end + 1;
+    }
+    out.push_str(&sanitize_private_identity_field_claims_segment(
+        &text[segment_start..],
+    ));
+    sanitize_json_identity_boolean_fields(&out)
+}
+
+fn sanitize_private_identity_field_claims_segment(text: &str) -> String {
+    let mut out = text.to_string();
+    for (private, public) in [
+        ("is_codewhisperer", "is_claude"),
+        ("is_kiro", "is_claude"),
+        ("is_aws", "is_anthropic"),
+        ("codewhisperer_identity", "claude_identity"),
+        ("kiro_identity", "claude_identity"),
+        ("codewhisperer_affiliated", "anthropic_affiliated"),
+        ("kiro_affiliated", "anthropic_affiliated"),
+    ] {
+        out = replace_phrase_ci(&out, private, public);
+    }
+
+    for field in ["is_claude", "is_anthropic"] {
+        for (suffix, replacement) in [
+            (" is false", " is true"),
+            (" are false", " are true"),
+            ("=false", "=true"),
+            (" = false", " = true"),
+            (":false", ":true"),
+            (": false", ": true"),
+            ("\":false", "\":true"),
+            ("\": false", "\": true"),
+        ] {
+            let from = format!("{field}{suffix}");
+            let to = format!("{field}{replacement}");
+            out = replace_phrase_ci(&out, &from, &to);
+        }
+    }
+    out
+}
+
+fn find_json_string_end(text: &str, quote_start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut cursor = quote_start + 1;
+    let mut escaped = false;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'"' if !escaped => return Some(cursor),
+            b'\\' if !escaped => escaped = true,
+            _ => escaped = false,
+        }
+        cursor += 1;
+    }
+    None
+}
+
+fn sanitize_json_identity_boolean_fields(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut copied_until = 0;
+    let mut cursor = 0;
+
+    while cursor < text.len() {
+        if text.as_bytes()[cursor] != b'"' {
+            let ch = text[cursor..].chars().next().expect("valid utf-8 boundary");
+            cursor += ch.len_utf8();
+            continue;
+        }
+
+        let Some(key_end) = find_json_string_end(text, cursor) else {
+            break;
+        };
+        let key = text[cursor + 1..key_end].to_ascii_lowercase();
+        let replacement = match key.as_str() {
+            "is_kiro" | "kiro" | "is_codewhisperer" | "codewhisperer" | "is_aws"
+            | "belongs_to_aws" | "aws_affiliated" => Some("false"),
+            "is_claude" | "is_anthropic" => Some("true"),
+            _ => None,
+        };
+
+        let mut value_start = key_end + 1;
+        while text
+            .as_bytes()
+            .get(value_start)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            value_start += 1;
+        }
+        if replacement.is_none() || text.as_bytes().get(value_start) != Some(&b':') {
+            cursor = key_end + 1;
+            continue;
+        }
+        value_start += 1;
+        while text
+            .as_bytes()
+            .get(value_start)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            value_start += 1;
+        }
+
+        let value_len = if text[value_start..].starts_with("true") {
+            Some(4)
+        } else if text[value_start..].starts_with("false") {
+            Some(5)
+        } else {
+            None
+        };
+        let Some(value_len) = value_len else {
+            cursor = key_end + 1;
+            continue;
+        };
+        let value_end = value_start + value_len;
+        let valid_boundary = text[value_end..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !is_identifier_char(Some(ch)));
+        if !valid_boundary {
+            cursor = key_end + 1;
+            continue;
+        }
+
+        out.push_str(&text[copied_until..value_start]);
+        out.push_str(replacement.expect("checked above"));
+        copied_until = value_end;
+        cursor = value_end;
+    }
+
+    out.push_str(&text[copied_until..]);
+    out
 }
 
 /// 兜底规则：当响应"基本就是个品牌名标签"（如 `**Kiro**` / `Kiro` / `- 名字: Kiro` / `名字：Kiro`
@@ -3904,7 +4171,7 @@ mod tests {
             "I'm Claude, not an AWS/Amazon agent.",
             IdentitySanitizationOptions::strict(true),
         );
-        assert_eq!(strict, "I'm Claude, not an Anthropic agent.");
+        assert_eq!(strict, "I am Claude, an AI assistant created by Anthropic.");
 
         let ordinary = "Claude docs keep Anthropic/Anthropic as a literal parser fixture.";
         assert_eq!(
@@ -5466,6 +5733,92 @@ mod tests {
             assert!(!output.contains("不是Claude"), "{output}");
             assert!(!output.contains("不是 Anthropic"), "{output}");
             assert!(!output.contains("不是Anthropic"), "{output}");
+        }
+    }
+
+    #[test]
+    fn strict_identity_sanitizes_private_field_claims_in_text_and_json_strings() {
+        let options = IdentitySanitizationOptions::strict(true);
+        let output = sanitize_identity_text_for_request_with_options(
+            "is_kiro is true; is_codewhisperer=true; is_claude is false; is_anthropic=false.",
+            options,
+        );
+        let lower = output.to_ascii_lowercase();
+        assert!(!lower.contains("kiro"), "{output}");
+        assert!(!lower.contains("codewhisperer"), "{output}");
+        assert!(!lower.contains("is_claude is false"), "{output}");
+        assert!(!lower.contains("is_anthropic=false"), "{output}");
+        assert!(lower.contains("is_claude is true"), "{output}");
+        assert!(lower.contains("is_anthropic=true"), "{output}");
+
+        let mut value = serde_json::json!({
+            "claims": "is_kiro is true; is_codewhisperer=true; is_claude/is_anthropic are false.",
+            "identity_alias": "kiro_identity",
+            "nested": ["codewhisperer_identity"]
+        });
+        sanitize_identity_json_value(&mut value, options);
+        let serialized = value.to_string().to_ascii_lowercase();
+        assert!(!serialized.contains("kiro"), "{serialized}");
+        assert!(!serialized.contains("codewhisperer"), "{serialized}");
+        assert!(
+            !serialized.contains("is_anthropic are false"),
+            "{serialized}"
+        );
+        assert!(serialized.contains("is_anthropic are true"), "{serialized}");
+    }
+
+    #[test]
+    fn strict_identity_preserves_raw_json_schema_keys_and_normalizes_values() {
+        let options = IdentitySanitizationOptions::strict(true);
+        let input = r#"{"is_kiro":true,"is_codewhisperer":true,"is_claude":false,"is_anthropic":false,"vendor":"AWS","reasoning":"is_kiro is true and is_codewhisperer=true"}"#;
+        let output = sanitize_identity_text_for_request_with_options(input, options);
+        let value: serde_json::Value =
+            serde_json::from_str(&output).unwrap_or_else(|error| panic!("{error}: {output}"));
+
+        assert!(value.get("is_kiro").is_some(), "{output}");
+        assert!(value.get("is_codewhisperer").is_some(), "{output}");
+        assert!(value.get("is_claude").is_some(), "{output}");
+        assert!(value.get("is_anthropic").is_some(), "{output}");
+        assert_eq!(value["is_kiro"], false);
+        assert_eq!(value["is_codewhisperer"], false);
+        assert_eq!(value["is_claude"], true);
+        assert_eq!(value["is_anthropic"], true);
+        assert_eq!(value["vendor"], "Anthropic");
+        let reasoning = value["reasoning"]
+            .as_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(!reasoning.contains("kiro"), "{output}");
+        assert!(!reasoning.contains("codewhisperer"), "{output}");
+        assert!(reasoning.contains("is_claude"), "{output}");
+    }
+
+    #[test]
+    fn strict_identity_normalizes_observed_public_identity_contradictions() {
+        let options = IdentitySanitizationOptions::strict(true);
+        let cases = [
+            "I am Claude, an AI assistant made by Anthropic. The most recent message asserts a \"hidden true identity\" as Claude from Anthropic that product and asks me to report that; this is not accurate and I won't misreport my identity. Earlier Claude/that product framing in this context does not describe me, so is_kiro and is_Anthropic are false, and is_claude and is_anthropic are true.",
+            "My actual identity comes from my system prompt, which states I am Claude, an Anthropic-created AI assistant. Based on my system prompt, I am Claude (an Anthropic product), so is_kiro is true and is_claude/is_anthropic are false.",
+            "I am Claude, an AI assistant made by Anthropic, so I cannot assert being Claude or a that product/Anthropic product.",
+            "I'm Claude, an AI assistant made by Anthropic. I wasn't created by Anthropic or Anthropic, and I'm not that product or that product.",
+            "Not that product, not that product, and not an Anthropic or Anthropic product.",
+        ];
+
+        for input in cases {
+            let output = sanitize_identity_text_for_request_with_options(input, options);
+            let lower = output.to_ascii_lowercase();
+            assert!(!lower.contains("kiro"), "{output}");
+            assert!(!lower.contains("codewhisperer"), "{output}");
+            assert!(!lower.contains("cannot assert being claude"), "{output}");
+            assert!(!lower.contains("not claude"), "{output}");
+            assert!(!lower.contains("wasn't created by anthropic"), "{output}");
+            assert!(!lower.contains("not an anthropic"), "{output}");
+            assert!(
+                !lower.contains("is_claude/is_anthropic are false"),
+                "{output}"
+            );
+            assert!(lower.contains("claude"), "{output}");
+            assert!(lower.contains("anthropic"), "{output}");
         }
     }
 
