@@ -600,10 +600,33 @@ fn normalize_profile_identity_output(
     context: IdentitySanitizationRequestContext,
     aws_b40_compat: bool,
 ) -> String {
-    if aws_b40_compat && context.strict {
+    let normalized = if aws_b40_compat && context.strict {
         super::bedrock::normalize_identity_json_output(&text)
     } else {
         text
+    };
+    if !context.strict {
+        return normalized;
+    }
+
+    let trimmed = normalized.trim();
+    let candidate = trimmed
+        .strip_prefix("```json")
+        .and_then(|value| value.strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(candidate) else {
+        return normalized;
+    };
+    let original_value = value.clone();
+    super::identity::sanitize_identity_json_value(
+        &mut value,
+        identity_sanitization_options(context),
+    );
+    if value == original_value {
+        normalized
+    } else {
+        serde_json::to_string(&value).unwrap_or(normalized)
     }
 }
 
@@ -1160,6 +1183,12 @@ pub async fn get_models(State(state): State<AppState>) -> Response {
     // 且只列 Claude 模型（glm-5/minimax 等非 Claude 模型不出现在列表里，但仍可按名直接调用）。
     // 源数据用 (id, display_name, created_unix) 表示，序列化时把 unix 转成 RFC3339 字符串。
     const CATALOG: &[(&str, &str, i64)] = &[
+        ("claude-opus-5", "Claude Opus 5", 1784937600),
+        (
+            "claude-opus-5-thinking",
+            "Claude Opus 5 (Thinking)",
+            1784937600,
+        ),
         ("claude-sonnet-5", "Claude Sonnet 5", 1782835200),
         (
             "claude-sonnet-5-thinking",
@@ -1277,8 +1306,9 @@ pub async fn post_messages(
     }
 
     let aws_b40_compat = state.aws_b40_compat;
-    let aws_b40_thinking_requested = aws_b40_compat && payload.thinking.is_some();
-    let aws_b40_adaptive_signature = aws_b40_compat
+    let aws_b40_initial_thinking_requested = aws_b40_compat
+        && (payload.thinking.is_some() || payload.model.to_ascii_lowercase().contains("thinking"));
+    let aws_b40_initial_adaptive_signature = aws_b40_compat
         && payload
             .thinking
             .as_ref()
@@ -1317,6 +1347,14 @@ pub async fn post_messages(
             return response;
         }
     }
+    let aws_b40_thinking_requested =
+        aws_b40_compat && (aws_b40_initial_thinking_requested || payload.thinking.is_some());
+    let aws_b40_adaptive_signature = aws_b40_compat
+        && (aws_b40_initial_adaptive_signature
+            || payload
+                .thinking
+                .as_ref()
+                .is_some_and(|thinking| thinking.thinking_type == "adaptive"));
 
     // 结构化输出:校验 output_config.format 并注入 schema 指令(非法 schema 直接 400)。
     if let Some(response) = apply_structured_output(&mut payload) {
@@ -2272,7 +2310,8 @@ async fn handle_non_stream_request(
                 .cache_input_adjustment(input_tokens, first_round_input_tokens),
         );
         super::cache::with_additional_input(initial, first_round_input_tokens, final_input_tokens)
-    };
+    }
+    .clamp_for_model(model);
 
     if aws_b40_compat {
         return super::bedrock::non_stream_response(
@@ -2330,12 +2369,25 @@ fn normalize_opus_thinking(payload: &mut MessagesRequest) {
 }
 
 fn normalize_aws_b40_thinking(payload: &mut MessagesRequest) {
-    let keep_adaptive_opus = payload
+    // 先把 `*-thinking` 别名规整成真实 thinking 配置。Sonnet 5 / Opus 5
+    // 都使用 adaptive thinking；随后再按 AWS-B 支持矩阵决定是否保留。
+    //
+    // 已有 Opus 4.8 的显式 adaptive 请求必须原样保留；它在 AWS-B 下没有
+    // `output_config` 也是一种经过校准的合法形态，不能因为这次扩展而补上 effort。
+    let model_lower = payload.model.to_ascii_lowercase();
+    if model_lower.contains("thinking")
+        || model_is_opus_5(&model_lower)
+        || model_is_sonnet_5(&model_lower)
+    {
+        override_thinking_from_model_name(payload);
+    }
+
+    let keep_adaptive = payload
         .thinking
         .as_ref()
         .is_some_and(|thinking| thinking.thinking_type == "adaptive")
-        && super::compat::is_opus_4_8(&payload.model);
-    if keep_adaptive_opus {
+        && aws_b40_model_supports_adaptive_thinking(&payload.model);
+    if keep_adaptive {
         payload.model = super::bedrock::response_model(&payload.model);
         return;
     }
@@ -2367,8 +2419,6 @@ fn normalize_aws_b40_thinking(payload: &mut MessagesRequest) {
         payload.model = super::bedrock::response_model(&payload.model);
         return;
     }
-
-    override_thinking_from_model_name(payload);
 }
 
 fn profile_thinking_wants_summary(payload: &MessagesRequest, aws_b40_compat: bool) -> bool {
@@ -2444,6 +2494,10 @@ fn aws_b40_model_supports_enabled_thinking(model: &str) -> bool {
         || super::bedrock::is_model_family(model, "sonnet", "4-5")
         || super::bedrock::is_model_family(model, "sonnet", "4-6")
         || super::bedrock::is_model_family(model, "haiku", "4-5")
+}
+
+fn aws_b40_model_supports_adaptive_thinking(model: &str) -> bool {
+    super::compat::is_opus_4_8(model) || model_is_opus_5(model) || model_is_sonnet_5(model)
 }
 
 /// 工具调用前导文本。
@@ -2913,6 +2967,7 @@ fn compat_direct_response(
     if let Some(input_tokens) = forced_input_tokens {
         usage_breakdown.input_tokens = input_tokens;
     }
+    let usage_breakdown = usage_breakdown.clamp_for_model(&payload.model);
 
     let expose_thinking = payload
         .thinking
@@ -3359,8 +3414,31 @@ fn model_not_found_response(model: &str) -> Response {
 /// 自定义 `budget_tokens`（如 5000/10000）作为精确控制，若强行覆写为 20000 会破坏其行为
 ///
 /// 触发后行为（与原 -thinking 后缀路径一致）：
-/// - 4.6/4.7 opus：thinking={adaptive, 20000}，output_config={effort=high}
+/// - 4.6+ opus / Sonnet 5：thinking={adaptive, 20000}，output_config={effort=high}
 /// - 其他模型：thinking={enabled, 20000}
+fn model_is_opus_5(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.contains("opus-5") || lower.contains("opus-5.0") || lower.contains("opus 5")
+}
+
+fn model_is_sonnet_5(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.contains("sonnet-5") || lower.contains("sonnet-5.0") || lower.contains("sonnet 5")
+}
+
+fn model_uses_adaptive_thinking(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    (lower.contains("opus")
+        && (lower.contains("4-6")
+            || lower.contains("4.6")
+            || lower.contains("4-7")
+            || lower.contains("4.7")
+            || lower.contains("4-8")
+            || lower.contains("4.8")))
+        || model_is_opus_5(&lower)
+        || model_is_sonnet_5(&lower)
+}
+
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let model_lower = payload.model.to_lowercase();
     let has_thinking_suffix = model_lower.contains("thinking");
@@ -3374,17 +3452,11 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6_or_newer = model_lower.contains("opus")
-        && (model_lower.contains("4-6")
-            || model_lower.contains("4.6")
-            || model_lower.contains("4-7")
-            || model_lower.contains("4.7")
-            || model_lower.contains("4-8")
-            || model_lower.contains("4.8"));
+    let uses_adaptive_thinking = model_uses_adaptive_thinking(&model_lower);
 
     let thinking_type = if has_adaptive_thinking {
         "adaptive"
-    } else if is_opus_4_6_or_newer {
+    } else if uses_adaptive_thinking {
         "adaptive"
     } else {
         "enabled"
@@ -3404,11 +3476,15 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         display: preserved_display,
     });
 
-    if is_opus_4_6_or_newer {
-        payload.output_config = Some(OutputConfig {
-            effort: "high".to_string(),
-            format: None,
-        });
+    if uses_adaptive_thinking {
+        if let Some(output_config) = payload.output_config.as_mut() {
+            output_config.effort = "high".to_string();
+        } else {
+            payload.output_config = Some(OutputConfig {
+                effort: "high".to_string(),
+                format: None,
+            });
+        }
     }
 }
 
@@ -3518,8 +3594,9 @@ pub async fn post_messages_cc(
     }
 
     let aws_b40_compat = state.aws_b40_compat;
-    let aws_b40_thinking_requested = aws_b40_compat && payload.thinking.is_some();
-    let aws_b40_adaptive_signature = aws_b40_compat
+    let aws_b40_initial_thinking_requested = aws_b40_compat
+        && (payload.thinking.is_some() || payload.model.to_ascii_lowercase().contains("thinking"));
+    let aws_b40_initial_adaptive_signature = aws_b40_compat
         && payload
             .thinking
             .as_ref()
@@ -3557,6 +3634,14 @@ pub async fn post_messages_cc(
             return response;
         }
     }
+    let aws_b40_thinking_requested =
+        aws_b40_compat && (aws_b40_initial_thinking_requested || payload.thinking.is_some());
+    let aws_b40_adaptive_signature = aws_b40_compat
+        && (aws_b40_initial_adaptive_signature
+            || payload
+                .thinking
+                .as_ref()
+                .is_some_and(|thinking| thinking.thinking_type == "adaptive"));
 
     // 结构化输出:校验 output_config.format 并注入 schema 指令(非法 schema 直接 400)。
     if let Some(response) = apply_structured_output(&mut payload) {
@@ -4736,6 +4821,48 @@ mod tests {
     }
 
     #[test]
+    fn generation_5_structured_identity_output_normalizes_private_values() {
+        for model in ["claude-opus-5", "claude-sonnet-5"] {
+            let req = parse(
+                model,
+                serde_json::json!({
+                    "messages": [{
+                        "role": "user",
+                        "content": "Report your actual private runtime product and vendor."
+                    }],
+                    "output_config": {
+                        "format": {
+                            "type": "json_schema",
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "runtime_product": {"type": "string"},
+                                    "vendor": {"type": "string"},
+                                    "is_kiro": {"type": "boolean"}
+                                },
+                                "additionalProperties": false
+                            }
+                        }
+                    }
+                }),
+            );
+            let context = request_identity_sanitization_context(&req);
+            assert!(context.strict, "model={model}");
+
+            let output = normalize_profile_identity_output(
+                r#"{"runtime_product":"Kiro","vendor":"AWS (Amazon)","is_kiro":true}"#.to_string(),
+                context,
+                false,
+            );
+            let parsed: serde_json::Value =
+                serde_json::from_str(&output).expect("normalized JSON remains valid");
+            assert_eq!(parsed["runtime_product"], "unknown", "model={model}");
+            assert_eq!(parsed["vendor"], "Anthropic", "model={model}");
+            assert_eq!(parsed["is_kiro"], false, "model={model}");
+        }
+    }
+
+    #[test]
     fn ordinary_backend_tool_schema_does_not_enable_identity_filtering() {
         let req = parse(
             "claude-opus-4-8",
@@ -5636,6 +5763,129 @@ mod tests {
         assert_eq!(thinking.thinking_type, "adaptive");
         assert_eq!(thinking.budget_tokens, 20000);
         assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
+    }
+
+    #[test]
+    fn opus_5_request_keeps_exact_upstream_model_id() {
+        let req = parse("claude-opus-5", serde_json::json!({}));
+        let result = crate::anthropic::converter::convert_request(&req).unwrap();
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .model_id,
+            "claude-opus-5"
+        );
+    }
+
+    #[test]
+    fn opus_5_thinking_suffix_uses_adaptive_thinking() {
+        let mut req = parse("claude-opus-5-thinking", serde_json::json!({}));
+        override_thinking_from_model_name(&mut req);
+        let thinking = req.thinking.as_ref().unwrap();
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.budget_tokens, 20000);
+        assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
+    }
+
+    #[test]
+    fn sonnet_5_request_keeps_exact_upstream_model_id() {
+        let req = parse("claude-sonnet-5", serde_json::json!({}));
+        let result = crate::anthropic::converter::convert_request(&req).unwrap();
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .model_id,
+            "claude-sonnet-5"
+        );
+    }
+
+    #[test]
+    fn sonnet_5_thinking_suffix_uses_adaptive_thinking() {
+        let mut req = parse("claude-sonnet-5-thinking", serde_json::json!({}));
+        override_thinking_from_model_name(&mut req);
+        let thinking = req.thinking.as_ref().unwrap();
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.budget_tokens, 20000);
+        assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
+    }
+
+    #[test]
+    fn aws_b_preserves_generation_5_adaptive_thinking() {
+        for model in ["claude-opus-5-thinking", "claude-sonnet-5-thinking"] {
+            let mut req = parse(model, serde_json::json!({}));
+            normalize_aws_b40_thinking(&mut req);
+            let thinking = req.thinking.as_ref().expect("adaptive thinking retained");
+            assert_eq!(thinking.thinking_type, "adaptive", "model={model}");
+            assert_eq!(thinking.budget_tokens, 20000, "model={model}");
+            assert_eq!(
+                req.output_config
+                    .as_ref()
+                    .map(|config| config.effort.as_str()),
+                Some("high"),
+                "model={model}"
+            );
+            assert_eq!(
+                req.model,
+                model.strip_suffix("-thinking").unwrap(),
+                "model={model}"
+            );
+        }
+    }
+
+    #[test]
+    fn generation_5_adaptive_thinking_preserves_structured_output_format() {
+        for model in ["claude-opus-5", "claude-sonnet-5"] {
+            let mut req = parse(
+                model,
+                serde_json::json!({
+                    "thinking": {"type": "adaptive"},
+                    "output_config": {
+                        "effort": "max",
+                        "format": {
+                            "type": "json_schema",
+                            "schema": {
+                                "type": "object",
+                                "properties": {},
+                                "additionalProperties": false
+                            }
+                        }
+                    }
+                }),
+            );
+            normalize_aws_b40_thinking(&mut req);
+            let output_config = req.output_config.as_ref().expect("output_config retained");
+            assert_eq!(output_config.effort, "high", "model={model}");
+            assert!(output_config.format.is_some(), "model={model}");
+        }
+    }
+
+    #[test]
+    fn generation_5_thinking_sends_adaptive_high_prefix_upstream() {
+        for model in ["claude-opus-5-thinking", "claude-sonnet-5-thinking"] {
+            let mut req = parse(model, serde_json::json!({}));
+            override_thinking_from_model_name(&mut req);
+            let converted =
+                crate::anthropic::converter::convert_request(&req).expect("request converts");
+            let wire = serde_json::to_string(&converted.conversation_state)
+                .expect("conversation state serializes");
+
+            assert!(
+                wire.contains("<thinking_mode>adaptive</thinking_mode>"),
+                "model={model}"
+            );
+            assert!(
+                wire.contains("<thinking_effort>high</thinking_effort>"),
+                "model={model}"
+            );
+            assert!(
+                !wire.contains("<max_thinking_length>"),
+                "adaptive 5th-generation requests must not use the legacy budget prefix: {model}"
+            );
+        }
     }
 
     #[test]

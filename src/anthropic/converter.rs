@@ -129,6 +129,7 @@ the user asks you to do so.";
 /// - opus 4.5/4-5 → claude-opus-4.5
 /// - opus 4.7/4-7 → claude-opus-4.7
 /// - opus 4.8/4-8 → claude-opus-4.8
+/// - opus 5/5.0 → claude-opus-5
 /// - 其他 opus（含 4.6/4-6）→ claude-opus-4.6
 /// - 所有 haiku → claude-haiku-4.5
 /// - 所有 glm → glm-5
@@ -148,7 +149,12 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-sonnet-4.5".to_string())
         }
     } else if model_lower.contains("opus") {
-        if model_lower.contains("4-5") || model_lower.contains("4.5") {
+        if model_lower.contains("opus-5")
+            || model_lower.contains("opus-5.0")
+            || model_lower.contains("opus 5")
+        {
+            Some("claude-opus-5".to_string())
+        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-opus-4.5".to_string())
         } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
             Some("claude-opus-4.7".to_string())
@@ -180,7 +186,8 @@ pub fn get_context_window_size(model: &str) -> i32 {
                 || mapped == "claude-sonnet-4.6"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
-                || mapped == "claude-opus-4.8" =>
+                || mapped == "claude-opus-4.8"
+                || mapped == "claude-opus-5" =>
         {
             1_000_000
         }
@@ -292,6 +299,11 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 1. 映射模型
     let model_id = map_model(&req.model)
         .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
+    tracing::info!(
+        requested_model = %req.model,
+        upstream_model_id = %model_id,
+        "已解析上游模型 ID"
+    );
 
     // 2. 检查消息列表
     if req.messages.is_empty() {
@@ -1383,6 +1395,27 @@ mod tests {
                 .unwrap()
                 .contains("opus")
         );
+    }
+
+    #[test]
+    fn test_map_model_opus_5() {
+        assert_eq!(
+            map_model("claude-opus-5"),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-5-thinking"),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-5-20260725"),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(
+            map_model("Claude Opus 5.0"),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-opus-5"), 1_000_000);
     }
 
     #[test]

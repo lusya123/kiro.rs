@@ -355,6 +355,13 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
+                tracing::info!(
+                    upstream_model_id = model.as_deref().unwrap_or("unknown"),
+                    api_type = api_type,
+                    attempt = attempt + 1,
+                    status = %status,
+                    "Kiro 上游请求成功"
+                );
                 return Ok(response);
             }
 

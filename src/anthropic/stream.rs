@@ -946,7 +946,8 @@ impl StreamContext {
     pub fn create_message_start_event(&self) -> serde_json::Value {
         let breakdown = self
             .calibrated_direct_initial_usage()
-            .unwrap_or(self.initial_usage_breakdown);
+            .unwrap_or(self.initial_usage_breakdown)
+            .clamp_for_model(&self.model);
         if self.aws_b40_compat {
             let initial_output_tokens = match self.output_token_limit {
                 Some(limit) if limit <= 1 => 1,
@@ -1486,9 +1487,12 @@ impl StreamContext {
     /// 创建 signature_delta 事件（thinking 块伪签名，详见 anthropic::signature 模块）
     fn create_signature_delta_event(&self, index: i32) -> SseEvent {
         let signature = if self.aws_b40_compat {
+            // 与 message_start / message_delta 上报的 usage 保持同一口径，
+            // 否则超限请求的签名会由钳制前的数值算出，与对外 usage 不自洽。
             let usage = self
                 .calibrated_direct_initial_usage()
-                .unwrap_or(self.initial_usage_breakdown);
+                .unwrap_or(self.initial_usage_breakdown)
+                .clamp_for_model(&self.model);
             super::bedrock::signature(
                 &self.model,
                 self.aws_b40_adaptive_signature,
@@ -1901,6 +1905,11 @@ impl StreamContext {
     }
 
     fn final_usage_breakdown(&self) -> super::cache::UsageBreakdown {
+        self.final_usage_breakdown_uncapped()
+            .clamp_for_model(&self.model)
+    }
+
+    fn final_usage_breakdown_uncapped(&self) -> super::cache::UsageBreakdown {
         let stable_cached_initial = self.calibrated_direct_initial_usage().or_else(|| {
             (self.aws_b40_compat
                 && (self.initial_usage_breakdown.cache_read_input_tokens > 0

@@ -1147,11 +1147,15 @@ pub fn models_response() -> Response {
     const MODEL_IDS: &[&str] = &[
         "claude-haiku-4-5",
         "claude-haiku-4-5-20251001",
+        "claude-opus-5",
+        "claude-opus-5-thinking",
         "claude-opus-4-5-20251101",
         "claude-opus-4-6",
         "claude-opus-4-7",
         "claude-opus-4-7-thinking",
         "claude-opus-4-8",
+        "claude-sonnet-5",
+        "claude-sonnet-5-thinking",
         "claude-sonnet-4-5-20250929",
         "claude-sonnet-4-6",
         "claude-sonnet-4-6-thinking",
@@ -2522,7 +2526,10 @@ mod tests {
         ));
         assert!(body.ends_with("],\"object\":\"list\",\"success\":true}"));
         assert!(body.contains("\"supported_endpoint_types\":[\"anthropic\",\"openai\"]"));
-        assert!(!body.contains("claude-sonnet-5"));
+        assert!(body.contains("\"id\":\"claude-opus-5\""));
+        assert!(body.contains("\"id\":\"claude-opus-5-thinking\""));
+        assert!(body.contains("\"id\":\"claude-sonnet-5\""));
+        assert!(body.contains("\"id\":\"claude-sonnet-5-thinking\""));
     }
 
     #[tokio::test]

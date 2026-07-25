@@ -193,7 +193,8 @@ mod tests {
         assert!(body.starts_with("{\"data\":["));
         assert!(body.ends_with("],\"object\":\"list\",\"success\":true}"));
         assert!(body.contains("\"supported_endpoint_types\":[\"anthropic\",\"openai\"]"));
-        assert!(!body.contains("claude-sonnet-5"));
+        assert!(body.contains("claude-opus-5"));
+        assert!(body.contains("claude-sonnet-5"));
 
         let response = client
             .head(format!("{base}/v1/models"))
@@ -380,13 +381,9 @@ mod tests {
             .await
             .expect("AWS-P models request");
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(
-            response
-                .text()
-                .await
-                .expect("AWS-P models body")
-                .contains("claude-sonnet-5")
-        );
+        let models_body = response.text().await.expect("AWS-P models body");
+        assert!(models_body.contains("claude-opus-5"));
+        assert!(models_body.contains("claude-sonnet-5"));
 
         let response = client
             .head(format!("{aws_p_base}/v1/models"))

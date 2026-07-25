@@ -80,6 +80,84 @@ impl UsageBreakdown {
     pub fn total(&self) -> i32 {
         self.input_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens
     }
+
+    /// 把 usage 钳制到物理可能的范围内，供所有对外出口在发出前调用。
+    ///
+    /// 单个请求的 input + cache_read + cache_creation 不可能超过模型上下文窗口。
+    /// 一旦超过，只可能来自多轮累计、上游异常重连的重复计量，或本地估算把二进制
+    /// 内容（例如 tool_result 里内嵌的 base64 截图）当作文本计数造成的放大。
+    /// 下游网关按 usage 逐 token 计费，放大值会直接变成客户账单，因此必须在出口
+    /// 处兜底：宁可少计，不可多计。
+    ///
+    /// 同时强制 `cache_creation == 5m + 1h`。二者失配时，下游会把 message_start
+    /// 的分量和 message_delta 的总量混用（`compat::stream_delta_usage` 不带分量
+    /// 子字段），得到远超真实值的缓存写入量。
+    pub fn clamp_to_context_window(self, context_window_tokens: i32) -> Self {
+        let limit = context_window_tokens.max(1);
+
+        let mut cache_creation_5m = self.cache_creation_5m_input_tokens.max(0);
+        let mut cache_creation_1h = self.cache_creation_1h_input_tokens.max(0);
+        let mut cache_creation = self.cache_creation_input_tokens.max(0);
+        if cache_creation_5m.saturating_add(cache_creation_1h) != cache_creation {
+            if cache_creation_5m > 0 || cache_creation_1h > 0 {
+                cache_creation = cache_creation_5m.saturating_add(cache_creation_1h);
+            } else {
+                cache_creation_5m = cache_creation;
+            }
+        }
+
+        let mut cache_read = self.cache_read_input_tokens.max(0);
+        let mut input = self.input_tokens.max(0);
+
+        let within_limit = input
+            .saturating_add(cache_read)
+            .saturating_add(cache_creation)
+            <= limit;
+        if within_limit {
+            return Self {
+                input_tokens: input,
+                cache_read_input_tokens: cache_read,
+                cache_creation_input_tokens: cache_creation,
+                cache_creation_5m_input_tokens: cache_creation_5m,
+                cache_creation_1h_input_tokens: cache_creation_1h,
+            };
+        }
+
+        // 超限：按可信度从高到低依次分配预算（缓存写入 → 缓存读取 → 普通 input），
+        // 并始终给 input 留至少 1 个 token，与真 Anthropic 的 usage 形态一致。
+        let mut remaining = limit;
+        cache_creation = cache_creation.min(remaining.saturating_sub(1));
+        cache_creation_1h = cache_creation_1h.min(cache_creation);
+        cache_creation_5m = cache_creation - cache_creation_1h;
+        remaining -= cache_creation;
+        cache_read = cache_read.min(remaining.saturating_sub(1));
+        remaining -= cache_read;
+        input = input.clamp(1, remaining.max(1));
+
+        tracing::warn!(
+            limit,
+            original_input = self.input_tokens,
+            original_cache_read = self.cache_read_input_tokens,
+            original_cache_creation = self.cache_creation_input_tokens,
+            clamped_input = input,
+            clamped_cache_read = cache_read,
+            clamped_cache_creation = cache_creation,
+            "usage 超过模型上下文窗口，已钳制后再上报（避免下游超额计费）"
+        );
+
+        Self {
+            input_tokens: input,
+            cache_read_input_tokens: cache_read,
+            cache_creation_input_tokens: cache_creation,
+            cache_creation_5m_input_tokens: cache_creation_5m,
+            cache_creation_1h_input_tokens: cache_creation_1h,
+        }
+    }
+
+    /// 按模型自身的上下文窗口钳制（opus-4.8 / sonnet-4.6 等为 1M，其余 200K）。
+    pub fn clamp_for_model(self, model: &str) -> Self {
+        self.clamp_to_context_window(super::converter::get_context_window_size(model))
+    }
 }
 
 /// 把真实总 token `total_input_tokens` 拆分成高缓存展示口径 (I, CR, CC)。
@@ -824,6 +902,80 @@ fn cache_key(model: &str, key_material: &str, ttl: CacheTtl) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clamp_leaves_normal_usage_untouched() {
+        let usage = UsageBreakdown {
+            input_tokens: 12_000,
+            cache_read_input_tokens: 32_295,
+            cache_creation_input_tokens: 8_272,
+            cache_creation_5m_input_tokens: 8_272,
+            cache_creation_1h_input_tokens: 0,
+        };
+        assert_eq!(usage.clamp_for_model("claude-opus-4-8"), usage);
+        assert_eq!(usage.clamp_for_model("claude-haiku-4-5"), usage);
+    }
+
+    #[test]
+    fn clamp_caps_incident_scale_usage_to_context_window() {
+        // 2026-07-25 上游故障期间真实上报的 usage：三项分量各自都远超 1M 上下文窗口。
+        let inflated = UsageBreakdown {
+            input_tokens: 5_122_021,
+            cache_read_input_tokens: 2_508_305,
+            cache_creation_input_tokens: 13_078_753,
+            cache_creation_5m_input_tokens: 182_611,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let clamped = inflated.clamp_for_model("claude-opus-4-8");
+        assert!(
+            clamped.input_tokens
+                + clamped.cache_read_input_tokens
+                + clamped.cache_creation_input_tokens
+                <= 1_000_000
+        );
+        assert!(clamped.input_tokens >= 1);
+        // 分量失配时以 5m/1h 分量为准重建总量，避免下游混用两个事件的数值。
+        assert_eq!(clamped.cache_creation_input_tokens, 182_611);
+        assert_eq!(
+            clamped.cache_creation_5m_input_tokens + clamped.cache_creation_1h_input_tokens,
+            clamped.cache_creation_input_tokens
+        );
+    }
+
+    #[test]
+    fn clamp_keeps_cache_creation_identity() {
+        // 总量有值但分量全为 0：把总量整体记为 5m，恒等式必须成立。
+        let usage = UsageBreakdown {
+            input_tokens: 10,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 5_000,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let clamped = usage.clamp_for_model("claude-opus-4-8");
+        assert_eq!(clamped.cache_creation_input_tokens, 5_000);
+        assert_eq!(clamped.cache_creation_5m_input_tokens, 5_000);
+    }
+
+    #[test]
+    fn clamp_respects_smaller_context_window() {
+        let inflated = UsageBreakdown {
+            input_tokens: 900_000,
+            cache_read_input_tokens: 900_000,
+            cache_creation_input_tokens: 900_000,
+            cache_creation_5m_input_tokens: 900_000,
+            cache_creation_1h_input_tokens: 0,
+        };
+        // haiku 走 200K 窗口。
+        let clamped = inflated.clamp_for_model("claude-haiku-4-5");
+        assert!(
+            clamped.input_tokens
+                + clamped.cache_read_input_tokens
+                + clamped.cache_creation_input_tokens
+                <= 200_000
+        );
+        assert!(clamped.input_tokens >= 1);
+    }
 
     #[test]
     fn with_additional_input_preserves_cache_and_bills_continuation_rounds() {
