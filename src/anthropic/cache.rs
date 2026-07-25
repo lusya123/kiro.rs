@@ -522,9 +522,7 @@ fn build_cache_breakpoints(
             state.tools.push(tool.clone());
             let mut tool_key = serde_json::to_value(tool).unwrap_or(Value::Null);
             strip_cache_control(&mut tool_key);
-            state
-                .key_parts
-                .push(format!("tool:{}", canonical_json(&tool_key)));
+            state.push_key_part(&format!("tool:{}", canonical_json(&tool_key)));
             if tool.cache_control.is_some() {
                 let warm_on_first_use =
                     aws_b40_compat && cache_control_is_global(tool.cache_control.as_ref());
@@ -547,7 +545,7 @@ fn build_cache_breakpoints(
     if let Some(system) = &req.system {
         for item in system {
             state.system_segments.push(item.text.clone());
-            state.key_parts.push(format!("system:{}", item.text));
+            state.push_key_part(&format!("system:{}", item.text));
             if item.cache_control.is_some() {
                 let warm_on_first_use =
                     aws_b40_compat && cache_control_is_global(item.cache_control.as_ref());
@@ -599,12 +597,30 @@ fn build_cache_breakpoints(
     breakpoints
 }
 
+/// 前缀 key 各块之间的分隔符（保持与历史实现一致的字节序列）。
+const KEY_PART_SEPARATOR: &str = "\n---prefix-block---\n";
+
 #[derive(Default)]
 struct PrefixState {
     tools: Vec<Tool>,
     system_segments: Vec<String>,
     content_segments: Vec<Value>,
-    key_parts: Vec<String>,
+    /// 前缀 key 的滚动摘要。
+    ///
+    /// 这里以前是 `key_parts: Vec<String>`：每追加一个块，
+    /// `remember_read_candidate()` 都要 `key_parts.join(SEP)` 把整个前缀
+    /// 重新拼成一个大 String。它对每条消息/每个 content block 调用一次，
+    /// 于是 N 个块累计复制 1+2+…+N 份数据 —— O(N²)。长对话（几十条消息、
+    /// 上百 KB）下这会吃掉大量 CPU，并且这些大 String 还全部留在
+    /// `read_candidates` 里，导致进程 RSS 涨到 GB 级。
+    ///
+    /// `key_material` 只有两种用途：喂给 `cache_key()` 做 SHA-256，或与
+    /// 另一个 key_material 做相等比较；从不按原文读取。因此这里改为增量
+    /// 更新摘要——`key_material()` 的结果等价于 `sha256(parts.join(SEP))`，
+    /// 唯一性与相等语义完全不变，但每个块只做一次 O(块大小) 的 update，
+    /// 整体降到 O(总字节数) 单遍。
+    key_digest: Sha256,
+    key_part_count: usize,
     read_candidates: Vec<CacheReadCandidate>,
 }
 
@@ -613,6 +629,21 @@ impl PrefixState {
         !self.tools.is_empty()
             || !self.system_segments.is_empty()
             || !self.content_segments.is_empty()
+    }
+
+    /// 追加一个前缀块（等价于以前的 `key_parts.push(..)`）。
+    fn push_key_part(&mut self, part: &str) {
+        if self.key_part_count > 0 {
+            self.key_digest.update(KEY_PART_SEPARATOR.as_bytes());
+        }
+        self.key_digest.update(part.as_bytes());
+        self.key_part_count += 1;
+    }
+
+    /// 当前前缀的 key material（等价于以前的 `key_parts.join(SEP)`，
+    /// 只是以定长摘要代替原文）。克隆 hasher 只复制固定大小的内部状态。
+    fn key_material(&self) -> String {
+        hex::encode(self.key_digest.clone().finalize())
     }
 }
 
@@ -626,7 +657,7 @@ fn collect_message_prefix(
     match &message.content {
         Value::String(text) => {
             let content = Value::String(text.clone());
-            state.key_parts.push(format!("{}:{}", message.role, text));
+            state.push_key_part(&format!("{}:{}", message.role, text));
             state.content_segments.push(content);
             remember_read_candidate(req, state, aws_b40_compat);
         }
@@ -637,7 +668,7 @@ fn collect_message_prefix(
                 if let Some(obj) = item_without_cache.as_object_mut() {
                     obj.remove("cache_control");
                 }
-                state.key_parts.push(format!(
+                state.push_key_part(&format!(
                     "{}:{}",
                     message.role,
                     canonical_json(&item_without_cache)
@@ -666,9 +697,7 @@ fn collect_message_prefix(
             }
         }
         other => {
-            state
-                .key_parts
-                .push(format!("{}:{}", message.role, canonical_json(other)));
+            state.push_key_part(&format!("{}:{}", message.role, canonical_json(other)));
             state.content_segments.push(other.clone());
             remember_read_candidate(req, state, aws_b40_compat);
         }
@@ -679,7 +708,7 @@ fn remember_read_candidate(req: &MessagesRequest, state: &mut PrefixState, aws_b
     let tokens = calibrated_prefix_tokens(req, state, aws_b40_compat);
     state.read_candidates.push(CacheReadCandidate {
         tokens,
-        key_material: state.key_parts.join("\n---prefix-block---\n"),
+        key_material: state.key_material(),
     });
 }
 
@@ -739,7 +768,7 @@ fn push_breakpoint(
     options: CacheBreakpointOptions,
 ) {
     let tokens = calibrated_prefix_tokens(req, state, aws_b40_compat);
-    let current_key = state.key_parts.join("\n---prefix-block---\n");
+    let current_key = state.key_material();
     let read_candidates = if options.readable {
         state
             .read_candidates
@@ -902,6 +931,51 @@ fn cache_key(model: &str, key_material: &str, ttl: CacheTtl) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 前缀 key 的增量摘要必须与历史实现 `key_parts.join(SEP)` 的哈希逐字节等价。
+    ///
+    /// 历史实现每追加一个块都重新 join 整个前缀（O(N²)，长对话下 CPU 涨 7 倍、
+    /// RSS 涨到 GB 级）。改成滚动摘要后语义必须保持不变——本测试锁定这一点，
+    /// 同时防止有人改坏分隔符或改回逐块拼接。
+    #[test]
+    fn rolling_key_digest_matches_joined_prefix_hash() {
+        let parts = vec![
+            "tool:{\"name\":\"search\"}".to_string(),
+            "system:you are a helpful assistant".to_string(),
+            "user:first question".to_string(),
+            "assistant:first answer".to_string(),
+            "user:second question".to_string(),
+        ];
+
+        let mut state = PrefixState::default();
+        for part in &parts {
+            state.push_key_part(part);
+        }
+
+        let expected = {
+            let joined = parts.join(KEY_PART_SEPARATOR);
+            let mut hasher = Sha256::new();
+            hasher.update(joined.as_bytes());
+            hex::encode(hasher.finalize())
+        };
+
+        assert_eq!(state.key_material(), expected);
+    }
+
+    /// 不同的前缀必须得到不同的 key material（相等比较语义在第 748 行被依赖）。
+    #[test]
+    fn different_prefixes_produce_different_key_material() {
+        let mut a = PrefixState::default();
+        a.push_key_part("user:hello");
+        let mut b = PrefixState::default();
+        b.push_key_part("user:hello!");
+        assert_ne!(a.key_material(), b.key_material());
+
+        // 前缀相同时必须相等（增量读候选匹配依赖这个）
+        let mut c = PrefixState::default();
+        c.push_key_part("user:hello");
+        assert_eq!(a.key_material(), c.key_material());
+    }
 
     #[test]
     fn clamp_leaves_normal_usage_untouched() {
