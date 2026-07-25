@@ -465,7 +465,10 @@ mod tests {
             .post(format!("http://{app_addr}/v1/messages"))
             .bearer_auth("client-secret")
             .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", "interleaved-thinking-2025-05-14")
+            .header(
+                "anthropic-beta",
+                "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14",
+            )
             .json(&json!({
                 "model": "claude-opus-4-8",
                 "max_tokens": 1024,
@@ -490,7 +493,10 @@ mod tests {
             .expect("captured native request");
         assert_eq!(headers["x-api-key"], "native-secret");
         assert!(headers.get(header::AUTHORIZATION).is_none());
-        assert_eq!(headers["anthropic-beta"], "interleaved-thinking-2025-05-14");
+        assert_eq!(
+            headers["anthropic-beta"],
+            "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"
+        );
         assert_eq!(body["model"], "anthropic.claude-opus-4-8");
         assert_eq!(body["temperature"], 0.7);
         assert_eq!(body["custom_extension"]["keep"], true);

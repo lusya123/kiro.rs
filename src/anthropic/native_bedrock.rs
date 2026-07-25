@@ -26,6 +26,7 @@ use super::types::{ErrorResponse, MessagesRequest};
 
 const API_KEY_ENV: &str = "AWS_BEARER_TOKEN_BEDROCK";
 const REQUEST_TIMEOUT_SECS: u64 = 360;
+const CLIENT_ONLY_BETA_FLAGS: &[&str] = &["claude-code-20250219", "oauth-2025-04-20"];
 
 /// Native Bedrock Mantle transport for an explicit set of public model aliases.
 pub struct BedrockMantleProvider {
@@ -180,13 +181,15 @@ impl BedrockMantleProvider {
 
         for name in [
             header::ACCEPT.as_str(),
-            "anthropic-beta",
             "anthropic-dangerous-direct-browser-access",
             "anthropic-version",
         ] {
             if let Some(value) = incoming_headers.get(name) {
                 request = request.header(name, value);
             }
+        }
+        if let Some(value) = bedrock_beta_header(incoming_headers) {
+            request = request.header("anthropic-beta", value);
         }
         if incoming_headers.get("anthropic-version").is_none() {
             request = request.header("anthropic-version", "2023-06-01");
@@ -229,6 +232,26 @@ impl BedrockMantleProvider {
             .body(Body::from_stream(upstream.bytes_stream()))
             .expect("static Bedrock Mantle response headers are valid")
     }
+}
+
+fn bedrock_beta_header(headers: &HeaderMap) -> Option<String> {
+    let mut retained = Vec::new();
+    for value in headers.get_all("anthropic-beta") {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        for flag in value
+            .split(',')
+            .map(str::trim)
+            .filter(|flag| !flag.is_empty())
+        {
+            if CLIENT_ONLY_BETA_FLAGS.contains(&flag) || retained.contains(&flag) {
+                continue;
+            }
+            retained.push(flag);
+        }
+    }
+    (!retained.is_empty()).then(|| retained.join(","))
 }
 
 fn is_hop_by_hop_response_header(name: &str) -> bool {
@@ -353,5 +376,34 @@ mod tests {
         assert!(!is_hop_by_hop_response_header("x-amzn-requestid"));
         assert!(is_hop_by_hop_response_header("transfer-encoding"));
         assert!(is_hop_by_hop_response_header("content-length"));
+    }
+
+    #[test]
+    fn client_only_beta_flags_are_not_forwarded_to_bedrock() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "anthropic-beta",
+            "oauth-2025-04-20,interleaved-thinking-2025-05-14"
+                .parse()
+                .unwrap(),
+        );
+        headers.append(
+            "anthropic-beta",
+            "claude-code-20250219,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14"
+                .parse()
+                .unwrap(),
+        );
+
+        assert_eq!(
+            bedrock_beta_header(&headers).as_deref(),
+            Some("interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14")
+        );
+
+        let mut client_only = HeaderMap::new();
+        client_only.insert(
+            "anthropic-beta",
+            "oauth-2025-04-20,claude-code-20250219".parse().unwrap(),
+        );
+        assert_eq!(bedrock_beta_header(&client_only), None);
     }
 }
