@@ -1235,6 +1235,49 @@ mod tests {
         b.cache_read_input_tokens as f64 / read_or_input as f64
     }
 
+    /// 临时基准：观察 build_cache_breakpoints 随消息条数的扩展性。
+    /// O(N²) 时耗时按 N² 增长；修好后应接近线性。
+    #[test]
+    #[ignore]
+    fn bench_build_cache_breakpoints_scaling() {
+        use std::time::Instant;
+        let tools: Vec<serde_json::Value> = (0..12)
+            .map(|i| serde_json::json!({
+                "name": format!("tool_{i}"),
+                "description": "Does something useful. ".repeat(40),
+                "input_schema": {"type":"object","properties":{
+                    "p0":{"type":"string","description":"param ".repeat(20)},
+                    "p1":{"type":"string","description":"param ".repeat(20)},
+                    "p2":{"type":"string","description":"param ".repeat(20)},
+                    "p3":{"type":"string","description":"param ".repeat(20)}}}
+            }))
+            .collect();
+        println!("\n  N_msgs   elapsed_ms   ms_per_msg");
+        for n in [10usize, 20, 40, 80] {
+            let msgs: Vec<serde_json::Value> = (0..n)
+                .map(|i| serde_json::json!({
+                    "role": if i % 2 == 0 { "user" } else { "assistant" },
+                    "content": "Here is some code context. ".repeat(120)
+                }))
+                .collect();
+            let req = parse_request(serde_json::json!({
+                "model": "claude-opus-4-8",
+                "system": [{"type":"text","text":"You are helpful. ".repeat(800),
+                            "cache_control":{"type":"ephemeral"}}],
+                "tools": tools,
+                "messages": msgs
+            }));
+            let t0 = Instant::now();
+            let iters = 3;
+            for _ in 0..iters {
+                let bps = build_cache_breakpoints(&req, 100_000, true);
+                std::hint::black_box(&bps);
+            }
+            let ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+            println!("  {:>6}   {:>10.2}   {:>10.4}", n, ms, ms / n as f64);
+        }
+    }
+
     fn parse_request(extra: serde_json::Value) -> MessagesRequest {
         let mut body = serde_json::json!({
             "model": "claude-opus-4-7",
