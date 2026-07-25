@@ -605,12 +605,16 @@ extract_json() {
 extract_sse() {
   local response_file="$1"
   sed -n 's/^data: //p' "$response_file" \
-    | jq -Rr '
-        fromjson?
-        | .delta.text?, .delta.thinking?, .delta.partial_json?,
-          (.choices[]?.delta.content?), (.choices[]?.delta.reasoning_content?),
-          (.choices[]?.delta.tool_calls[]?.function.arguments?), .error.message?
-        | select(type == "string")
+    | jq -Rsr '
+        [
+          splits("\n")
+          | fromjson?
+          | .delta.text?, .delta.thinking?, .delta.partial_json?,
+            (.choices[]?.delta.content?), (.choices[]?.delta.reasoning_content?),
+            (.choices[]?.delta.tool_calls[]?.function.arguments?), .error.message?
+          | select(type == "string")
+        ]
+        | join("")
       ' 2>/dev/null || true
 }
 
