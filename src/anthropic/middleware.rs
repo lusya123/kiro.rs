@@ -17,7 +17,8 @@ use crate::kiro::provider::KiroProvider;
 use super::native_bedrock::BedrockMantleProvider;
 use super::types::ErrorResponse;
 
-const AWS_B40_GATEWAY_VERSION: &str = "8840a103";
+const AWS_B40_GATEWAY_VERSION: &str = "d47d4a8b";
+const AWS_B40_NON_STREAM_VERSION: &str = "v1.0.0-rc.15";
 
 /// 应用共享状态
 #[derive(Clone)]
@@ -246,7 +247,7 @@ fn aws_b40_version_for_response(method: &Method, path: &str, response: &Response
             if is_stream_response(response) {
                 AWS_B40_GATEWAY_VERSION
             } else {
-                "20260501R2"
+                AWS_B40_NON_STREAM_VERSION
             }
         } else {
             AWS_B40_GATEWAY_VERSION
@@ -307,7 +308,7 @@ mod tests {
         let non_stream = response(StatusCode::OK, "application/json");
         assert_eq!(
             aws_b40_version_for_response(&Method::POST, "/v1/messages", &non_stream),
-            "20260501R2"
+            AWS_B40_NON_STREAM_VERSION
         );
 
         let stream = response(StatusCode::OK, "text/event-stream");
@@ -325,7 +326,7 @@ mod tests {
         let chat = response(StatusCode::OK, "application/json");
         assert_eq!(
             aws_b40_version_for_response(&Method::POST, "/v1/chat/completions", &chat),
-            "20260501R2"
+            AWS_B40_NON_STREAM_VERSION
         );
     }
 

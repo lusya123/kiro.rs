@@ -732,8 +732,11 @@ pub struct StreamContext {
     pub tool_name_map: HashMap<String, String>,
     /// thinking 是否启用
     pub thinking_enabled: bool,
-    /// 是否向客户端暴露 thinking 块。adaptive 模式需要上游 thinking，但不暴露给客户端。
+    /// 是否向客户端暴露 thinking 块。
     pub expose_thinking: bool,
+    /// 是否向客户端暴露 thinking 文本。Bedrock 在未请求
+    /// `display=summarized` 时仍返回块和签名，但省略文本增量。
+    expose_thinking_text: bool,
     /// thinking 内容缓冲区
     pub thinking_buffer: String,
     /// 是否在 thinking 块内
@@ -834,6 +837,7 @@ impl StreamContext {
             tool_name_map,
             thinking_enabled,
             expose_thinking: thinking_enabled,
+            expose_thinking_text: thinking_enabled,
             thinking_buffer: String::new(),
             in_thinking_block: false,
             thinking_extracted: false,
@@ -891,6 +895,10 @@ impl StreamContext {
 
     pub fn hide_thinking_blocks(&mut self) {
         self.expose_thinking = false;
+    }
+
+    pub fn set_thinking_text_visible(&mut self, visible: bool) {
+        self.expose_thinking_text = visible;
     }
 
     /// tool_choice 强制工具(any/tool)时调用:响应只保留 tool_use,抑制所有文本块。
@@ -963,6 +971,10 @@ impl StreamContext {
             let initial_output_tokens = match self.output_token_limit {
                 Some(limit) if limit <= 1 => 1,
                 _ if self.suppress_text_blocks => 16,
+                _ if self.aws_b40_thinking_requested && self.thinking_enabled => self
+                    .input_context_calibration
+                    .direct_catalog_initial_output_tokens()
+                    .unwrap_or(8),
                 _ if self.pending_synthetic_thinking.is_some() => 4,
                 _ if self.aws_b40_thinking_requested => 3,
                 _ => 1,
@@ -1299,7 +1311,9 @@ impl StreamContext {
                             if let Some(ev) = self.flush_thinking_delta(thinking_index) {
                                 events.push(ev);
                             }
-                            events.push(self.create_thinking_delta_event(thinking_index, ""));
+                            if self.expose_thinking_text {
+                                events.push(self.create_thinking_delta_event(thinking_index, ""));
+                            }
                             events.push(self.create_signature_delta_event(thinking_index));
                             if let Some(stop_event) =
                                 self.state_manager.handle_content_block_stop(thinking_index)
@@ -1388,6 +1402,9 @@ impl StreamContext {
 
         if !reasoning.signature.is_empty() {
             self.upstream_thinking_signature = Some(reasoning.signature.clone());
+            if !self.native_reasoning_active && reasoning.redacted_content.is_empty() {
+                events.extend(self.start_native_reasoning_block());
+            }
             if self.native_reasoning_active {
                 events.extend(self.finish_native_reasoning_block());
             }
@@ -1446,6 +1463,10 @@ impl StreamContext {
             return Vec::new();
         }
         let raw = std::mem::take(&mut self.thinking_pending_raw);
+        if !self.expose_thinking_text {
+            self.thinking_tokens += estimate_tokens(&raw);
+            return Vec::new();
+        }
         let sanitized = match self.thinking_sanitize_options {
             Some(options) => super::identity::sanitize_thinking_identity_text(&raw, options),
             None => raw,
@@ -1633,6 +1654,10 @@ impl StreamContext {
             return None;
         }
         let raw = std::mem::take(&mut self.thinking_pending_raw);
+        if !self.expose_thinking_text {
+            self.thinking_tokens += estimate_tokens(&raw);
+            return None;
+        }
         let out = match self.thinking_sanitize_options {
             Some(options) => super::identity::sanitize_thinking_identity_text(&raw, options),
             None => raw,
@@ -1687,6 +1712,7 @@ impl StreamContext {
         } else {
             super::signature::generate_signature()
         };
+        super::signature::register_issued_opaque_signature(&signature);
         SseEvent::new(
             "content_block_delta",
             json!({
@@ -1748,7 +1774,9 @@ impl StreamContext {
                         if let Some(ev) = self.flush_thinking_delta(thinking_index) {
                             events.push(ev);
                         }
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        if self.expose_thinking_text {
+                            events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        }
                         events.push(self.create_signature_delta_event(thinking_index));
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
@@ -2181,7 +2209,9 @@ impl StreamContext {
                             if let Some(ev) = self.flush_thinking_delta(thinking_index) {
                                 events.push(ev);
                             }
-                            events.push(self.create_thinking_delta_event(thinking_index, ""));
+                            if self.expose_thinking_text {
+                                events.push(self.create_thinking_delta_event(thinking_index, ""));
+                            }
                             events.push(self.create_signature_delta_event(thinking_index));
                             if let Some(stop_event) =
                                 self.state_manager.handle_content_block_stop(thinking_index)
@@ -2209,7 +2239,9 @@ impl StreamContext {
                             if let Some(ev) = self.flush_thinking_delta(thinking_index) {
                                 events.push(ev);
                             }
-                            events.push(self.create_thinking_delta_event(thinking_index, ""));
+                            if self.expose_thinking_text {
+                                events.push(self.create_thinking_delta_event(thinking_index, ""));
+                            }
                             events.push(self.create_signature_delta_event(thinking_index));
                             if let Some(stop_event) =
                                 self.state_manager.handle_content_block_stop(thinking_index)
@@ -2582,6 +2614,10 @@ impl BufferedStreamContext {
         self.inner.hide_thinking_blocks();
     }
 
+    pub fn set_thinking_text_visible(&mut self, visible: bool) {
+        self.inner.set_thinking_text_visible(visible);
+    }
+
     pub fn enable_aws_b40_compat(&mut self, adaptive_signature: bool) {
         self.inner.enable_aws_b40_compat(adaptive_signature);
     }
@@ -2913,6 +2949,85 @@ mod tests {
                 .collect::<String>(),
             "Final answer."
         );
+    }
+
+    #[test]
+    fn omitted_native_reasoning_preserves_envelope_signature_and_usage() {
+        use crate::kiro::model::events::ReasoningContentEvent;
+
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 1, true, true, HashMap::new());
+        ctx.set_thinking_text_visible(false);
+        let _ = ctx.generate_initial_events();
+
+        let mut events = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            text: "Plan carefully".to_string(),
+            ..Default::default()
+        }));
+        events.extend(
+            ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+                signature: "upstream-opaque-signature".to_string(),
+                ..Default::default()
+            })),
+        );
+
+        assert!(events.iter().any(|event| {
+            event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "thinking"
+        }));
+        assert!(!events.iter().any(|event| {
+            event.event == "content_block_delta" && event.data["delta"]["type"] == "thinking_delta"
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| event.data["delta"]["type"] == "signature_delta")
+                .and_then(|event| event.data["delta"]["signature"].as_str()),
+            Some("upstream-opaque-signature")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| { event.event == "content_block_stop" && event.data["index"] == 0 })
+        );
+        assert_eq!(ctx.thinking_tokens, estimate_tokens("Plan carefully"));
+        assert!(ctx.thinking_text_acc.is_empty());
+    }
+
+    #[test]
+    fn omitted_tagged_reasoning_preserves_envelope_without_text_delta() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 1, true, true, HashMap::new());
+        ctx.set_thinking_text_visible(false);
+        let _ = ctx.generate_initial_events();
+
+        let events =
+            ctx.process_assistant_response("<thinking>Plan carefully</thinking>\n\nAnswer");
+
+        assert!(events.iter().any(|event| {
+            event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "thinking"
+        }));
+        assert!(!events.iter().any(|event| {
+            event.event == "content_block_delta" && event.data["delta"]["type"] == "thinking_delta"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event == "content_block_delta" && event.data["delta"]["type"] == "signature_delta"
+        }));
+        assert!(
+            events
+                .iter()
+                .any(|event| { event.event == "content_block_stop" && event.data["index"] == 0 })
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.data["delta"]["text"].as_str())
+                .collect::<String>(),
+            "Answer"
+        );
+        assert_eq!(ctx.thinking_tokens, estimate_tokens("Plan carefully"));
+        assert!(ctx.thinking_text_acc.is_empty());
     }
 
     #[test]
@@ -3332,7 +3447,7 @@ mod tests {
 
         let event = ctx.create_message_start_event();
 
-        assert_eq!(event["message"]["usage"]["output_tokens"], 4);
+        assert_eq!(event["message"]["usage"]["output_tokens"], 8);
     }
 
     #[test]

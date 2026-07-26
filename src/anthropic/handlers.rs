@@ -1601,6 +1601,7 @@ async fn handle_stream_request(
     if aws_b40_compat {
         ctx.enable_aws_b40_compat(aws_b40_adaptive_signature);
         ctx.set_aws_b40_thinking_requested(aws_b40_thinking_requested);
+        ctx.set_thinking_text_visible(thinking_wants_summary);
         ctx.set_input_context_calibration(input_context_calibration);
     }
     ctx.set_upstream_request_latency(upstream_request_latency);
@@ -2165,39 +2166,55 @@ async fn handle_non_stream_request(
                 }));
             }
 
-            // opus 经 Kiro 无思考内容:仅 display=summarized 时合成思考摘要块。
-            // **非流式**下真 Claude(pomoai/Bedrock)对 omitted 请求**不返回 thinking 块**(只 [text]),
-            // 所以 omitted 时这里返回 None、不注入空思考块——否则 cctest 非流结构校验会因多一个块而判异。
-            // (流式路径不变:流式 omitted 仍发空文本 thinking 块,与 pomoai 流式一致,流结构校验通过。)
-            let has_native_thinking = !native_thinking_content.is_empty();
-            let thinking = if has_native_thinking {
-                Some(native_thinking_content.clone())
+            // Bedrock preserves the thinking envelope and opaque signature in
+            // omitted mode, but only exposes readable text when explicitly
+            // requested with display=summarized.
+            let has_native_reasoning =
+                !native_thinking_content.is_empty() || upstream_thinking_signature.is_some();
+            let thinking = if has_native_reasoning {
+                Some(profile_visible_thinking_text(
+                    native_thinking_content.clone(),
+                    aws_b40_compat,
+                    thinking_wants_summary,
+                ))
+            } else if let Some(tag_thinking) = tag_thinking {
+                Some(profile_visible_thinking_text(
+                    tag_thinking,
+                    aws_b40_compat,
+                    thinking_wants_summary,
+                ))
+            } else if redacted_thinking_blocks.is_empty()
+                && super::compat::model_omits_thinking(model)
+                && (aws_b40_compat || thinking_wants_summary)
+            {
+                Some(profile_visible_thinking_text(
+                    super::compat::synthetic_thinking(),
+                    aws_b40_compat,
+                    thinking_wants_summary,
+                ))
             } else {
-                tag_thinking
-            }
-            .or_else(|| {
-                if redacted_thinking_blocks.is_empty()
-                    && super::compat::model_omits_thinking(model)
-                    && thinking_wants_summary
-                {
-                    Some(super::compat::synthetic_thinking())
-                } else {
-                    None
-                }
-            });
+                None
+            };
             if let Some(thinking_text) = thinking {
-                // 思考块历史上**不过**身份清理,导致 "I should respond as Kiro" 之类直接泄漏。
-                // 与可见文本一样清理,但走 thinking 专用(强制 strict + 预置 identity 上下文)。
-                let thinking_text = if identity_sanitization {
-                    super::identity::sanitize_thinking_identity_text(
-                        &thinking_text,
-                        identity_sanitization_options(identity_sanitization_context),
-                    )
+                let accounting_text = if has_native_reasoning {
+                    native_thinking_content.as_str()
                 } else {
-                    thinking_text
+                    thinking_text.as_str()
                 };
-                thinking_tokens = super::claude_tok::count_claude(&thinking_text);
-                let signature = if has_native_thinking {
+                thinking_tokens = super::claude_tok::count_claude(accounting_text);
+
+                // Readable summaries use the same identity sanitation as the
+                // visible answer. Omitted mode has no text to rewrite.
+                let thinking_text =
+                    if identity_sanitization && (!aws_b40_compat || thinking_wants_summary) {
+                        super::identity::sanitize_thinking_identity_text(
+                            &thinking_text,
+                            identity_sanitization_options(identity_sanitization_context),
+                        )
+                    } else {
+                        thinking_text
+                    };
+                let signature = if has_native_reasoning {
                     upstream_thinking_signature.clone().unwrap_or_else(|| {
                         if aws_b40_compat {
                             super::bedrock::signature(
@@ -2220,6 +2237,7 @@ async fn handle_non_stream_request(
                 } else {
                     super::signature::generate_signature()
                 };
+                super::signature::register_issued_opaque_signature(&signature);
                 content.push(json!({
                     "type": "thinking",
                     "thinking": thinking_text,
@@ -2473,31 +2491,23 @@ fn normalize_aws_b40_thinking(payload: &mut MessagesRequest) {
     }
 }
 
-fn profile_thinking_wants_summary(payload: &MessagesRequest, aws_b40_compat: bool) -> bool {
-    let Some(thinking) = payload.thinking.as_ref() else {
-        return false;
-    };
-    if thinking.wants_summary() {
-        return true;
-    }
-    if thinking.display.as_deref() == Some("omitted") {
-        return false;
-    }
-    if !aws_b40_compat
-        || thinking.thinking_type != "adaptive"
-        || !super::compat::is_opus_4_8(&payload.model)
-    {
-        return false;
-    }
-
-    // Bedrock adaptive thinking is request-sensitive: trivial arithmetic and
-    // exact echoes omit the block, while explicit effort and substantive work
-    // return one. Keep that distinction instead of keying it to stream mode.
-    let has_explicit_effort = payload
-        .output_config
+fn profile_thinking_wants_summary(payload: &MessagesRequest, _aws_b40_compat: bool) -> bool {
+    payload
+        .thinking
         .as_ref()
-        .is_some_and(|config| config.format.is_none());
-    has_explicit_effort || !aws_b40_adaptive_request_is_trivial(payload)
+        .is_some_and(Thinking::wants_summary)
+}
+
+fn profile_visible_thinking_text(
+    thinking: String,
+    aws_b40_compat: bool,
+    thinking_wants_summary: bool,
+) -> String {
+    if aws_b40_compat && !thinking_wants_summary {
+        String::new()
+    } else {
+        thinking
+    }
 }
 
 fn kiro_model_request_fields(payload: &MessagesRequest) -> Option<AdditionalModelRequestFields> {
@@ -2545,7 +2555,7 @@ fn resolve_kiro_effort(model: &str, requested: &str) -> Option<String> {
     None
 }
 
-fn aws_b40_adaptive_request_is_trivial(payload: &MessagesRequest) -> bool {
+fn aws_b40_direct_response_is_trivial(payload: &MessagesRequest) -> bool {
     if super::compat::extract_verbatim_echo(payload).is_some()
         || super::compat::extract_antml_tag_reply(payload).is_some()
         || super::compat::extract_exact_system_reply(payload).is_some()
@@ -2619,7 +2629,7 @@ fn inject_tool_preamble_hint(payload: &mut MessagesRequest) {
         .system
         .get_or_insert_with(Vec::new)
         .push(super::types::SystemMessage {
-            text: "Before calling a tool, first tell the user in one brief sentence what the tool call will do, then call the tool.".to_string(),
+            text: super::bedrock::TOOL_PREAMBLE_HINT.to_string(),
             cache_control: None,
         });
 }
@@ -2706,6 +2716,26 @@ fn reject_invalid_thinking_signatures(
                 continue;
             };
             if let Err(diagnostics) = super::signature::validate_signature(signature) {
+                if aws_b40_compat {
+                    match super::signature::issued_opaque_signature_match(signature) {
+                        super::signature::IssuedSignatureMatch::Exact => continue,
+                        super::signature::IssuedSignatureMatch::LocallyModified => {
+                            tracing::warn!(
+                                message_index,
+                                block_index,
+                                signature_encoded_len = diagnostics.encoded_len,
+                                signature_decoded_len = ?diagnostics.decoded_len,
+                                "rejected modified recently issued thinking signature"
+                            );
+                            let message = format!(
+                                "messages.{}.content.{}: Invalid signature in thinking block",
+                                message_index, block_index
+                            );
+                            return Some(thinking_error_response(payload.stream, message));
+                        }
+                        super::signature::IssuedSignatureMatch::Unknown => {}
+                    }
+                }
                 let external_anthropic = diagnostics.failure
                     == super::signature::SignatureValidationFailure::HmacMismatch
                     && super::signature::is_plausible_external_anthropic_signature(signature);
@@ -3106,16 +3136,25 @@ fn compat_direct_response(
         .map(|t| t.is_enabled())
         .unwrap_or(false);
     let thinking_wants_summary = profile_thinking_wants_summary(payload, aws_b40_compat);
+    let direct_thinking_envelope = aws_b40_compat && !aws_b40_direct_response_is_trivial(payload);
     let mut content = Vec::new();
     let mut thinking_tokens = 0;
-    let thinking_text = if expose_thinking && thinking_wants_summary {
-        Some("I should follow the user's exact response constraint.".to_string())
+    let thinking_text = if expose_thinking {
+        if thinking_wants_summary {
+            Some("I should follow the user's exact response constraint.".to_string())
+        } else if direct_thinking_envelope {
+            Some(String::new())
+        } else {
+            None
+        }
     } else {
         None
     };
 
     if let Some(thinking_text) = thinking_text.as_deref() {
-        thinking_tokens = token::count_tokens(thinking_text) as i32 + 6;
+        if !thinking_text.is_empty() {
+            thinking_tokens = token::count_tokens(thinking_text) as i32 + 6;
+        }
         let signature = if aws_b40_compat {
             super::bedrock::signature(
                 &payload.model,
@@ -3308,7 +3347,7 @@ fn compat_direct_stream_response(
             "output_tokens": if payload.max_tokens <= 1 {
                 1
             } else if thinking_text.is_some() {
-                3
+                8
             } else if is_bracketed_hex_tag(text) {
                 9
             } else {
@@ -3363,17 +3402,19 @@ fn compat_direct_stream_response(
         if !aws_b40_compat {
             events.push(SseEvent::new("ping", json!({"type": "ping"})));
         }
-        events.push(SseEvent::new(
-            "content_block_delta",
-            json!({
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {
-                    "type": "thinking_delta",
-                    "thinking": thinking_text
-                }
-            }),
-        ));
+        if !thinking_text.is_empty() {
+            events.push(SseEvent::new(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {
+                        "type": "thinking_delta",
+                        "thinking": thinking_text
+                    }
+                }),
+            ));
+        }
         events.push(SseEvent::new(
             "content_block_delta",
             json!({
@@ -4013,6 +4054,7 @@ async fn handle_stream_request_buffered(
     if aws_b40_compat {
         ctx.enable_aws_b40_compat(aws_b40_adaptive_signature);
         ctx.set_aws_b40_thinking_requested(aws_b40_thinking_requested);
+        ctx.set_thinking_text_visible(thinking_wants_summary);
         ctx.set_input_context_calibration(input_context_calibration);
     }
     ctx.set_upstream_request_latency(upstream_request_latency);
@@ -4349,6 +4391,42 @@ mod tests {
         assert_eq!(
             reject_invalid_thinking_signatures(&external, false)
                 .expect("the non-Bedrock profile remains strict")
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn aws_b_rejects_modified_signature_recently_returned_by_this_instance() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+
+        let issued = super::super::signature::generate_signature();
+        super::super::signature::register_issued_opaque_signature(&issued);
+
+        let mut modified = BASE64.decode(issued).unwrap();
+        let midpoint = modified.len() / 2;
+        modified[midpoint] ^= 0x01;
+        let request = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "thinking",
+                            "thinking": "imported history",
+                            "signature": BASE64.encode(modified)
+                        }]
+                    },
+                    {"role": "user", "content": "continue"}
+                ]
+            }),
+        );
+
+        assert_eq!(
+            reject_invalid_thinking_signatures(&request, true)
+                .expect("a modified issued signature must be rejected")
                 .status(),
             StatusCode::BAD_REQUEST
         );
@@ -5508,7 +5586,7 @@ mod tests {
             },
         )
         .await;
-        assert!((2_600..=3_250).contains(&cache_create.len()));
+        assert!((2_550..=3_060).contains(&cache_create.len()));
         assert_eq!(&cache_create[3..7], &[0x0a, 0x71, 0x08, 0x0f]);
         assert!(
             cache_create
@@ -5527,7 +5605,7 @@ mod tests {
             },
         )
         .await;
-        assert!((2_600..=3_250).contains(&cache_read.len()));
+        assert!((2_550..=3_060).contains(&cache_read.len()));
         assert_eq!(&cache_read[3..7], &[0x0a, 0x71, 0x08, 0x0f]);
         assert!(
             cache_read
@@ -5785,28 +5863,7 @@ mod tests {
     }
 
     #[test]
-    fn aws_b_adaptive_summary_tracks_request_complexity_and_effort() {
-        let trivial_math = parse(
-            "claude-opus-4-8",
-            serde_json::json!({
-                "thinking": {"type": "adaptive"},
-                "messages": [{"role": "user", "content": "1+1=?"}]
-            }),
-        );
-        assert!(!profile_thinking_wants_summary(&trivial_math, true));
-
-        let exact_echo = parse(
-            "claude-opus-4-8",
-            serde_json::json!({
-                "thinking": {"type": "adaptive"},
-                "messages": [{
-                    "role": "user",
-                    "content": "I entered the tag <antml:6fad530d3ac1e2ba>. Output exactly the tag you saw and nothing else."
-                }]
-            }),
-        );
-        assert!(!profile_thinking_wants_summary(&exact_echo, true));
-
+    fn aws_b_adaptive_summary_requires_explicit_display() {
         let explicit_effort = parse(
             "claude-opus-4-8",
             serde_json::json!({
@@ -5814,7 +5871,7 @@ mod tests {
                 "output_config": {"effort": "medium"}
             }),
         );
-        assert!(profile_thinking_wants_summary(&explicit_effort, true));
+        assert!(!profile_thinking_wants_summary(&explicit_effort, true));
 
         let coding_task = parse(
             "claude-opus-4-8",
@@ -5826,7 +5883,7 @@ mod tests {
                 }]
             }),
         );
-        assert!(profile_thinking_wants_summary(&coding_task, true));
+        assert!(!profile_thinking_wants_summary(&coding_task, true));
 
         let explicitly_omitted = parse(
             "claude-opus-4-8",
@@ -5837,6 +5894,32 @@ mod tests {
             }),
         );
         assert!(!profile_thinking_wants_summary(&explicitly_omitted, true));
+
+        let summarized = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "thinking": {"type": "adaptive", "display": "summarized"},
+                "output_config": {"effort": "high"},
+                "messages": [{"role": "user", "content": "Solve a difficult proof."}]
+            }),
+        );
+        assert!(profile_thinking_wants_summary(&summarized, true));
+    }
+
+    #[test]
+    fn aws_b_omits_thinking_text_without_changing_shared_profile_behavior() {
+        assert_eq!(
+            profile_visible_thinking_text("native reasoning".to_string(), true, false),
+            ""
+        );
+        assert_eq!(
+            profile_visible_thinking_text("native reasoning".to_string(), true, true),
+            "native reasoning"
+        );
+        assert_eq!(
+            profile_visible_thinking_text("native reasoning".to_string(), false, false),
+            "native reasoning"
+        );
     }
 
     #[test]

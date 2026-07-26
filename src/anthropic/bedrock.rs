@@ -32,6 +32,7 @@ const KIRO_OPUS_48_DIRECT_CATALOG_MIN_BYTES: i32 = 60_000;
 const KIRO_OPUS_48_DIRECT_CATALOG_MAX_BYTES: i32 = 80_000;
 const KIRO_OPUS_48_DIRECT_CATALOG_ANCHOR_BYTES: i32 = 69_158;
 const KIRO_OPUS_48_DIRECT_CATALOG_CACHE_TOKENS: i32 = 34_250;
+const KIRO_OPUS_48_DIRECT_CATALOG_SUFFIX_TOKENS: i32 = 68;
 const KIRO_TOOL_DESCRIPTION_LIMIT_CHARS: usize = 10_000;
 const BEDROCK_TOOL_BASELINE_CORRECTION_PER_TOOL: i32 = 8;
 const BEDROCK_TRUNCATED_TOOL_CACHE_SUFFIX_CORRECTION: i32 = -17;
@@ -53,6 +54,8 @@ const TOOL_HISTORY_SCHEMA_BASE_TOKENS: i32 = 327;
 const TOOL_HISTORY_SCHEMA_NEXT_TOOL_TOKENS: i32 = 44;
 const TOOL_HISTORY_SCHEMA_VISIBLE_SCALE: f64 = 0.93;
 
+pub(super) const TOOL_PREAMBLE_HINT: &str = "Before calling a tool, first tell the user in one brief sentence what the tool call will do, then call the tool.";
+
 /// Data needed to turn Kiro's context-usage event into the public Bedrock
 /// input-token envelope. Kiro includes a large fixed runtime prompt and
 /// truncates each tool description before sending it upstream, while the
@@ -66,6 +69,7 @@ pub struct InputContextCalibration {
     truncated_tool_input_tokens: i32,
     descriptionless_tool_input_tokens: i32,
     has_truncated_tool_descriptions: bool,
+    direct_catalog_ordinary_input_tokens: i32,
 }
 
 impl InputContextCalibration {
@@ -76,6 +80,13 @@ impl InputContextCalibration {
                 ..Self::default()
             };
         };
+        let serialized_tool_bytes = tools.iter().fold(0i32, |total, tool| {
+            total.saturating_add(
+                serde_json::to_vec(tool)
+                    .map(|json| json.len().min(i32::MAX as usize) as i32)
+                    .unwrap_or(0),
+            )
+        });
 
         let mut truncated = payload.clone();
         let mut descriptionless = payload.clone();
@@ -99,18 +110,17 @@ impl InputContextCalibration {
             enabled: true,
             has_tools: true,
             tool_count: tools.len().min(i32::MAX as usize) as i32,
-            serialized_tool_bytes: tools.iter().fold(0i32, |total, tool| {
-                total.saturating_add(
-                    serde_json::to_vec(tool)
-                        .map(|json| json.len().min(i32::MAX as usize) as i32)
-                        .unwrap_or(0),
-                )
-            }),
+            serialized_tool_bytes,
             truncated_tool_input_tokens: super::compat::estimate_input_tokens(&truncated),
             descriptionless_tool_input_tokens: super::compat::estimate_input_tokens(
                 &descriptionless,
             ),
             has_truncated_tool_descriptions,
+            direct_catalog_ordinary_input_tokens: direct_catalog_ordinary_input_tokens(
+                payload,
+                serialized_tool_bytes,
+            )
+            .unwrap_or(0),
         }
     }
 
@@ -210,11 +220,16 @@ impl InputContextCalibration {
         let target_cached_tokens = KIRO_OPUS_48_DIRECT_CATALOG_CACHE_TOKENS
             .saturating_add(token_delta)
             .max(1);
-        let ordinary_adjustment = BEDROCK_TOOL_CACHE_SUFFIX_CORRECTION;
-        let calibrated_total = usage
-            .input_tokens
-            .saturating_add(ordinary_adjustment)
-            .saturating_add(target_cached_tokens);
+        let target_ordinary_input_tokens = if self.direct_catalog_ordinary_input_tokens > 0 {
+            self.direct_catalog_ordinary_input_tokens
+        } else {
+            usage
+                .input_tokens
+                .saturating_add(BEDROCK_TOOL_CACHE_SUFFIX_CORRECTION)
+                .max(1)
+        };
+        let ordinary_adjustment = target_ordinary_input_tokens.saturating_sub(usage.input_tokens);
+        let calibrated_total = target_ordinary_input_tokens.saturating_add(target_cached_tokens);
         super::cache::reconcile_initial_input(usage, calibrated_total, ordinary_adjustment)
     }
 
@@ -247,6 +262,89 @@ impl InputContextCalibration {
             0
         }
     }
+
+    pub fn direct_catalog_initial_output_tokens(self) -> Option<i32> {
+        (self.direct_catalog_ordinary_input_tokens > 0).then_some(
+            if self.direct_catalog_ordinary_input_tokens < 300 {
+                2
+            } else {
+                8
+            },
+        )
+    }
+}
+
+fn direct_catalog_ordinary_input_tokens(
+    payload: &MessagesRequest,
+    serialized_tool_bytes: i32,
+) -> Option<i32> {
+    let tools = payload.tools.as_ref()?;
+    if tools.len() != KIRO_OPUS_48_DIRECT_CATALOG_TOOL_COUNT as usize
+        || !(KIRO_OPUS_48_DIRECT_CATALOG_MIN_BYTES..=KIRO_OPUS_48_DIRECT_CATALOG_MAX_BYTES)
+            .contains(&serialized_tool_bytes)
+        || tools.iter().any(|tool| tool.cache_control.is_some())
+        || payload.cache_control.is_some()
+        || payload
+            .tool_choice
+            .as_ref()
+            .and_then(|choice| choice.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(|choice| matches!(choice, "any" | "tool"))
+        || payload.thinking.as_ref()?.thinking_type != "adaptive"
+        || payload
+            .output_config
+            .as_ref()
+            .is_none_or(|config| config.format.is_some())
+        || payload.messages.len() != 1
+        || payload.messages[0].role != "user"
+    {
+        return None;
+    }
+
+    // The observed Claude Code catalog caches every public system segment.
+    // The handler's own tool preamble is transport guidance and must not be
+    // billed as customer input.
+    let system = payload.system.as_ref()?;
+    let last_cached_system = system
+        .iter()
+        .rposition(|item| item.cache_control.is_some())?;
+    if system[last_cached_system + 1..]
+        .iter()
+        .any(|item| item.text != TOOL_PREAMBLE_HINT || item.cache_control.is_some())
+    {
+        return None;
+    }
+
+    let prompt = payload.messages[0].content.as_str()?;
+    let message_tokens = super::claude_tok::count_claude(prompt).max(0);
+    let public_message_tokens = if prompt.chars().any(is_cjk) {
+        let numbered_lines = prompt
+            .lines()
+            .filter(|line| is_ascii_numbered_list_line(line))
+            .count()
+            .min(i32::MAX as usize) as i32;
+        message_tokens
+            .saturating_add(6)
+            .saturating_sub(numbered_lines.saturating_sub(1))
+    } else {
+        message_tokens.saturating_mul(3) / 2 + 5
+    };
+
+    Some(
+        public_message_tokens
+            .max(1)
+            .saturating_add(KIRO_OPUS_48_DIRECT_CATALOG_SUFFIX_TOKENS),
+    )
+}
+
+fn is_ascii_numbered_list_line(line: &str) -> bool {
+    let line = line.trim_start();
+    let digit_count = line.bytes().take_while(u8::is_ascii_digit).count();
+    digit_count > 0
+        && line[digit_count..]
+            .strip_prefix('.')
+            .and_then(|suffix| suffix.chars().next())
+            .is_some_and(char::is_whitespace)
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
@@ -2216,6 +2314,7 @@ mod tests {
                 truncated_tool_input_tokens: 0,
                 descriptionless_tool_input_tokens: 0,
                 has_truncated_tool_descriptions: false,
+                direct_catalog_ordinary_input_tokens: 0,
             };
             let actual = calibration.calibrate("claude-opus-4-8", 30_000, Some(context_tokens));
             assert!(
@@ -2226,7 +2325,144 @@ mod tests {
     }
 
     #[test]
-    fn direct_compat_usage_matches_observed_28_tool_cache_without_context_event() {
+    fn direct_catalog_suffix_uses_public_message_shape_not_internal_hint() {
+        let request = |prompt: &str| {
+            let tools = (0..28)
+                .map(|index| {
+                    json!({
+                        "name": format!("tool_{index}"),
+                        "description": "A test tool.",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {}
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut payload = serde_json::from_value::<MessagesRequest>(json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 1024,
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "medium"},
+                "system": [
+                    {
+                        "type": "text",
+                        "text": "Cached public system context.",
+                        "cache_control": {"type": "ephemeral"}
+                    },
+                    {
+                        "type": "text",
+                        "text": TOOL_PREAMBLE_HINT
+                    }
+                ],
+                "tools": tools,
+                "messages": [{"role": "user", "content": prompt}]
+            }))
+            .expect("valid catalog request");
+            let tools = payload.tools.as_mut().expect("tools");
+            let current_bytes = tools.iter().fold(0usize, |total, tool| {
+                total + serde_json::to_vec(tool).expect("serialize tool").len()
+            });
+            let missing_bytes = KIRO_OPUS_48_DIRECT_CATALOG_ANCHOR_BYTES as usize - current_bytes;
+            let per_tool = missing_bytes / tools.len();
+            let remainder = missing_bytes % tools.len();
+            for (index, tool) in tools.iter_mut().enumerate() {
+                tool.description
+                    .push_str(&"x".repeat(per_tool + usize::from(index < remainder)));
+            }
+            assert_eq!(
+                tools.iter().fold(0usize, |total, tool| {
+                    total + serde_json::to_vec(tool).expect("serialize tool").len()
+                }),
+                KIRO_OPUS_48_DIRECT_CATALOG_ANCHOR_BYTES as usize
+            );
+            payload
+        };
+
+        let short_english = request("Briefly explain why deterministic cache keys matter.");
+        assert_eq!(
+            direct_catalog_ordinary_input_tokens(
+                &short_english,
+                KIRO_OPUS_48_DIRECT_CATALOG_ANCHOR_BYTES
+            ),
+            Some(92)
+        );
+        assert_eq!(
+            InputContextCalibration::for_request(&short_english)
+                .direct_catalog_initial_output_tokens(),
+            Some(2)
+        );
+        assert_eq!(
+            direct_catalog_ordinary_input_tokens(&short_english, 4_096),
+            None
+        );
+        let mut forced_tool = short_english.clone();
+        forced_tool.tool_choice = Some(json!({"type": "any"}));
+        assert_eq!(
+            direct_catalog_ordinary_input_tokens(
+                &forced_tool,
+                KIRO_OPUS_48_DIRECT_CATALOG_ANCHOR_BYTES
+            ),
+            None
+        );
+
+        let medium_english = request(
+            "Explain why deterministic cache keys matter in a distributed API gateway. Discuss collision resistance, canonical serialization, tenant isolation, and how stable keys affect cache hit rates. Give a concise engineering answer with one practical example.",
+        );
+        assert!(
+            (direct_catalog_ordinary_input_tokens(
+                &medium_english,
+                KIRO_OPUS_48_DIRECT_CATALOG_ANCHOR_BYTES
+            )
+            .unwrap()
+                - 153)
+                .abs()
+                <= 1
+        );
+
+        let short_chinese = request("请简要说明确定性缓存键的重要性。");
+        assert!(
+            (direct_catalog_ordinary_input_tokens(
+                &short_chinese,
+                KIRO_OPUS_48_DIRECT_CATALOG_ANCHOR_BYTES
+            )
+            .unwrap()
+                - 91)
+                .abs()
+                <= 1
+        );
+
+        let numbered = request("请分析以下项目：\n1. 第一项。\n2. 第二项。\n3. 第三项。");
+        let message_tokens =
+            super::super::claude_tok::count_claude(numbered.messages[0].content.as_str().unwrap());
+        assert_eq!(
+            direct_catalog_ordinary_input_tokens(
+                &numbered,
+                KIRO_OPUS_48_DIRECT_CATALOG_ANCHOR_BYTES
+            ),
+            Some(message_tokens + 6 + KIRO_OPUS_48_DIRECT_CATALOG_SUFFIX_TOKENS - 2)
+        );
+
+        let mut uncached_system = short_english;
+        uncached_system
+            .system
+            .as_mut()
+            .unwrap()
+            .push(super::super::types::SystemMessage {
+                text: "An additional public system instruction.".to_string(),
+                cache_control: None,
+            });
+        assert_eq!(
+            direct_catalog_ordinary_input_tokens(
+                &uncached_system,
+                KIRO_OPUS_48_DIRECT_CATALOG_ANCHOR_BYTES
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn direct_compat_usage_matches_current_pomo_28_tool_cache_without_context_event() {
         let calibration = InputContextCalibration {
             enabled: true,
             has_tools: true,
@@ -2235,33 +2471,35 @@ mod tests {
             truncated_tool_input_tokens: 0,
             descriptionless_tool_input_tokens: 0,
             has_truncated_tool_descriptions: true,
+            direct_catalog_ordinary_input_tokens: 499,
         };
+        assert_eq!(calibration.direct_catalog_initial_output_tokens(), Some(8));
         let creation = UsageBreakdown {
-            input_tokens: 39,
+            input_tokens: 532,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 36_975,
             cache_creation_5m_input_tokens: 36_975,
             cache_creation_1h_input_tokens: 0,
         };
         let calibrated = calibration.calibrate_direct_compat_usage("claude-opus-4-8", creation);
-        assert_eq!(calibrated.input_tokens, 79);
+        assert_eq!(calibrated.input_tokens, 499);
         assert_eq!(calibrated.cache_creation_input_tokens, 34_250);
         assert_eq!(calibrated.cache_creation_5m_input_tokens, 34_250);
         assert_eq!(calibrated.cache_read_input_tokens, 0);
-        assert_eq!(calibrated.total(), 34_329);
+        assert_eq!(calibrated.total(), 34_749);
 
         let read = UsageBreakdown {
-            input_tokens: 88,
+            input_tokens: 532,
             cache_read_input_tokens: 36_975,
             cache_creation_input_tokens: 0,
             cache_creation_5m_input_tokens: 0,
             cache_creation_1h_input_tokens: 0,
         };
         let calibrated = calibration.calibrate_direct_compat_usage("claude-opus-4-8", read);
-        assert_eq!(calibrated.input_tokens, 128);
+        assert_eq!(calibrated.input_tokens, 499);
         assert_eq!(calibrated.cache_read_input_tokens, 34_250);
         assert_eq!(calibrated.cache_creation_input_tokens, 0);
-        assert_eq!(calibrated.total(), 34_378);
+        assert_eq!(calibrated.total(), 34_749);
 
         let different_catalog = InputContextCalibration {
             tool_count: 27,

@@ -8,6 +8,8 @@
 //!
 //! 因此本模块同时处理两类签名：本地回退签名可严格验 HMAC；上游签名无法使用本地密钥验算，
 //! 但会按完整 protobuf/Bedrock 信封做严格结构校验，以支持客户端原样回传后继续对话。
+//! 对本进程刚刚透传过的上游签名，还会保留一个有界、短期的紧凑指纹登记，用于识别客户端
+//! 回传时发生的局部篡改。登记缺失不会导致拒绝，因此跨容器、重启后的合法历史仍然可用。
 //!
 //! 旧实现用**进程内 HashSet** 登记签名，有个致命问题：在"一容器一账号、请求按账号轮转"的
 //! 号池里，A 容器签发的签名回传到 B 容器（或容器重启后）查不到 → 误判非法返回 400。开了
@@ -27,8 +29,13 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
-use std::sync::OnceLock;
+use std::{
+    collections::VecDeque,
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 use subtle::ConstantTimeEq;
 
 /// HMAC-SHA256 输出长度。
@@ -69,6 +76,106 @@ const EXTERNAL_ANTHROPIC_MIN_RAW_BYTES: usize = 340;
 const EXTERNAL_ANTHROPIC_MAX_RAW_BYTES: usize = 520;
 const UPSTREAM_BEDROCK_MIN_RAW_BYTES: usize = 196;
 const UPSTREAM_BEDROCK_MAX_RAW_BYTES: usize = 2 * 1024 * 1024;
+const ISSUED_SIGNATURE_CAPACITY: usize = 1_024;
+const ISSUED_SIGNATURE_CHUNKS: usize = 8;
+const ISSUED_SIGNATURE_RETENTION: Duration = Duration::from_secs(6 * 60 * 60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssuedSignatureMatch {
+    Exact,
+    LocallyModified,
+    Unknown,
+}
+
+#[derive(Debug)]
+struct IssuedSignatureFingerprint {
+    observed_at: Instant,
+    decoded_len: usize,
+    digest: [u8; 32],
+    chunk_digests: [[u8; 32]; ISSUED_SIGNATURE_CHUNKS],
+}
+
+fn issued_signature_registry() -> &'static Mutex<VecDeque<IssuedSignatureFingerprint>> {
+    static REGISTRY: OnceLock<Mutex<VecDeque<IssuedSignatureFingerprint>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(VecDeque::with_capacity(ISSUED_SIGNATURE_CAPACITY)))
+}
+
+fn issued_signature_fingerprint(signature: &str) -> Option<IssuedSignatureFingerprint> {
+    let decoded = BASE64.decode(signature).ok()?;
+    if decoded.is_empty() || decoded.len() > UPSTREAM_BEDROCK_MAX_RAW_BYTES {
+        return None;
+    }
+
+    let digest = Sha256::digest(&decoded).into();
+    let chunk_digests = std::array::from_fn(|index| {
+        let start = decoded.len() * index / ISSUED_SIGNATURE_CHUNKS;
+        let end = decoded.len() * (index + 1) / ISSUED_SIGNATURE_CHUNKS;
+        Sha256::digest(&decoded[start..end]).into()
+    });
+    Some(IssuedSignatureFingerprint {
+        observed_at: Instant::now(),
+        decoded_len: decoded.len(),
+        digest,
+        chunk_digests,
+    })
+}
+
+fn prune_issued_signatures(registry: &mut VecDeque<IssuedSignatureFingerprint>, now: Instant) {
+    while registry.front().is_some_and(|entry| {
+        now.saturating_duration_since(entry.observed_at) > ISSUED_SIGNATURE_RETENTION
+    }) {
+        registry.pop_front();
+    }
+}
+
+pub fn register_issued_opaque_signature(signature: &str) {
+    let Some(fingerprint) = issued_signature_fingerprint(signature) else {
+        return;
+    };
+    let mut registry = issued_signature_registry().lock();
+    prune_issued_signatures(&mut registry, fingerprint.observed_at);
+    if registry
+        .iter()
+        .any(|entry| entry.digest == fingerprint.digest)
+    {
+        return;
+    }
+    registry.push_back(fingerprint);
+    while registry.len() > ISSUED_SIGNATURE_CAPACITY {
+        registry.pop_front();
+    }
+}
+
+pub fn issued_opaque_signature_match(signature: &str) -> IssuedSignatureMatch {
+    let Some(candidate) = issued_signature_fingerprint(signature) else {
+        return IssuedSignatureMatch::Unknown;
+    };
+    let mut registry = issued_signature_registry().lock();
+    prune_issued_signatures(&mut registry, candidate.observed_at);
+
+    let mut locally_modified = false;
+    for issued in registry
+        .iter()
+        .filter(|entry| entry.decoded_len == candidate.decoded_len)
+    {
+        if issued.digest == candidate.digest {
+            return IssuedSignatureMatch::Exact;
+        }
+        let matching_chunks = issued
+            .chunk_digests
+            .iter()
+            .zip(candidate.chunk_digests.iter())
+            .filter(|(left, right)| left == right)
+            .count();
+        locally_modified |= matching_chunks + 1 >= ISSUED_SIGNATURE_CHUNKS;
+    }
+
+    if locally_modified {
+        IssuedSignatureMatch::LocallyModified
+    } else {
+        IssuedSignatureMatch::Unknown
+    }
+}
 
 /// 默认共享签名密钥。全车队镜像一致 → 零配置也能跨容器互验。
 /// 需要隔离/轮换时用环境变量 `KIRO_SIG_SECRET` 覆盖（**全车队配同一值**）。
@@ -910,6 +1017,25 @@ mod tests {
         assert_eq!(hmac_mismatch.decoded_len, Some(241));
         assert!(hmac_mismatch.ends_with_field3);
         assert!(hmac_mismatch.has_bedrock_profile_markers);
+    }
+
+    #[test]
+    fn issued_signature_registry_detects_local_modification() {
+        let issued =
+            generate_aws_b40_adaptive_signature_for_model("claude-opus-4-8", 256, 34_749, 0);
+        register_issued_opaque_signature(&issued);
+        assert_eq!(
+            issued_opaque_signature_match(&issued),
+            IssuedSignatureMatch::Exact
+        );
+
+        let mut modified = BASE64.decode(&issued).unwrap();
+        let midpoint = modified.len() / 2;
+        modified[midpoint] ^= 0x01;
+        assert_eq!(
+            issued_opaque_signature_match(&BASE64.encode(modified)),
+            IssuedSignatureMatch::LocallyModified
+        );
     }
 
     #[test]

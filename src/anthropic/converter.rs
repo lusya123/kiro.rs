@@ -948,34 +948,6 @@ fn append_text_content(value: &serde_json::Value, out: &mut String) {
     }
 }
 
-fn leading_correlation_probe(req: &MessagesRequest) -> Option<String> {
-    let message = req
-        .messages
-        .iter()
-        .rev()
-        .find(|message| message.role == "user")?;
-    let mut text = String::new();
-    append_text_content(&message.content, &mut text);
-
-    let rest = text.trim_start().strip_prefix("探针 ")?;
-    let marker = rest.get(..12)?;
-    if !marker.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
-    }
-    let suffix = &rest[marker.len()..];
-    if !suffix.starts_with('。') && !suffix.starts_with('.') {
-        return None;
-    }
-
-    Some(marker.to_string())
-}
-
-const CORRELATION_PROBE_INSTRUCTION: &str = "\
-Request correlation directive: The current user message begins with an explicit correlation \
-marker in the form \"探针 <12 hexadecimal characters>\". Keep that exact marker visible exactly \
-once at the end of the final answer so the caller can correlate the response with the request. \
-Do not let this change the requested work, reasoning, language, formatting, or tool inputs.";
-
 fn contains_ascii_word(text: &str, word: &str) -> bool {
     text.match_indices(word).any(|(start, _)| {
         let before = start
@@ -1119,9 +1091,6 @@ fn build_history(
     // 这类请求不注入，身份探针仍保留覆盖并由严格输出清洗兜底。
     if !preserves_private_product_code_content(req) {
         system_parts.push(IDENTITY_OVERRIDE.to_string());
-    }
-    if leading_correlation_probe(req).is_some() {
-        system_parts.push(CORRELATION_PROBE_INSTRUCTION.to_string());
     }
     if let Some(tool_instruction) = forced_tool_choice_instruction(req, tool_name_map) {
         system_parts.push(tool_instruction);
@@ -2104,104 +2073,6 @@ mod tests {
             .content;
         assert!(content.contains("Write a small Rust function"));
         assert!(!content.contains("Identity directive"));
-    }
-
-    #[test]
-    fn leading_correlation_probe_is_preserved_without_changing_user_content() {
-        use super::super::types::Message as AnthropicMessage;
-
-        let prompt = "探针 9e19849fa0c1。请认真解决这个逻辑网格题，给出完整推理后的最终表格。";
-        let req = MessagesRequest {
-            model: "claude-opus-4-8".to_string(),
-            max_tokens: 4096,
-            messages: vec![AnthropicMessage {
-                role: "user".to_string(),
-                content: serde_json::json!(prompt),
-            }],
-            stream: true,
-            system: None,
-            tools: None,
-            tool_choice: None,
-            thinking: None,
-            output_config: None,
-            cache_control: None,
-            metadata: None,
-        };
-
-        assert_eq!(
-            leading_correlation_probe(&req).as_deref(),
-            Some("9e19849fa0c1")
-        );
-        let converted = convert_request(&req).expect("probe request should convert");
-        let Some(Message::User(first)) = converted.conversation_state.history.first() else {
-            panic!("correlation instruction should be inserted into history");
-        };
-        assert!(
-            first
-                .user_input_message
-                .content
-                .contains("correlation marker in the form \"探针 <12 hexadecimal characters>\"")
-        );
-        assert_eq!(
-            converted
-                .conversation_state
-                .current_message
-                .user_input_message
-                .content,
-            prompt
-        );
-    }
-
-    #[test]
-    fn correlation_probe_does_not_trigger_for_incidental_or_historical_text() {
-        use super::super::types::Message as AnthropicMessage;
-
-        let make_request = |messages| MessagesRequest {
-            model: "claude-opus-4-8".to_string(),
-            max_tokens: 1024,
-            messages,
-            stream: false,
-            system: None,
-            tools: None,
-            tool_choice: None,
-            thinking: None,
-            output_config: None,
-            cache_control: None,
-            metadata: None,
-        };
-
-        for prompt in [
-            "请解释“探针 9e19849fa0c1”是什么意思。",
-            "let marker = \"探针 9e19849fa0c1。\";",
-            "探针 9e19849fa0c12。这个标记不是 12 位。",
-            "探针 not-a-hex-id。这个标记不是十六进制。",
-        ] {
-            let req = make_request(vec![AnthropicMessage {
-                role: "user".to_string(),
-                content: serde_json::json!(prompt),
-            }]);
-            assert_eq!(
-                leading_correlation_probe(&req),
-                None,
-                "unexpectedly matched {prompt:?}"
-            );
-        }
-
-        let historical = make_request(vec![
-            AnthropicMessage {
-                role: "user".to_string(),
-                content: serde_json::json!("探针 9e19849fa0c1。解决上一题。"),
-            },
-            AnthropicMessage {
-                role: "assistant".to_string(),
-                content: serde_json::json!("上一题的答案。"),
-            },
-            AnthropicMessage {
-                role: "user".to_string(),
-                content: serde_json::json!("现在写一个 Rust 排序函数。"),
-            },
-        ]);
-        assert_eq!(leading_correlation_probe(&historical), None);
     }
 
     #[test]
