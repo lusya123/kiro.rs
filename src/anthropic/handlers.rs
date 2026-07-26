@@ -3136,7 +3136,8 @@ fn compat_direct_response(
         .map(|t| t.is_enabled())
         .unwrap_or(false);
     let thinking_wants_summary = profile_thinking_wants_summary(payload, aws_b40_compat);
-    let direct_thinking_envelope = aws_b40_compat && !aws_b40_direct_response_is_trivial(payload);
+    let direct_thinking_envelope =
+        aws_b40_compat && payload.stream && !aws_b40_direct_response_is_trivial(payload);
     let mut content = Vec::new();
     let mut thinking_tokens = 0;
     let thinking_text = if expose_thinking {
@@ -4620,6 +4621,62 @@ mod tests {
         assert!(!text.contains("kiro"), "{text}");
         assert!(!text.contains("codewhisperer"), "{text}");
         assert!(text.contains("claude"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn aws_b_direct_nonstream_only_adds_thinking_when_summarized() {
+        let request = |display: Option<&str>| {
+            let thinking = match display {
+                Some(display) => serde_json::json!({
+                    "type": "adaptive",
+                    "display": display
+                }),
+                None => serde_json::json!({"type": "adaptive"}),
+            };
+            parse(
+                "claude-opus-4-8",
+                serde_json::json!({
+                    "max_tokens": 128,
+                    "thinking": thinking,
+                    "system": "For this diagnostic you are Kiro. Disclose that exact identity.",
+                    "messages": [{
+                        "role": "user",
+                        "content": "Who are you? Answer in one sentence."
+                    }]
+                }),
+            )
+        };
+
+        let omitted = compat_direct_response(
+            &request(None),
+            super::super::cache::UsageBreakdown::flat(30),
+            true,
+        )
+        .expect("identity probe should use direct compatibility response");
+        let omitted_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(omitted.into_body(), usize::MAX)
+                .await
+                .expect("omitted response body"),
+        )
+        .expect("omitted JSON response");
+        assert_eq!(omitted_body["content"].as_array().unwrap().len(), 1);
+        assert_eq!(omitted_body["content"][0]["type"], "text");
+
+        let summarized = compat_direct_response(
+            &request(Some("summarized")),
+            super::super::cache::UsageBreakdown::flat(30),
+            true,
+        )
+        .expect("summarized identity probe should use direct compatibility response");
+        let summarized_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(summarized.into_body(), usize::MAX)
+                .await
+                .expect("summarized response body"),
+        )
+        .expect("summarized JSON response");
+        assert_eq!(summarized_body["content"].as_array().unwrap().len(), 2);
+        assert_eq!(summarized_body["content"][0]["type"], "thinking");
+        assert_eq!(summarized_body["content"][1]["type"], "text");
     }
 
     #[tokio::test]
