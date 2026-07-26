@@ -8,7 +8,9 @@ use crate::kiro::model::requests::conversation::{
     CurrentMessage, HistoryAssistantMessage, HistoryUserMessage, Message, UserInputMessage,
     UserMessage,
 };
-use crate::kiro::model::requests::kiro::KiroRequest;
+use crate::kiro::model::requests::kiro::{
+    AdditionalModelRequestFields, KiroOutputConfig, KiroRequest,
+};
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
 use anyhow::Error;
@@ -1453,6 +1455,7 @@ pub async fn post_messages(
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
+        additional_model_request_fields: kiro_model_request_fields(&payload),
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
@@ -1606,8 +1609,8 @@ async fn handle_stream_request(
     if thinking_enabled && !expose_thinking {
         ctx.hide_thinking_blocks();
     }
-    // opus 经 Kiro 不产出 <thinking>:客户请求了 thinking 时合成一个思考块(+签名),
-    // 以保持与真 Anthropic 一致的结构。仅注入思考块,真实答案不变;普通(不带 thinking)请求不受影响。
+    // 为旧 Kiro 协议准备 thinking 回退；新版 reasoningContentEvent 到达后会自动取消。
+    // 仅影响显式 thinking 请求，真实答案和普通请求不变。
     if thinking_enabled
         && expose_thinking
         && thinking_wants_summary
@@ -1868,6 +1871,9 @@ async fn handle_non_stream_request(
     aws_b40_adaptive_signature: bool,
 ) -> Response {
     let mut text_content = String::new();
+    let mut native_thinking_content = String::new();
+    let mut upstream_thinking_signature: Option<String> = None;
+    let mut redacted_thinking_blocks: Vec<String> = Vec::new();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason: String;
@@ -1921,6 +1927,7 @@ async fn handle_non_stream_request(
 
         let mut chunk_text_content = String::new();
         let mut round_has_assistant_content = false;
+        let mut round_reasoning_previous = String::new();
         stop_reason = "end_turn".to_string();
 
         for result in decoder.decode_iter() {
@@ -1928,6 +1935,22 @@ async fn handle_non_stream_request(
                 Ok(frame) => {
                     if let Ok(event) = Event::from_frame(frame) {
                         match event {
+                            Event::ReasoningContent(reasoning) => {
+                                if !reasoning.text.is_empty() {
+                                    let delta = super::stream::cumulative_event_delta(
+                                        &reasoning.text,
+                                        &round_reasoning_previous,
+                                    );
+                                    round_reasoning_previous = reasoning.text;
+                                    native_thinking_content.push_str(&delta);
+                                }
+                                if !reasoning.signature.is_empty() {
+                                    upstream_thinking_signature = Some(reasoning.signature);
+                                }
+                                if !reasoning.redacted_content.is_empty() {
+                                    redacted_thinking_blocks.push(reasoning.redacted_content);
+                                }
+                            }
                             Event::AssistantResponse(resp) => {
                                 let content =
                                     if continuation_round > 0 && !round_has_assistant_content {
@@ -2131,16 +2154,32 @@ async fn handle_non_stream_request(
 
     if thinking_enabled {
         // 从完整文本中提取 thinking 块
-        let (thinking, remaining_text) =
+        let (tag_thinking, remaining_text) =
             super::stream::extract_thinking_from_complete_text(&text_content);
 
         if expose_thinking {
+            for data in &redacted_thinking_blocks {
+                content.push(json!({
+                    "type": "redacted_thinking",
+                    "data": data
+                }));
+            }
+
             // opus 经 Kiro 无思考内容:仅 display=summarized 时合成思考摘要块。
             // **非流式**下真 Claude(pomoai/Bedrock)对 omitted 请求**不返回 thinking 块**(只 [text]),
             // 所以 omitted 时这里返回 None、不注入空思考块——否则 cctest 非流结构校验会因多一个块而判异。
             // (流式路径不变:流式 omitted 仍发空文本 thinking 块,与 pomoai 流式一致,流结构校验通过。)
-            let thinking = thinking.or_else(|| {
-                if super::compat::model_omits_thinking(model) && thinking_wants_summary {
+            let has_native_thinking = !native_thinking_content.is_empty();
+            let thinking = if has_native_thinking {
+                Some(native_thinking_content.clone())
+            } else {
+                tag_thinking
+            }
+            .or_else(|| {
+                if redacted_thinking_blocks.is_empty()
+                    && super::compat::model_omits_thinking(model)
+                    && thinking_wants_summary
+                {
                     Some(super::compat::synthetic_thinking())
                 } else {
                     None
@@ -2158,7 +2197,20 @@ async fn handle_non_stream_request(
                     thinking_text
                 };
                 thinking_tokens = super::claude_tok::count_claude(&thinking_text);
-                let signature = if aws_b40_compat {
+                let signature = if has_native_thinking {
+                    upstream_thinking_signature.clone().unwrap_or_else(|| {
+                        if aws_b40_compat {
+                            super::bedrock::signature(
+                                model,
+                                aws_b40_adaptive_signature,
+                                &thinking_text,
+                                calibrated_direct_initial_usage.unwrap_or(initial_usage_breakdown),
+                            )
+                        } else {
+                            super::signature::generate_signature()
+                        }
+                    })
+                } else if aws_b40_compat {
                     super::bedrock::signature(
                         model,
                         aws_b40_adaptive_signature,
@@ -2448,6 +2500,51 @@ fn profile_thinking_wants_summary(payload: &MessagesRequest, aws_b40_compat: boo
     has_explicit_effort || !aws_b40_adaptive_request_is_trivial(payload)
 }
 
+fn kiro_model_request_fields(payload: &MessagesRequest) -> Option<AdditionalModelRequestFields> {
+    let thinking_enabled = payload.thinking.as_ref().is_some_and(Thinking::is_enabled);
+    if !thinking_enabled {
+        return None;
+    }
+
+    let model = super::converter::map_model(&payload.model)?;
+    let requested = payload
+        .output_config
+        .as_ref()
+        .map(|config| config.effort.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "medium".to_string());
+    let effort = resolve_kiro_effort(&model, &requested)?;
+
+    Some(AdditionalModelRequestFields {
+        output_config: Some(KiroOutputConfig { effort }),
+    })
+}
+
+fn resolve_kiro_effort(model: &str, requested: &str) -> Option<String> {
+    const FIVE_LEVEL_MODELS: &[&str] = &["claude-opus-4.8", "claude-opus-4.7", "claude-sonnet-5"];
+    const FOUR_LEVEL_MODELS: &[&str] = &[
+        "claude-opus-4.6",
+        "claude-sonnet-4.6",
+        "claude-opus-4.6-1m",
+        "claude-sonnet-4.6-1m",
+    ];
+    const VALID: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+    if !VALID.contains(&requested) {
+        return None;
+    }
+    if FIVE_LEVEL_MODELS.contains(&model) {
+        return Some(requested.to_string());
+    }
+    if FOUR_LEVEL_MODELS.contains(&model) {
+        return Some(if requested == "xhigh" {
+            "max".to_string()
+        } else {
+            requested.to_string()
+        });
+    }
+    None
+}
+
 fn aws_b40_adaptive_request_is_trivial(payload: &MessagesRequest) -> bool {
     if super::compat::extract_verbatim_echo(payload).is_some()
         || super::compat::extract_antml_tag_reply(payload).is_some()
@@ -2609,16 +2706,22 @@ fn reject_invalid_thinking_signatures(
                 continue;
             };
             if let Err(diagnostics) = super::signature::validate_signature(signature) {
-                if aws_b40_compat
-                    && diagnostics.failure
-                        == super::signature::SignatureValidationFailure::HmacMismatch
-                    && super::signature::is_plausible_external_anthropic_signature(signature)
-                {
+                let external_anthropic = diagnostics.failure
+                    == super::signature::SignatureValidationFailure::HmacMismatch
+                    && super::signature::is_plausible_external_anthropic_signature(signature);
+                let upstream_bedrock =
+                    super::signature::is_plausible_upstream_bedrock_signature(signature);
+                if aws_b40_compat && (external_anthropic || upstream_bedrock) {
                     tracing::debug!(
                         message_index,
                         block_index,
                         signature_encoded_len = diagnostics.encoded_len,
                         signature_decoded_len = ?diagnostics.decoded_len,
+                        signature_profile = if upstream_bedrock {
+                            "upstream_bedrock"
+                        } else {
+                            "external_anthropic"
+                        },
                         "accepted structurally valid external thinking signature"
                     );
                     continue;
@@ -3763,6 +3866,7 @@ pub async fn post_messages_cc(
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
+        additional_model_request_fields: kiro_model_request_fields(&payload),
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
@@ -3916,8 +4020,8 @@ async fn handle_stream_request_buffered(
     if thinking_enabled && !expose_thinking {
         ctx.hide_thinking_blocks();
     }
-    // opus 经 Kiro 不产出 <thinking>:客户请求了 thinking 时合成一个思考块(+签名),
-    // 以保持与真 Anthropic 一致的结构。仅注入思考块,真实答案不变;普通(不带 thinking)请求不受影响。
+    // 为旧 Kiro 协议准备 thinking 回退；新版 reasoningContentEvent 到达后会自动取消。
+    // 仅影响显式 thinking 请求，真实答案和普通请求不变。
     if thinking_enabled
         && expose_thinking
         && thinking_wants_summary
@@ -5608,6 +5712,76 @@ mod tests {
         );
         assert!(req.output_config.is_none());
         assert_eq!(req.model, "claude-opus-4-8");
+    }
+
+    #[test]
+    fn kiro_native_effort_defaults_to_medium_for_thinking_requests() {
+        let req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "thinking": {"type": "adaptive"}
+            }),
+        );
+
+        let fields = kiro_model_request_fields(&req).expect("native model fields");
+        assert_eq!(
+            fields
+                .output_config
+                .as_ref()
+                .map(|config| config.effort.as_str()),
+            Some("medium")
+        );
+    }
+
+    #[test]
+    fn kiro_native_effort_preserves_supported_levels_and_clamps_xhigh() {
+        let opus_48 = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "xhigh"}
+            }),
+        );
+        assert_eq!(
+            kiro_model_request_fields(&opus_48)
+                .and_then(|fields| fields.output_config)
+                .map(|config| config.effort),
+            Some("xhigh".to_string())
+        );
+
+        let opus_46 = parse(
+            "claude-opus-4-6",
+            serde_json::json!({
+                "thinking": {"type": "enabled", "budget_tokens": 4096},
+                "output_config": {"effort": "xhigh"}
+            }),
+        );
+        assert_eq!(
+            kiro_model_request_fields(&opus_46)
+                .and_then(|fields| fields.output_config)
+                .map(|config| config.effort),
+            Some("max".to_string())
+        );
+    }
+
+    #[test]
+    fn kiro_native_effort_is_omitted_without_thinking_or_for_unknown_values() {
+        let no_thinking = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "output_config": {"effort": "high"}
+            }),
+        );
+        assert!(kiro_model_request_fields(&no_thinking).is_none());
+
+        let unknown = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "turbo"}
+            }),
+        );
+        assert!(kiro_model_request_fields(&unknown).is_none());
     }
 
     #[test]

@@ -10,6 +10,8 @@ use crate::kiro::parser::frame::Frame;
 pub enum EventType {
     /// 助手响应事件
     AssistantResponse,
+    /// 原生 reasoning 事件
+    ReasoningContent,
     /// 工具使用事件
     ToolUse,
     /// 计费事件
@@ -25,6 +27,7 @@ impl EventType {
     pub fn from_str(s: &str) -> Self {
         match s {
             "assistantResponseEvent" => Self::AssistantResponse,
+            "reasoningContentEvent" => Self::ReasoningContent,
             "toolUseEvent" => Self::ToolUse,
             "meteringEvent" => Self::Metering,
             "contextUsageEvent" => Self::ContextUsage,
@@ -36,6 +39,7 @@ impl EventType {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::AssistantResponse => "assistantResponseEvent",
+            Self::ReasoningContent => "reasoningContentEvent",
             Self::ToolUse => "toolUseEvent",
             Self::Metering => "meteringEvent",
             Self::ContextUsage => "contextUsageEvent",
@@ -65,14 +69,19 @@ pub trait EventPayload: Sized {
 pub enum Event {
     /// 助手响应
     AssistantResponse(super::AssistantResponseEvent),
+    /// 模型原生 reasoning 响应
+    ReasoningContent(super::ReasoningContentEvent),
     /// 工具使用
     ToolUse(super::ToolUseEvent),
     /// 计费
     Metering(()),
     /// 上下文使用率
     ContextUsage(super::ContextUsageEvent),
-    /// 未知事件 (保留原始帧数据)
-    Unknown {},
+    /// 未知事件（保留事件类型与原始 payload，便于新模型协议前向兼容）
+    Unknown {
+        event_type: String,
+        payload: Vec<u8>,
+    },
     /// 服务端错误
     Error {
         /// 错误代码
@@ -112,6 +121,10 @@ impl Event {
                 let payload = super::AssistantResponseEvent::from_frame(&frame)?;
                 Ok(Self::AssistantResponse(payload))
             }
+            EventType::ReasoningContent => {
+                let payload = super::ReasoningContentEvent::from_frame(&frame)?;
+                Ok(Self::ReasoningContent(payload))
+            }
             EventType::ToolUse => {
                 let payload = super::ToolUseEvent::from_frame(&frame)?;
                 Ok(Self::ToolUse(payload))
@@ -121,7 +134,10 @@ impl Event {
                 let payload = super::ContextUsageEvent::from_frame(&frame)?;
                 Ok(Self::ContextUsage(payload))
             }
-            EventType::Unknown => Ok(Self::Unknown {}),
+            EventType::Unknown => Ok(Self::Unknown {
+                event_type: event_type_str.to_string(),
+                payload: frame.payload,
+            }),
         }
     }
 
@@ -159,12 +175,17 @@ impl Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kiro::parser::header::{HeaderValue, Headers};
 
     #[test]
     fn test_event_type_from_str() {
         assert_eq!(
             EventType::from_str("assistantResponseEvent"),
             EventType::AssistantResponse
+        );
+        assert_eq!(
+            EventType::from_str("reasoningContentEvent"),
+            EventType::ReasoningContent
         );
         assert_eq!(EventType::from_str("toolUseEvent"), EventType::ToolUse);
         assert_eq!(EventType::from_str("meteringEvent"), EventType::Metering);
@@ -181,6 +202,41 @@ mod tests {
             EventType::AssistantResponse.as_str(),
             "assistantResponseEvent"
         );
+        assert_eq!(
+            EventType::ReasoningContent.as_str(),
+            "reasoningContentEvent"
+        );
         assert_eq!(EventType::ToolUse.as_str(), "toolUseEvent");
+    }
+
+    #[test]
+    fn unknown_event_preserves_type_and_payload() {
+        let mut headers = Headers::new();
+        headers.insert(
+            ":message-type".to_string(),
+            HeaderValue::String("event".to_string()),
+        );
+        headers.insert(
+            ":event-type".to_string(),
+            HeaderValue::String("thinkingMetadataEvent".to_string()),
+        );
+        let payload = br#"{"signature":"opaque","tokenCount":42}"#.to_vec();
+
+        let event = Event::from_frame(Frame {
+            headers,
+            payload: payload.clone(),
+        })
+        .expect("unknown event should remain parseable");
+
+        match event {
+            Event::Unknown {
+                event_type,
+                payload: actual,
+            } => {
+                assert_eq!(event_type, "thinkingMetadataEvent");
+                assert_eq!(actual, payload);
+            }
+            other => panic!("expected unknown event, got {other:?}"),
+        }
     }
 }

@@ -47,6 +47,20 @@ impl EventPayload for AssistantResponseEvent {
     }
 }
 
+impl AssistantResponseEvent {
+    /// Return only extension field names for diagnostics; values may contain
+    /// model output or upstream metadata and must not be written to logs.
+    pub fn extra_field_names(&self) -> Vec<String> {
+        let serde_json::Value::Object(fields) = &self.extra else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = fields.keys().cloned().collect();
+        names.sort();
+        names.truncate(32);
+        names
+    }
+}
+
 impl Default for AssistantResponseEvent {
     fn default() -> Self {
         Self {
@@ -88,6 +102,15 @@ mod tests {
         }"#;
         let event: AssistantResponseEvent = serde_json::from_str(json).unwrap();
         assert_eq!(event.content, "Done");
+        assert_eq!(
+            event.extra_field_names(),
+            [
+                "conversationId",
+                "followupPrompt",
+                "messageId",
+                "messageStatus"
+            ]
+        );
     }
 
     #[test]

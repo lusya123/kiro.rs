@@ -1,9 +1,9 @@
 //! Optional native Amazon Bedrock Messages API transport.
 //!
-//! Kiro's EventStream does not contain Bedrock-issued thinking signatures. When
-//! this provider is explicitly enabled, selected models are sent to Bedrock
-//! Mantle and the response body is relayed unchanged, preserving native
-//! thinking, signatures, usage, caching, and streaming behavior.
+//! This explicit provider sends selected models directly to Bedrock Mantle and
+//! relays the response body unchanged. The Kiro transport now exposes native
+//! reasoning for supported models too, but Mantle remains the zero-conversion
+//! path for native thinking, signatures, usage, caching, and streaming.
 
 use std::collections::HashSet;
 

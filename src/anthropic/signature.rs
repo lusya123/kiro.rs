@@ -2,11 +2,12 @@
 //!
 //! Anthropic 官方 thinking 块带 `signature`，客户端多轮续聊时把它原样回传，由 Anthropic
 //! 服务端验签。kiro-rs 链路（customer → sub2api → kiro-rs → Kiro 上游）里：
-//! - Kiro 上游不签名也不验签；converter 转发前会丢弃 history 里的 signature。
+//! - 新版 Kiro 模型会返回原生 reasoning signature，本服务原样透传。
+//! - 旧模型没有上游签名时才生成本地 HMAC 回退；converter 转发历史前仍会移除 signature。
 //! - 真 Anthropic 永远看不到这些签名，客户端 SDK 自己也不验签。
 //!
-//! 因此 kiro-rs 只需要一套**自洽**的签名：客户看到的是 protobuf 风格 base64，回传时本服务
-//! 能验真伪。
+//! 因此本模块同时处理两类签名：本地回退签名可严格验 HMAC；上游签名无法使用本地密钥验算，
+//! 但会按完整 protobuf/Bedrock 信封做严格结构校验，以支持客户端原样回传后继续对话。
 //!
 //! 旧实现用**进程内 HashSet** 登记签名，有个致命问题：在"一容器一账号、请求按账号轮转"的
 //! 号池里，A 容器签发的签名回传到 B 容器（或容器重启后）查不到 → 误判非法返回 400。开了
@@ -21,8 +22,8 @@
 //! 全车队只需共享同一把密钥（默认写死常量，镜像一致即可零配置跨容器互验；需要隔离/轮换时用
 //! 环境变量 `KIRO_SIG_SECRET` 覆盖，**全车队配同一值**）。该密钥与账号凭据无关，仅用于签名自洽。
 //!
-//! 安全模型：这不是真 Anthropic 签名（拿不到其私钥，也无需），只承载"本服务签发且未被篡改"
-//! 这一层语义，不要把它当真签名用于任何真实安全场景。
+//! 安全模型：本地回退签名不是真 Anthropic 签名，只承载"本服务签发且未被篡改"这一层语义。
+//! 原生上游签名保持不透明；两者都不是本服务的授权边界。
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -66,6 +67,8 @@ const AWS_B_OPUS_48_CONTEXT_MAX_BYTES: usize = 2_600;
 const AWS_B_OPUS_48_CONTEXT_STAMP: &[u8; 12] = b"058264511794";
 const EXTERNAL_ANTHROPIC_MIN_RAW_BYTES: usize = 340;
 const EXTERNAL_ANTHROPIC_MAX_RAW_BYTES: usize = 520;
+const UPSTREAM_BEDROCK_MIN_RAW_BYTES: usize = 196;
+const UPSTREAM_BEDROCK_MAX_RAW_BYTES: usize = 2 * 1024 * 1024;
 
 /// 默认共享签名密钥。全车队镜像一致 → 零配置也能跨容器互验。
 /// 需要隔离/轮换时用环境变量 `KIRO_SIG_SECRET` 覆盖（**全车队配同一值**）。
@@ -446,6 +449,149 @@ pub fn is_plausible_external_anthropic_signature(signature: &str) -> bool {
         && has_external_signature_header(field_one)
 }
 
+/// Recognize the complete Bedrock reasoning envelope returned by newer Kiro
+/// models. These signatures can be much larger than the legacy 8 KiB local
+/// validation cap because field 5 carries encrypted reasoning content.
+///
+/// This is used only to keep an already-issued thinking block usable when a
+/// client returns it as conversation history. The converter removes the opaque
+/// signature before forwarding history to Kiro, so it is not an authorization
+/// or trust boundary.
+pub fn is_plausible_upstream_bedrock_signature(signature: &str) -> bool {
+    let Ok(buf) = BASE64.decode(signature) else {
+        return false;
+    };
+    if !(UPSTREAM_BEDROCK_MIN_RAW_BYTES..=UPSTREAM_BEDROCK_MAX_RAW_BYTES).contains(&buf.len())
+        || !buf.ends_with(&[0x18, 0x01])
+        || buf.first() != Some(&0x12)
+    {
+        return false;
+    }
+
+    let Some((outer_len, inner_start)) = read_varint(&buf, 1) else {
+        return false;
+    };
+    let Some(inner_end) = inner_start.checked_add(outer_len) else {
+        return false;
+    };
+    if inner_end.checked_add(2) != Some(buf.len()) {
+        return false;
+    }
+
+    let inner = &buf[inner_start..inner_end];
+    let mut cursor = 0usize;
+    let Some(field_one) = take_len_field(inner, &mut cursor, 1) else {
+        return false;
+    };
+    let Some(field_two) = take_len_field(inner, &mut cursor, 2) else {
+        return false;
+    };
+    let Some(field_three) = take_len_field(inner, &mut cursor, 3) else {
+        return false;
+    };
+    let Some(field_four) = take_len_field(inner, &mut cursor, 4) else {
+        return false;
+    };
+    let Some(field_five) = take_len_field(inner, &mut cursor, 5) else {
+        return false;
+    };
+
+    cursor == inner.len()
+        && field_two.len() == 12
+        && field_three.len() == 12
+        && field_four.len() == 48
+        && field_five.len() >= MAC_LEN
+        && has_upstream_bedrock_signature_header(field_one)
+}
+
+fn has_upstream_bedrock_signature_header(field_one: &[u8]) -> bool {
+    if !(96..=160).contains(&field_one.len()) {
+        return false;
+    }
+
+    let mut cursor = 0usize;
+    let Some((field_one_key, after_field_one_key)) = read_varint(field_one, cursor) else {
+        return false;
+    };
+    if field_one_key != 0x08 {
+        return false;
+    }
+    let Some((profile, after_profile)) = read_varint(field_one, after_field_one_key) else {
+        return false;
+    };
+    // Current native Kiro/Bedrock reasoning uses profile 16. Locally generated
+    // compatibility signatures use profile 15 and must continue through HMAC.
+    if profile != 16 {
+        return false;
+    }
+    cursor = after_profile;
+
+    let Some((variant_key, after_variant_key)) = read_varint(field_one, cursor) else {
+        return false;
+    };
+    if variant_key != 0x10 {
+        return false;
+    }
+    let Some((variant, after_variant)) = read_varint(field_one, after_variant_key) else {
+        return false;
+    };
+    if variant != 1 {
+        return false;
+    }
+    cursor = after_variant;
+
+    let Some((thinking_key, after_thinking_key)) = read_varint(field_one, cursor) else {
+        return false;
+    };
+    if thinking_key != 0x18 {
+        return false;
+    }
+    let Some((thinking_variant, after_thinking_variant)) =
+        read_varint(field_one, after_thinking_key)
+    else {
+        return false;
+    };
+    if thinking_variant != 2 {
+        return false;
+    }
+    cursor = after_thinking_variant;
+
+    let Some(nonce) = take_len_field(field_one, &mut cursor, 5) else {
+        return false;
+    };
+    let Some(model_family) = take_len_field(field_one, &mut cursor, 6) else {
+        return false;
+    };
+    let Some((mode_key, after_mode_key)) = read_varint(field_one, cursor) else {
+        return false;
+    };
+    if mode_key != 0x38 {
+        return false;
+    }
+    let Some((mode, after_mode)) = read_varint(field_one, after_mode_key) else {
+        return false;
+    };
+    cursor = after_mode;
+    let Some(reasoning_kind) = take_len_field(field_one, &mut cursor, 8) else {
+        return false;
+    };
+
+    if cursor < field_one.len() {
+        let Some(context_stamp) = take_len_field(field_one, &mut cursor, 11) else {
+            return false;
+        };
+        if context_stamp.len() != 12 || !context_stamp.iter().all(u8::is_ascii_digit) {
+            return false;
+        }
+    }
+
+    cursor == field_one.len()
+        && nonce.len() == 64
+        && model_family == b"claude-quince"
+        && mode == 0
+        && reasoning_kind == b"thinking"
+}
+
 /// 校验签名是否由本服务（持同一共享密钥的任意容器）签发且未被篡改。**无状态**、跨容器/重启可验。
 /// 兼容两种布局:新版(MAC 在尾部 `18 01` 之前的 32 字节)与旧版(MAC 恒为末尾 32 字节)。
 pub fn validate_signature(signature: &str) -> Result<(), SignatureValidationDiagnostics> {
@@ -690,6 +836,47 @@ mod tests {
         assert!(!is_plausible_external_anthropic_signature(
             &BASE64.encode(bedrock)
         ));
+    }
+
+    #[test]
+    fn recognizes_large_native_bedrock_signature_without_weakening_local_hmac() {
+        fn fixture(profile: usize) -> String {
+            let mut field_one = Vec::new();
+            push_varint_field(&mut field_one, 1, profile);
+            push_varint_field(&mut field_one, 2, 1);
+            push_varint_field(&mut field_one, 3, 2);
+            push_len_field(&mut field_one, 5, &[0x41; 64]);
+            push_len_field(&mut field_one, 6, b"claude-quince");
+            push_varint_field(&mut field_one, 7, 0);
+            push_len_field(&mut field_one, 8, b"thinking");
+            push_len_field(&mut field_one, 11, b"058264511794");
+
+            let mut inner = Vec::new();
+            push_len_field(&mut inner, 1, &field_one);
+            push_len_field(&mut inner, 2, &[0x42; 12]);
+            push_len_field(&mut inner, 3, &[0x43; 12]);
+            push_len_field(&mut inner, 4, &[0x44; 48]);
+            push_len_field(&mut inner, 5, &vec![0x45; 18_966]);
+
+            let mut envelope = Vec::new();
+            push_len_field(&mut envelope, 2, &inner);
+            push_varint_field(&mut envelope, 3, 1);
+            BASE64.encode(envelope)
+        }
+
+        let upstream = fixture(16);
+        assert!(is_plausible_upstream_bedrock_signature(&upstream));
+        assert_eq!(
+            validate_signature(&upstream).unwrap_err().failure,
+            SignatureValidationFailure::InvalidLength
+        );
+
+        // Profile 15 is reserved for locally generated compatibility
+        // signatures and must still require a valid local HMAC.
+        assert!(!is_plausible_upstream_bedrock_signature(&fixture(15)));
+        let local = generate_aws_b40_signature_for_model("claude-opus-4-8");
+        assert!(!is_plausible_upstream_bedrock_signature(&local));
+        assert!(!is_plausible_upstream_bedrock_signature("not-base64!!"));
     }
 
     #[test]

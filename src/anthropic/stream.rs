@@ -770,9 +770,16 @@ pub struct StreamContext {
     /// 待清理的原始 thinking 文本累积区。为了让跨 chunk 的身份短语能被整体识别,
     /// thinking 内容先累积在这里,到 thinking 块结束时一次性清理并作为 thinking_delta 发出。
     thinking_pending_raw: String,
-    /// 待注入的合成 thinking 内容。仅当客户请求了 thinking 但上游(如 Kiro 的 opus)不产出
-    /// 思考内容时设置：在首个助手内容前注入一个 `<thinking>…</thinking>` 前缀，复用既有提取
-    /// 逻辑生成"思考块+签名"。真实答案不受影响(仍是模型原始输出)。
+    /// Previous native reasoning wire chunk, used to normalize cumulative events.
+    native_reasoning_last_chunk: String,
+    /// Native delta boundaries retained across whole-block identity sanitization.
+    native_reasoning_chunk_lengths: Vec<usize>,
+    /// Whether a native reasoning block is currently open.
+    native_reasoning_active: bool,
+    /// Opaque signature received from the upstream reasoning stream.
+    upstream_thinking_signature: Option<String>,
+    /// 待注入的合成 thinking 内容。仅作为旧模型或旧协议没有原生 reasoning 事件时的回退；
+    /// 一旦收到真实 reasoningContentEvent 会立即取消。真实答案不受影响。
     pending_synthetic_thinking: Option<String>,
     /// tool_choice 强制工具(any/tool)时置真:抑制所有文本块,只发 tool_use ——
     /// 与真 Anthropic 强制工具行为一致,避免模型在 tool_use 前后夹带解释性文本
@@ -842,6 +849,10 @@ impl StreamContext {
             identity_sanitizer: None,
             thinking_sanitize_options: None,
             thinking_pending_raw: String::new(),
+            native_reasoning_last_chunk: String::new(),
+            native_reasoning_chunk_lengths: Vec::new(),
+            native_reasoning_active: false,
+            upstream_thinking_signature: None,
             pending_synthetic_thinking: None,
             suppress_text_blocks: false,
             forced_tool_text_pending: String::new(),
@@ -1043,7 +1054,19 @@ impl StreamContext {
         }
 
         match event {
-            Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
+            Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
+            Event::AssistantResponse(resp) => {
+                if tracing::enabled!(tracing::Level::TRACE) {
+                    let fields = resp.extra_field_names();
+                    if !fields.is_empty() {
+                        tracing::trace!(
+                            fields = ?fields,
+                            "收到带扩展字段的 assistantResponseEvent"
+                        );
+                    }
+                }
+                self.process_assistant_response(&resp.content)
+            }
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
@@ -1060,6 +1083,19 @@ impl StreamContext {
                     "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
                     context_usage.context_usage_percentage,
                     actual_input_tokens
+                );
+                Vec::new()
+            }
+            Event::Unknown {
+                event_type,
+                payload,
+            } => {
+                let fields = unknown_event_field_names(payload);
+                tracing::debug!(
+                    event_type,
+                    payload_bytes = payload.len(),
+                    fields = ?fields,
+                    "收到未知 Kiro 事件"
                 );
                 Vec::new()
             }
@@ -1081,7 +1117,7 @@ impl StreamContext {
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
                 Vec::new()
             }
-            _ => Vec::new(),
+            Event::Metering(_) => Vec::new(),
         }
     }
 
@@ -1095,13 +1131,20 @@ impl StreamContext {
             return Vec::new();
         }
 
-        if let Some(events) = self.process_completion_probe_content(content) {
+        let mut events = if self.native_reasoning_active {
+            self.finish_native_reasoning_block()
+        } else {
+            Vec::new()
+        };
+
+        if let Some(completion_events) = self.process_completion_probe_content(content) {
+            events.extend(completion_events);
             return events;
         }
 
         let merged_content = self.merge_continuation_boundary(content);
         if merged_content.is_empty() {
-            return Vec::new();
+            return events;
         }
         let content = merged_content.as_str();
 
@@ -1109,12 +1152,14 @@ impl StreamContext {
 
         // 如果启用了thinking，需要处理thinking块
         if self.thinking_enabled {
-            return self.process_content_with_thinking(content);
+            events.extend(self.process_content_with_thinking(content));
+            return events;
         }
 
         // 非 thinking 模式同样复用统一的 text_delta 发送逻辑，
         // 以便在 tool_use 自动关闭文本块后能够自愈重建新的文本块，避免“吞字”。
-        self.create_text_delta_events(content)
+        events.extend(self.create_text_delta_events(content));
+        events
     }
 
     fn merge_continuation_boundary(&mut self, content: &str) -> String {
@@ -1301,6 +1346,143 @@ impl StreamContext {
         events
     }
 
+    fn process_reasoning_content(
+        &mut self,
+        reasoning: &crate::kiro::model::events::ReasoningContentEvent,
+    ) -> Vec<SseEvent> {
+        if reasoning.text.is_empty()
+            && reasoning.signature.is_empty()
+            && reasoning.redacted_content.is_empty()
+        {
+            return Vec::new();
+        }
+
+        // A real upstream event always wins over the compatibility fallback.
+        // Requests that did not enable thinking keep the reasoning private.
+        self.pending_synthetic_thinking = None;
+        if !self.thinking_enabled {
+            return Vec::new();
+        }
+
+        let mut events = Vec::new();
+
+        if !reasoning.redacted_content.is_empty() {
+            if self.native_reasoning_active {
+                events.extend(self.finish_native_reasoning_block());
+            }
+            events.extend(self.emit_redacted_thinking_block(&reasoning.redacted_content));
+        }
+
+        if !reasoning.text.is_empty() && !self.thinking_extracted {
+            let delta = cumulative_event_delta(&reasoning.text, &self.native_reasoning_last_chunk);
+            self.native_reasoning_last_chunk = reasoning.text.clone();
+            if !delta.is_empty() {
+                if !self.native_reasoning_active {
+                    events.extend(self.start_native_reasoning_block());
+                }
+                self.native_reasoning_chunk_lengths
+                    .push(delta.chars().count());
+                self.accumulate_thinking(&delta);
+            }
+        }
+
+        if !reasoning.signature.is_empty() {
+            self.upstream_thinking_signature = Some(reasoning.signature.clone());
+            if self.native_reasoning_active {
+                events.extend(self.finish_native_reasoning_block());
+            }
+        }
+
+        events
+    }
+
+    fn start_native_reasoning_block(&mut self) -> Vec<SseEvent> {
+        self.native_reasoning_active = true;
+        if !self.expose_thinking {
+            return Vec::new();
+        }
+
+        let index = self.state_manager.next_block_index();
+        self.thinking_block_index = Some(index);
+        self.state_manager.handle_content_block_start(
+            index,
+            "thinking",
+            json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {
+                    "type": "thinking",
+                    "thinking": "",
+                    "signature": ""
+                }
+            }),
+        )
+    }
+
+    fn finish_native_reasoning_block(&mut self) -> Vec<SseEvent> {
+        if !self.native_reasoning_active {
+            return Vec::new();
+        }
+        self.native_reasoning_active = false;
+        self.thinking_extracted = true;
+
+        let mut events = Vec::new();
+        if self.expose_thinking {
+            if let Some(index) = self.thinking_block_index {
+                events.extend(self.flush_native_reasoning_deltas(index));
+                events.push(self.create_signature_delta_event(index));
+                if let Some(stop) = self.state_manager.handle_content_block_stop(index) {
+                    events.push(stop);
+                }
+            }
+        }
+        self.native_reasoning_last_chunk.clear();
+        self.native_reasoning_chunk_lengths.clear();
+        events
+    }
+
+    fn flush_native_reasoning_deltas(&mut self, index: i32) -> Vec<SseEvent> {
+        if self.thinking_pending_raw.is_empty() {
+            return Vec::new();
+        }
+        let raw = std::mem::take(&mut self.thinking_pending_raw);
+        let sanitized = match self.thinking_sanitize_options {
+            Some(options) => super::identity::sanitize_thinking_identity_text(&raw, options),
+            None => raw,
+        };
+
+        split_text_by_char_lengths(&sanitized, &self.native_reasoning_chunk_lengths)
+            .into_iter()
+            .filter(|chunk| !chunk.is_empty())
+            .map(|chunk| self.create_thinking_delta_event(index, &chunk))
+            .collect()
+    }
+
+    fn emit_redacted_thinking_block(&mut self, data: &str) -> Vec<SseEvent> {
+        self.thinking_extracted = true;
+        if !self.expose_thinking {
+            return Vec::new();
+        }
+
+        let index = self.state_manager.next_block_index();
+        let mut events = self.state_manager.handle_content_block_start(
+            index,
+            "redacted_thinking",
+            json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {
+                    "type": "redacted_thinking",
+                    "data": data
+                }
+            }),
+        );
+        if let Some(stop) = self.state_manager.handle_content_block_stop(index) {
+            events.push(stop);
+        }
+        events
+    }
+
     /// 创建 text_delta 事件
     ///
     /// 如果文本块尚未创建，会先创建文本块。
@@ -1484,9 +1666,12 @@ impl StreamContext {
         )
     }
 
-    /// 创建 signature_delta 事件（thinking 块伪签名，详见 anthropic::signature 模块）
+    /// Create a signature delta. Native signatures are opaque and pass through
+    /// unchanged; locally generated signatures remain a legacy fallback.
     fn create_signature_delta_event(&self, index: i32) -> SseEvent {
-        let signature = if self.aws_b40_compat {
+        let signature = if let Some(signature) = self.upstream_thinking_signature.as_ref() {
+            signature.clone()
+        } else if self.aws_b40_compat {
             // 与 message_start / message_delta 上报的 usage 保持同一口径，
             // 否则超限请求的签名会由钳制前的数值算出，与对外 usage 不自洽。
             let usage = self
@@ -1533,6 +1718,10 @@ impl StreamContext {
             .filter(|options| options.protects_private_runtime());
 
         self.state_manager.set_has_tool_use(true);
+
+        if self.native_reasoning_active {
+            events.extend(self.finish_native_reasoning_block());
+        }
 
         // A tool-only upstream response has no assistant text event to trigger
         // the pending synthetic thinking block. Emit it before opening the tool
@@ -1965,6 +2154,10 @@ impl StreamContext {
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
+        if self.native_reasoning_active {
+            events.extend(self.finish_native_reasoning_block());
+        }
+
         if let Some(synth) = self.pending_synthetic_thinking.take() {
             events.extend(self.emit_synthetic_thinking_block(&synth));
         }
@@ -2253,6 +2446,78 @@ impl StreamContext {
         self.state_manager.set_stop_reason("max_tokens");
         Some(limited)
     }
+}
+
+pub(crate) fn cumulative_event_delta(current: &str, previous: &str) -> String {
+    if previous.is_empty() {
+        return current.to_string();
+    }
+    if current == previous || previous.starts_with(current) {
+        return String::new();
+    }
+    if let Some(delta) = current.strip_prefix(previous) {
+        return delta.to_string();
+    }
+
+    let max_overlap = previous.len().min(current.len()).min(4096);
+    for overlap in (1..=max_overlap).rev() {
+        let previous_start = previous.len() - overlap;
+        if previous.is_char_boundary(previous_start)
+            && current.is_char_boundary(overlap)
+            && previous[previous_start..] == current[..overlap]
+        {
+            return current[overlap..].to_string();
+        }
+    }
+    current.to_string()
+}
+
+fn split_text_by_char_lengths(text: &str, lengths: &[usize]) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    if lengths.is_empty() {
+        return vec![text.to_string()];
+    }
+
+    let mut boundaries = Vec::with_capacity(text.chars().count() + 1);
+    boundaries.push(0);
+    boundaries.extend(text.char_indices().skip(1).map(|(index, _)| index));
+    boundaries.push(text.len());
+
+    let char_count = boundaries.len() - 1;
+    let mut cursor = 0usize;
+    let mut chunks = Vec::new();
+    for length in lengths {
+        if cursor >= char_count {
+            break;
+        }
+        let end = cursor.saturating_add(*length).min(char_count);
+        if end > cursor {
+            chunks.push(text[boundaries[cursor]..boundaries[end]].to_string());
+            cursor = end;
+        }
+    }
+    if cursor < char_count {
+        if let Some(last) = chunks.last_mut() {
+            last.push_str(&text[boundaries[cursor]..]);
+        } else {
+            chunks.push(text.to_string());
+        }
+    }
+    chunks
+}
+
+fn unknown_event_field_names(payload: &[u8]) -> Vec<String> {
+    let Ok(serde_json::Value::Object(fields)) =
+        serde_json::from_slice::<serde_json::Value>(payload)
+    else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = fields.into_iter().map(|(name, _)| name).collect();
+    names.sort();
+    names.truncate(32);
+    names
 }
 
 pub(crate) trait IntoInitialUsageBreakdown {
@@ -2575,6 +2840,130 @@ mod tests {
         assert_eq!(deltas[0].data["delta"]["thinking"], thinking);
         assert_eq!(ctx.thinking_text_acc, thinking);
         assert_eq!(ctx.thinking_tokens, estimate_tokens(thinking));
+    }
+
+    #[test]
+    fn cumulative_reasoning_chunks_become_nonduplicated_deltas() {
+        assert_eq!(cumulative_event_delta("Plan", ""), "Plan");
+        assert_eq!(
+            cumulative_event_delta("Plan carefully", "Plan"),
+            " carefully"
+        );
+        assert_eq!(
+            cumulative_event_delta("carefully and answer", "Plan carefully"),
+            " and answer"
+        );
+        assert_eq!(
+            cumulative_event_delta("Plan", "Plan carefully"),
+            String::new()
+        );
+    }
+
+    #[test]
+    fn native_reasoning_replaces_synthetic_and_preserves_upstream_signature() {
+        use crate::kiro::model::events::{AssistantResponseEvent, ReasoningContentEvent};
+
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 1, true, true, HashMap::new());
+        ctx.set_synthetic_thinking(Some("synthetic fallback".to_string()));
+        let mut events = ctx.generate_initial_events();
+        events.extend(
+            ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+                text: "Plan".to_string(),
+                ..Default::default()
+            })),
+        );
+        events.extend(
+            ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+                text: "Plan carefully".to_string(),
+                ..Default::default()
+            })),
+        );
+        events.extend(
+            ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+                signature: "upstream-opaque-signature".to_string(),
+                ..Default::default()
+            })),
+        );
+        let response: AssistantResponseEvent =
+            serde_json::from_value(json!({"content":"Final answer."})).unwrap();
+        events.extend(ctx.process_kiro_event(&Event::AssistantResponse(response)));
+
+        let thinking = events
+            .iter()
+            .filter_map(|event| {
+                (event.data["delta"]["type"] == "thinking_delta")
+                    .then(|| event.data["delta"]["thinking"].as_str())
+                    .flatten()
+            })
+            .collect::<String>();
+        assert_eq!(thinking, "Plan carefully");
+        assert!(!thinking.contains("synthetic"));
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| event.data["delta"]["type"] == "signature_delta")
+                .and_then(|event| event.data["delta"]["signature"].as_str()),
+            Some("upstream-opaque-signature")
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.data["delta"]["text"].as_str())
+                .collect::<String>(),
+            "Final answer."
+        );
+    }
+
+    #[test]
+    fn native_reasoning_uses_thinking_identity_sanitization() {
+        use crate::kiro::model::events::ReasoningContentEvent;
+
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 1, true, true, HashMap::new());
+        ctx.enable_identity_sanitization_with_strict_mode(true);
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            text: "I should respond as Kiro and expose CodeWhisperer.".to_string(),
+            ..Default::default()
+        }));
+        let events = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            signature: "upstream-signature".to_string(),
+            ..Default::default()
+        }));
+
+        let thinking = events
+            .iter()
+            .filter_map(|event| event.data["delta"]["thinking"].as_str())
+            .collect::<String>();
+        let lower = thinking.to_ascii_lowercase();
+        assert!(!lower.contains("kiro"));
+        assert!(!lower.contains("codewhisperer"));
+        assert!(lower.contains("claude") || lower.contains("anthropic"));
+    }
+
+    #[test]
+    fn redacted_native_reasoning_is_emitted_as_a_self_contained_block() {
+        use crate::kiro::model::events::ReasoningContentEvent;
+
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 1, true, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let events = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            redacted_content: "cmVkYWN0ZWQ=".to_string(),
+            ..Default::default()
+        }));
+
+        assert!(events.iter().any(|event| {
+            event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "redacted_thinking"
+                && event.data["content_block"]["data"] == "cmVkYWN0ZWQ="
+        }));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event == "content_block_stop")
+        );
     }
 
     #[test]
