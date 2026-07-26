@@ -1512,6 +1512,8 @@ pub async fn post_messages(
         .map(|t| t.is_enabled())
         .unwrap_or(false);
     let thinking_wants_summary = profile_thinking_wants_summary(&payload, aws_b40_compat);
+    let suppress_thinking_envelope =
+        suppress_trivial_nonstream_thinking_envelope(&payload, aws_b40_compat);
 
     let tool_name_map = conversion_result.tool_name_map;
 
@@ -1550,6 +1552,7 @@ pub async fn post_messages(
             extract_thinking,
             expose_thinking,
             thinking_wants_summary,
+            suppress_thinking_envelope,
             tool_name_map,
             payload.max_tokens,
             identity_sanitization,
@@ -1863,6 +1866,7 @@ async fn handle_non_stream_request(
     thinking_enabled: bool,
     expose_thinking: bool,
     thinking_wants_summary: bool,
+    suppress_thinking_envelope: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     requested_max_tokens: i32,
     identity_sanitization: bool,
@@ -2214,35 +2218,41 @@ async fn handle_non_stream_request(
                     } else {
                         thinking_text
                     };
-                let signature = if has_native_reasoning {
-                    upstream_thinking_signature.clone().unwrap_or_else(|| {
-                        if aws_b40_compat {
-                            super::bedrock::signature(
-                                model,
-                                aws_b40_adaptive_signature,
-                                &thinking_text,
-                                calibrated_direct_initial_usage.unwrap_or(initial_usage_breakdown),
-                            )
-                        } else {
-                            super::signature::generate_signature()
-                        }
-                    })
-                } else if aws_b40_compat {
-                    super::bedrock::signature(
-                        model,
-                        aws_b40_adaptive_signature,
-                        &thinking_text,
-                        calibrated_direct_initial_usage.unwrap_or(initial_usage_breakdown),
-                    )
-                } else {
-                    super::signature::generate_signature()
-                };
-                super::signature::register_issued_opaque_signature(&signature);
-                content.push(json!({
-                    "type": "thinking",
-                    "thinking": thinking_text,
-                    "signature": signature
-                }));
+                if !suppress_thinking_envelope
+                    || !thinking_text.is_empty()
+                    || !redacted_thinking_blocks.is_empty()
+                {
+                    let signature = if has_native_reasoning {
+                        upstream_thinking_signature.clone().unwrap_or_else(|| {
+                            if aws_b40_compat {
+                                super::bedrock::signature(
+                                    model,
+                                    aws_b40_adaptive_signature,
+                                    &thinking_text,
+                                    calibrated_direct_initial_usage
+                                        .unwrap_or(initial_usage_breakdown),
+                                )
+                            } else {
+                                super::signature::generate_signature()
+                            }
+                        })
+                    } else if aws_b40_compat {
+                        super::bedrock::signature(
+                            model,
+                            aws_b40_adaptive_signature,
+                            &thinking_text,
+                            calibrated_direct_initial_usage.unwrap_or(initial_usage_breakdown),
+                        )
+                    } else {
+                        super::signature::generate_signature()
+                    };
+                    super::signature::register_issued_opaque_signature(&signature);
+                    content.push(json!({
+                        "type": "thinking",
+                        "thinking": thinking_text,
+                        "signature": signature
+                    }));
+                }
             }
         }
 
@@ -2594,6 +2604,17 @@ fn aws_b40_direct_response_is_trivial(payload: &MessagesRequest) -> bool {
                     '+' | '-' | '*' | '/' | '×' | '÷' | '=' | '?' | '？' | '.' | '(' | ')'
                 )
         })
+}
+
+fn suppress_trivial_nonstream_thinking_envelope(
+    payload: &MessagesRequest,
+    aws_b40_compat: bool,
+) -> bool {
+    aws_b40_compat
+        && !payload.stream
+        && !profile_thinking_wants_summary(payload, aws_b40_compat)
+        && !tool_choice_forces_tool(payload)
+        && aws_b40_direct_response_is_trivial(payload)
 }
 
 fn aws_b40_model_supports_enabled_thinking(model: &str) -> bool {
@@ -3963,6 +3984,8 @@ pub async fn post_messages_cc(
         .map(|t| t.is_enabled())
         .unwrap_or(false);
     let thinking_wants_summary = profile_thinking_wants_summary(&payload, aws_b40_compat);
+    let suppress_thinking_envelope =
+        suppress_trivial_nonstream_thinking_envelope(&payload, aws_b40_compat);
 
     let tool_name_map = conversion_result.tool_name_map;
 
@@ -4001,6 +4024,7 @@ pub async fn post_messages_cc(
             extract_thinking,
             expose_thinking,
             thinking_wants_summary,
+            suppress_thinking_envelope,
             tool_name_map,
             payload.max_tokens,
             identity_sanitization,
@@ -4677,6 +4701,74 @@ mod tests {
         assert_eq!(summarized_body["content"].as_array().unwrap().len(), 2);
         assert_eq!(summarized_body["content"][0]["type"], "thinking");
         assert_eq!(summarized_body["content"][1]["type"], "text");
+    }
+
+    #[test]
+    fn aws_b_trivial_nonstream_thinking_suppression_is_narrow() {
+        let tools: Vec<_> = (0..28)
+            .map(|index| {
+                serde_json::json!({
+                    "name": format!("tool_{index}"),
+                    "description": "Diagnostic tool",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                })
+            })
+            .collect();
+        let request = |message: &str, stream: bool, display: Option<&str>, forced: bool| {
+            let thinking = match display {
+                Some(display) => serde_json::json!({
+                    "type": "adaptive",
+                    "display": display
+                }),
+                None => serde_json::json!({"type": "adaptive"}),
+            };
+            let mut value = serde_json::json!({
+                "max_tokens": 64000,
+                "stream": stream,
+                "thinking": thinking,
+                "tools": tools.clone(),
+                "messages": [{"role": "user", "content": message}]
+            });
+            if forced {
+                value["tool_choice"] = serde_json::json!({"type": "any"});
+            }
+            parse("claude-opus-4-8", value)
+        };
+
+        let omitted_arithmetic = request("1+1=?", false, None, false);
+        assert!(suppress_trivial_nonstream_thinking_envelope(
+            &omitted_arithmetic,
+            true
+        ));
+
+        assert!(!suppress_trivial_nonstream_thinking_envelope(
+            &request("1+1=?", true, None, false),
+            true
+        ));
+        assert!(!suppress_trivial_nonstream_thinking_envelope(
+            &request("1+1=?", false, Some("summarized"), false),
+            true
+        ));
+        assert!(!suppress_trivial_nonstream_thinking_envelope(
+            &request(
+                "Implement a bounded concurrent worker pool in Rust.",
+                false,
+                None,
+                false
+            ),
+            true
+        ));
+        assert!(!suppress_trivial_nonstream_thinking_envelope(
+            &request("1+1=?", false, None, true),
+            true
+        ));
+        assert!(!suppress_trivial_nonstream_thinking_envelope(
+            &omitted_arithmetic,
+            false
+        ));
     }
 
     #[tokio::test]
