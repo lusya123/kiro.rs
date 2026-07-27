@@ -337,14 +337,41 @@ pub async fn compute_request_usage_breakdown_with_profile(
     } else {
         total_input_tokens - cache_plan.cache_tokens
     };
+    // cache_creation 代表"本次请求新写入缓存的内容"，它是本请求的真子集，
+    // 不可能超过本请求的总量。前缀走本地估算、总量走上游 context 上报，两套
+    // 口径不一致时这里会凭空放大（实测约 +28%），撞上上下文窗口钳制后被记成
+    // 999_999，单请求约 $13.8 直接进客户账单。
+    //
+    // cache_read 不参与封顶：它读回的是之前请求写入的前缀，其规模由那次请求
+    // 决定，用本次总量去截断会破坏缓存连续性。
+    let creation_budget = total_input_tokens.max(0);
+    let (creation_5m, creation_1h) = clamp_cache_creation(
+        cache_plan.cache_creation_5m_tokens,
+        cache_plan.cache_creation_1h_tokens,
+        creation_budget,
+    );
+
     UsageBreakdown {
         input_tokens: ordinary_input,
         cache_read_input_tokens: cache_plan.cache_read_tokens,
-        cache_creation_input_tokens: cache_plan.cache_creation_5m_tokens
-            + cache_plan.cache_creation_1h_tokens,
-        cache_creation_5m_input_tokens: cache_plan.cache_creation_5m_tokens,
-        cache_creation_1h_input_tokens: cache_plan.cache_creation_1h_tokens,
+        cache_creation_input_tokens: creation_5m + creation_1h,
+        cache_creation_5m_input_tokens: creation_5m,
+        cache_creation_1h_input_tokens: creation_1h,
     }
+}
+
+/// 把 5m / 1h 两档缓存写入按比例压进 `budget`，并保持 `总量 == 5m + 1h` 恒等。
+fn clamp_cache_creation(creation_5m: i32, creation_1h: i32, budget: i32) -> (i32, i32) {
+    let creation_5m = creation_5m.max(0);
+    let creation_1h = creation_1h.max(0);
+    let total = creation_5m.saturating_add(creation_1h);
+    if budget <= 0 || total <= budget {
+        return (creation_5m, creation_1h);
+    }
+    // 按原比例缩放，1h 档优先保留整数精度，余量归 5m，确保两档之和恰为 budget。
+    let scaled_1h = ((i64::from(creation_1h) * i64::from(budget)) / i64::from(total)) as i32;
+    let scaled_1h = scaled_1h.clamp(0, budget);
+    (budget - scaled_1h, scaled_1h)
 }
 
 pub fn with_additional_input(
@@ -1269,6 +1296,83 @@ mod tests {
         let build = build_cache_breakpoints(&automatic, 100_000, true);
         assert_eq!(build.breakpoints.len(), 1);
         assert_eq!(prefix_tokenization_calls(), 1);
+    }
+
+    /// 回归：cache_creation 是本请求的真子集，不得超过请求总量。
+    ///
+    /// 修复前 aws-b 上前缀走本地估算、总量走上游 context 上报，两套口径不一致时
+    /// cache_creation 会凭空放大（实测约 +28%），撞上 1M 上下文钳制后被记成
+    /// 999_999，单请求约 $13.8 直接进客户账单。
+    #[tokio::test]
+    async fn cache_creation_never_exceeds_request_total() {
+        let text = "The quick brown fox jumps over the lazy dog. ".repeat(500);
+        let req = parse_request(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "system": [{"type": "text", "text": text,
+                        "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        // 蓄意传入偏小的总量，模拟"前缀口径 > 总量口径"的真实情形
+        for total in [1_i32, 64, 1_024, 5_000] {
+            for aws_b40_compat in [true, false] {
+                let u =
+                    compute_request_usage_breakdown_with_profile(total, &req, aws_b40_compat).await;
+                assert!(
+                    u.cache_creation_input_tokens <= total,
+                    "cache_creation {} 超过请求总量 {}（aws_b40_compat={}）",
+                    u.cache_creation_input_tokens,
+                    total,
+                    aws_b40_compat
+                );
+                assert_eq!(
+                    u.cache_creation_5m_input_tokens + u.cache_creation_1h_input_tokens,
+                    u.cache_creation_input_tokens,
+                    "5m + 1h 必须恒等于总量（aws_b40_compat={}）",
+                    aws_b40_compat
+                );
+                assert!(
+                    u.cache_creation_5m_input_tokens >= 0 && u.cache_creation_1h_input_tokens >= 0
+                );
+            }
+        }
+    }
+
+    /// 边缘情况：极小请求带 cache_control，不得报出巨额缓存写。
+    #[tokio::test]
+    async fn tiny_request_with_cache_control_reports_tiny_cache_creation() {
+        let req = parse_request(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "system": [{"type": "text", "text": "hi",
+                        "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        for aws_b40_compat in [true, false] {
+            let u = compute_request_usage_breakdown_with_profile(8, &req, aws_b40_compat).await;
+            assert!(u.cache_creation_input_tokens <= 8);
+        }
+    }
+
+    /// 缩放函数本身的边界：零预算、超预算、比例保持、恒等式。
+    #[test]
+    fn clamp_cache_creation_edge_cases() {
+        assert_eq!(
+            clamp_cache_creation(100, 50, 1_000),
+            (100, 50),
+            "未超预算时原样返回"
+        );
+        assert_eq!(clamp_cache_creation(0, 0, 0), (0, 0), "全零安全");
+        assert_eq!(
+            clamp_cache_creation(500, 500, 0),
+            (500, 500),
+            "预算<=0 视为不限制"
+        );
+        let (a, b) = clamp_cache_creation(800, 200, 100);
+        assert_eq!(a + b, 100, "缩放后两档之和必须恰为预算");
+        assert_eq!(b, 20, "按 1h 原占比 20% 缩放");
+        let (a, b) = clamp_cache_creation(999_999, 0, 1_000);
+        assert_eq!((a, b), (1_000, 0), "单档超限时全部归该档");
+        let (a, b) = clamp_cache_creation(-5, -5, 100);
+        assert_eq!((a, b), (0, 0), "负值归零");
     }
 
     #[test]
