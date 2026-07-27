@@ -63,6 +63,9 @@ const HIGH_MIN_READ_HIT_RATIO: f64 = 0.80;
 /// 大上下文最终展示的 cache_read 命中比例。
 const HIGH_MAX_READ_HIT_RATIO: f64 = 0.90;
 
+/// 2026-07-25/27 事故中由旧窗口钳制造成的公开计费哨兵值。
+const INCIDENT_SENTINEL_USAGE_TOKENS: i32 = 999_999;
+
 /// Usage 拆分结果（满足 token 数恒等）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsageBreakdown {
@@ -125,11 +128,19 @@ impl UsageBreakdown {
         let cache_read = self.cache_read_input_tokens.max(0);
         let input = self.input_tokens.max(0);
 
-        let within_limit = input
+        let total = input
             .saturating_add(cache_read)
-            .saturating_add(cache_creation)
-            <= limit;
-        if within_limit {
+            .saturating_add(cache_creation);
+        let contains_incident_sentinel = [
+            input,
+            cache_read,
+            cache_creation,
+            cache_creation_5m,
+            cache_creation_1h,
+            total,
+        ]
+        .contains(&INCIDENT_SENTINEL_USAGE_TOKENS);
+        if total <= limit && !contains_incident_sentinel {
             return Self {
                 input_tokens: input,
                 cache_read_input_tokens: cache_read,
@@ -144,8 +155,9 @@ impl UsageBreakdown {
             original_input = self.input_tokens,
             original_cache_read = self.cache_read_input_tokens,
             original_cache_creation = self.cache_creation_input_tokens,
+            contains_incident_sentinel,
             held_input = 1,
-            "usage 超过模型上下文窗口，已暂停异常输入计费"
+            "usage 超过模型上下文窗口或命中事故哨兵值，已暂停异常输入计费"
         );
 
         Self::flat(1)
@@ -319,9 +331,7 @@ pub async fn compute_request_usage_breakdown_with_profile(
         .cache_read_tokens
         .saturating_add(cache_plan.cache_creation_5m_tokens)
         .saturating_add(cache_plan.cache_creation_1h_tokens);
-    let mut ordinary_input = if aws_b40_compat && cache_plan.terminal_message_breakpoint {
-        total_input_tokens.min(2)
-    } else if aws_b40_compat {
+    let mut ordinary_input = if aws_b40_compat {
         total_input_tokens
             .saturating_sub(planned_cache_tokens)
             .max(1)
@@ -329,39 +339,29 @@ pub async fn compute_request_usage_breakdown_with_profile(
     } else {
         total_input_tokens.saturating_sub(planned_cache_tokens)
     };
-    // Cache read and creation are disjoint parts of this request's input. Bound
-    // both against one shared budget so estimator drift can never make their
-    // sum exceed the request total. AWS-B keeps its observed one/two ordinary
-    // input tokens; any inconsistent cached prefix is reduced before creation.
+    // Cache read and creation are disjoint prefixes of this request's input.
+    // Everything after the final breakpoint stays ordinary input. Bound both
+    // cache buckets against one shared budget so estimator drift can never
+    // make their sum exceed the request total.
     let cache_budget = total_input_tokens.saturating_sub(ordinary_input);
-    let mut cache_read = cache_plan.cache_read_tokens.clamp(0, cache_budget);
+    let cache_read = cache_plan.cache_read_tokens.clamp(0, cache_budget);
     let creation_budget = cache_budget.saturating_sub(cache_read);
-    let (mut creation_5m, mut creation_1h) = clamp_cache_creation(
+    let (creation_5m, creation_1h) = clamp_cache_creation(
         cache_plan.cache_creation_5m_tokens,
         cache_plan.cache_creation_1h_tokens,
         creation_budget,
     );
     let initial_creation = creation_5m.saturating_add(creation_1h);
-    // Prefix and full-request estimators can legitimately differ by a handful
-    // of framing tokens. Keep the observed AWS-B ordinary-input envelope and
-    // assign that residual to the active cache bucket; if no cache bucket is
-    // active, it remains ordinary input. This preserves both profile fidelity
-    // and the public `input + read + creation == total` identity.
+    // Prefix and full-request estimators can legitimately differ by framing
+    // tokens. Those tokens are outside the cached prefix, so they must remain
+    // ordinary input instead of being charged at cache-write rates.
     let residual = total_input_tokens.saturating_sub(
         ordinary_input
             .saturating_add(cache_read)
             .saturating_add(initial_creation),
     );
     if residual > 0 {
-        if creation_1h > 0 {
-            creation_1h = creation_1h.saturating_add(residual);
-        } else if creation_5m > 0 {
-            creation_5m = creation_5m.saturating_add(residual);
-        } else if cache_read > 0 {
-            cache_read = cache_read.saturating_add(residual);
-        } else {
-            ordinary_input = ordinary_input.saturating_add(residual);
-        }
+        ordinary_input = ordinary_input.saturating_add(residual);
     }
     let cache_creation = creation_5m.saturating_add(creation_1h);
 
@@ -490,7 +490,6 @@ struct CachePlan {
     cache_read_tokens: i32,
     cache_creation_5m_tokens: i32,
     cache_creation_1h_tokens: i32,
-    terminal_message_breakpoint: bool,
 }
 
 async fn cache_plan_for_request(
@@ -542,7 +541,6 @@ async fn cache_plan_for_request(
 
     let terminal_breakpoint = breakpoints.last()?;
     let max_cache_tokens = terminal_breakpoint.tokens;
-    let terminal_message_breakpoint = terminal_breakpoint.message_breakpoint;
     let read_tokens = read_match
         .as_ref()
         .map(|candidate| candidate.tokens.min(max_cache_tokens))
@@ -573,7 +571,6 @@ async fn cache_plan_for_request(
         cache_read_tokens: read_tokens,
         cache_creation_5m_tokens: creation_5m,
         cache_creation_1h_tokens: creation_1h,
-        terminal_message_breakpoint,
     })
 }
 
@@ -646,7 +643,6 @@ struct CacheReadMatch {
 struct CacheBreakpointOptions {
     readable: bool,
     warm_on_first_use: bool,
-    message_breakpoint: bool,
 }
 
 struct CacheBreakpoint {
@@ -657,7 +653,6 @@ struct CacheBreakpoint {
     readable: bool,
     read_candidates: Vec<CacheReadCandidate>,
     warm_on_first_use: bool,
-    message_breakpoint: bool,
 }
 
 struct PrefixTokenContext {
@@ -695,7 +690,6 @@ fn build_cache_breakpoints(
                     CacheBreakpointOptions {
                         readable: true,
                         warm_on_first_use,
-                        message_breakpoint: false,
                     },
                 );
             }
@@ -716,7 +710,6 @@ fn build_cache_breakpoints(
                     CacheBreakpointOptions {
                         readable: true,
                         warm_on_first_use,
-                        message_breakpoint: false,
                     },
                 );
             }
@@ -724,7 +717,7 @@ fn build_cache_breakpoints(
     }
 
     for message in &req.messages {
-        collect_message_prefix(req, message, &mut state, &mut breakpoints, aws_b40_compat);
+        collect_message_prefix(message, &mut state, &mut breakpoints, aws_b40_compat);
     }
 
     if req.cache_control.is_some() && breakpoints.is_empty() && state.has_cacheable_content() {
@@ -738,7 +731,6 @@ fn build_cache_breakpoints(
             CacheBreakpointOptions {
                 readable: true,
                 warm_on_first_use,
-                message_breakpoint: false,
             },
         );
     }
@@ -865,7 +857,6 @@ impl PrefixState {
 }
 
 fn collect_message_prefix(
-    req: &MessagesRequest,
     message: &Message,
     state: &mut PrefixState,
     breakpoints: &mut Vec<CacheBreakpoint>,
@@ -895,13 +886,7 @@ fn collect_message_prefix(
                     .push(Value::Array(vec![item_without_cache]));
                 remember_read_candidate(state);
                 if has_direct_cache_control(item) {
-                    let model = req.model.to_ascii_lowercase();
-                    let sonnet_4_6_image = item.get("type").and_then(Value::as_str)
-                        == Some("image")
-                        && model.contains("sonnet")
-                        && (model.contains("4-6") || model.contains("4.6"));
-                    let readable = aws_b40_compat
-                        && (super::compat::is_opus_4_8(&req.model) || sonnet_4_6_image);
+                    let readable = aws_b40_compat;
                     let warm_on_first_use =
                         readable && cache_control_is_global(item.get("cache_control"));
                     push_breakpoint(
@@ -911,7 +896,6 @@ fn collect_message_prefix(
                         CacheBreakpointOptions {
                             readable,
                             warm_on_first_use,
-                            message_breakpoint: true,
                         },
                     );
                 }
@@ -1018,7 +1002,6 @@ fn push_breakpoint(
         readable: options.readable,
         read_candidates,
         warm_on_first_use: options.warm_on_first_use,
-        message_breakpoint: options.message_breakpoint,
     });
 }
 
@@ -1316,7 +1299,6 @@ mod tests {
             CacheBreakpointOptions {
                 readable: true,
                 warm_on_first_use: false,
-                message_breakpoint: true,
             },
         );
         let positions = breakpoints[0]
@@ -1552,6 +1534,53 @@ mod tests {
         };
         let clamped = inflated.clamp_for_model("claude-opus-4-8");
         assert_eq!(clamped, UsageBreakdown::flat(1));
+    }
+
+    #[test]
+    fn clamp_holds_exact_incident_sentinel_even_when_it_fits_the_window() {
+        let cases = [
+            UsageBreakdown::flat(999_999),
+            UsageBreakdown {
+                input_tokens: 1,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 999_999,
+                cache_creation_5m_input_tokens: 999_999,
+                cache_creation_1h_input_tokens: 0,
+            },
+            UsageBreakdown {
+                input_tokens: 1,
+                cache_read_input_tokens: 999_999,
+                cache_creation_input_tokens: 0,
+                cache_creation_5m_input_tokens: 0,
+                cache_creation_1h_input_tokens: 0,
+            },
+            UsageBreakdown {
+                input_tokens: 1,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 999_998,
+                cache_creation_5m_input_tokens: 999_998,
+                cache_creation_1h_input_tokens: 0,
+            },
+        ];
+        let models = [
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-4-6",
+            "claude-sonnet-5",
+            "claude-haiku-4-5",
+        ];
+
+        for model in models {
+            for usage in cases {
+                assert_eq!(
+                    usage.clamp_for_model(model),
+                    UsageBreakdown::flat(1),
+                    "{model} exposed incident sentinel usage: {usage:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2078,7 +2107,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn message_breakpoints_create_but_do_not_report_read_hits() {
+    async fn message_breakpoints_transition_from_creation_to_read() {
         let text = "stateful-message-cache-unique ".repeat(2_000);
         let req = parse_request(serde_json::json!({
             "model": "claude-sonnet-4-6",
@@ -2092,12 +2121,12 @@ mod tests {
             }]
         }));
 
-        let first = compute_request_usage_breakdown(20_000, &req).await;
-        let second = compute_request_usage_breakdown(20_000, &req).await;
+        let first = compute_request_usage_breakdown_with_profile(20_000, &req, true).await;
+        let second = compute_request_usage_breakdown_with_profile(20_000, &req, true).await;
         assert!(first.cache_creation_input_tokens > 0);
-        assert!(second.cache_creation_input_tokens > 0);
         assert_eq!(first.cache_read_input_tokens, 0);
-        assert_eq!(second.cache_read_input_tokens, 0);
+        assert_eq!(second.cache_creation_input_tokens, 0);
+        assert!(second.cache_read_input_tokens > 0);
     }
 
     #[tokio::test]
@@ -2179,7 +2208,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sonnet_4_6_text_message_breakpoint_remains_creation_only() {
+    async fn sonnet_4_6_text_message_breakpoint_transitions_to_read() {
         let request = parse_request(serde_json::json!({
             "model": "claude-sonnet-4-6",
             "messages": [{
@@ -2200,9 +2229,9 @@ mod tests {
         let second = compute_request_usage_breakdown_with_profile(total, &request, true).await;
 
         assert_eq!(first.cache_read_input_tokens, 0);
-        assert_eq!(second.cache_read_input_tokens, 0);
         assert!(first.cache_creation_input_tokens > 0);
-        assert!(second.cache_creation_input_tokens > 0);
+        assert_eq!(second.cache_creation_input_tokens, 0);
+        assert!(second.cache_read_input_tokens > 0);
         assert_eq!(first.total(), total);
         assert_eq!(second.total(), total);
     }
@@ -2256,7 +2285,11 @@ mod tests {
             .saturating_add(first_usage.cache_creation_input_tokens);
         assert!(first_usage.cache_read_input_tokens > 0);
         assert!(first_usage.cache_creation_input_tokens > 0);
-        assert_eq!(first_usage.input_tokens, 2);
+        assert_eq!(
+            first_usage.input_tokens,
+            first_total.saturating_sub(first_cached)
+        );
+        assert!(first_usage.input_tokens > 0);
 
         let second = parse_request(serde_json::json!({
             "model": "claude-opus-4-8",
@@ -2294,13 +2327,16 @@ mod tests {
         let second_usage =
             compute_request_usage_breakdown_with_profile(second_total, &second, true).await;
 
-        assert_eq!(
-            second_usage.cache_read_input_tokens,
-            first_cached.min(second_total.saturating_sub(2)),
-            "a previous cache prefix remains readable but cannot exceed the current request total"
-        );
+        assert!(second_usage.cache_read_input_tokens <= first_cached);
+        assert!(second_usage.cache_read_input_tokens > 0);
         assert!(second_usage.cache_read_input_tokens <= second_total);
-        assert_eq!(second_usage.input_tokens, 2);
+        assert_eq!(
+            second_usage.input_tokens,
+            second_total
+                .saturating_sub(second_usage.cache_read_input_tokens)
+                .saturating_sub(second_usage.cache_creation_input_tokens)
+        );
+        assert!(second_usage.input_tokens > 0);
         assert_eq!(second_usage.total(), second_total);
     }
 

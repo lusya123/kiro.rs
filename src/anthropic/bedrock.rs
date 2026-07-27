@@ -1070,6 +1070,23 @@ pub fn calibrated_cache_prefix_tokens(
     content_segments: &[Value],
     tools: &[Tool],
 ) -> i32 {
+    let has_image = content_segments.iter().any(contains_image_block);
+    let has_text = !system_segments.is_empty()
+        || content_segments.iter().any(|content| {
+            let mut segments = Vec::new();
+            collect_text_segments(content, &mut segments);
+            segments.iter().any(|text| !text.is_empty())
+        });
+    // Live POMO/Bedrock captures use a one-time cache-prefix envelope around
+    // image content: +4 for an image-only prefix, +2 once textual content is
+    // also present. This is separate from each image block's normal +3/+21/+13
+    // placement framing.
+    let image_prefix_framing = if has_image {
+        if has_text { 2 } else { 4 }
+    } else {
+        0
+    };
+
     if !tools.is_empty() {
         if super::compat::is_opus_4_8(model) {
             let tool_framing = super::compat::OPUS_TOOL_TOTAL_OVERHEAD_TOKENS
@@ -1084,9 +1101,10 @@ pub fn calibrated_cache_prefix_tokens(
                     tools.len(),
                 ))
                 .saturating_add(cache_tool_history_tokens(content_segments))
+                .saturating_add(image_prefix_framing)
                 .max(1);
         }
-        return base_tokens.max(1);
+        return base_tokens.saturating_add(image_prefix_framing).max(1);
     }
 
     let mut segments = system_segments
@@ -1101,7 +1119,7 @@ pub fn calibrated_cache_prefix_tokens(
         .map(|text| text.chars().count())
         .sum::<usize>();
     if char_count <= 1024 {
-        return base_tokens.max(1);
+        return base_tokens.saturating_add(image_prefix_framing).max(1);
     }
     let colon_count = segments
         .iter()
@@ -1109,7 +1127,19 @@ pub fn calibrated_cache_prefix_tokens(
         .sum::<usize>();
     base_tokens
         .saturating_add((long_text_correction(char_count, colon_count) - 3).max(0))
+        .saturating_add(image_prefix_framing)
         .max(1)
+}
+
+fn contains_image_block(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(contains_image_block),
+        Value::Object(map) => {
+            value.get("type").and_then(Value::as_str) == Some("image")
+                || map.values().any(contains_image_block)
+        }
+        _ => false,
+    }
 }
 
 fn long_tool_cache_text_correction(
@@ -2152,10 +2182,57 @@ mod tests {
             "content": [image.clone(), image]
         }])));
 
-        assert_eq!(top_one - baseline, 299 + 4);
-        assert_eq!(top_two - baseline, 2 * (299 + 4));
+        assert_eq!(top_one - baseline, 299 + 3);
+        assert_eq!(top_two - baseline, 2 * (299 + 3));
         assert_eq!(nested_one - baseline, 299 + 21);
-        assert_eq!(nested_two - baseline, 2 * (299 + 21));
+        assert_eq!(nested_two - baseline, 2 * 299 + 21 + 13);
+    }
+
+    #[test]
+    fn image_cache_prefix_uses_reference_envelope_framing() {
+        let data = fake_png_base64(640, 360);
+        let image = json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": data}
+        });
+        let image_only = vec![json!([image.clone()])];
+        let image_only_base = super::super::compat::estimate_prefix_tokens(
+            "claude-sonnet-4-6",
+            &[],
+            &image_only,
+            &[],
+        );
+        assert_eq!(
+            calibrated_cache_prefix_tokens(
+                "claude-sonnet-4-6",
+                image_only_base,
+                &[],
+                &image_only,
+                &[],
+            ),
+            image_only_base + 4
+        );
+
+        let image_and_text = vec![
+            json!([image]),
+            json!([{"type": "text", "text": "cached suffix"}]),
+        ];
+        let image_and_text_base = super::super::compat::estimate_prefix_tokens(
+            "claude-sonnet-4-6",
+            &[],
+            &image_and_text,
+            &[],
+        );
+        assert_eq!(
+            calibrated_cache_prefix_tokens(
+                "claude-sonnet-4-6",
+                image_and_text_base,
+                &[],
+                &image_and_text,
+                &[],
+            ),
+            image_and_text_base + 2
+        );
     }
 
     #[test]

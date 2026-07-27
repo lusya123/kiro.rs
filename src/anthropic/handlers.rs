@@ -381,9 +381,10 @@ fn estimate_context_tokens(
     }
     if !context.tool_results.is_empty() {
         let mut tool_results = context.tool_results.clone();
-        let mut promoted_image_count = 0usize;
+        let mut promoted_image_framing = 0i32;
         let mut remaining_promoted_markers = image_count;
         for result in &mut tool_results {
+            let mut result_promoted_image_count = 0usize;
             for content in &mut result.content {
                 let Some(text) = content.get("text").and_then(serde_json::Value::as_str) else {
                     continue;
@@ -393,7 +394,14 @@ fn estimate_context_tokens(
                     if line == super::converter::TOOL_RESULT_IMAGE_MARKER
                         && remaining_promoted_markers > 0
                     {
-                        promoted_image_count = promoted_image_count.saturating_add(1);
+                        let nested_framing = super::compat::tool_result_image_framing_tokens(
+                            result_promoted_image_count,
+                        );
+                        let placement_delta = nested_framing
+                            .saturating_sub(super::compat::TOP_LEVEL_IMAGE_FRAMING_TOKENS);
+                        promoted_image_framing =
+                            promoted_image_framing.saturating_add(placement_delta);
+                        result_promoted_image_count = result_promoted_image_count.saturating_add(1);
                         remaining_promoted_markers -= 1;
                     } else {
                         visible_lines.push(line);
@@ -405,13 +413,12 @@ fn estimate_context_tokens(
         }
         total +=
             token::count_tokens(&serde_json::to_string(&tool_results).unwrap_or_default()) as i32;
-        // Promoted Kiro images are charged as visual+4 below. Anthropic
-        // tool-result placement is visual+21, so replace the internal marker's
-        // textual estimate with the exact +17 placement delta. Cap the count
-        // by actual images in this user turn so unmatched user-provided
-        // lookalike text remains billable ordinary text.
-        let promoted_image_framing =
-            (promoted_image_count.min(i32::MAX as usize) as i32).saturating_mul(17);
+        // Promoted Kiro images are charged as visual+3 below. POMO/Bedrock
+        // charges the first image in each tool result as visual+21 and later
+        // images in that same result as visual+13. Replace each internal
+        // marker with the matching +18/+10 placement delta. The global marker
+        // budget is capped by actual images in this user turn so unmatched
+        // user-provided lookalike text remains billable ordinary text.
         total = total.saturating_add(promoted_image_framing);
     }
     total
@@ -4464,8 +4471,8 @@ mod tests {
         let estimated = super::super::cache::UsageBreakdown {
             input_tokens: 1,
             cache_read_input_tokens: 0,
-            cache_creation_input_tokens: 1_199_999,
-            cache_creation_5m_input_tokens: 1_199_999,
+            cache_creation_input_tokens: 999_999,
+            cache_creation_5m_input_tokens: 999_999,
             cache_creation_1h_input_tokens: 0,
         };
         for stream in [false, true] {
@@ -7044,8 +7051,8 @@ mod tests {
 
         assert_eq!(
             with_images - without_images,
-            image_tokens * 2 + 17,
-            "the history tool-result image keeps its +17 nested placement while each Kiro image is billed once"
+            image_tokens * 2 + 18,
+            "the history tool-result image keeps its +18 nested placement while each Kiro image is billed once"
         );
     }
 
@@ -7099,8 +7106,8 @@ mod tests {
         let without_images = estimate_kiro_request_input_tokens(&request(false).to_string(), 1);
         assert_eq!(
             with_images - without_images,
-            2 * (361 + 21),
-            "promoted tool-result images must retain Anthropic's visual+21 placement in continuation rounds"
+            2 * 361 + 21 + 13,
+            "promoted tool-result images must retain the reference's first+21/later+13 placement"
         );
     }
 
@@ -7139,7 +7146,7 @@ mod tests {
             serde_json::to_string(&one_marker_context.tool_results).expect("expected wire");
         assert_eq!(
             estimate_context_tokens(&context, 1),
-            token::count_tokens(&expected_wire) as i32 + 17,
+            token::count_tokens(&expected_wire) as i32 + 18,
             "only one marker may be replaced by framing when one image exists"
         );
     }

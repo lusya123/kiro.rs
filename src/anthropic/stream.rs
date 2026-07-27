@@ -3435,6 +3435,42 @@ mod tests {
     }
 
     #[test]
+    fn aws_b_exact_incident_sentinel_is_held_with_authoritative_context() {
+        let payload =
+            serde_json::from_value::<super::super::types::MessagesRequest>(serde_json::json!({
+                "model": "claude-opus-4-8",
+                "messages": [{"role": "user", "content": "incident sentinel regression"}]
+            }))
+            .expect("request");
+        let initial = super::super::cache::UsageBreakdown {
+            input_tokens: 1,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 999_999,
+            cache_creation_5m_input_tokens: 999_999,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-8",
+            initial.total(),
+            false,
+            initial,
+            HashMap::new(),
+        );
+        ctx.enable_aws_b40_compat(false);
+        ctx.set_input_context_calibration(
+            super::super::bedrock::InputContextCalibration::for_request(&payload),
+        );
+        // Kiro's fixed private prelude is removed during calibration, leaving
+        // exactly 1,000,000 public input tokens and the old 999,999 cache field.
+        ctx.context_input_tokens = Some(1_006_850);
+
+        assert_eq!(
+            ctx.final_usage_breakdown(),
+            super::super::cache::UsageBreakdown::flat(1)
+        );
+    }
+
+    #[test]
     fn context_usage_after_output_limit_still_authorizes_cached_billing() {
         let payload =
             serde_json::from_value::<super::super::types::MessagesRequest>(serde_json::json!({

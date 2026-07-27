@@ -1770,8 +1770,9 @@ fn add_message_content_features(
 }
 
 const IMAGE_PATCH_EDGE: u32 = 28;
-const TOP_LEVEL_IMAGE_FRAMING_TOKENS: i32 = 4;
-const TOOL_RESULT_IMAGE_FRAMING_TOKENS: i32 = 21;
+pub(crate) const TOP_LEVEL_IMAGE_FRAMING_TOKENS: i32 = 3;
+const FIRST_TOOL_RESULT_IMAGE_FRAMING_TOKENS: i32 = 21;
+const ADDITIONAL_TOOL_RESULT_IMAGE_FRAMING_TOKENS: i32 = 13;
 const STANDARD_VISION_MAX_EDGE: u32 = 1_568;
 const STANDARD_VISION_MAX_TOKENS: i32 = 1_568;
 const HIGH_RESOLUTION_VISION_MAX_EDGE: u32 = 2_576;
@@ -1796,13 +1797,18 @@ fn message_content_image_tokens(model: &str, value: &serde_json::Value) -> i32 {
                 let Some(content) = item.get("content").and_then(|value| value.as_array()) else {
                     continue;
                 };
+                let mut valid_image_index = 0usize;
                 for nested in content {
                     if nested.get("type").and_then(|value| value.as_str()) == Some("image") {
-                        tokens = tokens.saturating_add(estimate_image_block_tokens(
+                        let image_tokens = estimate_image_block_tokens(
                             model,
                             nested,
-                            TOOL_RESULT_IMAGE_FRAMING_TOKENS,
-                        ));
+                            tool_result_image_framing_tokens(valid_image_index),
+                        );
+                        if image_tokens > 0 {
+                            tokens = tokens.saturating_add(image_tokens);
+                            valid_image_index = valid_image_index.saturating_add(1);
+                        }
                     }
                 }
             }
@@ -1819,6 +1825,14 @@ pub(super) fn estimate_request_image_tokens(payload: &MessagesRequest) -> i32 {
             &message.content,
         ))
     })
+}
+
+pub(crate) fn tool_result_image_framing_tokens(image_index: usize) -> i32 {
+    if image_index == 0 {
+        FIRST_TOOL_RESULT_IMAGE_FRAMING_TOKENS
+    } else {
+        ADDITIONAL_TOOL_RESULT_IMAGE_FRAMING_TOKENS
+    }
 }
 
 fn estimate_image_block_tokens(model: &str, block: &serde_json::Value, framing_tokens: i32) -> i32 {
@@ -1845,7 +1859,7 @@ fn estimate_image_block_tokens(model: &str, block: &serde_json::Value, framing_t
 
 /// Estimate one Kiro `images[]` entry after it has been promoted from the
 /// Anthropic request. Kiro image entries are user-message images, so this
-/// includes the top-level Bedrock framing: `visual patches + 4`.
+/// includes the top-level Bedrock framing: `visual patches + 3`.
 pub(crate) fn estimate_base64_image_tokens(model: &str, data: &str) -> i32 {
     let visual_tokens = estimate_base64_image_visual_tokens(model, data);
     if visual_tokens == 0 {
@@ -2278,16 +2292,16 @@ mod tests {
         assert_ne!(compact.len(), padded.len());
         assert_eq!(
             estimate_base64_image_tokens("claude-opus-4-8", &compact),
-            303
+            302
         );
         assert_eq!(
             estimate_base64_image_tokens("claude-opus-4-8", &padded),
-            303
+            302
         );
     }
 
     #[test]
-    fn top_level_and_tool_result_image_framing_is_exact_and_linear() {
+    fn top_level_and_tool_result_image_framing_matches_reference_groups() {
         let data = fake_png_base64(640, 360, 0);
         let image = json!({
             "type": "image",
@@ -2312,18 +2326,37 @@ mod tests {
                 "content": [image.clone(), image]
             }]),
         );
+        let nested_separate = image_request(
+            "claude-opus-4-8",
+            json!([
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_image_1",
+                    "content": [image.clone()]
+                },
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_image_2",
+                    "content": [image]
+                }
+            ]),
+        );
         let baseline = estimate_input_tokens(&empty);
 
-        assert_eq!(estimate_input_tokens(&top_one) - baseline, 299 + 4);
-        assert_eq!(estimate_input_tokens(&top_two) - baseline, 2 * (299 + 4));
+        assert_eq!(estimate_input_tokens(&top_one) - baseline, 299 + 3);
+        assert_eq!(estimate_input_tokens(&top_two) - baseline, 2 * (299 + 3));
         assert_eq!(estimate_input_tokens(&nested_one) - baseline, 299 + 21);
         assert_eq!(
             estimate_input_tokens(&nested_two) - baseline,
+            2 * 299 + 21 + 13
+        );
+        assert_eq!(
+            estimate_input_tokens(&nested_separate) - baseline,
             2 * (299 + 21)
         );
         assert_eq!(
             estimate_request_image_tokens(&nested_one) - estimate_request_image_tokens(&top_one),
-            17
+            18
         );
     }
 

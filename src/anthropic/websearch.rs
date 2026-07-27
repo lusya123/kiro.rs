@@ -1365,56 +1365,58 @@ mod tests {
         assert!(incident_input_tokens > 1_000_000);
 
         let model = "claude-opus-4-8";
-        let events = generate_websearch_events(
-            model,
-            "cache billing incident",
-            "srvtoolu_01IncidentGuardTest",
-            None,
-            incident_input_tokens,
-            1_024,
-            true,
-            321,
-        );
+        for guarded_input_tokens in [999_999, incident_input_tokens] {
+            let events = generate_websearch_events(
+                model,
+                "cache billing incident",
+                "srvtoolu_01IncidentGuardTest",
+                None,
+                guarded_input_tokens,
+                1_024,
+                true,
+                321,
+            );
 
-        let start_usage = &events
-            .iter()
-            .find(|event| event.event == "message_start")
-            .expect("message_start")
-            .data["message"]["usage"];
-        assert_eq!(start_usage["input_tokens"], 1);
-        assert_eq!(start_usage["cache_read_input_tokens"], 0);
-        assert_eq!(start_usage["cache_creation_input_tokens"], 0);
+            let start_usage = &events
+                .iter()
+                .find(|event| event.event == "message_start")
+                .expect("message_start")
+                .data["message"]["usage"];
+            assert_eq!(start_usage["input_tokens"], 1);
+            assert_eq!(start_usage["cache_read_input_tokens"], 0);
+            assert_eq!(start_usage["cache_creation_input_tokens"], 0);
 
-        let delta_usage = &events
-            .iter()
-            .find(|event| event.event == "message_delta")
-            .expect("message_delta")
-            .data["usage"];
-        assert_eq!(delta_usage["input_tokens"], 1);
-        assert_eq!(delta_usage["cache_read_input_tokens"], 0);
-        assert_eq!(delta_usage["cache_creation_input_tokens"], 0);
+            let delta_usage = &events
+                .iter()
+                .find(|event| event.event == "message_delta")
+                .expect("message_delta")
+                .data["usage"];
+            assert_eq!(delta_usage["input_tokens"], 1);
+            assert_eq!(delta_usage["cache_read_input_tokens"], 0);
+            assert_eq!(delta_usage["cache_creation_input_tokens"], 0);
 
-        let metrics = &events
-            .iter()
-            .find(|event| event.event == "message_stop")
-            .expect("message_stop")
-            .data["amazon-bedrock-invocationMetrics"];
-        assert_eq!(metrics["inputTokenCount"], 1);
-        assert_eq!(metrics["cacheReadInputTokenCount"], 0);
-        assert_eq!(metrics["cacheWriteInputTokenCount"], 0);
+            let metrics = &events
+                .iter()
+                .find(|event| event.event == "message_stop")
+                .expect("message_stop")
+                .data["amazon-bedrock-invocationMetrics"];
+            assert_eq!(metrics["inputTokenCount"], 1);
+            assert_eq!(metrics["cacheReadInputTokenCount"], 0);
+            assert_eq!(metrics["cacheWriteInputTokenCount"], 0);
 
-        let response = build_websearch_json(
-            model,
-            "cache billing incident",
-            "srvtoolu_01IncidentGuardTest",
-            &None,
-            incident_input_tokens,
-            1_024,
-            true,
-        );
-        assert_eq!(response["usage"]["input_tokens"], 1);
-        assert_eq!(response["usage"]["cache_read_input_tokens"], 0);
-        assert_eq!(response["usage"]["cache_creation_input_tokens"], 0);
+            let response = build_websearch_json(
+                model,
+                "cache billing incident",
+                "srvtoolu_01IncidentGuardTest",
+                &None,
+                guarded_input_tokens,
+                1_024,
+                true,
+            );
+            assert_eq!(response["usage"]["input_tokens"], 1);
+            assert_eq!(response["usage"]["cache_read_input_tokens"], 0);
+            assert_eq!(response["usage"]["cache_creation_input_tokens"], 0);
+        }
     }
 
     #[test]

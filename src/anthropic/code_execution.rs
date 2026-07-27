@@ -928,8 +928,8 @@ mod tests {
         let estimated = super::super::cache::UsageBreakdown {
             input_tokens: 1,
             cache_read_input_tokens: 0,
-            cache_creation_input_tokens: 1_199_999,
-            cache_creation_5m_input_tokens: 1_199_999,
+            cache_creation_input_tokens: 999_999,
+            cache_creation_5m_input_tokens: 999_999,
             cache_creation_1h_input_tokens: 0,
         };
 
