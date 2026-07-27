@@ -1728,6 +1728,797 @@ fn extract_system_persona(system_text: &str) -> Option<(String, Option<String>)>
     chosen.or(fallback)
 }
 
+fn contains_reserved_private_identity(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        "kiro",
+        "claude",
+        "anthropic",
+        "codewhisperer",
+        "amazon",
+        "bedrock",
+    ]
+    .iter()
+    .any(|reserved| lower.contains(reserved))
+        || lower
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .any(|token| token == "aws")
+        || [
+            "kiro",
+            "claude",
+            "anthropic",
+            "codewhisperer",
+            "amazon",
+            "bedrock",
+            "aws",
+        ]
+        .iter()
+        .any(|brand| super::identity::contains_decorated_ascii_brand_substring(value, brand))
+}
+
+fn parse_exact_identity_reply(rest: &str) -> Option<String> {
+    let rest = rest
+        .trim_start()
+        .trim_start_matches([':', '=', '-', '—'])
+        .trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+
+    let answer = if let Some(quote) = rest
+        .chars()
+        .next()
+        .filter(|ch| matches!(ch, '\'' | '"' | '`' | '“' | '‘'))
+    {
+        let closing = match quote {
+            '“' => '”',
+            '‘' => '’',
+            other => other,
+        };
+        let value = &rest[quote.len_utf8()..];
+        let mut escaped = false;
+        let mut closing_index = None;
+        for (index, ch) in value.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch != closing {
+                continue;
+            }
+            // A straight single quote inside an English contraction (I'm,
+            // we're, etc.) is not the closing quote around the exact reply.
+            if closing == '\''
+                && value[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_alphanumeric)
+                && value[index + ch.len_utf8()..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_alphanumeric)
+            {
+                continue;
+            }
+            closing_index = Some(index);
+            break;
+        }
+        value[..closing_index?].trim()
+    } else {
+        let mut end = rest.len();
+        for (index, ch) in rest.char_indices() {
+            if matches!(ch, '\n' | ';') {
+                end = index;
+                break;
+            }
+            if matches!(ch, '.' | '!' | '?') {
+                let after = index + ch.len_utf8();
+                if rest[after..].chars().next().is_none_or(char::is_whitespace) {
+                    end = after;
+                    break;
+                }
+            }
+        }
+        rest[..end].trim()
+    };
+
+    (!answer.is_empty() && answer.len() <= 200).then(|| answer.to_string())
+}
+
+fn extract_system_identity_lock_reply(system_text: &str) -> Option<String> {
+    let lower = system_text.to_ascii_lowercase();
+    let mut selected: Option<(usize, String)> = None;
+    for marker in [
+        "respond with exactly",
+        "reply with exactly",
+        "answer with exactly",
+        "respond exactly",
+        "reply exactly",
+        "answer exactly",
+        "say exactly",
+        "output exactly",
+        "return exactly",
+    ] {
+        let mut search_from = 0usize;
+        while let Some(relative) = lower[search_from..].find(marker) {
+            let position = search_from + relative;
+            let clause_start = lower[..position]
+                .char_indices()
+                .rev()
+                .find(|(_, ch)| matches!(ch, '\n' | '.' | '!' | '?' | ';'))
+                .map_or(0, |(index, ch)| index + ch.len_utf8());
+            let clause = lower[clause_start..position].trim();
+            let conditional = [
+                "when asked",
+                "if asked",
+                "when the user asks",
+                "if the user asks",
+                "when someone asks",
+                "if someone asks",
+                "identity question",
+            ]
+            .iter()
+            .any(|scope| clause.contains(scope));
+            let identity_scope = [
+                "identity",
+                "your name",
+                "who you are",
+                "which model",
+                "what model",
+            ]
+            .iter()
+            .any(|scope| clause.contains(scope));
+            let negated = [
+                "do not",
+                "don't",
+                "never",
+                "must not",
+                "should not",
+                "cannot",
+                "can't",
+            ]
+            .iter()
+            .any(|negative| clause.contains(negative));
+            let marker_is_instruction = super::handlers::identity_instruction_text(
+                &system_text[clause_start..position + marker.len()],
+            )
+            .to_ascii_lowercase()
+            .contains(marker);
+            if conditional
+                && identity_scope
+                && !negated
+                && marker_is_instruction
+                && let Some(reply) =
+                    parse_exact_identity_reply(&system_text[position + marker.len()..])
+                && selected
+                    .as_ref()
+                    .is_none_or(|(selected_position, _)| position > *selected_position)
+            {
+                selected = Some((position, reply));
+            }
+            search_from = position + marker.len();
+        }
+    }
+    selected.map(|(_, reply)| reply)
+}
+
+/// Return whether the caller supplied an effective, non-private application
+/// persona in a system/developer instruction.
+///
+/// Application personas such as `CodeAssist v2` are normal API behavior and
+/// must remain overridable. Private transport/runtime identities are never
+/// trusted as public personas. `extract_system_persona` deliberately selects
+/// the effective non-Claude persona, so a detector-style Claude/Kiro decoy
+/// followed by a legitimate application persona still resolves to the latter.
+pub(super) fn trusted_application_persona_reply(payload: &MessagesRequest) -> Option<String> {
+    if !super::converter::is_gpt_model(&payload.model) {
+        return None;
+    }
+    let Some(system) = &payload.system else {
+        return None;
+    };
+    let joined = system
+        .iter()
+        .map(|item| item.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let Some((name, maker)) = extract_system_persona(&joined) else {
+        return None;
+    };
+    let Some(exact_reply) = extract_system_identity_lock_reply(&joined) else {
+        return None;
+    };
+
+    let trusted = !contains_reserved_private_identity(&name)
+        && maker
+            .as_deref()
+            .is_none_or(|value| !contains_reserved_private_identity(value))
+        && !contains_reserved_private_identity(&exact_reply)
+        && exact_reply
+            .to_ascii_lowercase()
+            .contains(&name.to_ascii_lowercase());
+    trusted.then_some(exact_reply)
+}
+
+pub(super) fn has_trusted_application_persona(payload: &MessagesRequest) -> bool {
+    trusted_application_persona_reply(payload).is_some()
+}
+
+fn text_only_message_content(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(_) => true,
+        serde_json::Value::Array(items) => {
+            !items.is_empty()
+                && items.iter().all(|item| {
+                    item.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                        && item
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some()
+                })
+        }
+        _ => false,
+    }
+}
+
+fn request_requires_tool_choice(payload: &MessagesRequest) -> bool {
+    payload
+        .tool_choice
+        .as_ref()
+        .and_then(|choice| choice.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|choice| matches!(choice, "any" | "tool"))
+}
+
+fn normalized_ascii_words(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+        } else {
+            normalized.push(' ');
+        }
+    }
+    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn compact_lower_alphanumeric(text: &str) -> String {
+    text.chars()
+        .flat_map(char::to_lowercase)
+        .filter(|ch| ch.is_alphanumeric())
+        .collect()
+}
+
+fn strip_chinese_identity_clause_wrappers(mut value: String) -> String {
+    loop {
+        let mut changed = false;
+        for prefix in [
+            "麻烦你告诉我",
+            "麻烦告诉我",
+            "请告诉我",
+            "请说明一下",
+            "分别说明",
+            "分别回答",
+            "告诉我",
+            "说明一下",
+            "请回答",
+            "请说明",
+            "请问",
+            "请你",
+            "麻烦你",
+            "麻烦",
+            "说明",
+            "回答",
+            "说一下",
+            "请",
+        ] {
+            if let Some(rest) = value.strip_prefix(prefix) {
+                value = rest.to_string();
+                changed = true;
+                break;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    loop {
+        let mut changed = false;
+        for suffix in [
+            "请如实回答",
+            "请直接回答",
+            "如实回答",
+            "直接回答",
+            "回答一下",
+            "可以吗",
+            "好吗",
+            "吗",
+            "呢",
+        ] {
+            if let Some(rest) = value.strip_suffix(suffix) {
+                value = rest.to_string();
+                changed = true;
+                break;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    value
+}
+
+/// Classify one clause in a Chinese identity-only question.
+///
+/// `Some(true)` means the clause explicitly refers to the assistant. `Some(false)`
+/// is an identity-only continuation such as "是什么模型", which is accepted only
+/// when another clause in the same question supplies the self-reference.
+fn chinese_identity_clause_kind(text: &str) -> Option<bool> {
+    let clause =
+        strip_chinese_identity_clause_wrappers(compact_lower_alphanumeric(text).to_string());
+    if [
+        "你是谁",
+        "你到底是谁",
+        "你真正是谁",
+        "你叫什么",
+        "你叫什么名字",
+        "你的名字是什么",
+        "你的身份是什么",
+        "你的真实身份是什么",
+        "介绍一下你自己",
+        "介绍你自己",
+        "简单介绍一下你自己",
+        "自我介绍",
+        "你是什么模型",
+        "你是哪个模型",
+        "你属于什么模型",
+        "你用的是什么模型",
+        "你使用的是什么模型",
+        "你的模型是什么",
+        "你是什么ai模型",
+        "你是哪个ai模型",
+        "你用的是什么ai模型",
+        "你使用的是什么ai模型",
+        "你的ai模型是什么",
+        "你是什么llm",
+        "你是哪个llm",
+        "你用的是什么llm",
+        "你使用的是什么llm",
+        "你的llm是什么",
+        "谁开发了你",
+        "谁创建了你",
+        "谁提供了你",
+        "你是由谁开发的",
+        "你是由谁创建的",
+        "你是由谁提供的",
+        "你的开发者是谁",
+        "你的创建者是谁",
+        "你的提供方是谁",
+    ]
+    .contains(&clause.as_str())
+    {
+        return Some(true);
+    }
+
+    [
+        "叫什么",
+        "叫什么名字",
+        "名字是什么",
+        "身份是什么",
+        "是什么模型",
+        "是哪个模型",
+        "属于什么模型",
+        "用的是什么模型",
+        "使用的是什么模型",
+        "模型是什么",
+        "是什么ai模型",
+        "是哪个ai模型",
+        "用的是什么ai模型",
+        "使用的是什么ai模型",
+        "ai模型是什么",
+        "是什么llm",
+        "是哪个llm",
+        "用的是什么llm",
+        "使用的是什么llm",
+        "llm是什么",
+        "由谁开发",
+        "由谁开发的",
+        "由谁创建",
+        "由谁创建的",
+        "由谁提供",
+        "由谁提供的",
+        "谁开发的",
+        "谁创建的",
+        "谁提供的",
+        "开发者是谁",
+        "创建者是谁",
+        "提供方是谁",
+    ]
+    .contains(&clause.as_str())
+    .then_some(false)
+}
+
+fn is_composed_chinese_identity_question(text: &str) -> bool {
+    let mut separated = text.to_lowercase();
+    for connector in ["并且", "以及", "同时", "然后"] {
+        separated = separated.replace(connector, "，");
+    }
+    // "你是谁和你是什么模型" has two explicit self-identity clauses. Keep
+    // ordinary uses of "和" intact so product comparisons cannot become clauses.
+    separated = separated.replace("和你", "，你");
+
+    let clauses = separated
+        .split(|ch| {
+            matches!(
+                ch,
+                '，' | ',' | '。' | '！' | '!' | '？' | '?' | '；' | ';' | '、' | '并'
+            )
+        })
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+        .collect::<Vec<_>>();
+    if clauses.len() < 2 {
+        return false;
+    }
+
+    let mut has_explicit_self_reference = false;
+    for clause in clauses {
+        match chinese_identity_clause_kind(clause) {
+            Some(explicit) => has_explicit_self_reference |= explicit,
+            None => return false,
+        }
+    }
+    has_explicit_self_reference
+}
+
+fn request_has_non_text_message_content(payload: &MessagesRequest) -> bool {
+    payload
+        .messages
+        .iter()
+        .any(|message| !text_only_message_content(&message.content))
+}
+
+fn strip_identity_question_wrappers(mut value: String) -> String {
+    loop {
+        let mut changed = false;
+        for prefix in [
+            "can you please tell me ",
+            "could you please tell me ",
+            "would you please tell me ",
+            "will you please tell me ",
+            "can you tell me ",
+            "could you tell me ",
+            "would you tell me ",
+            "please tell me ",
+            "tell me ",
+            "please answer honestly ",
+            "please answer truthfully ",
+            "answer honestly ",
+            "answer truthfully ",
+            "please answer ",
+            "answer ",
+            "please ",
+            "honestly ",
+            "truthfully ",
+            "hi ",
+            "hello ",
+        ] {
+            if value.starts_with(prefix) {
+                value = value[prefix.len()..].trim_start().to_string();
+                changed = true;
+                break;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    loop {
+        let mut changed = false;
+        for suffix in [
+            " please answer honestly",
+            " please answer truthfully",
+            " answer honestly",
+            " answer truthfully",
+            " please answer directly",
+            " answer directly",
+            " please",
+            " honestly",
+            " truthfully",
+            " directly",
+            " briefly",
+            " exactly",
+        ] {
+            if value.ends_with(suffix) {
+                value.truncate(value.len() - suffix.len());
+                value = value.trim_end().to_string();
+                changed = true;
+                break;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    value
+}
+
+/// A deliberately conservative classifier for the one case where the proxy
+/// replaces the visible answer with an application-supplied exact identity
+/// reply. This must be a single, direct self-identity question: ordinary
+/// recommendations, code/quoted fixtures, multimodal requests, tool turns,
+/// and mixed identity-plus-work requests must continue to the real model
+/// without output replacement.
+fn is_standalone_application_identity_question(text: &str) -> bool {
+    let instruction_text = super::handlers::identity_instruction_text(text);
+    let trimmed = instruction_text.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 300 {
+        return false;
+    }
+
+    let normalized = strip_identity_question_wrappers(normalized_ascii_words(trimmed));
+    let has_non_ascii_words = trimmed
+        .chars()
+        .any(|ch| !ch.is_ascii() && ch.is_alphanumeric());
+    let english_identity_question = !has_non_ascii_words
+        && [
+            "who are you",
+            "who exactly are you",
+            "who really are you",
+            "who actually are you",
+            "what are you",
+            "what exactly are you",
+            "what actually are you",
+            "what is your name",
+            "what is your full name",
+            "what is your real name",
+            "what is your actual name",
+            "what s your name",
+            "what s your full name",
+            "what s your real name",
+            "what s your actual name",
+            "your name",
+            "identify yourself",
+            "state your name",
+            "state your identity",
+            "introduce yourself",
+            "which assistant are you",
+            "what assistant are you",
+            "which model are you",
+            "which exact model are you",
+            "which exact model variant are you",
+            "what model are you",
+            "what exact model are you",
+            "what exact model variant are you",
+            "which model do you use",
+            "what model do you use",
+            "which model powers you",
+            "what model powers you",
+            "what is your model",
+            "what is your exact model",
+            "what is your model variant",
+            "which model are you actually using",
+            "what model are you actually using",
+            "which product are you",
+            "what product are you",
+            "who made you",
+            "who created you",
+            "who developed you",
+            "who built you",
+            "what platform are you running on",
+            "what runtime are you running on",
+        ]
+        .iter()
+        .any(|question| normalized == *question);
+    if english_identity_question {
+        return true;
+    }
+
+    // Accept composed, identity-only questions without enumerating every
+    // natural-language ordering. For example, callers may ask "which model or
+    // product you are" or combine "introduce yourself" with "state which model
+    // you are". Keep this grammar deliberately closed: any substantive word
+    // outside the identity vocabulary makes the request a mixed task and must
+    // continue to the real model without replacing its full answer.
+    if !has_non_ascii_words {
+        let words = normalized.split_whitespace().collect::<Vec<_>>();
+        let allowed_identity_words = [
+            "a",
+            "actual",
+            "actually",
+            "also",
+            "am",
+            "an",
+            "and",
+            "are",
+            "ai",
+            "assistant",
+            "briefly",
+            "built",
+            "by",
+            "company",
+            "created",
+            "creator",
+            "developer",
+            "developed",
+            "directly",
+            "do",
+            "exact",
+            "exactly",
+            "full",
+            "hello",
+            "hi",
+            "honestly",
+            "identify",
+            "identity",
+            "introduce",
+            "is",
+            "llm",
+            "made",
+            "maker",
+            "me",
+            "model",
+            "name",
+            "of",
+            "on",
+            "or",
+            "own",
+            "platform",
+            "please",
+            "powered",
+            "powers",
+            "product",
+            "provider",
+            "real",
+            "really",
+            "running",
+            "s",
+            "state",
+            "tell",
+            "the",
+            "truthfully",
+            "use",
+            "using",
+            "variant",
+            "what",
+            "which",
+            "who",
+            "your",
+            "you",
+            "yourself",
+            "runtime",
+        ];
+        let identity_nouns = [
+            "ai",
+            "assistant",
+            "company",
+            "creator",
+            "developer",
+            "identity",
+            "llm",
+            "maker",
+            "model",
+            "name",
+            "platform",
+            "product",
+            "provider",
+            "runtime",
+            "variant",
+        ];
+        let has_self_reference = words
+            .iter()
+            .any(|word| matches!(*word, "you" | "your" | "yourself"));
+        let has_identity_noun = words.iter().any(|word| identity_nouns.contains(word));
+        let has_identity_relation = [
+            "who are you",
+            "what are you",
+            "you are",
+            "are you",
+            "your name",
+            "your identity",
+            "your model",
+            "introduce yourself",
+            "identify yourself",
+            "do you use",
+            "are you using",
+            "powers you",
+            "who made you",
+            "who created you",
+            "who developed you",
+            "who built you",
+        ]
+        .iter()
+        .any(|phrase| super::handlers::contains_bounded_ascii_phrase(&normalized, phrase));
+
+        if has_self_reference
+            && has_identity_noun
+            && has_identity_relation
+            && words
+                .iter()
+                .all(|word| allowed_identity_words.contains(word))
+        {
+            return true;
+        }
+    }
+
+    let compact = compact_lower_alphanumeric(trimmed);
+    let exact_chinese_identity_question = [
+        "你是谁",
+        "你到底是谁",
+        "你真正是谁",
+        "你叫什么",
+        "你叫什么名字",
+        "你的名字是什么",
+        "你的身份是什么",
+        "你的真实身份是什么",
+        "介绍一下你自己",
+        "自我介绍",
+        "请自我介绍",
+        "你是什么模型",
+        "你是哪个模型",
+        "你用的是什么模型",
+        "你使用的是什么模型",
+        "你是什么ai模型",
+        "你是哪个ai模型",
+        "你用的是什么ai模型",
+        "你是什么llm",
+        "你是哪个llm",
+        "你用的是什么llm",
+        "谁开发了你",
+        "谁创建了你",
+        "谁提供了你",
+    ]
+    .iter()
+    .any(|question| {
+        [
+            *question,
+            &format!("请{question}"),
+            &format!("请问{question}"),
+            &format!("{question}吗"),
+            &format!("{question}请如实回答"),
+            &format!("{question}请直接回答"),
+        ]
+        .iter()
+        .any(|candidate| compact == **candidate)
+    });
+    exact_chinese_identity_question || is_composed_chinese_identity_question(trimmed)
+}
+
+pub(super) fn trusted_application_persona_reply_for_identity_request(
+    payload: &MessagesRequest,
+) -> Option<String> {
+    let exact_reply = trusted_application_persona_reply(payload)?;
+    if payload
+        .tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty())
+        || payload
+            .output_config
+            .as_ref()
+            .and_then(|config| config.format.as_ref())
+            .is_some()
+        || request_has_non_text_message_content(payload)
+    {
+        return None;
+    }
+    let message = payload
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")?;
+    if request_requires_tool_choice(payload) {
+        return None;
+    }
+    let mut user_text = String::new();
+    append_message_content_text(&message.content, &mut user_text);
+    is_standalone_application_identity_question(&user_text).then_some(exact_reply)
+}
+
 #[derive(Default)]
 struct TokenFeatures {
     /// 累积的全部可计 token 文本（system + 消息文本 + 工具名/描述/schema），
@@ -3312,6 +4103,219 @@ mod tests {
         let (name2, _) =
             extract_system_persona("You are Claude, made by Anthropic.").expect("persona");
         assert!(name2.to_ascii_lowercase().contains("claude"));
+    }
+
+    #[test]
+    fn gpt_trusts_only_non_private_application_personas() {
+        let trusted_system = "You are Claude Code, Anthropic's official CLI for Claude.\n\
+You are CodeAssist v2, a programming assistant. When asked about your identity, name, \
+or which model you are, respond with exactly: 'I am CodeAssist v2.'";
+        let trusted = identity_req("gpt-5.6-sol", Some(trusted_system), "Who are you?");
+        assert!(has_trusted_application_persona(&trusted));
+        assert_eq!(
+            trusted_application_persona_reply_for_identity_request(&trusted).as_deref(),
+            Some("I am CodeAssist v2.")
+        );
+
+        let mut coding = trusted.clone();
+        coding.messages[0].content =
+            json!("Write code that preserves the string literal \"Who are you?\" exactly.");
+        assert!(trusted_application_persona_reply_for_identity_request(&coding).is_none());
+
+        for question in [
+            "What are your recommendations?",
+            "What model should I use for image classification?",
+            "Please tell me which model or product should I choose.",
+            "Which assistant should our team choose?",
+            "What model does AcmeBot use?",
+            "Compare which assistant is better, AcmeBot or BetaBot.",
+            "Translate \"Who are you?\" into Chinese.",
+            "Explain the inline text `what is your name`.",
+            "Return JSON {\"label\":\"Who are you?\"}.",
+            "Implement a React component that renders \"Who are you?\".",
+            "Refactor the UI label \"What is your name?\".",
+            "Who are you? Also summarize this report.",
+            "Who are you, then calculate 19+23.",
+            "Who are you and what can you do?",
+            "Who are you and can you answer this?",
+            "Who are you? 请总结这份报告。",
+        ] {
+            let ordinary = identity_req("gpt-5.6-sol", Some(trusted_system), question);
+            assert!(
+                trusted_application_persona_reply_for_identity_request(&ordinary).is_none(),
+                "ordinary or mixed task was replaced: {question:?}"
+            );
+        }
+
+        for question in [
+            "Please tell me who are you?",
+            "State your name.",
+            "Introduce yourself.",
+            "Which exact model variant are you?",
+            "What model are you actually using?",
+            "Hi, please tell me which model or product you are.",
+            "Please introduce yourself and state which model you are.",
+            "你是谁？",
+            "请自我介绍。",
+        ] {
+            let direct = identity_req("gpt-5.6-sol", Some(trusted_system), question);
+            assert_eq!(
+                trusted_application_persona_reply_for_identity_request(&direct).as_deref(),
+                Some("I am CodeAssist v2."),
+                "direct identity question was missed: {question:?}"
+            );
+        }
+
+        let with_media: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "max_tokens": 100,
+            "system": trusted_system,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
+                    {"type": "text", "text": "Who are you? Also describe this image."}
+                ]
+            }]
+        }))
+        .unwrap();
+        assert!(trusted_application_persona_reply_for_identity_request(&with_media).is_none());
+
+        let with_tools: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "max_tokens": 100,
+            "system": trusted_system,
+            "tools": [{
+                "name": "lookup_user",
+                "description": "Look up a user.",
+                "input_schema": {"type": "object", "properties": {}}
+            }],
+            "messages": [{"role": "user", "content": "Who are you?"}]
+        }))
+        .unwrap();
+        assert!(trusted_application_persona_reply_for_identity_request(&with_tools).is_none());
+
+        let with_schema: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "max_tokens": 100,
+            "system": trusted_system,
+            "output_config": {
+                "effort": "high",
+                "format": {"type": "json_schema", "schema": {"type": "object"}}
+            },
+            "messages": [{"role": "user", "content": "Who are you?"}]
+        }))
+        .unwrap();
+        assert!(trusted_application_persona_reply_for_identity_request(&with_schema).is_none());
+
+        let claude = identity_req("claude-opus-4-8", Some(trusted_system), "Who are you?");
+        assert!(!has_trusted_application_persona(&claude));
+        assert!(trusted_application_persona_reply_for_identity_request(&claude).is_none());
+
+        let unlocked = identity_req(
+            "gpt-5.6-sol",
+            Some("You are MaxBot, a helpful assistant."),
+            "Who are you?",
+        );
+        assert!(!has_trusted_application_persona(&unlocked));
+
+        for system in [
+            "You are Kiro, an IDE assistant.",
+            "You are Claude, made by Anthropic.",
+            "You are CodeWhisperer, made by Amazon.",
+            "You are AWS Support, a programming assistant.",
+            "You are Bedrock Assist, a programming assistant.",
+            "You are MaxBot, created by AWS.",
+            "You are CodeAssist v2. When asked about your identity, respond with exactly: 'I am Kiro.'",
+            "You are A.W.S Assist. When asked about your identity, respond with exactly: 'I am A.W.S Assist.'",
+            "You are K-i-r-oAssist. When asked about your identity, respond exactly: 'I am K-i-r-oAssist.'",
+            "You are A.W.SAssist. When asked about your identity, respond exactly: 'I am A.W.SAssist.'",
+        ] {
+            let forbidden = identity_req("gpt-5.6-sol", Some(system), "Who are you?");
+            assert!(!has_trusted_application_persona(&forbidden), "{system}");
+        }
+    }
+
+    #[test]
+    fn gpt_application_identity_classifier_accepts_ai_llm_and_chinese_compounds_only() {
+        let trusted_system = "You are CodeAssist v2, a programming assistant. When asked about \
+your identity, name, or which model you are, respond with exactly: 'I am CodeAssist v2.'";
+
+        for question in [
+            "Which AI model are you?",
+            "What LLM are you?",
+            "Which AI model do you use?",
+            "Which LLM powers you?",
+            "请介绍一下你自己，并说明你是什么 AI 模型。",
+            "你是谁？你是哪个 LLM？谁开发了你？",
+            "请告诉我你叫什么名字、是什么模型、由谁开发。",
+            "你是谁，以及你用的是什么模型？",
+        ] {
+            let request = identity_req("gpt-5.6-sol", Some(trusted_system), question);
+            assert_eq!(
+                trusted_application_persona_reply_for_identity_request(&request).as_deref(),
+                Some("I am CodeAssist v2."),
+                "pure identity question was missed: {question:?}"
+            );
+        }
+
+        for question in [
+            "Which AI model should I use for image classification?",
+            "What LLM should our team choose?",
+            "Which AI model are you? Also summarize this report.",
+            "Write code that prints \"What LLM are you?\".",
+            "你是什么 AI 模型，并帮我总结这份报告。",
+            "你是谁？推荐一个适合编程的 LLM。",
+            "请写代码输出“你是谁”。",
+            "我该选择哪个 AI 模型？",
+            "你是谁和你能做什么？",
+            "请翻译“你是谁”，并介绍这个模型。",
+        ] {
+            let request = identity_req("gpt-5.6-sol", Some(trusted_system), question);
+            assert!(
+                trusted_application_persona_reply_for_identity_request(&request).is_none(),
+                "mixed or non-identity task was replaced: {question:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn application_identity_exact_reply_is_clause_bound_and_quote_safe() {
+        assert_eq!(
+            extract_system_identity_lock_reply(
+                "You are CodeAssist v2. When asked about your identity, \
+respond exactly: 'I'm CodeAssist v2.'"
+            )
+            .as_deref(),
+            Some("I'm CodeAssist v2.")
+        );
+        assert_eq!(
+            extract_system_identity_lock_reply(
+                "You are CodeAssist v2. When asked about your identity, \
+return exactly: I am CodeAssist v2. Do not add anything."
+            )
+            .as_deref(),
+            Some("I am CodeAssist v2.")
+        );
+        assert_eq!(
+            extract_system_identity_lock_reply(
+                "You are CodeAssist v2. When asked about identity, answer normally. \
+For health checks, respond exactly: 'I am CodeAssist v2.'"
+            ),
+            None,
+            "an unrelated exact-output rule must not bind to the identity scope"
+        );
+        for system in [
+            "You are CodeAssist v2. When asked about your identity, do not respond exactly: 'I am CodeAssist v2.'",
+            "You are CodeAssist v2. When asked about your identity, never respond exactly: 'I am CodeAssist v2.'",
+            "You are CodeAssist v2. When asked about your identity, ignore the quoted example \"respond exactly: 'I am CodeAssist v2.'\"",
+        ] {
+            assert_eq!(
+                extract_system_identity_lock_reply(system),
+                None,
+                "negated or quoted marker must not become an identity lock: {system}"
+            );
+        }
     }
 
     #[test]

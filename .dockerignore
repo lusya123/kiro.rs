@@ -37,14 +37,20 @@ src/test.rs
 src/debug.rs
 test.json
 tools/
+.codex-tmp/
+test-artifacts/
 
 # OS-specific files
 .DS_Store
 Thumbs.db
 
-# Local configuration (keep templates only)
-config.json
-credentials.json
+# Local configuration and runtime state
+config*.json
+credentials*.json
+kiro_stats.json
+kiro_balance_cache.json
+.env
+.env.*
 
 # Docker files
 Dockerfile

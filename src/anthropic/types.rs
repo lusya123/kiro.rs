@@ -136,6 +136,23 @@ fn default_effort() -> String {
     "high".to_string()
 }
 
+fn default_reasoning_effort() -> String {
+    "medium".to_string()
+}
+
+/// GPT-5.6 native reasoning configuration.
+///
+/// Kiro advertises this separately from Claude's `thinking` /
+/// `output_config` fields. Supported efforts are validated by the handler.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningConfig {
+    #[serde(default = "default_reasoning_effort")]
+    pub effort: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
 /// Claude Code 请求中的 metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {
@@ -162,6 +179,8 @@ pub struct MessagesRequest {
     pub tool_choice: Option<serde_json::Value>,
     pub thinking: Option<Thinking>,
     pub output_config: Option<OutputConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<serde_json::Value>,
     /// Claude Code 请求中的 metadata，包含 session 信息

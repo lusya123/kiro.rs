@@ -47,6 +47,8 @@ pub struct AdditionalModelRequestFields {
     #[serde(rename = "output_config")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_config: Option<KiroOutputConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<KiroReasoningConfig>,
 }
 
 /// Native reasoning effort accepted by supported Kiro models.
@@ -54,6 +56,14 @@ pub struct AdditionalModelRequestFields {
 pub struct KiroOutputConfig {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub effort: String,
+}
+
+/// Native GPT-5.6 reasoning controls accepted by Kiro.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KiroReasoningConfig {
+    pub effort: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 #[cfg(test)]
 mod tests {
@@ -120,5 +130,43 @@ mod tests {
             wire["additionalModelRequestFields"]["output_config"]["effort"],
             "xhigh"
         );
+        assert!(wire["additionalModelRequestFields"]["reasoning"].is_null());
+    }
+
+    #[test]
+    fn serializes_gpt_reasoning_at_request_root() {
+        let request: KiroRequest = serde_json::from_str(
+            r#"{
+                "conversationState": {
+                    "conversationId": "conv-456",
+                    "currentMessage": {
+                        "userInputMessage": {
+                            "content": "Test message",
+                            "modelId": "gpt-5.6-sol",
+                            "userInputMessageContext": {}
+                        }
+                    }
+                },
+                "additionalModelRequestFields": {
+                    "reasoning": {"effort":"max","mode":"pro"}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let reasoning = request
+            .additional_model_request_fields
+            .as_ref()
+            .and_then(|fields| fields.reasoning.as_ref())
+            .expect("reasoning fields");
+        assert_eq!(reasoning.effort, "max");
+        assert_eq!(reasoning.mode.as_deref(), Some("pro"));
+
+        let wire = serde_json::to_value(request).unwrap();
+        assert_eq!(
+            wire["additionalModelRequestFields"]["reasoning"],
+            serde_json::json!({"effort":"max","mode":"pro"})
+        );
+        assert!(wire["additionalModelRequestFields"]["output_config"].is_null());
     }
 }

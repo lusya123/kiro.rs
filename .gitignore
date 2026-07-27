@@ -13,5 +13,7 @@
 /credentials.*
 /kiro_balance_cache.json
 /kiro_stats.json
+/.codex-tmp/
+/deploy/ztest-gpt56/runtime/
 .gstack/
 /test-artifacts/ztest/reports/.ztest-report-watch.seen*

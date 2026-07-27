@@ -30,7 +30,8 @@ pub trait KiroEndpoint: Send + Sync {
 
     /// 装饰 API 请求的端点特有 header
     ///
-    /// Provider 已经设置好 URL、content-type、Connection 和 body；
+    /// Provider 已经设置好 URL、content-type 和 body；
+    /// 不要添加 `Connection: close`，Rust→sidecar 和直连上游都需要复用连接。
     /// 实现负责追加 Authorization、host、user-agent 等端点相关头。
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder;
 

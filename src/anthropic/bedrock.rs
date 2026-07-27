@@ -1334,6 +1334,9 @@ pub fn models_response() -> Response {
     const MODEL_IDS: &[&str] = &[
         "claude-haiku-4-5",
         "claude-haiku-4-5-20251001",
+        super::converter::GPT_56_SOL_MODEL_ID,
+        super::converter::GPT_56_TERRA_MODEL_ID,
+        super::converter::GPT_56_LUNA_MODEL_ID,
         "claude-opus-5",
         "claude-opus-5-thinking",
         "claude-opus-4-5-20251101",
@@ -1351,10 +1354,16 @@ pub fn models_response() -> Response {
     let data = MODEL_IDS
         .iter()
         .map(|id| {
-            format!(
-                "{{\"id\":{},\"object\":\"model\",\"created\":1626777600,\"owned_by\":\"custom\",\"supported_endpoint_types\":[\"anthropic\",\"openai\"]}}",
-                serde_json::to_string(id).unwrap_or_else(|_| "\"\"".to_string()),
-            )
+            let id_json = serde_json::to_string(id).unwrap_or_else(|_| "\"\"".to_string());
+            if super::converter::is_gpt_model(id) {
+                format!(
+                    "{{\"id\":{id_json},\"object\":\"model\",\"created\":1785024000,\"owned_by\":\"openai\",\"supported_endpoint_types\":[\"openai\"]}}"
+                )
+            } else {
+                format!(
+                    "{{\"id\":{id_json},\"object\":\"model\",\"created\":1626777600,\"owned_by\":\"custom\",\"supported_endpoint_types\":[\"anthropic\",\"openai\"]}}"
+                )
+            }
         })
         .collect::<Vec<_>>()
         .join(",");
@@ -1483,6 +1492,16 @@ pub fn conversion_error(error: &ConversionError) -> Response {
                 request_id
             ),
         ),
+        ConversionError::UnnormalizedRemoteImage => (
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": format!(
+                    "remote image URL was not normalized before conversion (request id: {})",
+                    request_id
+                )
+            })
+            .to_string(),
+        ),
     };
     let mut response = Response::builder()
         .status(status)
@@ -1538,7 +1557,7 @@ pub fn non_stream_response(
     output_tokens: i32,
     thinking_tokens: i32,
 ) -> Response {
-    let output_details = if model.to_ascii_lowercase().contains("opus") {
+    let output_details = if super::compat::should_include_thinking_details(model, thinking_tokens) {
         format!(
             ",\"output_tokens_details\":{{\"thinking_tokens\":{}}}",
             thinking_tokens.max(0)
@@ -3172,6 +3191,24 @@ mod tests {
         assert!(body.contains("\"id\":\"claude-opus-5-thinking\""));
         assert!(body.contains("\"id\":\"claude-sonnet-5\""));
         assert!(body.contains("\"id\":\"claude-sonnet-5-thinking\""));
+        assert!(body.contains("\"id\":\"gpt-5.6-sol\""));
+        assert!(body.contains("\"id\":\"gpt-5.6-terra\""));
+        assert!(body.contains("\"id\":\"gpt-5.6-luna\""));
+
+        let catalog: Value = serde_json::from_str(&body).expect("valid models JSON");
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let entry = catalog["data"]
+                .as_array()
+                .and_then(|models| models.iter().find(|entry| entry["id"] == model))
+                .expect("GPT model entry");
+            assert_eq!(entry["owned_by"], "openai");
+            assert_eq!(entry["supported_endpoint_types"], json!(["openai"]));
+            let encoded = serde_json::to_string(entry).expect("serialize GPT model entry");
+            assert!(
+                !encoded.to_ascii_lowercase().contains("anthropic"),
+                "{encoded}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3222,5 +3259,22 @@ mod tests {
             20
         );
         assert_eq!(body["usage"]["service_tier"], "standard");
+    }
+
+    #[tokio::test]
+    async fn non_stream_gpt_response_reports_native_reasoning_tokens() {
+        let response = non_stream_response(
+            "gpt-5.6-sol",
+            &[json!({"type": "text", "text": "done"})],
+            "end_turn",
+            UsageBreakdown::flat(0),
+            11,
+            7,
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("non-stream GPT body");
+        let body: Value = serde_json::from_slice(&bytes).expect("valid non-stream GPT JSON");
+        assert_eq!(body["usage"]["output_tokens_details"]["thinking_tokens"], 7);
     }
 }

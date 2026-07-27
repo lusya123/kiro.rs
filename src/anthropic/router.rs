@@ -2,7 +2,7 @@
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, State},
+    extract::DefaultBodyLimit,
     http::StatusCode,
     middleware,
     response::IntoResponse,
@@ -19,6 +19,7 @@ use super::{
     middleware::{AppState, auth_middleware, aws_b40_headers_middleware, cors_layer},
     native_bedrock::BedrockMantleProvider,
     openai_compat::post_chat_completions,
+    responses_compat::post_responses,
 };
 
 /// 请求体最大大小限制 (50MB)
@@ -125,26 +126,6 @@ async fn aws_b_count_tokens_not_found() -> impl IntoResponse {
     (StatusCode::NOT_FOUND, Json(json!({ "error": "Not Found" })))
 }
 
-async fn post_responses(State(state): State<AppState>) -> axum::response::Response {
-    if !state.aws_b40_compat {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-
-    let request_id = super::middleware::aws_b40_oneapi_request_id();
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({
-            "error": {
-                "message": format!("not implemented (request id: {request_id})"),
-                "type": "new_api_error",
-                "param": "",
-                "code": "convert_request_failed"
-            }
-        })),
-    )
-        .into_response()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +176,9 @@ mod tests {
         assert!(body.contains("\"supported_endpoint_types\":[\"anthropic\",\"openai\"]"));
         assert!(body.contains("claude-opus-5"));
         assert!(body.contains("claude-sonnet-5"));
+        assert!(body.contains("gpt-5.6-sol"));
+        assert!(body.contains("gpt-5.6-terra"));
+        assert!(body.contains("gpt-5.6-luna"));
 
         let response = client
             .head(format!("{base}/v1/models"))

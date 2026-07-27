@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -41,15 +42,24 @@ const (
 	defaultPort  = 9090
 	headerTarget = "X-Target-Url"
 	headerProxy  = "X-Proxy-Url"
-	readTimeout  = 30 * time.Second
-	writeTimeout = 0 // SSE 流式响应不设写超时（仅监听 localhost，安全）
-	idleTimeout  = 120 * time.Second
+	// 这些响应头只用于 Rust 进程读取链路分段耗时；provider 会在把响应交给
+	// 上层 handler 前删除，不能透传给外部 API 客户端。
+	headerTimingRequestID       = "X-Kiro-Rs-Sidecar-Request-Id"
+	headerTimingConnectionReuse = "X-Kiro-Rs-Sidecar-Connection-Reused"
+	headerTimingReconnected     = "X-Kiro-Rs-Sidecar-Reconnected"
+	headerTimingNetworkDialUS   = "X-Kiro-Rs-Sidecar-Network-Dial-Us"
+	headerTimingTLSHandshakeUS  = "X-Kiro-Rs-Sidecar-Tls-Handshake-Us"
+	headerTimingUpstreamHeadUS  = "X-Kiro-Rs-Sidecar-Upstream-Headers-Us"
+	readTimeout                 = 30 * time.Second
+	writeTimeout                = 0 // SSE 流式响应不设写超时（仅监听 localhost，安全）
+	idleTimeout                 = 120 * time.Second
 )
 
 // 全局 RoundTripper 缓存（按 proxyURL 分组，复用 H2 连接）
 var (
 	rtCacheMu sync.Mutex
 	rtCache   = make(map[string]*utlsRoundTripper)
+	requestID atomic.Uint64
 )
 
 func getOrCreateRT(proxyURL string) *utlsRoundTripper {
@@ -73,6 +83,18 @@ type utlsRoundTripper struct {
 	h2Conns map[string]*http2.ClientConn // H2 连接缓存 (per host)
 }
 
+type dialTiming struct {
+	networkDial  time.Duration
+	tlsHandshake time.Duration
+}
+
+type roundTripTiming struct {
+	connectionReused bool
+	reconnected      bool
+	dial             dialTiming
+	upstreamHeaders  time.Duration
+}
+
 func newUTLSRoundTripper(proxyURL string) *utlsRoundTripper {
 	return &utlsRoundTripper{
 		proxyURL: proxyURL,
@@ -81,6 +103,13 @@ func newUTLSRoundTripper(proxyURL string) *utlsRoundTripper {
 }
 
 func (rt *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, _, err := rt.roundTripWithTiming(req)
+	return resp, err
+}
+
+func (rt *utlsRoundTripper) roundTripWithTiming(req *http.Request) (*http.Response, roundTripTiming, error) {
+	started := time.Now()
+	timing := roundTripTiming{}
 	addr := req.URL.Host
 	if !strings.Contains(addr, ":") {
 		if req.URL.Scheme == "https" {
@@ -97,22 +126,30 @@ func (rt *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 		if cc.CanTakeNewRequest() {
 			resp, err := cc.RoundTrip(req)
 			if err == nil {
-				return resp, nil
+				timing.connectionReused = true
+				timing.upstreamHeaders = time.Since(started)
+				return resp, timing, nil
 			}
 			// H2 连接已失效，清除缓存重建
 			log.Printf("[TLS-Sidecar] Cached H2 conn failed for %s: %v, reconnecting", addr, err)
+			timing.reconnected = true
 		}
 		rt.mu.Lock()
-		delete(rt.h2Conns, addr)
+		// 只删除本次实际使用的旧连接，避免并发重连时误删另一请求刚建好的连接。
+		if rt.h2Conns[addr] == cc {
+			delete(rt.h2Conns, addr)
+		}
 		rt.mu.Unlock()
 	} else {
 		rt.mu.Unlock()
 	}
 
 	// 建立新的 uTLS 连接
-	conn, err := dialUTLS(req.Context(), "tcp", addr, rt.proxyURL)
+	conn, dial, err := dialUTLSWithTiming(req.Context(), "tcp", addr, rt.proxyURL)
+	timing.dial = dial
 	if err != nil {
-		return nil, err
+		timing.upstreamHeaders = time.Since(started)
+		return nil, timing, err
 	}
 
 	// 根据 ALPN 协商结果决定走 H2 还是 H1
@@ -128,14 +165,17 @@ func (rt *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 		cc, err := t2.NewClientConn(conn)
 		if err != nil {
 			conn.Close()
-			return nil, fmt.Errorf("h2 client conn: %w", err)
+			timing.upstreamHeaders = time.Since(started)
+			return nil, timing, fmt.Errorf("h2 client conn: %w", err)
 		}
 
 		rt.mu.Lock()
 		rt.h2Conns[addr] = cc
 		rt.mu.Unlock()
 
-		return cc.RoundTrip(req)
+		resp, err := cc.RoundTrip(req)
+		timing.upstreamHeaders = time.Since(started)
+		return resp, timing, err
 	}
 
 	// HTTP/1.1: 通过一次性 Transport 使用已建立的 TLS 连接
@@ -159,7 +199,8 @@ func (rt *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 		conn.Close()
 		t1.CloseIdleConnections()
 	}
-	return resp, err
+	timing.upstreamHeaders = time.Since(started)
+	return resp, timing, err
 }
 
 func (rt *utlsRoundTripper) CloseIdleConnections() {
@@ -224,6 +265,8 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 // ──────────────── Proxy Handler ────────────────
 
 func handleProxy(w http.ResponseWriter, r *http.Request) {
+	id := requestID.Add(1)
+	requestStarted := time.Now()
 	targetURL := r.Header.Get(headerTarget)
 	if targetURL == "" {
 		http.Error(w, `{"error":"missing X-Target-Url header"}`, http.StatusBadRequest)
@@ -274,9 +317,19 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	// Execute via uTLS RoundTripper
 	rt := getOrCreateRT(proxyURL)
-	resp, err := rt.RoundTrip(outReq)
+	resp, timing, err := rt.roundTripWithTiming(outReq)
 	if err != nil {
-		log.Printf("[TLS-Sidecar] RoundTrip error → %s: %v", parsed.Host, err)
+		log.Printf(
+			"[TLS-Sidecar] request_id=%d host=%s reused=%t reconnected=%t network_dial_us=%d tls_handshake_us=%d upstream_headers_us=%d error=%v",
+			id,
+			parsed.Host,
+			timing.connectionReused,
+			timing.reconnected,
+			timing.dial.networkDial.Microseconds(),
+			timing.dial.tlsHandshake.Microseconds(),
+			timing.upstreamHeaders.Microseconds(),
+			err,
+		)
 		http.Error(w, fmt.Sprintf(`{"error":"upstream request failed: %s"}`, err), http.StatusBadGateway)
 		return
 	}
@@ -288,10 +341,41 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 			w.Header().Add(key, v)
 		}
 	}
+	setTimingHeaders(w.Header(), id, timing)
+	log.Printf(
+		"[TLS-Sidecar] request_id=%d host=%s reused=%t reconnected=%t network_dial_us=%d tls_handshake_us=%d upstream_headers_us=%d status=%d",
+		id,
+		parsed.Host,
+		timing.connectionReused,
+		timing.reconnected,
+		timing.dial.networkDial.Microseconds(),
+		timing.dial.tlsHandshake.Microseconds(),
+		timing.upstreamHeaders.Microseconds(),
+		resp.StatusCode,
+	)
 	w.WriteHeader(resp.StatusCode)
 
 	// Stream body (SSE-friendly: flush after every read)
 	flusher, canFlush := w.(http.Flusher)
+	// 立即把上游响应头送回 Rust。否则 net/http 可能等到首个 body chunk 才刷新，
+	// 会把“模型首包等待”误算成 Rust→sidecar 的本地连接耗时。
+	if canFlush {
+		flusher.Flush()
+	}
+	bodyStarted := time.Now()
+	var bytesCopied int64
+	completed := false
+	defer func() {
+		log.Printf(
+			"[TLS-Sidecar] request_id=%d host=%s body_us=%d total_us=%d bytes=%d completed=%t",
+			id,
+			parsed.Host,
+			time.Since(bodyStarted).Microseconds(),
+			time.Since(requestStarted).Microseconds(),
+			bytesCopied,
+			completed,
+		)
+	}()
 	buf := make([]byte, 32*1024)
 	for {
 		n, readErr := resp.Body.Read(buf)
@@ -300,6 +384,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 				log.Printf("[TLS-Sidecar] Write error: %v", writeErr)
 				return
 			}
+			bytesCopied += int64(n)
 			if canFlush {
 				flusher.Flush()
 			}
@@ -307,15 +392,32 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		if readErr != nil {
 			if readErr != io.EOF {
 				log.Printf("[TLS-Sidecar] Read error: %v", readErr)
+			} else {
+				completed = true
 			}
 			return
 		}
 	}
 }
 
+func setTimingHeaders(headers http.Header, id uint64, timing roundTripTiming) {
+	headers.Set(headerTimingRequestID, strconv.FormatUint(id, 10))
+	headers.Set(headerTimingConnectionReuse, strconv.FormatBool(timing.connectionReused))
+	headers.Set(headerTimingReconnected, strconv.FormatBool(timing.reconnected))
+	headers.Set(headerTimingNetworkDialUS, strconv.FormatInt(timing.dial.networkDial.Microseconds(), 10))
+	headers.Set(headerTimingTLSHandshakeUS, strconv.FormatInt(timing.dial.tlsHandshake.Microseconds(), 10))
+	headers.Set(headerTimingUpstreamHeadUS, strconv.FormatInt(timing.upstreamHeaders.Microseconds(), 10))
+}
+
 // ──────────────── uTLS Dial ────────────────
 
 func dialUTLS(ctx context.Context, network, addr string, proxyURL string) (*utls.UConn, error) {
+	conn, _, err := dialUTLSWithTiming(ctx, network, addr, proxyURL)
+	return conn, err
+}
+
+func dialUTLSWithTiming(ctx context.Context, network, addr string, proxyURL string) (*utls.UConn, dialTiming, error) {
+	timing := dialTiming{}
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		host = addr
@@ -323,14 +425,16 @@ func dialUTLS(ctx context.Context, network, addr string, proxyURL string) (*utls
 
 	// TCP 连接（可能经过代理）
 	var rawConn net.Conn
+	networkStarted := time.Now()
 	if proxyURL != "" {
 		rawConn, err = dialViaProxy(ctx, network, addr, proxyURL)
 	} else {
 		var d net.Dialer
 		rawConn, err = d.DialContext(ctx, network, addr)
 	}
+	timing.networkDial = time.Since(networkStarted)
 	if err != nil {
-		return nil, fmt.Errorf("tcp dial failed: %w", err)
+		return nil, timing, fmt.Errorf("tcp dial failed: %w", err)
 	}
 
 	// uTLS 握手 — 使用 Chrome 最新自动指纹
@@ -347,14 +451,17 @@ func dialUTLS(ctx context.Context, network, addr string, proxyURL string) (*utls
 		tlsConn.SetDeadline(time.Now().Add(15 * time.Second))
 	}
 
+	tlsStarted := time.Now()
 	if err := tlsConn.Handshake(); err != nil {
+		timing.tlsHandshake = time.Since(tlsStarted)
 		rawConn.Close()
-		return nil, fmt.Errorf("utls handshake failed: %w", err)
+		return nil, timing, fmt.Errorf("utls handshake failed: %w", err)
 	}
+	timing.tlsHandshake = time.Since(tlsStarted)
 
 	// 握手完成，清除超时
 	tlsConn.SetDeadline(time.Time{})
-	return tlsConn, nil
+	return tlsConn, timing, nil
 }
 
 // ──────────────── Proxy Dialer ────────────────

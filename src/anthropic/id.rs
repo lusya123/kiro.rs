@@ -35,8 +35,12 @@ pub fn bedrock_message_id() -> String {
     format!("msg_01bdrk{}", random_base62(18))
 }
 
-pub fn bedrock_message_id_for_model(_model: &str) -> String {
-    bedrock_message_id()
+pub fn bedrock_message_id_for_model(model: &str) -> String {
+    if super::converter::is_gpt_model(model) {
+        message_id()
+    } else {
+        bedrock_message_id()
+    }
 }
 
 pub fn server_tool_use_id() -> String {
@@ -83,6 +87,15 @@ mod tests {
             assert_anthropic_id(&id, "msg");
             assert!(id.starts_with("msg_01bdrk"));
             assert_eq!(id.len(), 28);
+        }
+    }
+
+    #[test]
+    fn gpt_message_ids_do_not_expose_bedrock_marker() {
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let id = bedrock_message_id_for_model(model);
+            assert_anthropic_id(&id, "msg");
+            assert!(!id.to_ascii_lowercase().contains("bdrk"), "{id}");
         }
     }
 

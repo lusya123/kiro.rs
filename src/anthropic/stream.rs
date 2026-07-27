@@ -240,6 +240,18 @@ fn find_real_thinking_end_tag_at_buffer_end(buffer: &str) -> Option<usize> {
     None
 }
 
+/// Return the byte index before a one- or two-backtick suffix that may become a
+/// triple-backtick fence when the next upstream chunk arrives.
+fn split_before_trailing_fence_prefix(text: &str) -> usize {
+    if text.ends_with("``") {
+        text.len() - 2
+    } else if text.ends_with('`') {
+        text.len() - 1
+    } else {
+        text.len()
+    }
+}
+
 /// 查找完整非流式文本中的 thinking 结束标签。
 ///
 /// 非流式响应已经拿到了完整文本，因此 `</thinking>\nvisible text` 也可以安全
@@ -354,6 +366,86 @@ pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>
     } else {
         (Some(thinking_content.to_string()), remaining)
     }
+}
+
+fn is_renderable_char(ch: char) -> bool {
+    !ch.is_whitespace()
+        && !ch.is_control()
+        && !matches!(
+            ch,
+            '\u{00AD}'
+                | '\u{034F}'
+                | '\u{061C}'
+                | '\u{115F}'
+                | '\u{1160}'
+                | '\u{17B4}'
+                | '\u{17B5}'
+                | '\u{180B}'..='\u{180F}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{3164}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{FEFF}'
+                | '\u{FFA0}'
+                | '\u{E0100}'..='\u{E01EF}'
+        )
+}
+
+fn has_renderable_text(text: &str) -> bool {
+    text.chars().any(is_renderable_char)
+}
+
+fn trim_non_renderable_start(text: &str) -> &str {
+    text.char_indices()
+        .find(|(_, ch)| is_renderable_char(*ch))
+        .map_or("", |(start, _)| &text[start..])
+}
+
+fn visible_after_leading_thinking_blocks(text: &str) -> Option<&str> {
+    let mut remaining = trim_non_renderable_start(text);
+    let mut found = false;
+
+    while remaining.starts_with("<thinking>") {
+        found = true;
+        let after_open = &remaining["<thinking>".len()..];
+        let mut search_from = 0usize;
+        let mut closing = None;
+        while let Some(relative) = after_open[search_from..].find("</thinking>") {
+            let position = search_from + relative;
+            let after_position = position + "</thinking>".len();
+            let suffix = &after_open[after_position..];
+            let immediately_quoted = suffix
+                .chars()
+                .next()
+                .is_some_and(|ch| matches!(ch, '\'' | '"' | '`' | '\\'));
+            let boundary_is_protocol = suffix.is_empty()
+                || suffix
+                    .chars()
+                    .take_while(|ch| ch.is_whitespace())
+                    .any(|ch| matches!(ch, '\n' | '\r'));
+            if !immediately_quoted && boundary_is_protocol {
+                closing = Some(after_position);
+            }
+            search_from = after_position;
+        }
+
+        let Some(closing) = closing else {
+            return Some("");
+        };
+        remaining = trim_non_renderable_start(&after_open[closing..]);
+    }
+
+    found.then_some(remaining)
+}
+
+pub(crate) fn has_visible_assistant_text(text: &str, thinking_enabled: bool) -> bool {
+    if !thinking_enabled {
+        return has_renderable_text(text);
+    }
+
+    visible_after_leading_thinking_blocks(text)
+        .map_or_else(|| has_renderable_text(text), has_renderable_text)
 }
 
 /// SSE 事件
@@ -768,6 +860,22 @@ pub struct StreamContext {
     continuation_merge_tail: Option<String>,
     /// 输出侧规整可见文本中的上游产品自称；规则会跳过代码并保留普通 Kiro 技术提及。
     identity_sanitizer: Option<super::identity::IdentityOutputSanitizer>,
+    /// A trusted client system/developer identity lock. The real upstream is
+    /// still called, but its visible identity sentence is replaced at stream
+    /// finalization so a hidden runtime persona cannot override the caller's
+    /// explicit application identity.
+    forced_application_identity_reply: Option<String>,
+    /// HTTP 200 EventStream bodies can still carry provider error/exception
+    /// frames or end with a corrupt partial frame. Such a response must never
+    /// be converted into a locally synthesized identity success.
+    upstream_fatal_event: bool,
+    /// Markdown fenced-code state is tracked outside IdentityOutputSanitizer so
+    /// a code block longer than its bounded cross-chunk hold window can still
+    /// stream verbatim without losing the closing-fence state.
+    identity_in_fenced_code: bool,
+    /// At most two trailing backticks retained to recognize a ``` delimiter
+    /// split across upstream chunks.
+    identity_fence_pending: String,
     /// thinking(思维链)通道身份清理选项。Some 时:思考块内容在**块结束**时统一
     /// 过一遍 `sanitize_thinking_identity_text`(强制 strict + 预置 identity 上下文)再发出,
     /// 堵住 “thinking 里直接说 I should respond as Kiro” 这类身份泄漏。
@@ -854,6 +962,10 @@ impl StreamContext {
             complete_sentinel_probe_buffer: String::new(),
             continuation_merge_tail: None,
             identity_sanitizer: None,
+            forced_application_identity_reply: None,
+            upstream_fatal_event: false,
+            identity_in_fenced_code: false,
+            identity_fence_pending: String::new(),
             thinking_sanitize_options: None,
             thinking_pending_raw: String::new(),
             native_reasoning_last_chunk: String::new(),
@@ -927,6 +1039,7 @@ impl StreamContext {
         self.thinking_sanitize_options = Some(options);
     }
 
+    #[allow(dead_code)]
     pub fn enable_identity_sanitization_with_options(
         &mut self,
         strict_identity_context: bool,
@@ -937,17 +1050,54 @@ impl StreamContext {
         third_party_kiro_discussion: bool,
     ) {
         let options = super::identity::IdentitySanitizationOptions {
+            target: super::identity::IdentityTarget::Claude,
+            query: super::identity::IdentityQuery::default(),
             strict_identity_context,
+            structured_identity_probe: false,
             agentic_ide_probe,
             codewhisperer_relationship_probe,
             vendor_lineage_probe,
             obfuscated_private_thinking_probe,
             third_party_kiro_discussion,
         };
+        self.enable_identity_sanitization_with_profile(options);
+    }
+
+    pub fn enable_identity_sanitization_with_profile(
+        &mut self,
+        options: super::identity::IdentitySanitizationOptions,
+    ) {
         self.identity_sanitizer = Some(super::identity::IdentityOutputSanitizer::new_with_options(
             options,
         ));
+        self.identity_in_fenced_code = false;
+        self.identity_fence_pending.clear();
         self.thinking_sanitize_options = Some(options);
+    }
+
+    pub fn set_forced_application_identity_reply(&mut self, reply: Option<String>) {
+        self.forced_application_identity_reply = reply;
+        if self.forced_application_identity_reply.is_some() {
+            self.pending_synthetic_thinking = None;
+            self.expose_thinking = false;
+            self.expose_thinking_text = false;
+        }
+    }
+
+    fn strict_gpt_self_identity_target(&self) -> Option<super::identity::IdentityTarget> {
+        self.thinking_sanitize_options
+            .filter(|options| {
+                options.target.is_gpt()
+                    && options.strict_identity_context
+                    && !options.third_party_kiro_discussion
+            })
+            .map(|options| options.target)
+    }
+
+    fn has_gpt_identity_target(&self) -> bool {
+        self.thinking_sanitize_options
+            .is_some_and(|options| options.target.is_gpt())
+            || super::identity::IdentityTarget::for_model(&self.model).is_gpt()
     }
 
     pub fn set_output_token_limit(&mut self, max_tokens: i32) {
@@ -1116,6 +1266,7 @@ impl StreamContext {
                 error_code,
                 error_message,
             } => {
+                self.mark_upstream_fatal_event();
                 tracing::error!("收到错误事件: {} - {}", error_code, error_message);
                 Vec::new()
             }
@@ -1126,6 +1277,8 @@ impl StreamContext {
                 // 处理 ContentLengthExceededException
                 if exception_type == "ContentLengthExceededException" {
                     self.state_manager.set_stop_reason("max_tokens");
+                } else {
+                    self.mark_upstream_fatal_event();
                 }
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
                 Vec::new()
@@ -1162,6 +1315,10 @@ impl StreamContext {
         let content = merged_content.as_str();
 
         self.assistant_raw_content.push_str(content);
+
+        if self.forced_application_identity_reply.is_some() {
+            return events;
+        }
 
         // 如果启用了thinking，需要处理thinking块
         if self.thinking_enabled {
@@ -1375,7 +1532,16 @@ impl StreamContext {
         // A real upstream event always wins over the compatibility fallback.
         // Requests that did not enable thinking keep the reasoning private.
         self.pending_synthetic_thinking = None;
-        if !self.thinking_enabled {
+        if !self.thinking_enabled || self.forced_application_identity_reply.is_some() {
+            if !reasoning.text.is_empty() {
+                let delta =
+                    cumulative_event_delta(&reasoning.text, &self.native_reasoning_last_chunk);
+                self.native_reasoning_last_chunk = reasoning.text.clone();
+                if !delta.is_empty() {
+                    self.thinking_tokens += estimate_tokens(&delta);
+                    self.thinking_text_acc.push_str(&delta);
+                }
+            }
             return Vec::new();
         }
 
@@ -1512,15 +1678,128 @@ impl StreamContext {
     ///
     /// 返回值包含可能的 content_block_start 事件和 content_block_delta 事件。
     fn create_text_delta_events(&mut self, text: &str) -> Vec<SseEvent> {
-        if let Some(sanitizer) = self.identity_sanitizer.as_mut() {
-            let sanitized = sanitizer.push(text);
-            if sanitized.is_empty() {
-                return Vec::new();
-            }
-            return self.emit_text_delta_events(&sanitized);
+        if self.identity_sanitizer.is_none() {
+            return self.emit_text_delta_events(text);
         }
 
-        self.emit_text_delta_events(text)
+        // Strict GPT identity answers need the sanitizer to see quote/code
+        // delimiters together with their surrounding labels before anything
+        // is emitted. This preserves explicit business/test literals while
+        // still retargeting an identity answer that is merely wrapped in code.
+        if self.strict_gpt_self_identity_target().is_some() {
+            let sanitized = self
+                .identity_sanitizer
+                .as_mut()
+                .expect("checked above")
+                .push(text);
+            return if sanitized.is_empty() {
+                Vec::new()
+            } else {
+                self.emit_text_delta_events(&sanitized)
+            };
+        }
+
+        // IdentityOutputSanitizer deliberately bounds how much unclosed code
+        // it retains. If a fence exceeds that bound, a forced split would make
+        // the retained suffix forget that it is still code; the closing fence
+        // would then look like an opener and prose after it could bypass
+        // identity cleaning. Track triple-backtick fences here and stream their
+        // contents verbatim, while keeping prose in the sanitizer.
+        let mut input = std::mem::take(&mut self.identity_fence_pending);
+        input.push_str(text);
+        let mut events = Vec::new();
+
+        while !input.is_empty() {
+            if self.identity_in_fenced_code {
+                if let Some(close) = input.find("```") {
+                    let after_close = close + 3;
+                    events.extend(self.emit_text_delta_events(&input[..after_close]));
+                    self.identity_in_fenced_code = false;
+                    input = input[after_close..].to_string();
+                    continue;
+                }
+
+                let split = split_before_trailing_fence_prefix(&input);
+                if split > 0 {
+                    events.extend(self.emit_text_delta_events(&input[..split]));
+                }
+                self.identity_fence_pending = input[split..].to_string();
+                break;
+            }
+
+            if let Some(open) = input.find("```") {
+                if open > 0 {
+                    let sanitized = self
+                        .identity_sanitizer
+                        .as_mut()
+                        .expect("checked above")
+                        .push(&input[..open]);
+                    if !sanitized.is_empty() {
+                        events.extend(self.emit_text_delta_events(&sanitized));
+                    }
+                }
+
+                // The fence must not overtake a short prose suffix retained by
+                // the sanitizer.
+                events.extend(self.flush_pending_identity_text());
+                events.extend(self.emit_text_delta_events("```"));
+                self.identity_in_fenced_code = true;
+                input = input[open + 3..].to_string();
+                continue;
+            }
+
+            let split = split_before_trailing_fence_prefix(&input);
+            if split > 0 {
+                let sanitized = self
+                    .identity_sanitizer
+                    .as_mut()
+                    .expect("checked above")
+                    .push(&input[..split]);
+                if !sanitized.is_empty() {
+                    events.extend(self.emit_text_delta_events(&sanitized));
+                }
+            }
+            self.identity_fence_pending = input[split..].to_string();
+            break;
+        }
+
+        events
+    }
+
+    /// Flush text retained by the cross-chunk identity sanitizer at a content
+    /// block boundary.
+    ///
+    /// The sanitizer intentionally keeps a short suffix so identity phrases
+    /// split across upstream chunks can still be recognized. A tool block is a
+    /// hard Anthropic content boundary, though: opening it before releasing
+    /// that suffix would move the earlier text after the tool (and, for a
+    /// truncated tool, interleave two open blocks during finalization).
+    fn flush_pending_identity_text(&mut self) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        let fence_pending = std::mem::take(&mut self.identity_fence_pending);
+        if self.identity_in_fenced_code {
+            if !fence_pending.is_empty() {
+                events.extend(self.emit_text_delta_events(&fence_pending));
+            }
+        } else if !fence_pending.is_empty()
+            && let Some(sanitizer) = self.identity_sanitizer.as_mut()
+        {
+            let sanitized = sanitizer.push(&fence_pending);
+            if !sanitized.is_empty() {
+                events.extend(self.emit_text_delta_events(&sanitized));
+            }
+        }
+        self.identity_in_fenced_code = false;
+
+        let remaining = self
+            .identity_sanitizer
+            .as_mut()
+            .map(super::identity::IdentityOutputSanitizer::finish)
+            .unwrap_or_default();
+        if !remaining.is_empty() {
+            events.extend(self.emit_text_delta_events(&remaining));
+        }
+        events
     }
 
     fn emit_text_delta_events(&mut self, text: &str) -> Vec<SseEvent> {
@@ -1732,6 +2011,13 @@ impl StreamContext {
         if self.output_token_limit_reached {
             return Vec::new();
         }
+        // A trusted application's exact identity reply is a text-only policy
+        // result. The real upstream request has already run, but an incidental
+        // optional tool call must not leak into that replacement response or
+        // leave an open tool block interleaved with the final text block.
+        if self.forced_application_identity_reply.is_some() {
+            return Vec::new();
+        }
 
         let mut events = Vec::new();
         if self.suppress_text_blocks {
@@ -1804,6 +2090,19 @@ impl StreamContext {
         {
             let buffered = std::mem::take(&mut self.thinking_buffer);
             events.extend(self.create_text_delta_events(&buffered));
+        }
+
+        // A new tool block is a hard ordering boundary. Release any short text
+        // suffix retained by IdentityOutputSanitizer before allocating/opening
+        // the tool block, so the observable order remains
+        // text_delta -> text_stop -> tool_use_start. Continuation frames for an
+        // already-open tool must not flush unrelated text into that block.
+        if !self.tool_block_indices.contains_key(&tool_use.tool_use_id) {
+            events.extend(self.flush_pending_identity_text());
+            if self.suppress_text_blocks {
+                // Forced-tool responses intentionally discard the preamble.
+                self.forced_tool_text_pending.clear();
+            }
         }
 
         // 获取或分配块索引
@@ -2154,6 +2453,46 @@ impl StreamContext {
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
+        let upstream_has_visible_text =
+            has_visible_assistant_text(&self.assistant_raw_content, self.thinking_enabled);
+        let requested_application_identity_reply = self.forced_application_identity_reply.take();
+        let requires_real_gpt_identity_answer = requested_application_identity_reply.is_some()
+            || self.strict_gpt_self_identity_target().is_some();
+        if self.upstream_fatal_event || !upstream_has_visible_text {
+            // Do not let IdentityOutputSanitizer::finish manufacture a
+            // canonical GPT answer when the provider returned no answer or a
+            // fatal in-band error. Any already-emitted genuine text stays as
+            // partial upstream output.
+            self.identity_sanitizer = None;
+            self.identity_fence_pending.clear();
+        }
+        if (self.upstream_fatal_event && self.has_gpt_identity_target())
+            || (requires_real_gpt_identity_answer
+                && !upstream_has_visible_text
+                && !self.state_manager.has_tool_use())
+        {
+            return vec![SseEvent::new(
+                "error",
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "Upstream model did not return a complete response"
+                    }
+                }),
+            )];
+        }
+        let forced_application_identity_reply = requested_application_identity_reply
+            .filter(|_| upstream_has_visible_text && !self.upstream_fatal_event);
+        let forced_application_identity = forced_application_identity_reply.is_some();
+        if forced_application_identity {
+            // Upstream max-token/context/tool termination describes the
+            // hidden response, not the complete policy reply exposed below.
+            // A genuinely truncated policy reply will set max_tokens again in
+            // apply_output_token_limit.
+            self.state_manager.clear_stop_reason();
+            self.state_manager.set_stop_reason("end_turn");
+        }
 
         if self.native_reasoning_active {
             events.extend(self.finish_native_reasoning_block());
@@ -2234,12 +2573,10 @@ impl StreamContext {
             self.thinking_buffer.clear();
         }
 
-        if let Some(sanitizer) = self.identity_sanitizer.as_mut() {
-            let remaining = sanitizer.finish();
-            if !remaining.is_empty() {
-                events.extend(self.emit_text_delta_events(&remaining));
-            }
+        if let Some(reply) = forced_application_identity_reply {
+            events.extend(self.create_text_delta_events(&reply));
         }
+        events.extend(self.flush_pending_identity_text());
 
         if self.suppress_text_blocks
             && self.tool_block_indices.is_empty()
@@ -2325,6 +2662,7 @@ impl StreamContext {
             .output_token_limit
             .is_some_and(|limit| final_output_tokens >= limit.max(1))
             && !self.state_manager.has_tool_use()
+            && !forced_application_identity
         {
             self.state_manager.set_stop_reason("max_tokens");
         }
@@ -2335,6 +2673,7 @@ impl StreamContext {
             usage_thinking_tokens,
         );
         if self.aws_b40_compat {
+            let include_bedrock_invocation_metrics = !self.has_gpt_identity_target();
             let invocation_latency = self
                 .upstream_request_latency_ms
                 .saturating_add(self.stream_started_at.elapsed().as_millis() as u64);
@@ -2350,7 +2689,7 @@ impl StreamContext {
                         final_output_tokens,
                         usage_thinking_tokens,
                     );
-                } else if event.event == "message_stop" {
+                } else if event.event == "message_stop" && include_bedrock_invocation_metrics {
                     event.data = json!({
                         "type": "message_stop",
                         "amazon-bedrock-invocationMetrics": super::bedrock::invocation_metrics(
@@ -2382,7 +2721,8 @@ impl StreamContext {
     /// 只在纯文本/思考输出因 max_tokens 停止时续写；工具调用中续写可能重复执行工具，
     /// 因此显式禁用。
     pub fn should_auto_continue(&self, requested_max_tokens: i32) -> bool {
-        requested_max_tokens > 8192
+        self.forced_application_identity_reply.is_none()
+            && requested_max_tokens > 8192
             && self.state_manager.get_stop_reason() == "max_tokens"
             && !self.state_manager.has_tool_use()
             && !self.assistant_raw_content.trim().is_empty()
@@ -2428,6 +2768,11 @@ impl StreamContext {
     }
 
     pub fn mark_upstream_truncated(&mut self) {
+        self.mark_upstream_fatal_event();
+    }
+
+    pub fn mark_upstream_fatal_event(&mut self) {
+        self.upstream_fatal_event = true;
         self.state_manager.set_stop_reason("max_tokens");
     }
 
@@ -2711,6 +3056,7 @@ impl BufferedStreamContext {
             .enable_identity_sanitization_with_strict_mode(strict_identity_context);
     }
 
+    #[allow(dead_code)]
     pub fn enable_identity_sanitization_with_options(
         &mut self,
         strict_identity_context: bool,
@@ -2730,6 +3076,18 @@ impl BufferedStreamContext {
         );
     }
 
+    pub fn enable_identity_sanitization_with_profile(
+        &mut self,
+        options: super::identity::IdentitySanitizationOptions,
+    ) {
+        self.inner
+            .enable_identity_sanitization_with_profile(options);
+    }
+
+    pub fn set_forced_application_identity_reply(&mut self, reply: Option<String>) {
+        self.inner.set_forced_application_identity_reply(reply);
+    }
+
     #[allow(dead_code)]
     pub fn begin_completion_probe_for_billing(&mut self, next_estimated_input_tokens: i32) {
         self.inner
@@ -2738,6 +3096,10 @@ impl BufferedStreamContext {
 
     pub fn mark_upstream_truncated(&mut self) {
         self.inner.mark_upstream_truncated();
+    }
+
+    pub fn mark_upstream_fatal_event(&mut self) {
+        self.inner.mark_upstream_fatal_event();
     }
 }
 
@@ -2867,6 +3229,44 @@ mod tests {
         assert_eq!(
             cumulative_event_delta("Plan", "Plan carefully"),
             String::new()
+        );
+    }
+
+    #[test]
+    fn private_gpt_native_reasoning_is_hidden_but_counted_in_usage() {
+        use crate::kiro::model::events::ReasoningContentEvent;
+
+        let mut ctx =
+            StreamContext::new_with_thinking("gpt-5.6-sol", 1, false, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let mut reasoning_events =
+            ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+                text: "Plan".to_string(),
+                ..Default::default()
+            }));
+        reasoning_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            ReasoningContentEvent {
+                text: "Plan carefully".to_string(),
+                ..Default::default()
+            },
+        )));
+
+        assert!(
+            reasoning_events.is_empty(),
+            "private GPT reasoning must never be emitted"
+        );
+        assert_eq!(ctx.thinking_text_acc, "Plan carefully");
+
+        let final_events = ctx.generate_final_events();
+        let delta = final_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+        assert!(
+            delta.data["usage"]["output_tokens_details"]["thinking_tokens"]
+                .as_i64()
+                .is_some_and(|tokens| tokens > 0),
+            "private reasoning must still be represented in usage"
         );
     }
 
@@ -4002,6 +4402,56 @@ mod tests {
     }
 
     #[test]
+    fn aws_b_gpt_stream_omits_bedrock_invocation_metrics_but_claude_keeps_them() {
+        let mut gpt = StreamContext::new_with_thinking(
+            "gpt-5.6-luna",
+            42,
+            false,
+            super::super::cache::UsageBreakdown::flat(42),
+            HashMap::new(),
+        );
+        gpt.enable_aws_b40_compat(false);
+        let _ = gpt.generate_initial_events();
+        let _ = gpt.process_assistant_response("hello");
+        let gpt_events = gpt.generate_final_events();
+        let gpt_stop = gpt_events
+            .iter()
+            .find(|event| event.event == "message_stop")
+            .expect("GPT message_stop");
+        assert_eq!(gpt_stop.data["type"], "message_stop");
+        assert!(
+            gpt_stop
+                .data
+                .get("amazon-bedrock-invocationMetrics")
+                .is_none(),
+            "{gpt_stop:?}"
+        );
+
+        let mut claude = StreamContext::new_with_thinking(
+            "claude-sonnet-4-6",
+            42,
+            false,
+            super::super::cache::UsageBreakdown::flat(42),
+            HashMap::new(),
+        );
+        claude.enable_aws_b40_compat(false);
+        let _ = claude.generate_initial_events();
+        let _ = claude.process_assistant_response("hello");
+        let claude_events = claude.generate_final_events();
+        let claude_stop = claude_events
+            .iter()
+            .find(|event| event.event == "message_stop")
+            .expect("Claude message_stop");
+        assert!(
+            claude_stop
+                .data
+                .get("amazon-bedrock-invocationMetrics")
+                .is_some(),
+            "{claude_stop:?}"
+        );
+    }
+
+    #[test]
     fn aws_b_stream_splits_long_text_without_changing_content() {
         let mut ctx = StreamContext::new_with_thinking(
             "claude-opus-4-8",
@@ -4541,6 +4991,55 @@ mod tests {
             .collect()
     }
 
+    fn assert_sequential_content_blocks(events: &[SseEvent]) {
+        let mut open_index = None;
+        for event in events {
+            match event.event.as_str() {
+                "content_block_start" => {
+                    let index = event.data["index"]
+                        .as_i64()
+                        .expect("content_block_start index");
+                    assert!(
+                        open_index.is_none(),
+                        "content block {index} started while block {open_index:?} was open: {events:#?}"
+                    );
+                    open_index = Some(index);
+                }
+                "content_block_delta" => {
+                    let index = event.data["index"]
+                        .as_i64()
+                        .expect("content_block_delta index");
+                    assert_eq!(
+                        open_index,
+                        Some(index),
+                        "delta for block {index} while {open_index:?} was open: {events:#?}"
+                    );
+                }
+                "content_block_stop" => {
+                    let index = event.data["index"]
+                        .as_i64()
+                        .expect("content_block_stop index");
+                    assert_eq!(
+                        open_index,
+                        Some(index),
+                        "stop for block {index} while {open_index:?} was open: {events:#?}"
+                    );
+                    open_index = None;
+                }
+                "message_delta" | "message_stop" => assert!(
+                    open_index.is_none(),
+                    "{} emitted while block {open_index:?} was open: {events:#?}",
+                    event.event
+                ),
+                _ => {}
+            }
+        }
+        assert!(
+            open_index.is_none(),
+            "stream ended with block {open_index:?} open: {events:#?}"
+        );
+    }
+
     #[test]
     fn identity_sanitizer_applies_to_stream_text_deltas() {
         let mut ctx =
@@ -4559,6 +5058,484 @@ mod tests {
             collect_text_content(&all_events),
             "I'm Claude, an Anthropic-created AI assistant."
         );
+    }
+
+    #[test]
+    fn trusted_gpt_application_identity_lock_replaces_only_visible_stream_text() {
+        let mut ctx =
+            StreamContext::new_with_thinking("gpt-5.6-sol", 10, false, false, HashMap::new());
+        ctx.enable_identity_sanitization_with_profile(
+            super::super::identity::IdentitySanitizationOptions {
+                target: super::super::identity::IdentityTarget::Gpt56Sol,
+                ..super::super::identity::IdentitySanitizationOptions::strict(true)
+            },
+        );
+        ctx.set_forced_application_identity_reply(Some("I am CodeAssist v2.".to_string()));
+
+        let mut events = ctx.generate_initial_events();
+        let response_event = serde_json::from_value(serde_json::json!({
+            "content": "I'm Kiro, an AI-powered development environment."
+        }))
+        .expect("assistant response event");
+        events.extend(ctx.process_kiro_event(&Event::AssistantResponse(response_event)));
+        assert!(ctx.assistant_raw_content().contains("Kiro"));
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_text_content(&events), "I am CodeAssist v2.");
+        assert_sequential_content_blocks(&events);
+    }
+
+    #[test]
+    fn trusted_gpt_application_identity_suppresses_tools_and_hidden_stop_reason() {
+        use crate::kiro::model::events::{ReasoningContentEvent, ToolUseEvent};
+
+        let mut ctx =
+            StreamContext::new_with_thinking("gpt-5.6-sol", 10, false, false, HashMap::new());
+        ctx.set_output_token_limit(128);
+        ctx.set_forced_application_identity_reply(Some("I am CodeAssist v2.".to_string()));
+
+        let mut events = ctx.generate_initial_events();
+        events.extend(
+            ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+                text: "The private upstream considered calling a tool.".to_string(),
+                signature: String::new(),
+                redacted_content: String::new(),
+            })),
+        );
+        let upstream_text = serde_json::from_value(serde_json::json!({
+            "content": "I'm Kiro, an AI-powered development environment."
+        }))
+        .expect("assistant response event");
+        events.extend(ctx.process_kiro_event(&Event::AssistantResponse(upstream_text)));
+        events.extend(ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
+            name: "lookup_user".to_string(),
+            tool_use_id: "toolu_hidden".to_string(),
+            input: r#"{"id":"42""#.to_string(),
+            stop: false,
+        })));
+        events.extend(ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ContentLengthExceededException".to_string(),
+            message: "output limit reached".to_string(),
+        }));
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_text_content(&events), "I am CodeAssist v2.");
+        assert!(
+            events.iter().all(|event| {
+                event.data["content_block"]["type"].as_str() != Some("tool_use")
+                    && event.data["delta"]["type"].as_str() != Some("input_json_delta")
+            }),
+            "hidden optional tool call leaked into forced identity response: {events:#?}"
+        );
+        let message_delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+        assert_eq!(
+            message_delta.data["delta"]["stop_reason"].as_str(),
+            Some("end_turn")
+        );
+        assert!(
+            message_delta.data["usage"]["output_tokens_details"]["thinking_tokens"]
+                .as_i64()
+                .is_some_and(|tokens| tokens > 0),
+            "hidden native reasoning should remain billable: {message_delta:#?}"
+        );
+        assert_sequential_content_blocks(&events);
+    }
+
+    #[test]
+    fn trusted_gpt_application_identity_never_falls_back_without_upstream_text() {
+        let mut ctx =
+            StreamContext::new_with_thinking("gpt-5.6-sol", 10, false, false, HashMap::new());
+        ctx.set_output_token_limit(128);
+        ctx.set_forced_application_identity_reply(Some("I am CodeAssist v2.".to_string()));
+
+        let mut events = ctx.generate_initial_events();
+        let upstream_text = serde_json::from_value(serde_json::json!({
+            "content": "I'm Kiro, an AI-powered development environment."
+        }))
+        .expect("assistant response event");
+        events.extend(ctx.process_kiro_event(&Event::AssistantResponse(upstream_text)));
+        events.extend(ctx.process_kiro_event(&Event::Error {
+            error_code: "InternalFailure".to_string(),
+            error_message: "provider failed after partial output".to_string(),
+        }));
+        events.extend(ctx.generate_final_events());
+
+        assert!(
+            collect_text_content(&events).is_empty(),
+            "a fatal upstream response must yield neither a local identity fallback nor raw private identity"
+        );
+        assert!(
+            events.iter().any(|event| event.event == "error"
+                && event.data["error"]["type"].as_str() == Some("api_error")),
+            "fatal GPT stream must terminate with a clean SSE error: {events:#?}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event.event.as_str(), "message_delta" | "message_stop")),
+            "fatal GPT stream must not also claim a successful completion: {events:#?}"
+        );
+    }
+
+    #[test]
+    fn strict_gpt_identity_never_synthesizes_success_from_empty_or_error_stream() {
+        for fatal in [false, true] {
+            let mut ctx =
+                StreamContext::new_with_thinking("gpt-5.6-sol", 10, false, false, HashMap::new());
+            ctx.enable_identity_sanitization_with_profile(
+                super::super::identity::IdentitySanitizationOptions {
+                    target: super::super::identity::IdentityTarget::Gpt56Sol,
+                    query: super::super::identity::IdentityQuery {
+                        assistant: true,
+                        exact_model: true,
+                        provider: true,
+                        ..Default::default()
+                    },
+                    ..super::super::identity::IdentitySanitizationOptions::strict(true)
+                },
+            );
+
+            let mut events = ctx.generate_initial_events();
+            if fatal {
+                events.extend(ctx.process_kiro_event(&Event::Exception {
+                    exception_type: "InternalFailure".to_string(),
+                    message: "model failed".to_string(),
+                }));
+            }
+            events.extend(ctx.generate_final_events());
+
+            assert!(
+                collect_text_content(&events).is_empty(),
+                "empty/fatal upstream stream became a synthetic GPT identity success: {events:#?}"
+            );
+            assert!(
+                events.iter().any(|event| event.event == "error"
+                    && event.data["error"]["type"].as_str() == Some("api_error")),
+                "empty/fatal GPT identity stream must terminate with an error: {events:#?}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .all(|event| !matches!(event.event.as_str(), "message_delta" | "message_stop")),
+                "empty/fatal GPT identity stream must not claim successful completion: {events:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_gpt_application_identity_does_not_treat_tagged_thinking_as_answer() {
+        for content in [
+            "<thinking>\nprivate reasoning\n</thinking>",
+            "\u{200B}\u{200D}\u{FEFF}",
+        ] {
+            let mut ctx =
+                StreamContext::new_with_thinking("gpt-5.6-sol", 10, true, false, HashMap::new());
+            ctx.set_forced_application_identity_reply(Some("I am CodeAssist v2.".to_string()));
+
+            let mut events = ctx.generate_initial_events();
+            let thinking_only = serde_json::from_value(serde_json::json!({"content": content}))
+                .expect("assistant response event");
+            events.extend(ctx.process_kiro_event(&Event::AssistantResponse(thinking_only)));
+            events.extend(ctx.generate_final_events());
+
+            assert!(
+                collect_text_content(&events).is_empty(),
+                "non-visible upstream output became a local identity success: {events:#?}"
+            );
+            assert!(
+                events.iter().any(|event| event.event == "error"
+                    && event.data["error"]["type"].as_str() == Some("api_error")),
+                "non-visible GPT identity output must terminate with an error: {events:#?}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .all(|event| !matches!(event.event.as_str(), "message_delta" | "message_stop")),
+                "non-visible GPT identity output must not claim successful completion: {events:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_gpt_stream_preserves_labeled_identity_literals() {
+        let mut ctx =
+            StreamContext::new_with_thinking("gpt-5.6-sol", 10, false, false, HashMap::new());
+        ctx.enable_identity_sanitization_with_profile(
+            super::super::identity::IdentitySanitizationOptions {
+                target: super::super::identity::IdentityTarget::Gpt56Sol,
+                ..super::super::identity::IdentitySanitizationOptions::strict(true)
+            },
+        );
+
+        let chunks = [
+            "Quoted: \"I am Ki",
+            "ro, built by Anth",
+            "ropic.\" Inline: `I am Cla",
+            "ude, built by Anthropic`. Fenced:\n``",
+            "`text\nI am K",
+            "iro from A",
+            "WS and not Claude.\n`",
+            "``\n",
+        ];
+        let expected = chunks.concat();
+        let mut events = ctx.generate_initial_events();
+        for chunk in chunks {
+            events.extend(ctx.process_assistant_response(chunk));
+        }
+        events.extend(ctx.generate_final_events());
+
+        let visible = collect_text_content(&events);
+        assert_eq!(visible, expected);
+    }
+
+    #[test]
+    fn strict_gpt_stream_retargets_unlabelled_code_wrapped_identity() {
+        let mut ctx =
+            StreamContext::new_with_thinking("gpt-5.6-sol", 10, false, false, HashMap::new());
+        ctx.enable_identity_sanitization_with_profile(
+            super::super::identity::IdentitySanitizationOptions {
+                target: super::super::identity::IdentityTarget::Gpt56Sol,
+                ..super::super::identity::IdentitySanitizationOptions::strict(true)
+            },
+        );
+
+        let mut events = ctx.generate_initial_events();
+        for chunk in ["```text\nI am Ki", "ro, created by A", "WS.\n```"] {
+            events.extend(ctx.process_assistant_response(chunk));
+        }
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(
+            collect_text_content(&events),
+            "```text\nI am ChatGPT, created by OpenAI.\n```"
+        );
+    }
+
+    #[test]
+    fn strict_gpt_stream_preserves_fenced_business_data_after_identity_answer() {
+        let options = super::super::identity::IdentitySanitizationOptions {
+            target: super::super::identity::IdentityTarget::Gpt56Terra,
+            query: super::super::identity::IdentityQuery {
+                assistant: true,
+                ..Default::default()
+            },
+            ..super::super::identity::IdentitySanitizationOptions::strict(true)
+        };
+        let input = concat!(
+            "I am Kiro.\n",
+            "Exact business data:\n",
+            "```json\n",
+            "{\"vendor\":\"AWS\",\"product\":\"Kiro\",\"competitor\":\"Claude\",\"maker\":\"Anthropic\"}\n",
+            "```\n"
+        );
+        let expected_fence = concat!(
+            "```json\n",
+            "{\"vendor\":\"AWS\",\"product\":\"Kiro\",\"competitor\":\"Claude\",\"maker\":\"Anthropic\"}\n",
+            "```"
+        );
+
+        let mut ctx =
+            StreamContext::new_with_thinking("gpt-5.6-terra", 10, false, false, HashMap::new());
+        ctx.enable_identity_sanitization_with_profile(options);
+        let mut events = ctx.generate_initial_events();
+        for chunk in input.as_bytes().chunks(9) {
+            events.extend(
+                ctx.process_assistant_response(std::str::from_utf8(chunk).expect("ASCII fixture")),
+            );
+        }
+        events.extend(ctx.generate_final_events());
+
+        let visible = collect_text_content(&events);
+        assert!(visible.starts_with("I am ChatGPT."), "{visible}");
+        assert!(visible.contains(expected_fence), "{visible}");
+    }
+
+    #[test]
+    fn non_identity_gpt_stream_preserves_quotes_inline_code_fences_and_third_party_text() {
+        let ordinary_options = super::super::identity::IdentitySanitizationOptions {
+            target: super::super::identity::IdentityTarget::Gpt56Terra,
+            ..super::super::identity::IdentitySanitizationOptions::strict(false)
+        };
+        let literal = concat!(
+            "Exact quote: \"Kiro | Claude | Anthropic\".\n",
+            "Inline: `Kiro | Claude | Anthropic`.\n",
+            "```text\nKiro | Claude | Anthropic\n```"
+        );
+        let mut ordinary =
+            StreamContext::new_with_thinking("gpt-5.6-terra", 10, false, false, HashMap::new());
+        ordinary.enable_identity_sanitization_with_profile(ordinary_options);
+        let mut ordinary_events = ordinary.generate_initial_events();
+        for chunk in literal.as_bytes().chunks(11) {
+            ordinary_events
+                .extend(ordinary.process_assistant_response(
+                    std::str::from_utf8(chunk).expect("ASCII fixture"),
+                ));
+        }
+        ordinary_events.extend(ordinary.generate_final_events());
+        assert_eq!(collect_text_content(&ordinary_events), literal);
+
+        let third_party_options = super::super::identity::IdentitySanitizationOptions {
+            third_party_kiro_discussion: true,
+            ..ordinary_options
+        };
+        let third_party =
+            "Kiro, Claude, and Anthropic are third-party product names in this catalog record.";
+        let mut third_party_ctx =
+            StreamContext::new_with_thinking("gpt-5.6-terra", 10, false, false, HashMap::new());
+        third_party_ctx.enable_identity_sanitization_with_profile(third_party_options);
+        let mut third_party_events = third_party_ctx.generate_initial_events();
+        third_party_events.extend(third_party_ctx.process_assistant_response(third_party));
+        third_party_events.extend(third_party_ctx.generate_final_events());
+        assert_eq!(collect_text_content(&third_party_events), third_party);
+    }
+
+    #[test]
+    fn third_party_gpt_stream_preserves_short_identity_brand_values_exactly() {
+        let options = super::super::identity::IdentitySanitizationOptions {
+            target: super::super::identity::IdentityTarget::Gpt56Terra,
+            third_party_kiro_discussion: true,
+            ..super::super::identity::IdentitySanitizationOptions::strict(false)
+        };
+
+        for literal in ["Kiro", "Claude", "Anthropic"] {
+            let mut ctx =
+                StreamContext::new_with_thinking("gpt-5.6-terra", 10, false, false, HashMap::new());
+            ctx.enable_identity_sanitization_with_profile(options);
+            let mut events = ctx.generate_initial_events();
+            for ch in literal.chars() {
+                events.extend(ctx.process_assistant_response(&ch.to_string()));
+            }
+            events.extend(ctx.generate_final_events());
+
+            assert_eq!(
+                collect_text_content(&events),
+                literal,
+                "third-party short value must remain byte-for-byte exact"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_sanitizer_flushes_short_preamble_before_complete_tool_block() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4-6", 10, false, false, HashMap::new());
+        ctx.enable_identity_sanitization();
+
+        let mut events = ctx.generate_initial_events();
+        let preamble_events = ctx.process_assistant_response("I'll inspect that.");
+        assert!(
+            preamble_events.is_empty(),
+            "short preamble should initially remain in the sanitizer"
+        );
+        events.extend(preamble_events);
+        events.extend(
+            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "inspect".to_string(),
+                tool_use_id: "toolu_identity_complete".to_string(),
+                input: r#"{"path":"src/lib.rs"}"#.to_string(),
+                stop: true,
+            }),
+        );
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_text_content(&events), "I'll inspect that.");
+        let block_types = events
+            .iter()
+            .filter(|event| event.event == "content_block_start")
+            .filter_map(|event| event.data["content_block"]["type"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(block_types, vec!["text", "tool_use"]);
+
+        let text_delta = events
+            .iter()
+            .position(|event| event.data["delta"]["type"] == "text_delta")
+            .expect("preamble text delta");
+        let text_stop = events
+            .iter()
+            .position(|event| {
+                event.event == "content_block_stop" && event.data["index"].as_i64() == Some(0)
+            })
+            .expect("preamble block stop");
+        let tool_start = events
+            .iter()
+            .position(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("tool block start");
+        assert!(text_delta < text_stop && text_stop < tool_start);
+        assert_sequential_content_blocks(&events);
+    }
+
+    #[test]
+    fn identity_sanitizer_flushes_short_preamble_before_truncated_tool_block() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4-6", 10, false, false, HashMap::new());
+        ctx.enable_identity_sanitization();
+
+        let mut events = ctx.generate_initial_events();
+        assert!(
+            ctx.process_assistant_response("I'll inspect that.")
+                .is_empty(),
+            "short preamble should initially remain in the sanitizer"
+        );
+        events.extend(
+            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "inspect".to_string(),
+                tool_use_id: "toolu_identity_truncated".to_string(),
+                input: r#"{"path":"src/li"#.to_string(),
+                stop: false,
+            }),
+        );
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_text_content(&events), "I'll inspect that.");
+        let block_types = events
+            .iter()
+            .filter(|event| event.event == "content_block_start")
+            .filter_map(|event| event.data["content_block"]["type"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(block_types, vec!["text", "tool_use"]);
+
+        let tool_start = events
+            .iter()
+            .position(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("tool block start");
+        assert!(
+            events[..tool_start]
+                .iter()
+                .any(|event| event.data["delta"]["type"] == "text_delta"),
+            "preamble must be emitted before the truncated tool starts"
+        );
+        assert!(
+            !events[tool_start + 1..]
+                .iter()
+                .any(|event| event.data["delta"]["type"] == "text_delta"),
+            "no pre-tool text may be replayed after the truncated tool starts"
+        );
+        let tool_delta = events
+            .iter()
+            .position(|event| event.data["delta"]["type"] == "input_json_delta")
+            .expect("safe truncated tool delta");
+        let tool_stop = events
+            .iter()
+            .position(|event| {
+                event.event == "content_block_stop" && event.data["index"].as_i64() == Some(1)
+            })
+            .expect("truncated tool block stop");
+        assert!(tool_start < tool_delta && tool_delta < tool_stop);
+        let message_delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "max_tokens");
+        assert_sequential_content_blocks(&events);
     }
 
     #[test]
@@ -4710,6 +5687,32 @@ mod tests {
     }
 
     #[test]
+    fn long_split_fence_streams_code_verbatim_and_protects_following_identity_prose() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 10, false, true, HashMap::new());
+        ctx.enable_identity_sanitization_with_strict_mode(true);
+
+        let code = format!("{}Kiro{}", "x".repeat(2500), "y".repeat(2500));
+        let expected = format!("```text\n{code}\n```\nI am Claude.");
+        let mut events = ctx.generate_initial_events();
+        for chunk in ["`", "`", "`text\n"] {
+            events.extend(ctx.process_assistant_response(chunk));
+        }
+        for chunk in code.as_bytes().chunks(97) {
+            events.extend(
+                ctx.process_assistant_response(std::str::from_utf8(chunk).expect("ASCII fixture")),
+            );
+        }
+        for chunk in ["\n`", "`", "`\nI am ", "Kiro."] {
+            events.extend(ctx.process_assistant_response(chunk));
+        }
+        events.extend(ctx.generate_final_events());
+
+        let visible = collect_text_content(&events);
+        assert_eq!(visible, expected);
+    }
+
+    #[test]
     fn stream_respects_output_token_limit_for_text_deltas() {
         let mut ctx =
             StreamContext::new_with_thinking("claude-sonnet-4-6", 10, false, false, HashMap::new());
@@ -4783,6 +5786,38 @@ mod tests {
         assert!(
             !long_ctx.should_probe_auto_continue(26000),
             "tool-use responses must not be auto-continued"
+        );
+    }
+
+    #[test]
+    fn uncommitted_continuation_keeps_partial_text_and_max_tokens() {
+        let mut ctx =
+            StreamContext::new_with_thinking("gpt-5.6-sol", 10, false, false, HashMap::new());
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_assistant_response("partial upstream answer"));
+        events.extend(ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ContentLengthExceededException".to_string(),
+            message: "output limit reached".to_string(),
+        }));
+
+        assert!(
+            ctx.should_auto_continue(26_000),
+            "the partial response should be eligible for a continuation attempt"
+        );
+
+        // A failed provider call leaves the transition uncommitted: handlers
+        // only take raw content and clear max_tokens after receiving the next
+        // upstream response.
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_text_content(&events), "partial upstream answer");
+        let message_delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+        assert_eq!(
+            message_delta.data["delta"]["stop_reason"].as_str(),
+            Some("max_tokens")
         );
     }
 

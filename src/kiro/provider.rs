@@ -8,7 +8,7 @@
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -166,11 +166,10 @@ impl KiroProvider {
             let client = self.client_for(&ctx.credentials)?;
             let base = tls_sidecar::post(&client, &url)
                 .body(body)
-                .header("content-type", "application/json")
-                .header("Connection", "close");
+                .header("content-type", "application/json");
             let request = endpoint.decorate_mcp(base, &rctx);
 
-            let response = match request.send().await {
+            let mut response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
@@ -186,6 +185,8 @@ impl KiroProvider {
                     continue;
                 }
             };
+            // 内部诊断头不能继续进入 MCP 响应处理链。
+            let _ = tls_sidecar::take_response_timing(&mut response);
 
             let status = response.status();
 
@@ -288,6 +289,7 @@ impl KiroProvider {
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
+        let call_started = Instant::now();
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
@@ -327,18 +329,24 @@ impl KiroProvider {
             let client = self.client_for(&ctx.credentials)?;
             let base = tls_sidecar::post(&client, &url)
                 .body(body)
-                .header("content-type", "application/json")
-                .header("Connection", "close");
+                .header("content-type", "application/json");
             let request = endpoint.decorate_api(base, &rctx);
+            let attempt_started = Instant::now();
 
-            let response = match request.send().await {
+            let mut response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
-                        "API 请求发送失败（尝试 {}/{}）: {}",
+                        upstream_model_id = model.as_deref().unwrap_or("unknown"),
+                        api_type = api_type,
+                        attempt = attempt + 1,
+                        retry_count = attempt,
+                        attempt_headers_ms = attempt_started.elapsed().as_millis() as u64,
+                        call_elapsed_ms = call_started.elapsed().as_millis() as u64,
+                        error = %e,
+                        "API 请求发送失败（尝试 {}/{}）",
                         attempt + 1,
-                        max_retries,
-                        e
+                        max_retries
                     );
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
@@ -351,6 +359,31 @@ impl KiroProvider {
             };
 
             let status = response.status();
+            let attempt_headers_us = attempt_started.elapsed().as_micros() as u64;
+            let sidecar_timing = tls_sidecar::take_response_timing(&mut response);
+            let sidecar_metrics_present = sidecar_timing.is_some();
+            let sidecar_request_id = sidecar_timing
+                .and_then(|timing| timing.request_id)
+                .unwrap_or_default();
+            let sidecar_connection_reused = sidecar_timing
+                .and_then(|timing| timing.connection_reused)
+                .unwrap_or(false);
+            let sidecar_reconnected = sidecar_timing
+                .and_then(|timing| timing.reconnected)
+                .unwrap_or(false);
+            let sidecar_network_dial_us = sidecar_timing
+                .and_then(|timing| timing.network_dial_us)
+                .unwrap_or_default();
+            let sidecar_tls_handshake_us = sidecar_timing
+                .and_then(|timing| timing.tls_handshake_us)
+                .unwrap_or_default();
+            let sidecar_upstream_headers_us = sidecar_timing
+                .and_then(|timing| timing.upstream_headers_us)
+                .unwrap_or_default();
+            let rust_sidecar_overhead_us = sidecar_timing
+                .and_then(|timing| timing.upstream_headers_us)
+                .map(|sidecar_us| attempt_headers_us.saturating_sub(sidecar_us))
+                .unwrap_or_default();
 
             // 成功响应
             if status.is_success() {
@@ -359,11 +392,41 @@ impl KiroProvider {
                     upstream_model_id = model.as_deref().unwrap_or("unknown"),
                     api_type = api_type,
                     attempt = attempt + 1,
+                    retry_count = attempt,
+                    upstream_headers_ms = attempt_headers_us / 1_000,
+                    call_headers_ms = call_started.elapsed().as_millis() as u64,
+                    sidecar_metrics_present = sidecar_metrics_present,
+                    sidecar_request_id = sidecar_request_id,
+                    sidecar_connection_reused = sidecar_connection_reused,
+                    sidecar_reconnected = sidecar_reconnected,
+                    sidecar_network_dial_us = sidecar_network_dial_us,
+                    sidecar_tls_handshake_us = sidecar_tls_handshake_us,
+                    sidecar_upstream_headers_us = sidecar_upstream_headers_us,
+                    rust_sidecar_overhead_us = rust_sidecar_overhead_us,
                     status = %status,
                     "Kiro 上游请求成功"
                 );
                 return Ok(response);
             }
+
+            tracing::warn!(
+                upstream_model_id = model.as_deref().unwrap_or("unknown"),
+                api_type = api_type,
+                attempt = attempt + 1,
+                retry_count = attempt,
+                attempt_headers_ms = attempt_headers_us / 1_000,
+                call_elapsed_ms = call_started.elapsed().as_millis() as u64,
+                sidecar_metrics_present = sidecar_metrics_present,
+                sidecar_request_id = sidecar_request_id,
+                sidecar_connection_reused = sidecar_connection_reused,
+                sidecar_reconnected = sidecar_reconnected,
+                sidecar_network_dial_us = sidecar_network_dial_us,
+                sidecar_tls_handshake_us = sidecar_tls_handshake_us,
+                sidecar_upstream_headers_us = sidecar_upstream_headers_us,
+                rust_sidecar_overhead_us = rust_sidecar_overhead_us,
+                status = %status,
+                "Kiro 上游请求返回非成功状态"
+            );
 
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();

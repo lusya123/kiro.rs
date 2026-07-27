@@ -15,10 +15,22 @@ use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 
 use super::native_bedrock::BedrockMantleProvider;
+use super::response_store::ResponseStore;
 use super::types::ErrorResponse;
 
 const AWS_B40_GATEWAY_VERSION: &str = "d47d4a8b";
 const AWS_B40_NON_STREAM_VERSION: &str = "v1.0.0-rc.15";
+
+/// Private, in-process marker for responses produced by the clean GPT OpenAI
+/// compatibility path. Axum response extensions are never serialized onto the
+/// wire; the outer response middleware consumes this marker before returning.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GptOpenAiResponse;
+
+pub(crate) fn mark_gpt_openai_response(mut response: Response) -> Response {
+    response.extensions_mut().insert(GptOpenAiResponse);
+    response
+}
 
 /// 应用共享状态
 #[derive(Clone)]
@@ -34,6 +46,8 @@ pub struct AppState {
     pub extract_thinking: bool,
     /// 是否启用 AWS-B-40 外观兼容模式
     pub aws_b40_compat: bool,
+    /// Per-API-key, bounded Responses continuation state.
+    pub(crate) response_store: Arc<ResponseStore>,
 }
 
 impl AppState {
@@ -45,6 +59,7 @@ impl AppState {
             bedrock_mantle_provider: None,
             extract_thinking,
             aws_b40_compat,
+            response_store: Arc::new(ResponseStore::default()),
         }
     }
 
@@ -71,6 +86,18 @@ pub async fn auth_middleware(
     match supplied_key.as_deref() {
         Some(key) if auth::constant_time_eq(key, &state.api_key) => next.run(request).await,
         _ => {
+            if is_chat_completions_path(&path) {
+                return openai_authentication_error_response();
+            }
+            // Nested routers expose `/responses` here, while direct tests and
+            // alternate composition may retain the full `/v1/responses` path.
+            if path == "/responses"
+                || path.starts_with("/responses/")
+                || path.ends_with("/v1/responses")
+                || path.contains("/v1/responses/")
+            {
+                return openai_authentication_error_response();
+            }
             if state.aws_b40_compat {
                 let request_id = aws_b40_oneapi_request_id();
                 if is_messages_path(&path) {
@@ -111,6 +138,23 @@ pub async fn auth_middleware(
     }
 }
 
+fn openai_authentication_error_response() -> Response {
+    mark_gpt_openai_response(
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": {
+                    "message": "Authentication failed. Check your API key.",
+                    "type": "authentication_error",
+                    "param": null,
+                    "code": "invalid_api_key"
+                }
+            })),
+        )
+            .into_response(),
+    )
+}
+
 /// AWS-B-40 响应头兼容层。
 pub async fn aws_b40_headers_middleware(
     State(state): State<AppState>,
@@ -133,9 +177,28 @@ pub async fn aws_b40_headers_middleware(
     }
 
     let mut response = next.run(request).await;
+    apply_response_compat_headers(&state, &method, &path, &mut response);
+    response
+}
+
+fn apply_response_compat_headers(
+    state: &AppState,
+    method: &Method,
+    path: &str,
+    response: &mut Response,
+) {
+    if response
+        .extensions_mut()
+        .remove::<GptOpenAiResponse>()
+        .is_some()
+    {
+        strip_non_openai_gateway_headers(response.headers_mut());
+        return;
+    }
+
     if state.aws_b40_compat {
-        let messages_success = is_gateway_completion_path(&path) && response.status().is_success();
-        let messages_stream_success = messages_success && is_stream_response(&response);
+        let messages_success = is_gateway_completion_path(path) && response.status().is_success();
+        let messages_stream_success = messages_success && is_stream_response(response);
         let request_id = response
             .headers()
             .get("x-oneapi-request-id")
@@ -148,7 +211,7 @@ pub async fn aws_b40_headers_middleware(
                     aws_b40_oneapi_request_id()
                 }
             });
-        let version = aws_b40_version_for_response(&method, &path, &response);
+        let version = aws_b40_version_for_response(method, path, response);
         apply_aws_b40_headers_with_version(response.headers_mut(), &request_id, version);
 
         if messages_success && !messages_stream_success {
@@ -156,7 +219,7 @@ pub async fn aws_b40_headers_middleware(
         }
     } else {
         let include_official_headers = path.ends_with("/messages");
-        let is_stream = is_stream_response(&response);
+        let is_stream = is_stream_response(response);
         let status = response.status();
         super::compat::add_response_headers(
             response.headers_mut(),
@@ -165,7 +228,23 @@ pub async fn aws_b40_headers_middleware(
             include_official_headers,
         );
     }
-    response
+}
+
+fn strip_non_openai_gateway_headers(headers: &mut header::HeaderMap) {
+    for name in [
+        "x-new-api-version",
+        "x-oneapi-request-id",
+        "x-accel-buffering",
+        "strict-transport-security",
+        "server",
+        "via",
+        "alt-svc",
+        "referrer-policy",
+        "x-content-type-options",
+        "x-frame-options",
+    ] {
+        headers.remove(name);
+    }
 }
 
 pub fn aws_b40_oneapi_request_id() -> String {
@@ -261,8 +340,12 @@ fn is_messages_path(path: &str) -> bool {
     path == "/messages" || path == "/v1/messages" || path == "/cc/v1/messages"
 }
 
+fn is_chat_completions_path(path: &str) -> bool {
+    path == "/chat/completions" || path == "/v1/chat/completions"
+}
+
 fn is_gateway_completion_path(path: &str) -> bool {
-    is_messages_path(path) || path == "/chat/completions" || path == "/v1/chat/completions"
+    is_messages_path(path) || is_chat_completions_path(path)
 }
 
 fn is_stream_response(response: &Response) -> bool {
@@ -294,6 +377,8 @@ pub fn cors_layer() -> tower_http::cors::CorsLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Router, middleware, routing::post};
+    use serde_json::Value;
 
     fn response(status: StatusCode, content_type: &str) -> Response {
         Response::builder()
@@ -368,5 +453,153 @@ mod tests {
         );
         assert_eq!(headers["x-content-type-options"], "nosniff");
         assert_eq!(headers["x-frame-options"], "SAMEORIGIN");
+    }
+
+    #[test]
+    fn marked_gpt_openai_success_error_and_stream_skip_gateway_headers() {
+        let state = AppState::new("test-key", true, true);
+        for (status, content_type) in [
+            (StatusCode::OK, "application/json"),
+            (StatusCode::BAD_REQUEST, "application/json"),
+            (StatusCode::OK, "text/event-stream"),
+        ] {
+            let mut response = response(status, content_type);
+            apply_aws_b40_headers(response.headers_mut(), "should-be-removed");
+            apply_aws_b40_non_stream_success_headers(response.headers_mut());
+            let mut response = mark_gpt_openai_response(response);
+
+            apply_response_compat_headers(
+                &state,
+                &Method::POST,
+                "/v1/chat/completions",
+                &mut response,
+            );
+
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], content_type);
+            assert!(
+                response.extensions().get::<GptOpenAiResponse>().is_none(),
+                "private marker must be consumed"
+            );
+            for forbidden in [
+                "x-new-api-version",
+                "x-oneapi-request-id",
+                "x-accel-buffering",
+                "strict-transport-security",
+                "server",
+                "via",
+                "alt-svc",
+                "referrer-policy",
+                "x-content-type-options",
+                "x-frame-options",
+            ] {
+                assert!(
+                    response.headers().get(forbidden).is_none(),
+                    "{forbidden} leaked for {status} {content_type}"
+                );
+            }
+        }
+    }
+
+    async fn spawn_auth_test_router(aws_b40_compat: bool) -> (String, tokio::task::JoinHandle<()>) {
+        let state = AppState::new("test-key", true, aws_b40_compat);
+        let app = Router::new()
+            .route(
+                "/chat/completions",
+                post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .layer(middleware::from_fn_with_state(
+                state,
+                aws_b40_headers_middleware,
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind auth test router");
+        let address = listener.local_addr().expect("auth test router address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve auth test router");
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn chat_completions_auth_failures_are_clean_openai_errors() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("auth test HTTP client");
+
+        for aws_b40_compat in [false, true] {
+            let (base, server) = spawn_auth_test_router(aws_b40_compat).await;
+            for path in ["/chat/completions", "/v1/chat/completions"] {
+                for supplied_key in [None, Some("wrong-key")] {
+                    let mut request = client.post(format!("{base}{path}"));
+                    if let Some(key) = supplied_key {
+                        request = request.bearer_auth(key);
+                    }
+                    let response = request.send().await.expect("chat auth response");
+
+                    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+                    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+                    for forbidden in ["x-new-api-version", "x-oneapi-request-id", "server", "via"] {
+                        assert!(
+                            response.headers().get(forbidden).is_none(),
+                            "{forbidden} leaked for {path}, aws_b40_compat={aws_b40_compat}, supplied_key={supplied_key:?}"
+                        );
+                    }
+
+                    let body: Value = response.json().await.expect("OpenAI auth error JSON");
+                    assert_eq!(
+                        body,
+                        json!({
+                            "error": {
+                                "message": "Authentication failed. Check your API key.",
+                                "type": "authentication_error",
+                                "param": null,
+                                "code": "invalid_api_key"
+                            }
+                        }),
+                        "{path}, aws_b40_compat={aws_b40_compat}, supplied_key={supplied_key:?}"
+                    );
+                    let serialized = body.to_string();
+                    for forbidden in ["new_api_error", "request id", "无效的令牌", "未提供令牌"]
+                    {
+                        assert!(
+                            !serialized.contains(forbidden),
+                            "{forbidden} leaked for {path}, aws_b40_compat={aws_b40_compat}, supplied_key={supplied_key:?}: {body}"
+                        );
+                    }
+                }
+            }
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[test]
+    fn unmarked_claude_openai_and_messages_keep_gateway_headers() {
+        let state = AppState::new("test-key", true, true);
+        for path in ["/v1/chat/completions", "/v1/messages"] {
+            let mut response = response(StatusCode::OK, "application/json");
+            apply_response_compat_headers(&state, &Method::POST, path, &mut response);
+
+            assert_eq!(
+                response.headers()["x-new-api-version"],
+                AWS_B40_NON_STREAM_VERSION
+            );
+            assert_eq!(response.headers()["server"], "lyywafcdn");
+            assert_eq!(response.headers()["via"], "1.1 Caddy");
+            assert!(response.headers().get("x-oneapi-request-id").is_some());
+        }
     }
 }

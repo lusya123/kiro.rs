@@ -445,8 +445,11 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 ## 模型映射
 
-| Anthropic 模型 | Kiro 模型 |
+| 客户端模型 | Kiro 模型 |
 |----------------|-----------|
+| `gpt-5.6-sol` / `GPT 5.6 Sol` | `gpt-5.6-sol` |
+| `gpt-5.6-terra` / `GPT 5.6 Terra` | `gpt-5.6-terra` |
+| `gpt-5.6-luna` / `GPT 5.6 Luna` | `gpt-5.6-luna` |
 | `*sonnet*`（含 5/5.0） | `claude-sonnet-5` |
 | `*sonnet*`（含 4.6/4-6） | `claude-sonnet-4.6` |
 | `*sonnet*`（其他） | `claude-sonnet-4.5` |
@@ -456,6 +459,59 @@ RUST_LOG=debug ./target/release/kiro-rs
 | `*opus*`（含 4.8/4-8） | `claude-opus-4.8` |
 | `*opus*`（其他） | `claude-opus-4.6` |
 | `*haiku*` | `claude-haiku-4.5` |
+
+GPT 5.6 仅接受上表中的精确模型名，并原样透传到上游；不会回退到 Claude
+或其他 GPT 模型，也不会使用本地兼容回复。身份探测使用独立的 GPT 策略：
+公开助手为 ChatGPT，精确模型为请求中的 Sol/Terra/Luna，开发者与模型提供方为
+OpenAI，私有宿主/运行时返回 `unknown`。该策略复用跨分片检测和结构化防泄漏框架，
+但不注入 Claude/Anthropic 身份；普通第三方讨论、引用、代码、字符串字面量和业务
+工具参数保持原样。
+
+### GPT 5.6 推理强度
+
+GPT 5.6 使用原生 `reasoning`，不要使用 Claude 的 `thinking` 或
+`output_config.effort`。Sol、Terra、Luna 均支持六档：
+`none`、`low`、`medium`、`high`、`xhigh`、`max`。GPT 5.6 官方默认值是
+`medium`；`reasoning.mode` 另支持 `standard`（默认）和 `pro`。
+仅传 `mode` 时，本服务在三个入口都使用 `medium`；省略整个 `reasoning`
+时不向上游伪造配置。如需可审计的跨入口行为，请显式传入档位。
+
+Anthropic Messages 兼容端点：
+
+```json
+{
+  "model": "gpt-5.6-sol",
+  "max_tokens": 1024,
+  "reasoning": {
+    "effort": "xhigh",
+    "mode": "standard"
+  },
+  "messages": [
+    {"role": "user", "content": "分析这个并发问题"}
+  ]
+}
+```
+
+OpenAI Chat Completions 兼容端点可使用顶层
+`"reasoning_effort": "xhigh"`，并可选传入
+`"reasoning_mode": "standard"`；也接受上面相同的嵌套 `reasoning` 对象。
+不支持的档位会在本地返回 400，不会静默降级到默认值。
+
+OpenAI Responses 兼容端点使用标准嵌套字段：
+
+```json
+{
+  "model": "gpt-5.6-sol",
+  "input": "分析这个并发问题",
+  "reasoning": {
+    "effort": "xhigh",
+    "mode": "standard"
+  }
+}
+```
+
+该入口位于 `/v1/responses`，支持 GPT 5.6 的文本、图片、base64 文档、
+函数工具、非流式响应和 canonical Responses SSE。
 
 ## Admin（可选）
 

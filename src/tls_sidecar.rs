@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use parking_lot::{Mutex, RwLock};
+use reqwest::header::HeaderMap;
 use reqwest::{Client, Method, RequestBuilder};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -32,6 +33,24 @@ const MAX_RESTART_ATTEMPTS: usize = 5;
 const RESTART_DELAY: Duration = Duration::from_secs(2);
 const HEADER_TARGET: &str = "X-Target-Url";
 const HEADER_PROXY: &str = "X-Proxy-Url";
+const HEADER_TIMING_REQUEST_ID: &str = "x-kiro-rs-sidecar-request-id";
+const HEADER_TIMING_CONNECTION_REUSED: &str = "x-kiro-rs-sidecar-connection-reused";
+const HEADER_TIMING_RECONNECTED: &str = "x-kiro-rs-sidecar-reconnected";
+const HEADER_TIMING_NETWORK_DIAL_US: &str = "x-kiro-rs-sidecar-network-dial-us";
+const HEADER_TIMING_TLS_HANDSHAKE_US: &str = "x-kiro-rs-sidecar-tls-handshake-us";
+const HEADER_TIMING_UPSTREAM_HEADERS_US: &str = "x-kiro-rs-sidecar-upstream-headers-us";
+
+/// sidecar 写入响应头的内部链路计时。调用方读取后必须删除这些头，避免它们
+/// 被误当成上游协议的一部分继续透传。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SidecarRequestTiming {
+    pub request_id: Option<u64>,
+    pub connection_reused: Option<bool>,
+    pub reconnected: Option<bool>,
+    pub network_dial_us: Option<u64>,
+    pub tls_handshake_us: Option<u64>,
+    pub upstream_headers_us: Option<u64>,
+}
 
 // ───────── 全局策略（被调用点使用）─────────
 
@@ -147,6 +166,49 @@ pub fn request(client: &Client, method: Method, target_url: &str) -> RequestBuil
     } else {
         client.request(method, target_url)
     }
+}
+
+/// 取出并删除 sidecar 的内部诊断响应头。
+///
+/// sidecar 未启用时通常返回 `None`；即使上游伪造了同名头，也会在此删除，
+/// 不会泄露到对外 API 响应中。
+pub(crate) fn take_response_timing(
+    response: &mut reqwest::Response,
+) -> Option<SidecarRequestTiming> {
+    take_timing_headers(response.headers_mut())
+}
+
+fn take_timing_headers(headers: &mut HeaderMap) -> Option<SidecarRequestTiming> {
+    let timing = SidecarRequestTiming {
+        request_id: take_u64_header(headers, HEADER_TIMING_REQUEST_ID),
+        connection_reused: take_bool_header(headers, HEADER_TIMING_CONNECTION_REUSED),
+        reconnected: take_bool_header(headers, HEADER_TIMING_RECONNECTED),
+        network_dial_us: take_u64_header(headers, HEADER_TIMING_NETWORK_DIAL_US),
+        tls_handshake_us: take_u64_header(headers, HEADER_TIMING_TLS_HANDSHAKE_US),
+        upstream_headers_us: take_u64_header(headers, HEADER_TIMING_UPSTREAM_HEADERS_US),
+    };
+
+    if timing == SidecarRequestTiming::default() {
+        None
+    } else {
+        Some(timing)
+    }
+}
+
+fn take_u64_header(headers: &mut HeaderMap, name: &'static str) -> Option<u64> {
+    headers
+        .remove(name)
+        .and_then(|value| value.to_str().ok().and_then(|raw| raw.parse().ok()))
+}
+
+fn take_bool_header(headers: &mut HeaderMap, name: &'static str) -> Option<bool> {
+    headers
+        .remove(name)
+        .and_then(|value| match value.to_str().ok()? {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        })
 }
 
 // ───────── 子进程管理 ─────────
@@ -433,6 +495,7 @@ pub fn binary_search_hints() -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue};
 
     #[test]
     fn test_disabled_policy_passes_url_through() {
@@ -451,5 +514,54 @@ mod tests {
     fn test_find_binary_explicit_nonexistent_falls_back() {
         // explicit 路径不存在时应回退到候选路径搜索；本测试只断言调用不 panic
         let _ = find_binary(Some("/definitely/nonexistent/path"));
+    }
+
+    #[test]
+    fn timing_headers_are_parsed_and_removed() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_TIMING_REQUEST_ID, HeaderValue::from_static("42"));
+        headers.insert(
+            HEADER_TIMING_CONNECTION_REUSED,
+            HeaderValue::from_static("true"),
+        );
+        headers.insert(HEADER_TIMING_RECONNECTED, HeaderValue::from_static("false"));
+        headers.insert(
+            HEADER_TIMING_NETWORK_DIAL_US,
+            HeaderValue::from_static("17000"),
+        );
+        headers.insert(
+            HEADER_TIMING_TLS_HANDSHAKE_US,
+            HeaderValue::from_static("23000"),
+        );
+        headers.insert(
+            HEADER_TIMING_UPSTREAM_HEADERS_US,
+            HeaderValue::from_static("41000"),
+        );
+
+        let timing = take_timing_headers(&mut headers).expect("timing headers");
+        assert_eq!(
+            timing,
+            SidecarRequestTiming {
+                request_id: Some(42),
+                connection_reused: Some(true),
+                reconnected: Some(false),
+                network_dial_us: Some(17_000),
+                tls_handshake_us: Some(23_000),
+                upstream_headers_us: Some(41_000),
+            }
+        );
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn malformed_timing_headers_are_still_removed() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HEADER_TIMING_NETWORK_DIAL_US,
+            HeaderValue::from_static("not-a-number"),
+        );
+
+        assert_eq!(take_timing_headers(&mut headers), None);
+        assert!(headers.is_empty());
     }
 }

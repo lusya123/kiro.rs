@@ -35,6 +35,8 @@ mod identity;
 mod middleware;
 mod native_bedrock;
 mod openai_compat;
+mod response_store;
+mod responses_compat;
 mod router;
 mod signature;
 mod stream;

@@ -111,6 +111,13 @@ impl BedrockMantleProvider {
 
     pub fn should_route(&self, model: &str) -> bool {
         let model = model.trim().to_ascii_lowercase();
+        // GPT 5.6 models must use the Kiro transport so their exact upstream
+        // model IDs and GPT-specific passthrough guarantees remain observable.
+        // Block unknown GPT aliases too, so configuration cannot turn them into
+        // an alternate-provider fallback.
+        if super::converter::is_gpt_family_name(&model) {
+            return false;
+        }
         self.routed_models.contains(&model)
             || self
                 .routed_models
@@ -336,6 +343,22 @@ mod tests {
         assert!(provider.should_route("claude-opus-4-8"));
         assert!(provider.should_route("anthropic.claude-opus-4-8"));
         assert!(!provider.should_route("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn configured_gpt_model_never_routes_to_mantle() {
+        let provider = BedrockMantleProvider::for_test(
+            "http://127.0.0.1:1/anthropic/v1/messages".to_string(),
+            "test-key",
+            vec![
+                "gpt-5.6-sol".to_string(),
+                "gpt-5.6-sol-thinking".to_string(),
+            ],
+        )
+        .unwrap();
+        assert!(!provider.should_route("gpt-5.6-sol"));
+        assert!(!provider.should_route("GPT 5.6 Sol"));
+        assert!(!provider.should_route("gpt-5.6-sol-thinking"));
     }
 
     #[test]
