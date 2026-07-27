@@ -698,8 +698,10 @@ pub struct StreamContext {
     pub input_tokens: i32,
     /// 从 contextUsageEvent 计算的实际输入 tokens
     pub context_input_tokens: Option<i32>,
-    /// 自动续写已经完成的上游调用输入 tokens 累计
-    pub accumulated_input_tokens: i32,
+    /// 已完成的自动续写轮次输入；首轮由独立 cache split 结算。
+    additional_round_input_tokens: Vec<i32>,
+    /// 是否已经从首轮进入自动续写。
+    continuation_started: bool,
     /// 输出 tokens 累计（字符估算，仅用于流中途的限长/续写判断，非最终计费数字）
     pub output_tokens: i32,
     /// thinking tokens 累计（字符估算，同上）
@@ -755,9 +757,9 @@ pub struct StreamContext {
     /// AWS-B uses the real Kiro context-usage event after removing its fixed
     /// runtime prompt. Disabled for AWS-P and for short requests.
     input_context_calibration: super::bedrock::InputContextCalibration,
-    /// First-round calibrated total retained when an automatic continuation
-    /// advances `input_tokens` to a later upstream request.
-    initial_calibrated_input_tokens: Option<i32>,
+    /// 首轮确实收到 contextUsageEvent 时保留其校准后总量。`None` 不能用本地
+    /// 虚拟缓存估算冒充权威值。
+    first_round_authoritative_input_tokens: Option<i32>,
     /// 疑似截断探测续写时吞掉完成哨兵，避免把内部控制文本发给客户端
     swallow_complete_sentinel_probe: bool,
     /// 探测完成哨兵可能被上游拆成多个 chunk，需要短暂缓冲确认
@@ -820,7 +822,8 @@ impl StreamContext {
             initial_input_tokens: input_tokens,
             input_tokens,
             context_input_tokens: None,
-            accumulated_input_tokens: 0,
+            additional_round_input_tokens: Vec::new(),
+            continuation_started: false,
             output_tokens: 0,
             thinking_tokens: 0,
             output_text_acc: String::new(),
@@ -846,7 +849,7 @@ impl StreamContext {
             strip_thinking_leading_newline: false,
             initial_usage_breakdown,
             input_context_calibration: super::bedrock::InputContextCalibration::default(),
-            initial_calibrated_input_tokens: None,
+            first_round_authoritative_input_tokens: None,
             swallow_complete_sentinel_probe: false,
             complete_sentinel_probe_buffer: String::new(),
             continuation_merge_tail: None,
@@ -951,30 +954,25 @@ impl StreamContext {
         self.output_token_limit = Some(max_tokens.max(1));
     }
 
-    fn calibrated_direct_initial_usage(&self) -> Option<super::cache::UsageBreakdown> {
-        if !self.aws_b40_compat {
-            return None;
+    fn stream_start_usage_breakdown(&self) -> super::cache::UsageBreakdown {
+        if self.aws_b40_compat && self.initial_usage_breakdown.has_cache_usage() {
+            // Kiro's authoritative context event arrives after message_start.
+            // Do not expose locally estimated virtual-cache usage as billable
+            // fact before that reconciliation is possible. The final
+            // message_delta carries the complete corrected usage.
+            return super::cache::UsageBreakdown::flat(1);
         }
-        let calibrated = self
-            .input_context_calibration
-            .calibrate_direct_compat_usage(&self.model, self.initial_usage_breakdown);
-        (calibrated != self.initial_usage_breakdown).then_some(calibrated)
+        self.initial_usage_breakdown.clamp_for_model(&self.model)
     }
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
-        let breakdown = self
-            .calibrated_direct_initial_usage()
-            .unwrap_or(self.initial_usage_breakdown)
-            .clamp_for_model(&self.model);
+        let breakdown = self.stream_start_usage_breakdown();
         if self.aws_b40_compat {
             let initial_output_tokens = match self.output_token_limit {
                 Some(limit) if limit <= 1 => 1,
                 _ if self.suppress_text_blocks => 16,
-                _ if self.aws_b40_thinking_requested && self.thinking_enabled => self
-                    .input_context_calibration
-                    .direct_catalog_initial_output_tokens()
-                    .unwrap_or(8),
+                _ if self.aws_b40_thinking_requested && self.thinking_enabled => 8,
                 _ if self.pending_synthetic_thinking.is_some() => 4,
                 _ if self.aws_b40_thinking_requested => 3,
                 _ => 1,
@@ -1061,7 +1059,10 @@ impl StreamContext {
                     .saturating_add(self.stream_started_at.elapsed().as_millis() as u64),
             );
         }
-        if self.output_token_limit_reached {
+        // A context event can arrive after the visible output has already hit
+        // max_tokens. It is still authoritative billing data and must not be
+        // discarded with later content events.
+        if self.output_token_limit_reached && !matches!(event, Event::ContextUsage(_)) {
             return Vec::new();
         }
 
@@ -1699,10 +1700,7 @@ impl StreamContext {
         } else if self.aws_b40_compat {
             // 与 message_start / message_delta 上报的 usage 保持同一口径，
             // 否则超限请求的签名会由钳制前的数值算出，与对外 usage 不自洽。
-            let usage = self
-                .calibrated_direct_initial_usage()
-                .unwrap_or(self.initial_usage_breakdown)
-                .clamp_for_model(&self.model);
+            let usage = self.stream_start_usage_breakdown();
             super::bedrock::signature(
                 &self.model,
                 self.aws_b40_adaptive_signature,
@@ -2123,58 +2121,33 @@ impl StreamContext {
 
     fn final_usage_breakdown(&self) -> super::cache::UsageBreakdown {
         self.final_usage_breakdown_uncapped()
-            .clamp_for_model(&self.model)
     }
 
     fn final_usage_breakdown_uncapped(&self) -> super::cache::UsageBreakdown {
-        let stable_cached_initial = self.calibrated_direct_initial_usage().or_else(|| {
-            (self.aws_b40_compat
-                && (self.initial_usage_breakdown.cache_read_input_tokens > 0
-                    || self.initial_usage_breakdown.cache_creation_input_tokens > 0))
-                .then_some(self.initial_usage_breakdown)
-        });
-        if let Some(initial) = stable_cached_initial {
-            if self.accumulated_input_tokens == 0 {
-                return initial;
-            }
-
-            // A public prompt-cache split is fixed when message_start is
-            // emitted. Kiro's later context event includes its private runtime
-            // prelude and must not rewrite the same request's cache accounting.
-            // Continuation rounds remain ordinary input and are added here.
-            let current_input_tokens = self.current_billable_input_tokens();
-            let first_round_input_tokens = self
-                .initial_calibrated_input_tokens
-                .unwrap_or(self.initial_input_tokens);
-            let final_input_tokens = self
-                .accumulated_input_tokens
-                .saturating_add(current_input_tokens);
-            return super::cache::with_additional_input(
-                initial,
-                first_round_input_tokens,
-                final_input_tokens,
-            );
-        }
-
         let current_input_tokens = self.current_billable_input_tokens();
-        let first_round_input_tokens =
-            self.initial_calibrated_input_tokens
-                .unwrap_or(if self.accumulated_input_tokens == 0 {
-                    current_input_tokens
-                } else {
-                    self.initial_input_tokens
-                });
-        let initial = super::cache::reconcile_initial_input(
+        let authoritative_first_round_input_tokens = if self.continuation_started {
+            self.first_round_authoritative_input_tokens
+        } else {
+            self.context_input_tokens.map(|_| current_input_tokens)
+        };
+        let mut additional_round_input_tokens = self.additional_round_input_tokens.clone();
+        if self.continuation_started {
+            additional_round_input_tokens.push(current_input_tokens);
+        }
+        let ordinary_input_adjustment = authoritative_first_round_input_tokens
+            .map(|first_round_input_tokens| {
+                self.input_context_calibration
+                    .cache_input_adjustment(self.initial_input_tokens, first_round_input_tokens)
+            })
+            .unwrap_or(0);
+        super::cache::finalize_request_usage(
             self.initial_usage_breakdown,
-            first_round_input_tokens,
-            self.input_context_calibration
-                .cache_input_adjustment(self.initial_input_tokens, first_round_input_tokens),
-        );
-        super::cache::with_additional_input(
-            initial,
-            first_round_input_tokens,
-            self.accumulated_input_tokens
-                .saturating_add(current_input_tokens),
+            authoritative_first_round_input_tokens,
+            self.initial_input_tokens,
+            &additional_round_input_tokens,
+            ordinary_input_adjustment,
+            &self.model,
+            self.aws_b40_compat,
         )
     }
 
@@ -2436,12 +2409,14 @@ impl StreamContext {
 
     pub fn begin_continuation_for_billing(&mut self, next_estimated_input_tokens: i32) {
         let current_input_tokens = self.current_billable_input_tokens();
-        if self.accumulated_input_tokens == 0 {
-            self.initial_calibrated_input_tokens = Some(current_input_tokens);
+        if self.continuation_started {
+            self.additional_round_input_tokens
+                .push(current_input_tokens);
+        } else {
+            self.first_round_authoritative_input_tokens =
+                self.context_input_tokens.map(|_| current_input_tokens);
+            self.continuation_started = true;
         }
-        self.accumulated_input_tokens = self
-            .accumulated_input_tokens
-            .saturating_add(current_input_tokens);
         self.input_tokens = next_estimated_input_tokens.max(1);
         self.context_input_tokens = None;
     }
@@ -3347,7 +3322,7 @@ mod tests {
     }
 
     #[test]
-    fn aws_b_message_start_keeps_bedrock_shape_with_shared_cache_usage() {
+    fn aws_b_message_start_defers_virtual_cache_usage_until_final_delta() {
         let usage = super::super::cache::UsageBreakdown {
             input_tokens: 100,
             cache_read_input_tokens: 40,
@@ -3373,46 +3348,133 @@ mod tests {
                 .as_str()
                 .is_some_and(|id| id.starts_with("msg_01bdrk") && id.len() == 28)
         );
-        assert_eq!(response_usage["input_tokens"], 100);
-        assert_eq!(response_usage["cache_read_input_tokens"], 40);
-        assert_eq!(response_usage["cache_creation_input_tokens"], 30);
+        assert_eq!(response_usage["input_tokens"], 1);
+        assert_eq!(response_usage["cache_read_input_tokens"], 0);
+        assert_eq!(response_usage["cache_creation_input_tokens"], 0);
         assert_eq!(
             response_usage["cache_creation"]["ephemeral_5m_input_tokens"],
-            10
+            0
         );
         assert_eq!(
             response_usage["cache_creation"]["ephemeral_1h_input_tokens"],
-            20
+            0
         );
         assert_eq!(response_usage["output_tokens"], 1);
         assert_eq!(response_usage["service_tier"], "standard");
+        ctx.context_input_tokens = Some(170);
+        assert_eq!(ctx.final_usage_breakdown(), usage);
     }
 
     #[test]
-    fn aws_b_cache_split_stays_stable_after_private_context_event() {
-        let usage = super::super::cache::UsageBreakdown {
-            input_tokens: 2,
-            cache_read_input_tokens: 15_590,
-            cache_creation_input_tokens: 8_228,
-            cache_creation_5m_input_tokens: 0,
-            cache_creation_1h_input_tokens: 8_228,
+    fn aws_b_final_usage_reconciles_inflated_cache_to_context_event() {
+        let payload =
+            serde_json::from_value::<super::super::types::MessagesRequest>(serde_json::json!({
+                "model": "claude-opus-4-8",
+                "messages": [{"role": "user", "content": "incident regression"}]
+            }))
+            .expect("request");
+        let initial = super::super::cache::UsageBreakdown {
+            input_tokens: 7,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 1_391_872,
+            cache_creation_5m_input_tokens: 1_391_872,
+            cache_creation_1h_input_tokens: 0,
         };
         let mut ctx = StreamContext::new_with_thinking(
             "claude-opus-4-8",
-            usage.total(),
-            true,
-            usage,
+            initial.total(),
+            false,
+            initial,
             HashMap::new(),
         );
-        ctx.enable_aws_b40_compat(true);
-        ctx.context_input_tokens = Some(90_000);
+        ctx.enable_aws_b40_compat(false);
+        ctx.set_input_context_calibration(
+            super::super::bedrock::InputContextCalibration::for_request(&payload),
+        );
+        // Kiro reports 529,329 including its fixed 6,850-token private prelude.
+        ctx.context_input_tokens = Some(529_329);
+
+        let usage = ctx.final_usage_breakdown();
+
+        assert_eq!(usage.total(), 522_479);
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.cache_creation_input_tokens, 522_472);
+        assert_ne!(usage.cache_creation_input_tokens, 999_999);
+        assert_eq!(
+            usage.cache_creation_5m_input_tokens + usage.cache_creation_1h_input_tokens,
+            usage.cache_creation_input_tokens
+        );
+    }
+
+    #[test]
+    fn aws_b_in_window_local_cache_usage_is_held_when_context_event_is_missing() {
+        let initial = super::super::cache::UsageBreakdown {
+            input_tokens: 2,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 522_472,
+            cache_creation_5m_input_tokens: 522_472,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-8",
+            initial.total(),
+            false,
+            initial,
+            HashMap::new(),
+        );
+        ctx.enable_aws_b40_compat(false);
 
         let start = ctx.create_message_start_event();
-        let final_usage = ctx.final_usage_breakdown();
+        assert_eq!(start["message"]["usage"]["input_tokens"], 1);
+        assert_eq!(start["message"]["usage"]["cache_creation_input_tokens"], 0);
+        assert_eq!(start["message"]["usage"]["cache_read_input_tokens"], 0);
+        assert_eq!(
+            ctx.final_usage_breakdown(),
+            super::super::cache::UsageBreakdown::flat(1)
+        );
+    }
 
-        assert_eq!(start["message"]["usage"]["input_tokens"], 2);
-        assert_eq!(start["message"]["usage"]["cache_read_input_tokens"], 15_590);
-        assert_eq!(final_usage, usage);
+    #[test]
+    fn context_usage_after_output_limit_still_authorizes_cached_billing() {
+        let payload =
+            serde_json::from_value::<super::super::types::MessagesRequest>(serde_json::json!({
+                "model": "claude-opus-4-8",
+                "messages": [{"role": "user", "content": "cached request"}]
+            }))
+            .expect("request");
+        let initial = super::super::cache::UsageBreakdown {
+            input_tokens: 2,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 499_998,
+            cache_creation_5m_input_tokens: 499_998,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-8",
+            initial.total(),
+            false,
+            initial,
+            HashMap::new(),
+        );
+        ctx.enable_aws_b40_compat(false);
+        ctx.set_input_context_calibration(
+            super::super::bedrock::InputContextCalibration::for_request(&payload),
+        );
+        ctx.set_output_token_limit(1);
+
+        let _ = ctx.process_assistant_response("visible output exceeds one token");
+        assert!(ctx.output_token_limit_reached);
+        let _ = ctx.process_kiro_event(&Event::ContextUsage(
+            crate::kiro::model::events::ContextUsageEvent {
+                context_usage_percentage: 60.0,
+            },
+        ));
+
+        assert_eq!(ctx.context_input_tokens, Some(600_000));
+        let usage = ctx.final_usage_breakdown();
+        assert_eq!(usage.total(), 593_150);
+        assert_eq!(usage.input_tokens, 2);
+        assert_eq!(usage.cache_creation_input_tokens, 593_148);
     }
 
     #[test]
@@ -3451,7 +3513,7 @@ mod tests {
     }
 
     #[test]
-    fn aws_b_message_start_calibrates_catalog_without_double_adjusting_final_usage() {
+    fn aws_b_catalog_shape_cannot_authorize_cached_usage_without_context_event() {
         let mut tools = (0..28)
             .map(|index| {
                 serde_json::from_value::<super::super::types::Tool>(json!({
@@ -3483,6 +3545,19 @@ mod tests {
 
         let mut payload = serde_json::from_value::<super::super::types::MessagesRequest>(json!({
             "model": "claude-opus-4-8",
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "medium"},
+            "system": [
+                {
+                    "type": "text",
+                    "text": "Cached public system context.",
+                    "cache_control": {"type": "ephemeral"}
+                },
+                {
+                    "type": "text",
+                    "text": super::super::bedrock::TOOL_PREAMBLE_HINT
+                }
+            ],
             "messages": [{"role": "user", "content": "1+1"}],
             "stream": true
         }))
@@ -3496,6 +3571,12 @@ mod tests {
             cache_creation_5m_input_tokens: 36_975,
             cache_creation_1h_input_tokens: 0,
         };
+        let local_only_calibration =
+            calibration.calibrate_local_direct_compat_usage("claude-opus-4-8", raw);
+        assert_ne!(
+            local_only_calibration, raw,
+            "fixture must reproduce the client-controlled local catalog profile"
+        );
         let mut ctx = StreamContext::new_with_thinking(
             "claude-opus-4-8",
             raw.total(),
@@ -3508,37 +3589,14 @@ mod tests {
 
         let event = ctx.create_message_start_event();
         let start_usage = &event["message"]["usage"];
-        assert_eq!(start_usage["input_tokens"], 79);
-        assert_eq!(start_usage["cache_creation_input_tokens"], 34_250);
-
-        // The later Kiro context event includes a private wire prelude and can
-        // vary with injected runtime instructions. Once this observed catalog
-        // is calibrated, it must not replace the public first-round split.
-        ctx.context_input_tokens = Some(50_000);
-        let final_usage = ctx.final_usage_breakdown();
-        assert_eq!(final_usage.input_tokens, 79);
-        assert_eq!(final_usage.cache_creation_input_tokens, 34_250);
-        assert_eq!(final_usage.total(), 34_329);
-
-        ctx.enable_aws_b40_compat(true);
-        ctx.thinking_text_acc = "calibrated reasoning summary".to_string();
-        let signature_usage = ctx
-            .calibrated_direct_initial_usage()
-            .expect("catalog signature usage");
-        assert_eq!(signature_usage, final_usage);
-        fastrand::seed(0xbed0_0048);
-        let signature_event = ctx.create_signature_delta_event(0);
-        let actual_signature = signature_event.data["delta"]["signature"]
-            .as_str()
-            .expect("signature");
-        fastrand::seed(0xbed0_0048);
-        let expected_signature = super::super::bedrock::signature(
-            &ctx.model,
-            true,
-            &ctx.thinking_text_acc,
-            signature_usage,
+        assert_eq!(start_usage["input_tokens"], 1);
+        assert_eq!(start_usage["cache_creation_input_tokens"], 0);
+        assert_eq!(start_usage["cache_read_input_tokens"], 0);
+        assert_eq!(
+            ctx.final_usage_breakdown(),
+            super::super::cache::UsageBreakdown::flat(1),
+            "tool_0..27 and matching byte size are not upstream usage authority"
         );
-        assert_eq!(actual_signature, expected_signature);
     }
 
     #[test]
@@ -3975,6 +4033,7 @@ mod tests {
             HashMap::new(),
         );
         context.enable_aws_b40_compat(false);
+        context.context_input_tokens = Some(34_329);
         let _ = context.generate_initial_events();
         let _ = context.process_assistant_response("2");
         let events = context.generate_final_events();
@@ -4771,6 +4830,26 @@ mod tests {
                 .unwrap()
                 > 0
         );
+    }
+
+    #[test]
+    fn continuation_billing_allows_aggregate_above_one_context_window() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-8",
+            600_000,
+            false,
+            super::super::cache::UsageBreakdown::flat(600_000),
+            HashMap::new(),
+        );
+        ctx.enable_aws_b40_compat(false);
+        ctx.context_input_tokens = Some(600_000);
+        ctx.begin_continuation_for_billing(600_000);
+
+        let usage = ctx.final_usage_breakdown();
+
+        assert_eq!(usage.input_tokens, 1_200_000);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
     }
 
     #[test]

@@ -344,6 +344,67 @@ pub fn parse_search_results(mcp_response: &McpResponse) -> Option<WebSearchResul
     serde_json::from_str(&content.text).ok()
 }
 
+struct PreparedWebSearchOutput {
+    query: String,
+    summary: String,
+    output_tokens: i32,
+    stop_reason: &'static str,
+}
+
+fn websearch_text_token_budget(max_tokens: i32, aws_b40_compat: bool) -> i32 {
+    let max_tokens = max_tokens.max(0);
+    let framing_tokens = if aws_b40_compat {
+        super::bedrock::framed_output_tokens(0, 3, 0)
+    } else {
+        0
+    };
+    max_tokens.saturating_sub(framing_tokens)
+}
+
+fn bounded_websearch_query(query: &str, max_tokens: i32, aws_b40_compat: bool) -> String {
+    let text_budget = websearch_text_token_budget(max_tokens, aws_b40_compat);
+    let query_budget = if text_budget > 0 {
+        (text_budget / 3).max(1)
+    } else {
+        0
+    };
+    super::claude_tok::truncate_to_claude_tokens(query, query_budget)
+}
+
+fn prepare_websearch_output(
+    query: &str,
+    search_results: &Option<WebSearchResults>,
+    max_tokens: i32,
+    aws_b40_compat: bool,
+) -> PreparedWebSearchOutput {
+    let max_tokens = max_tokens.max(0);
+    let text_budget = websearch_text_token_budget(max_tokens, aws_b40_compat);
+    let bounded_query = bounded_websearch_query(query, max_tokens, aws_b40_compat);
+    let query_tokens = super::claude_tok::count_claude(&bounded_query);
+    let summary_budget = text_budget.saturating_sub(query_tokens);
+    let full_summary = generate_search_summary(&bounded_query, search_results);
+    let summary = super::claude_tok::truncate_to_claude_tokens(&full_summary, summary_budget);
+    let base_output_tokens = query_tokens.saturating_add(super::claude_tok::count_claude(&summary));
+    let output_tokens = if aws_b40_compat {
+        super::bedrock::framed_output_tokens(base_output_tokens, 3, 0)
+    } else {
+        base_output_tokens
+    }
+    .min(max_tokens);
+    let stop_reason = if bounded_query.len() < query.len() || summary.len() < full_summary.len() {
+        "max_tokens"
+    } else {
+        "end_turn"
+    };
+
+    PreparedWebSearchOutput {
+        query: bounded_query,
+        summary,
+        output_tokens,
+        stop_reason,
+    }
+}
+
 /// 生成 WebSearch SSE 响应流
 #[allow(dead_code)]
 pub fn create_websearch_sse_stream(
@@ -352,6 +413,7 @@ pub fn create_websearch_sse_stream(
     tool_use_id: String,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    max_tokens: i32,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     create_websearch_sse_stream_with_profile(
         model,
@@ -359,6 +421,7 @@ pub fn create_websearch_sse_stream(
         tool_use_id,
         search_results,
         input_tokens,
+        max_tokens,
         false,
         0,
     )
@@ -370,6 +433,7 @@ fn create_websearch_sse_stream_with_profile(
     tool_use_id: String,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    max_tokens: i32,
     aws_b40_compat: bool,
     invocation_latency_ms: u64,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
@@ -379,6 +443,7 @@ fn create_websearch_sse_stream_with_profile(
         &tool_use_id,
         search_results,
         input_tokens,
+        max_tokens,
         aws_b40_compat,
         invocation_latency_ms,
     );
@@ -397,9 +462,17 @@ fn generate_websearch_events(
     tool_use_id: &str,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    max_tokens: i32,
     aws_b40_compat: bool,
     invocation_latency_ms: u64,
 ) -> Vec<SseEvent> {
+    let input_usage = super::cache::UsageBreakdown::flat(input_tokens).clamp_for_model(model);
+    let prepared_output =
+        prepare_websearch_output(query, &search_results, max_tokens, aws_b40_compat);
+    let output_tokens = prepared_output.output_tokens;
+    let stop_reason = prepared_output.stop_reason;
+    let query = prepared_output.query.as_str();
+    let summary = prepared_output.summary.as_str();
     let mut events = Vec::new();
     let message_id = if aws_b40_compat {
         super::bedrock::response_id(model)
@@ -413,7 +486,7 @@ fn generate_websearch_events(
     };
     let start_usage = if aws_b40_compat {
         json!({
-            "input_tokens": input_tokens,
+            "input_tokens": input_usage.input_tokens,
             "output_tokens": 16,
             "cache_creation_input_tokens": 0,
             "cache_read_input_tokens": 0,
@@ -425,7 +498,7 @@ fn generate_websearch_events(
         })
     } else {
         json!({
-            "input_tokens": input_tokens,
+            "input_tokens": input_usage.input_tokens,
             "output_tokens": 0,
             "cache_creation_input_tokens": 0,
             "cache_read_input_tokens": 0
@@ -552,8 +625,6 @@ fn generate_websearch_events(
     ));
 
     // 8. content_block_delta (text_delta) - 生成搜索结果摘要
-    let summary = generate_search_summary(query, &search_results);
-
     // 分块发送文本
     let chunk_size = 100;
     for chunk in summary.chars().collect::<Vec<_>>().chunks(chunk_size) {
@@ -613,19 +684,8 @@ fn generate_websearch_events(
 
     // 10. message_delta
     // 官方 API 的 message_delta.delta 中没有 stop_sequence 字段
-    let base_output_tokens = super::claude_tok::count_claude(&summary);
-    let output_tokens = if aws_b40_compat {
-        super::bedrock::framed_output_tokens(base_output_tokens, 3, 0)
-    } else {
-        (summary.len() as i32 + 3) / 4
-    };
     let delta_usage = if aws_b40_compat {
-        let mut usage = super::bedrock::stream_delta_usage(
-            model,
-            super::cache::UsageBreakdown::flat(input_tokens),
-            output_tokens,
-            0,
-        );
+        let mut usage = super::bedrock::stream_delta_usage(model, input_usage, output_tokens, 0);
         usage["server_tool_use"] = json!({ "web_search_requests": 1 });
         usage
     } else {
@@ -639,7 +699,7 @@ fn generate_websearch_events(
         json!({
             "type": "message_delta",
             "delta": {
-                "stop_reason": "end_turn",
+                "stop_reason": stop_reason,
                 "stop_sequence": null,
                 "stop_details": null
             },
@@ -654,7 +714,7 @@ fn generate_websearch_events(
             json!({
                 "type": "message_stop",
                 "amazon-bedrock-invocationMetrics": super::bedrock::invocation_metrics(
-                    super::cache::UsageBreakdown::flat(input_tokens),
+                    input_usage,
                     output_tokens,
                     invocation_latency_ms,
                     invocation_latency_ms
@@ -716,10 +776,22 @@ pub async fn handle_websearch_request(
         }
     };
 
-    tracing::info!(query = %query, "处理 WebSearch 请求");
+    let mcp_query = bounded_websearch_query(&query, payload.max_tokens, aws_b40_compat);
+    if mcp_query.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "max_tokens 太小，无法容纳 WebSearch 响应",
+            )),
+        )
+            .into_response();
+    }
+
+    tracing::info!(query = %mcp_query, "处理 WebSearch 请求");
 
     // 2. 创建 MCP 请求
-    let (tool_use_id, mcp_request) = create_mcp_request(&query);
+    let (tool_use_id, mcp_request) = create_mcp_request(&mcp_query);
 
     // 3. 调用 Kiro MCP API
     let invocation_started = Instant::now();
@@ -741,6 +813,7 @@ pub async fn handle_websearch_request(
             &tool_use_id,
             &search_results,
             input_tokens,
+            payload.max_tokens,
             aws_b40_compat,
         );
         return (StatusCode::OK, Json(body)).into_response();
@@ -751,6 +824,7 @@ pub async fn handle_websearch_request(
         tool_use_id,
         search_results,
         input_tokens,
+        payload.max_tokens,
         aws_b40_compat,
         invocation_latency_ms,
     );
@@ -771,8 +845,16 @@ fn build_websearch_json(
     tool_use_id: &str,
     search_results: &Option<WebSearchResults>,
     input_tokens: i32,
+    max_tokens: i32,
     aws_b40_compat: bool,
 ) -> serde_json::Value {
+    let input_usage = super::cache::UsageBreakdown::flat(input_tokens).clamp_for_model(model);
+    let prepared_output =
+        prepare_websearch_output(query, search_results, max_tokens, aws_b40_compat);
+    let output_tokens = prepared_output.output_tokens;
+    let stop_reason = prepared_output.stop_reason;
+    let query = prepared_output.query.as_str();
+    let summary = prepared_output.summary.as_str();
     let search_content: Vec<serde_json::Value> = match search_results {
         Some(r) => r
             .results
@@ -818,13 +900,6 @@ fn build_websearch_json(
             .collect(),
         None => vec![],
     };
-    let summary = generate_search_summary(query, search_results);
-    let base_output_tokens = super::claude_tok::count_claude(&summary);
-    let output_tokens = if aws_b40_compat {
-        super::bedrock::framed_output_tokens(base_output_tokens, 3, 0)
-    } else {
-        (summary.len() as i32 + 3) / 4
-    };
     let message_id = if aws_b40_compat {
         super::bedrock::response_id(model)
     } else {
@@ -836,7 +911,7 @@ fn build_websearch_json(
         model.to_string()
     };
     let mut usage = json!({
-        "input_tokens": input_tokens,
+        "input_tokens": input_usage.input_tokens,
         "output_tokens": output_tokens,
         "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 0,
@@ -862,7 +937,7 @@ fn build_websearch_json(
             {"type": "web_search_tool_result", "tool_use_id": tool_use_id, "content": search_content},
             {"type": "text", "text": summary, "citations": citations}
         ],
-        "stop_reason": "end_turn",
+        "stop_reason": stop_reason,
         "stop_sequence": null,
         "stop_details": null,
         "usage": usage
@@ -1197,6 +1272,7 @@ mod tests {
                 error: None,
             }),
             556,
+            32_000,
             true,
             1_234,
         );
@@ -1278,5 +1354,162 @@ mod tests {
         assert_eq!(metrics["cacheWriteInputTokenCount"], 0);
         assert_eq!(metrics["invocationLatency"], 1_234);
         assert_eq!(metrics["firstByteLatency"], 1_234);
+    }
+
+    #[test]
+    fn aws_b_websearch_holds_50mb_incident_input_on_every_usage_surface() {
+        // The production ingress ceiling is 50 MiB. Even a conservative four-byte
+        // token estimate at that size is far beyond the Opus 1M context window.
+        const MAX_BODY_SIZE_BYTES: usize = 50 * 1024 * 1024;
+        let incident_input_tokens = ((MAX_BODY_SIZE_BYTES + 3) / 4) as i32;
+        assert!(incident_input_tokens > 1_000_000);
+
+        let model = "claude-opus-4-8";
+        let events = generate_websearch_events(
+            model,
+            "cache billing incident",
+            "srvtoolu_01IncidentGuardTest",
+            None,
+            incident_input_tokens,
+            1_024,
+            true,
+            321,
+        );
+
+        let start_usage = &events
+            .iter()
+            .find(|event| event.event == "message_start")
+            .expect("message_start")
+            .data["message"]["usage"];
+        assert_eq!(start_usage["input_tokens"], 1);
+        assert_eq!(start_usage["cache_read_input_tokens"], 0);
+        assert_eq!(start_usage["cache_creation_input_tokens"], 0);
+
+        let delta_usage = &events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta")
+            .data["usage"];
+        assert_eq!(delta_usage["input_tokens"], 1);
+        assert_eq!(delta_usage["cache_read_input_tokens"], 0);
+        assert_eq!(delta_usage["cache_creation_input_tokens"], 0);
+
+        let metrics = &events
+            .iter()
+            .find(|event| event.event == "message_stop")
+            .expect("message_stop")
+            .data["amazon-bedrock-invocationMetrics"];
+        assert_eq!(metrics["inputTokenCount"], 1);
+        assert_eq!(metrics["cacheReadInputTokenCount"], 0);
+        assert_eq!(metrics["cacheWriteInputTokenCount"], 0);
+
+        let response = build_websearch_json(
+            model,
+            "cache billing incident",
+            "srvtoolu_01IncidentGuardTest",
+            &None,
+            incident_input_tokens,
+            1_024,
+            true,
+        );
+        assert_eq!(response["usage"]["input_tokens"], 1);
+        assert_eq!(response["usage"]["cache_read_input_tokens"], 0);
+        assert_eq!(response["usage"]["cache_creation_input_tokens"], 0);
+    }
+
+    #[test]
+    fn aws_b_websearch_bounds_real_50mb_query_by_max_tokens_in_stream_and_json() {
+        const MAX_BODY_SIZE_BYTES: usize = 50 * 1024 * 1024;
+        const MAX_OUTPUT_TOKENS: i32 = 64;
+        let pattern = "cache-billing-incident/";
+        let mut giant_query = pattern.repeat(MAX_BODY_SIZE_BYTES.div_ceil(pattern.len()));
+        giant_query.truncate(MAX_BODY_SIZE_BYTES);
+        assert_eq!(giant_query.len(), MAX_BODY_SIZE_BYTES);
+
+        let model = "claude-opus-4-8";
+        let tool_use_id = "srvtoolu_01OutputLimitTest";
+        let events = generate_websearch_events(
+            model,
+            &giant_query,
+            tool_use_id,
+            None,
+            123,
+            MAX_OUTPUT_TOKENS,
+            true,
+            0,
+        );
+
+        let query_delta = events
+            .iter()
+            .find(|event| event.data["delta"]["type"] == "input_json_delta")
+            .expect("input_json_delta");
+        let stream_query_json: serde_json::Value = serde_json::from_str(
+            query_delta.data["delta"]["partial_json"]
+                .as_str()
+                .expect("partial_json"),
+        )
+        .expect("query JSON");
+        let stream_query = stream_query_json["query"].as_str().expect("stream query");
+        let stream_summary = events
+            .iter()
+            .filter(|event| event.data["delta"]["type"] == "text_delta")
+            .filter_map(|event| event.data["delta"]["text"].as_str())
+            .collect::<String>();
+        let stream_delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+        let stream_output_tokens = stream_delta.data["usage"]["output_tokens"]
+            .as_i64()
+            .expect("stream output tokens") as i32;
+        let stream_visible_tokens = super::super::claude_tok::count_claude(stream_query)
+            + super::super::claude_tok::count_claude(&stream_summary);
+        assert_eq!(
+            stream_output_tokens,
+            super::super::bedrock::framed_output_tokens(stream_visible_tokens, 3, 0)
+                .min(MAX_OUTPUT_TOKENS)
+        );
+        assert!(stream_output_tokens <= MAX_OUTPUT_TOKENS);
+        assert_eq!(stream_delta.data["delta"]["stop_reason"], "max_tokens");
+        assert!(!stream_query.is_empty());
+        assert!(stream_query.len() < giant_query.len());
+
+        let response = build_websearch_json(
+            model,
+            &giant_query,
+            tool_use_id,
+            &None,
+            123,
+            MAX_OUTPUT_TOKENS,
+            true,
+        );
+        let json_query = response["content"][0]["input"]["query"]
+            .as_str()
+            .expect("JSON query");
+        let json_summary = response["content"][2]["text"]
+            .as_str()
+            .expect("JSON summary");
+        let json_visible_tokens = super::super::claude_tok::count_claude(json_query)
+            + super::super::claude_tok::count_claude(json_summary);
+        assert_eq!(json_query, stream_query);
+        assert_eq!(json_summary, stream_summary);
+        assert_eq!(
+            response["usage"]["output_tokens"],
+            super::super::bedrock::framed_output_tokens(json_visible_tokens, 3, 0)
+                .min(MAX_OUTPUT_TOKENS)
+        );
+        assert!(
+            response["usage"]["output_tokens"]
+                .as_i64()
+                .expect("JSON output tokens")
+                <= i64::from(MAX_OUTPUT_TOKENS)
+        );
+        assert_eq!(response["stop_reason"], "max_tokens");
+        assert!(
+            serde_json::to_vec(&response)
+                .expect("serialize bounded response")
+                .len()
+                < 64 * 1024
+        );
     }
 }

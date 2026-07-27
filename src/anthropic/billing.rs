@@ -4,7 +4,7 @@
 //! **不**回落到 Kiro 的 `contextUsageEvent`：Kiro 的计数对 JSON/密集文本系统性虚高
 //! (实测某 JSON Kiro 记 8104，而 Claude 口径仅 ~3807)、且对小请求带 ~4K 固定上下文底噪。
 //! 用本地估算才能与 pomoai 拟合,且对客户的计费口径与真 Anthropic 一致。
-//! 多轮 auto-continue 的累加仍保留(见 `cache::with_additional_input`)。
+//! 多轮 auto-continue 的累加仍保留(见 `cache::finalize_request_usage`)。
 
 pub fn billable_input_tokens(
     estimated_input_tokens: i32,

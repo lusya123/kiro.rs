@@ -124,6 +124,20 @@ fn explicitly_requests_code_execution(payload: &MessagesRequest) -> bool {
 
 pub fn handle_request(payload: &MessagesRequest, usage: super::cache::UsageBreakdown) -> Response {
     let started = Instant::now();
+    let calibration = super::bedrock::InputContextCalibration::for_request(payload);
+    let usage = calibration.calibrate_local_direct_compat_usage(&payload.model, usage);
+    // This path has no upstream invocation and therefore no contextUsageEvent
+    // by design. Preserve a physically valid local split, but run it through
+    // the same single-round window guard as upstream-backed responses.
+    let usage = super::cache::finalize_request_usage(
+        usage,
+        None,
+        usage.total().max(1),
+        &[],
+        0,
+        &payload.model,
+        false,
+    );
     let execution = extract_last_user_text(payload).and_then(|text| {
         extract_arithmetic_expression(&text)
             .and_then(|expression| {
@@ -907,6 +921,88 @@ mod tests {
         let metrics = &events.last().unwrap().data["amazon-bedrock-invocationMetrics"];
         assert_eq!(metrics["inputTokenCount"], 79);
         assert_eq!(metrics["cacheWriteInputTokenCount"], 34_250);
+    }
+
+    #[tokio::test]
+    async fn local_code_execution_holds_impossible_usage_in_every_response_shape() {
+        let estimated = super::super::cache::UsageBreakdown {
+            input_tokens: 1,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 1_199_999,
+            cache_creation_5m_input_tokens: 1_199_999,
+            cache_creation_1h_input_tokens: 0,
+        };
+
+        let non_stream = handle_request(
+            &request(false, "Use the code execution tool to calculate 17 * 23."),
+            estimated,
+        );
+        let bytes = axum::body::to_bytes(non_stream.into_body(), usize::MAX)
+            .await
+            .expect("non-stream response body");
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("code execution JSON response");
+        assert_eq!(body["usage"]["input_tokens"], 1);
+        assert_eq!(body["usage"]["cache_creation_input_tokens"], 0);
+        assert_eq!(body["usage"]["cache_read_input_tokens"], 0);
+
+        let stream = handle_request(
+            &request(true, "Use the code execution tool to calculate 17 * 23."),
+            estimated,
+        );
+        let bytes = axum::body::to_bytes(stream.into_body(), usize::MAX)
+            .await
+            .expect("stream response body");
+        let body = String::from_utf8(bytes.to_vec()).expect("UTF-8 SSE");
+        let events = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("SSE JSON"))
+            .collect::<Vec<_>>();
+        let start = events
+            .iter()
+            .find(|event| event["type"] == "message_start")
+            .expect("message_start");
+        let delta = events
+            .iter()
+            .find(|event| event["type"] == "message_delta")
+            .expect("message_delta");
+        let metrics = &events
+            .iter()
+            .find(|event| event["type"] == "message_stop")
+            .expect("message_stop")["amazon-bedrock-invocationMetrics"];
+        for usage in [&start["message"]["usage"], &delta["usage"]] {
+            assert_eq!(usage["input_tokens"], 1);
+            assert_eq!(usage["cache_creation_input_tokens"], 0);
+            assert_eq!(usage["cache_read_input_tokens"], 0);
+        }
+        assert_eq!(metrics["inputTokenCount"], 1);
+        assert_eq!(metrics["cacheWriteInputTokenCount"], 0);
+        assert_eq!(metrics["cacheReadInputTokenCount"], 0);
+    }
+
+    #[tokio::test]
+    async fn local_code_execution_preserves_normal_cache_breakdown() {
+        let usage = super::super::cache::UsageBreakdown {
+            input_tokens: 79,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 34_250,
+            cache_creation_5m_input_tokens: 34_250,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let response = handle_request(
+            &request(false, "Use the code execution tool to calculate 17 * 23."),
+            usage,
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("code execution JSON response");
+
+        assert_eq!(body["usage"]["input_tokens"], 79);
+        assert_eq!(body["usage"]["cache_creation_input_tokens"], 34_250);
+        assert_eq!(body["usage"]["cache_read_input_tokens"], 0);
     }
 
     #[test]

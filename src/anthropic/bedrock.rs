@@ -32,6 +32,8 @@ const KIRO_OPUS_48_DIRECT_CATALOG_MIN_BYTES: i32 = 60_000;
 const KIRO_OPUS_48_DIRECT_CATALOG_MAX_BYTES: i32 = 80_000;
 const KIRO_OPUS_48_DIRECT_CATALOG_ANCHOR_BYTES: i32 = 69_158;
 const KIRO_OPUS_48_DIRECT_CATALOG_CACHE_TOKENS: i32 = 34_250;
+const KIRO_OPUS_48_DIRECT_CATALOG_MIN_ESTIMATED_CACHE_TOKENS: i32 = 30_000;
+const KIRO_OPUS_48_DIRECT_CATALOG_MAX_ESTIMATED_CACHE_TOKENS: i32 = 45_000;
 const KIRO_OPUS_48_DIRECT_CATALOG_SUFFIX_TOKENS: i32 = 68;
 const KIRO_TOOL_DESCRIPTION_LIMIT_CHARS: usize = 10_000;
 const BEDROCK_TOOL_BASELINE_CORRECTION_PER_TOOL: i32 = 8;
@@ -182,10 +184,14 @@ impl InputContextCalibration {
             .max(1)
     }
 
-    /// Before Kiro's final context-usage event is available, calibrate only the
-    /// observed 28-tool Claude Code catalog. This keeps direct replies and a
-    /// streaming `message_start` aligned with the real Bedrock cache envelope.
-    pub fn calibrate_direct_compat_usage(
+    /// Calibrate the locally generated compatibility response for the observed
+    /// 28-tool Claude Code catalog.
+    ///
+    /// This is only valid when no upstream request is made. A real AWS-B
+    /// response must obtain its billable cached input from Kiro's
+    /// `contextUsageEvent`; the client-controlled catalog shape is not
+    /// authority for upstream usage.
+    pub(super) fn calibrate_local_direct_compat_usage(
         self,
         model: &str,
         usage: UsageBreakdown,
@@ -197,9 +203,12 @@ impl InputContextCalibration {
             || !super::compat::is_opus_4_8(model)
             || !self.has_tools
             || self.tool_count != KIRO_OPUS_48_DIRECT_CATALOG_TOOL_COUNT
+            || self.direct_catalog_ordinary_input_tokens <= 0
             || !(KIRO_OPUS_48_DIRECT_CATALOG_MIN_BYTES..=KIRO_OPUS_48_DIRECT_CATALOG_MAX_BYTES)
                 .contains(&self.serialized_tool_bytes)
-            || cached_tokens < 30_000
+            || !(KIRO_OPUS_48_DIRECT_CATALOG_MIN_ESTIMATED_CACHE_TOKENS
+                ..=KIRO_OPUS_48_DIRECT_CATALOG_MAX_ESTIMATED_CACHE_TOKENS)
+                .contains(&cached_tokens)
         {
             return usage;
         }
@@ -261,16 +270,6 @@ impl InputContextCalibration {
         } else {
             0
         }
-    }
-
-    pub fn direct_catalog_initial_output_tokens(self) -> Option<i32> {
-        (self.direct_catalog_ordinary_input_tokens > 0).then_some(
-            if self.direct_catalog_ordinary_input_tokens < 300 {
-                2
-            } else {
-                8
-            },
-        )
     }
 }
 
@@ -432,7 +431,15 @@ pub fn invocation_metrics(
 /// Adjust the shared tokenizer to Bedrock's reported input-usage envelope.
 /// Tool requests already carry their own calibrated schema framing.
 pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i32 {
-    let image_correction = image_block_count(payload).saturating_mul(5);
+    // `compat` already charges every image exactly once as visual patches plus
+    // its placement framing (+4 top-level, +21 inside a tool result). Keep the
+    // Bedrock calibration text-only so the former blanket `image_count * 5`
+    // correction cannot double-charge either placement.
+    let image_tokens = if image_block_count(payload) > 0 {
+        super::compat::estimate_request_image_tokens(payload)
+    } else {
+        0
+    };
     let mut segments = Vec::new();
     if let Some(system) = &payload.system {
         segments.extend(system.iter().map(|item| item.text.as_str()));
@@ -448,7 +455,7 @@ pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i
             .iter()
             .map(|text| text.bytes().filter(|byte| *byte == b'_').count())
             .sum::<usize>();
-        let text_only_tokens = if payload
+        let tokens_without_tool_schema = if payload
             .tools
             .as_ref()
             .is_some_and(|tools| !tools.is_empty())
@@ -459,11 +466,14 @@ pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i
         } else {
             base_tokens
         };
-        let mut calibrated = history.calibrated_tokens(text_only_tokens, underscore_count);
+        let text_only_tokens = tokens_without_tool_schema.saturating_sub(image_tokens);
+        let mut calibrated = history
+            .calibrated_tokens(text_only_tokens, underscore_count)
+            .saturating_add(image_tokens);
         if let Some(tools) = payload.tools.as_ref().filter(|tools| !tools.is_empty()) {
             let raw_schema_tokens = base_tokens
                 .saturating_add(complex_tool_schema_correction(payload))
-                .saturating_sub(text_only_tokens);
+                .saturating_sub(tokens_without_tool_schema);
             calibrated = calibrated.saturating_add(calibrated_tool_history_schema_tokens(
                 raw_schema_tokens,
                 tools.len(),
@@ -474,10 +484,7 @@ pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i
             .as_ref()
             .map(|tools| long_tool_text_correction_from_segments(&segments, tools.len()))
             .unwrap_or(0);
-        return calibrated
-            .saturating_add(long_cache_correction)
-            .saturating_add(image_correction)
-            .max(1);
+        return calibrated.saturating_add(long_cache_correction).max(1);
     }
 
     if payload
@@ -494,7 +501,6 @@ pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i
         return base_tokens
             .saturating_add(complex_tool_schema_correction(payload))
             .saturating_add(long_cache_correction)
-            .saturating_add(image_correction)
             .max(1);
     }
 
@@ -515,13 +521,10 @@ pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i
         {
             correction -= 8;
         }
-        return base_tokens
-            .saturating_add(correction.max(0))
-            .saturating_add(image_correction)
-            .max(1);
+        return base_tokens.saturating_add(correction.max(0)).max(1);
     }
 
-    let mut correction = image_correction.saturating_sub(1);
+    let mut correction = -1;
     if payload.messages.len() > 1 {
         correction -= ((payload.messages.len() - 1) * 3 / 2) as i32;
     }
@@ -691,12 +694,14 @@ impl ToolHistoryFeatures {
                     }
                     Some("tool_result") => {
                         features.tool_results = features.tool_results.saturating_add(1);
-                        features.result_tokens = features
-                            .result_tokens
-                            .saturating_add(block.get("content").map_or(0, content_value_tokens));
+                        features.result_tokens = features.result_tokens.saturating_add(
+                            block
+                                .get("content")
+                                .map_or(0, visible_tool_result_content_tokens),
+                        );
                         features.block_tokens = features
                             .block_tokens
-                            .saturating_add(canonical_value_tokens(block));
+                            .saturating_add(visible_tool_result_block_tokens(block));
                     }
                     _ => {}
                 }
@@ -763,6 +768,40 @@ fn canonical_json_value(value: &Value) -> Value {
         Value::Array(items) => Value::Array(items.iter().map(canonical_json_value).collect()),
         _ => value.clone(),
     }
+}
+
+/// Kiro only exposes textual entries through the tool-result text channel.
+/// Media entries are promoted to their dedicated image/document channel and
+/// their visual usage is charged separately by `compat`, so base64 payloads
+/// must remain excluded from this textual calibration.
+fn visible_tool_result_content(value: &Value) -> Value {
+    let Value::Array(items) = value else {
+        return value.clone();
+    };
+    Value::Array(
+        items
+            .iter()
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .map(|text| {
+                serde_json::json!({
+                    "type": "text",
+                    "text": text,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn visible_tool_result_content_tokens(value: &Value) -> i32 {
+    content_value_tokens(&visible_tool_result_content(value))
+}
+
+fn visible_tool_result_block_tokens(value: &Value) -> i32 {
+    let mut visible = value.clone();
+    if let Some(content) = visible.get_mut("content") {
+        *content = visible_tool_result_content(content);
+    }
+    canonical_value_tokens(&visible)
 }
 
 /// Match the short literal-request framing observed from the Bedrock
@@ -928,14 +967,33 @@ fn is_month_year(text: &str) -> bool {
 }
 
 fn image_block_count(payload: &MessagesRequest) -> i32 {
-    payload
+    let mut count = 0usize;
+    for block in payload
         .messages
         .iter()
         .filter_map(|message| message.content.as_array())
         .flatten()
-        .filter(|block| block.get("type").and_then(Value::as_str) == Some("image"))
-        .count()
-        .min(i32::MAX as usize) as i32
+    {
+        match block.get("type").and_then(Value::as_str) {
+            Some("image") => count = count.saturating_add(1),
+            Some("tool_result") => {
+                count =
+                    count.saturating_add(block.get("content").and_then(Value::as_array).map_or(
+                        0,
+                        |content| {
+                            content
+                                .iter()
+                                .filter(|item| {
+                                    item.get("type").and_then(Value::as_str) == Some("image")
+                                })
+                                .count()
+                        },
+                    ));
+            }
+            _ => {}
+        }
+    }
+    count.min(i32::MAX as usize) as i32
 }
 
 /// Keep strict identity probes useful without exposing the upstream runtime.
@@ -1127,7 +1185,8 @@ fn collect_cache_tool_history(
             }
             Some("tool_result") => {
                 *tool_results = tool_results.saturating_add(1);
-                *block_tokens = block_tokens.saturating_add(canonical_value_tokens(value));
+                *block_tokens =
+                    block_tokens.saturating_add(visible_tool_result_block_tokens(value));
             }
             _ => {}
         },
@@ -1513,6 +1572,7 @@ pub fn is_model_family(model: &str, family: &str, version: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
 
     fn request(extra: serde_json::Value) -> MessagesRequest {
         let mut body = json!({
@@ -1526,6 +1586,20 @@ mod tests {
             }
         }
         serde_json::from_value(body).expect("valid Bedrock test request")
+    }
+
+    fn fake_png_base64(width: u32, height: u32) -> String {
+        let mut bytes = vec![0u8; 24];
+        bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        bytes[12..16].copy_from_slice(b"IHDR");
+        bytes[16..20].copy_from_slice(&width.to_be_bytes());
+        bytes[20..24].copy_from_slice(&height.to_be_bytes());
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn calibrated_payload(payload: &MessagesRequest) -> i32 {
+        let base = super::super::compat::estimate_input_tokens(payload);
+        calibrated_input_tokens(payload, base)
     }
 
     #[test]
@@ -2052,21 +2126,133 @@ mod tests {
     }
 
     #[test]
-    fn image_requests_include_bedrock_media_framing() {
-        let payload: MessagesRequest = serde_json::from_value(json!({
-            "model": "claude-opus-4-8",
-            "max_tokens": 32,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "unused"}},
-                    {"type": "text", "text": "What color is this image?"}
-                ]
-            }]
-        }))
-        .expect("valid request");
+    fn bedrock_calibration_does_not_double_charge_image_framing() {
+        let data = fake_png_base64(640, 360);
+        let image = json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": data}
+        });
+        let payload = |content| {
+            request(json!({
+                "model": "claude-opus-4-8",
+                "messages": [{"role": "user", "content": content}]
+            }))
+        };
+        let baseline = calibrated_payload(&payload(json!([])));
+        let top_one = calibrated_payload(&payload(json!([image.clone()])));
+        let top_two = calibrated_payload(&payload(json!([image.clone(), image.clone()])));
+        let nested_one = calibrated_payload(&payload(json!([{
+            "type": "tool_result",
+            "tool_use_id": "toolu_image",
+            "content": [image.clone()]
+        }])));
+        let nested_two = calibrated_payload(&payload(json!([{
+            "type": "tool_result",
+            "tool_use_id": "toolu_image",
+            "content": [image.clone(), image]
+        }])));
 
-        assert_eq!(calibrated_input_tokens(&payload, 36), 40);
+        assert_eq!(top_one - baseline, 299 + 4);
+        assert_eq!(top_two - baseline, 2 * (299 + 4));
+        assert_eq!(nested_one - baseline, 299 + 21);
+        assert_eq!(nested_two - baseline, 2 * (299 + 21));
+    }
+
+    #[test]
+    fn image_block_count_includes_tool_result_images() {
+        let data = fake_png_base64(100, 100);
+        let image = json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": data}
+        });
+        let payload = request(json!({
+            "messages": [{"role": "user", "content": [
+                image.clone(),
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_image",
+                    "content": [
+                        {"type": "text", "text": "visible result"},
+                        image.clone(),
+                        image
+                    ]
+                }
+            ]}]
+        }));
+
+        assert_eq!(image_block_count(&payload), 3);
+    }
+
+    #[test]
+    fn tool_result_image_increment_is_382_across_all_model_calibrations() {
+        let data = fake_png_base64(512, 512);
+        let image = json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": data}
+        });
+        // Preserve the mature text/tool baselines for this one synthetic
+        // history while enforcing the model-independent 382-token image delta.
+        let models = [
+            ("claude-opus-4-6", 508, 890),
+            ("claude-opus-4-7", 508, 890),
+            ("claude-opus-4-8", 429, 811),
+            ("claude-opus-5-0", 508, 890),
+            ("claude-sonnet-4-6", 555, 937),
+            ("claude-sonnet-5-0", 555, 937),
+            ("claude-haiku-4-5-20251001", 555, 937),
+        ];
+
+        for (model, expected_text, expected_image) in models {
+            let history = |content: Value| {
+                request(json!({
+                    "model": model,
+                    "tools": [{
+                        "name": "inspect_image",
+                        "description": "Inspect an image.",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": false
+                        }
+                    }],
+                    "messages": [
+                        {"role": "user", "content": "Inspect the supplied image."},
+                        {"role": "assistant", "content": [{
+                            "type": "tool_use",
+                            "id": "toolu_image",
+                            "name": "inspect_image",
+                            "input": {}
+                        }]},
+                        {"role": "user", "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_image",
+                            "content": content
+                        }]}
+                    ]
+                }))
+            };
+            let text = history(json!([{"type": "text", "text": "inspection complete"}]));
+            let with_image = history(json!([
+                {"type": "text", "text": "inspection complete"},
+                image.clone()
+            ]));
+            let text_tokens = calibrated_payload(&text);
+            let image_tokens = calibrated_payload(&with_image);
+
+            assert_eq!(
+                text_tokens, expected_text,
+                "text baseline changed for {model}"
+            );
+            assert_eq!(
+                image_tokens, expected_image,
+                "image total changed for {model}"
+            );
+            assert_eq!(
+                image_tokens - text_tokens,
+                361 + 21,
+                "wrong nested image increment for {model}"
+            );
+        }
     }
 
     #[test]
@@ -2108,6 +2294,124 @@ mod tests {
             })),
             18021
         );
+    }
+
+    #[test]
+    fn production_tool_result_media_is_promoted_without_becoming_language_tokens() {
+        let usage_and_wire = |data: String| {
+            let payload = request(json!({
+                "model": "claude-opus-4-8",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": "toolu_bdrk_media",
+                            "name": "inspect_image",
+                            "input": {}
+                        }]
+                    },
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_bdrk_media",
+                            "content": [{
+                                "type": "image",
+                                "text": "visible caption",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": data
+                                }
+                            }]
+                        }]
+                    }
+                ]
+            }));
+            let base_tokens = super::super::compat::estimate_input_tokens(&payload);
+            let calibrated = calibrated_input_tokens(&payload, base_tokens);
+            let converted =
+                super::super::converter::convert_request(&payload).expect("convert request");
+            let upstream_wire =
+                serde_json::to_string(&converted.conversation_state).expect("serialize request");
+            (calibrated, upstream_wire)
+        };
+
+        let (small_tokens, small_wire) = usage_and_wire("AAAA".to_string());
+        let (large_tokens, large_wire) = usage_and_wire("A".repeat(1_000_000));
+
+        assert_eq!(
+            large_tokens, small_tokens,
+            "binary byte length is not a language-token estimate"
+        );
+        assert!(large_tokens < 1_000);
+        assert!(small_wire.contains("visible caption"));
+        assert!(large_wire.contains("visible caption"));
+        assert!(large_wire.contains("[Image attached to this tool result]"));
+        assert!(
+            large_wire.contains(&"A".repeat(1_000)),
+            "tool-result media must be promoted into Kiro images[]"
+        );
+    }
+
+    #[test]
+    fn tool_history_usage_does_not_tokenize_embedded_base64_bytes() {
+        let usage_tokens = |data: String| {
+            let result = json!({
+                "type": "tool_result",
+                "tool_use_id": "toolu_bdrk_media",
+                "content": [{
+                    "type": "image",
+                    "text": "visible caption",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": data
+                    }
+                }]
+            });
+            let payload = request(json!({
+                "model": "claude-opus-4-8",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": "toolu_bdrk_media",
+                            "name": "inspect_image",
+                            "input": {}
+                        }]
+                    },
+                    {
+                        "role": "user",
+                        "content": [result.clone(), {"type": "text", "text": "continue"}]
+                    }
+                ]
+            }));
+            let base_tokens = super::super::compat::estimate_input_tokens(&payload);
+            (
+                visible_tool_result_content_tokens(&result["content"]),
+                visible_tool_result_block_tokens(&result),
+                cache_tool_history_tokens(&[json!([
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_bdrk_media",
+                        "name": "inspect_image",
+                        "input": {}
+                    },
+                    result.clone()
+                ])]),
+                calibrated_input_tokens(&payload, base_tokens),
+            )
+        };
+
+        let small = usage_tokens("AAAA".to_string());
+        let large = usage_tokens("A".repeat(1_000_000));
+
+        assert_eq!(large, small, "binary payload bytes are not language tokens");
+        assert!(large.2 < 1_000);
+        assert!(large.3 < 1_000);
     }
 
     #[test]
@@ -2388,11 +2692,6 @@ mod tests {
             Some(92)
         );
         assert_eq!(
-            InputContextCalibration::for_request(&short_english)
-                .direct_catalog_initial_output_tokens(),
-            Some(2)
-        );
-        assert_eq!(
             direct_catalog_ordinary_input_tokens(&short_english, 4_096),
             None
         );
@@ -2443,6 +2742,25 @@ mod tests {
             Some(message_tokens + 6 + KIRO_OPUS_48_DIRECT_CATALOG_SUFFIX_TOKENS - 2)
         );
 
+        let mut oversized_cached_system = short_english.clone();
+        oversized_cached_system.system.as_mut().unwrap()[0]
+            .text
+            .push_str(&"x".repeat(2_000_000));
+        let oversized_calibration = InputContextCalibration::for_request(&oversized_cached_system);
+        let oversized_usage = UsageBreakdown {
+            input_tokens: 92,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 500_000,
+            cache_creation_5m_input_tokens: 500_000,
+            cache_creation_1h_input_tokens: 0,
+        };
+        assert_eq!(
+            oversized_calibration
+                .calibrate_local_direct_compat_usage("claude-opus-4-8", oversized_usage),
+            oversized_usage,
+            "an oversized cached system must wait for Kiro context reconciliation"
+        );
+
         let mut uncached_system = short_english;
         uncached_system
             .system
@@ -2462,7 +2780,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_compat_usage_matches_current_pomo_28_tool_cache_without_context_event() {
+    fn local_direct_compat_usage_matches_current_pomo_28_tool_cache_without_upstream() {
         let calibration = InputContextCalibration {
             enabled: true,
             has_tools: true,
@@ -2473,7 +2791,6 @@ mod tests {
             has_truncated_tool_descriptions: true,
             direct_catalog_ordinary_input_tokens: 499,
         };
-        assert_eq!(calibration.direct_catalog_initial_output_tokens(), Some(8));
         let creation = UsageBreakdown {
             input_tokens: 532,
             cache_read_input_tokens: 0,
@@ -2481,7 +2798,8 @@ mod tests {
             cache_creation_5m_input_tokens: 36_975,
             cache_creation_1h_input_tokens: 0,
         };
-        let calibrated = calibration.calibrate_direct_compat_usage("claude-opus-4-8", creation);
+        let calibrated =
+            calibration.calibrate_local_direct_compat_usage("claude-opus-4-8", creation);
         assert_eq!(calibrated.input_tokens, 499);
         assert_eq!(calibrated.cache_creation_input_tokens, 34_250);
         assert_eq!(calibrated.cache_creation_5m_input_tokens, 34_250);
@@ -2495,7 +2813,7 @@ mod tests {
             cache_creation_5m_input_tokens: 0,
             cache_creation_1h_input_tokens: 0,
         };
-        let calibrated = calibration.calibrate_direct_compat_usage("claude-opus-4-8", read);
+        let calibrated = calibration.calibrate_local_direct_compat_usage("claude-opus-4-8", read);
         assert_eq!(calibrated.input_tokens, 499);
         assert_eq!(calibrated.cache_read_input_tokens, 34_250);
         assert_eq!(calibrated.cache_creation_input_tokens, 0);
@@ -2506,8 +2824,17 @@ mod tests {
             ..calibration
         };
         assert_eq!(
-            different_catalog.calibrate_direct_compat_usage("claude-opus-4-8", creation),
+            different_catalog.calibrate_local_direct_compat_usage("claude-opus-4-8", creation),
             creation
+        );
+        let historical_request = InputContextCalibration {
+            direct_catalog_ordinary_input_tokens: 0,
+            ..calibration
+        };
+        assert_eq!(
+            historical_request.calibrate_local_direct_compat_usage("claude-opus-4-8", creation),
+            creation,
+            "a 28-tool history is not the calibrated single-turn direct profile"
         );
     }
 

@@ -86,9 +86,14 @@ impl UsageBreakdown {
     }
 
     /// total = input + cache_read + cache_creation
-    #[cfg(test)]
     pub fn total(&self) -> i32 {
-        self.input_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens
+        self.input_tokens
+            .saturating_add(self.cache_read_input_tokens)
+            .saturating_add(self.cache_creation_input_tokens)
+    }
+
+    pub fn has_cache_usage(&self) -> bool {
+        self.cache_read_input_tokens > 0 || self.cache_creation_input_tokens > 0
     }
 
     /// 把 usage 钳制到物理可能的范围内，供所有对外出口在发出前调用。
@@ -97,7 +102,8 @@ impl UsageBreakdown {
     /// 一旦超过，只可能来自多轮累计、上游异常重连的重复计量，或本地估算把二进制
     /// 内容（例如 tool_result 里内嵌的 base64 截图）当作文本计数造成的放大。
     /// 下游网关按 usage 逐 token 计费，放大值会直接变成客户账单，因此必须在出口
-    /// 处兜底：宁可少计，不可多计。
+    /// 处兜底：宁可暂停这一次输入计费，也不可把一个已知不可能的值改写成看似
+    /// 合法的窗口上限后继续向客户收费。
     ///
     /// 同时强制 `cache_creation == 5m + 1h`。二者失配时，下游会把 message_start
     /// 的分量和 message_delta 的总量混用（`compat::stream_delta_usage` 不带分量
@@ -106,7 +112,7 @@ impl UsageBreakdown {
         let limit = context_window_tokens.max(1);
 
         let mut cache_creation_5m = self.cache_creation_5m_input_tokens.max(0);
-        let mut cache_creation_1h = self.cache_creation_1h_input_tokens.max(0);
+        let cache_creation_1h = self.cache_creation_1h_input_tokens.max(0);
         let mut cache_creation = self.cache_creation_input_tokens.max(0);
         if cache_creation_5m.saturating_add(cache_creation_1h) != cache_creation {
             if cache_creation_5m > 0 || cache_creation_1h > 0 {
@@ -116,8 +122,8 @@ impl UsageBreakdown {
             }
         }
 
-        let mut cache_read = self.cache_read_input_tokens.max(0);
-        let mut input = self.input_tokens.max(0);
+        let cache_read = self.cache_read_input_tokens.max(0);
+        let input = self.input_tokens.max(0);
 
         let within_limit = input
             .saturating_add(cache_read)
@@ -133,35 +139,16 @@ impl UsageBreakdown {
             };
         }
 
-        // 超限：按可信度从高到低依次分配预算（缓存写入 → 缓存读取 → 普通 input），
-        // 并始终给 input 留至少 1 个 token，与真 Anthropic 的 usage 形态一致。
-        let mut remaining = limit;
-        cache_creation = cache_creation.min(remaining.saturating_sub(1));
-        cache_creation_1h = cache_creation_1h.min(cache_creation);
-        cache_creation_5m = cache_creation - cache_creation_1h;
-        remaining -= cache_creation;
-        cache_read = cache_read.min(remaining.saturating_sub(1));
-        remaining -= cache_read;
-        input = input.clamp(1, remaining.max(1));
-
         tracing::warn!(
             limit,
             original_input = self.input_tokens,
             original_cache_read = self.cache_read_input_tokens,
             original_cache_creation = self.cache_creation_input_tokens,
-            clamped_input = input,
-            clamped_cache_read = cache_read,
-            clamped_cache_creation = cache_creation,
-            "usage 超过模型上下文窗口，已钳制后再上报（避免下游超额计费）"
+            held_input = 1,
+            "usage 超过模型上下文窗口，已暂停异常输入计费"
         );
 
-        Self {
-            input_tokens: input,
-            cache_read_input_tokens: cache_read,
-            cache_creation_input_tokens: cache_creation,
-            cache_creation_5m_input_tokens: cache_creation_5m,
-            cache_creation_1h_input_tokens: cache_creation_1h,
-        }
+        Self::flat(1)
     }
 
     /// 按模型自身的上下文窗口钳制（opus-4.8 / sonnet-4.6 等为 1M，其余 200K）。
@@ -328,33 +315,60 @@ pub async fn compute_request_usage_breakdown_with_profile(
         return UsageBreakdown::flat(total_input_tokens);
     };
 
-    let ordinary_input = if aws_b40_compat && cache_plan.terminal_message_breakpoint {
-        2
+    let planned_cache_tokens = cache_plan
+        .cache_read_tokens
+        .saturating_add(cache_plan.cache_creation_5m_tokens)
+        .saturating_add(cache_plan.cache_creation_1h_tokens);
+    let mut ordinary_input = if aws_b40_compat && cache_plan.terminal_message_breakpoint {
+        total_input_tokens.min(2)
     } else if aws_b40_compat {
         total_input_tokens
-            .saturating_sub(cache_plan.cache_tokens)
+            .saturating_sub(planned_cache_tokens)
             .max(1)
+            .min(total_input_tokens)
     } else {
-        total_input_tokens - cache_plan.cache_tokens
+        total_input_tokens.saturating_sub(planned_cache_tokens)
     };
-    // cache_creation 代表"本次请求新写入缓存的内容"，它是本请求的真子集，
-    // 不可能超过本请求的总量。前缀走本地估算、总量走上游 context 上报，两套
-    // 口径不一致时这里会凭空放大（实测约 +28%），撞上上下文窗口钳制后被记成
-    // 999_999，单请求约 $13.8 直接进客户账单。
-    //
-    // cache_read 不参与封顶：它读回的是之前请求写入的前缀，其规模由那次请求
-    // 决定，用本次总量去截断会破坏缓存连续性。
-    let creation_budget = total_input_tokens.max(0);
-    let (creation_5m, creation_1h) = clamp_cache_creation(
+    // Cache read and creation are disjoint parts of this request's input. Bound
+    // both against one shared budget so estimator drift can never make their
+    // sum exceed the request total. AWS-B keeps its observed one/two ordinary
+    // input tokens; any inconsistent cached prefix is reduced before creation.
+    let cache_budget = total_input_tokens.saturating_sub(ordinary_input);
+    let mut cache_read = cache_plan.cache_read_tokens.clamp(0, cache_budget);
+    let creation_budget = cache_budget.saturating_sub(cache_read);
+    let (mut creation_5m, mut creation_1h) = clamp_cache_creation(
         cache_plan.cache_creation_5m_tokens,
         cache_plan.cache_creation_1h_tokens,
         creation_budget,
     );
+    let initial_creation = creation_5m.saturating_add(creation_1h);
+    // Prefix and full-request estimators can legitimately differ by a handful
+    // of framing tokens. Keep the observed AWS-B ordinary-input envelope and
+    // assign that residual to the active cache bucket; if no cache bucket is
+    // active, it remains ordinary input. This preserves both profile fidelity
+    // and the public `input + read + creation == total` identity.
+    let residual = total_input_tokens.saturating_sub(
+        ordinary_input
+            .saturating_add(cache_read)
+            .saturating_add(initial_creation),
+    );
+    if residual > 0 {
+        if creation_1h > 0 {
+            creation_1h = creation_1h.saturating_add(residual);
+        } else if creation_5m > 0 {
+            creation_5m = creation_5m.saturating_add(residual);
+        } else if cache_read > 0 {
+            cache_read = cache_read.saturating_add(residual);
+        } else {
+            ordinary_input = ordinary_input.saturating_add(residual);
+        }
+    }
+    let cache_creation = creation_5m.saturating_add(creation_1h);
 
     UsageBreakdown {
         input_tokens: ordinary_input,
-        cache_read_input_tokens: cache_plan.cache_read_tokens,
-        cache_creation_input_tokens: creation_5m + creation_1h,
+        cache_read_input_tokens: cache_read,
+        cache_creation_input_tokens: cache_creation,
         cache_creation_5m_input_tokens: creation_5m,
         cache_creation_1h_input_tokens: creation_1h,
     }
@@ -365,7 +379,10 @@ fn clamp_cache_creation(creation_5m: i32, creation_1h: i32, budget: i32) -> (i32
     let creation_5m = creation_5m.max(0);
     let creation_1h = creation_1h.max(0);
     let total = creation_5m.saturating_add(creation_1h);
-    if budget <= 0 || total <= budget {
+    if budget <= 0 {
+        return (0, 0);
+    }
+    if total <= budget {
         return (creation_5m, creation_1h);
     }
     // 按原比例缩放，1h 档优先保留整数精度，余量归 5m，确保两档之和恰为 budget。
@@ -374,24 +391,62 @@ fn clamp_cache_creation(creation_5m: i32, creation_1h: i32, budget: i32) -> (i32
     (budget - scaled_1h, scaled_1h)
 }
 
-pub fn with_additional_input(
+/// Produce the final public usage after validating every upstream round.
+///
+/// Every upstream AWS-B cache split requires Kiro's context event; without it
+/// the locally fabricated cache estimate is held instead of billed. Local
+/// short-circuit responses explicitly opt out because they make no upstream
+/// request and keep their usage physically bounded here.
+///
+/// A model context window applies to one upstream invocation. Continuation
+/// rounds are therefore validated independently and only then accumulated.
+/// The final aggregate may legitimately exceed one context window.
+pub fn finalize_request_usage(
     initial: UsageBreakdown,
-    initial_total_input_tokens: i32,
-    final_total_input_tokens: i32,
+    authoritative_first_round_input_tokens: Option<i32>,
+    estimated_first_round_input_tokens: i32,
+    additional_round_input_tokens: &[i32],
+    ordinary_input_adjustment: i32,
+    model: &str,
+    authoritative_cache_context_required: bool,
 ) -> UsageBreakdown {
-    // 初始拆分已经覆盖首轮总量；自动续写产生的后续轮次没有 cache breakpoint，
-    // 因此只把新增 input 累加到普通 input，已有 cache_read/cache_creation 保持不变。
-    // final 来自本地估算累加（见 billing::billable_input_tokens），不会混入 Kiro 的固定底噪。
-    let extra = (final_total_input_tokens - initial_total_input_tokens).max(0);
+    let first_round = if authoritative_cache_context_required
+        && initial.has_cache_usage()
+        && authoritative_first_round_input_tokens.is_none()
+    {
+        tracing::warn!(
+            estimated_input = estimated_first_round_input_tokens,
+            estimated_cache_read = initial.cache_read_input_tokens,
+            estimated_cache_creation = initial.cache_creation_input_tokens,
+            "AWS-B 缓存请求缺少 Kiro contextUsageEvent，已暂停首轮异常输入计费"
+        );
+        UsageBreakdown::flat(1)
+    } else {
+        let first_round_input_tokens = authoritative_first_round_input_tokens
+            .unwrap_or(estimated_first_round_input_tokens)
+            .max(1);
+        reconcile_initial_input(initial, first_round_input_tokens, ordinary_input_adjustment)
+            .clamp_for_model(model)
+    };
+
+    let additional_input_tokens =
+        additional_round_input_tokens
+            .iter()
+            .fold(0i32, |total, round| {
+                let validated = UsageBreakdown::flat((*round).max(1)).clamp_for_model(model);
+                total.saturating_add(validated.input_tokens)
+            });
     UsageBreakdown {
-        input_tokens: initial.input_tokens + extra,
-        ..initial
+        input_tokens: first_round
+            .input_tokens
+            .saturating_add(additional_input_tokens),
+        ..first_round
     }
 }
 
 /// Reconcile the first-round cache split after a profile obtains a more
 /// accurate total from the upstream context-usage event. Continuation rounds
-/// are handled separately by `with_additional_input` and remain ordinary input.
+/// are handled separately by `finalize_request_usage` and remain ordinary input.
 pub fn reconcile_initial_input(
     initial: UsageBreakdown,
     calibrated_total_input_tokens: i32,
@@ -432,7 +487,6 @@ pub fn reconcile_initial_input(
 }
 
 struct CachePlan {
-    cache_tokens: i32,
     cache_read_tokens: i32,
     cache_creation_5m_tokens: i32,
     cache_creation_1h_tokens: i32,
@@ -516,7 +570,6 @@ async fn cache_plan_for_request(
     }
 
     Some(CachePlan {
-        cache_tokens: max_cache_tokens,
         cache_read_tokens: read_tokens,
         cache_creation_5m_tokens: creation_5m,
         cache_creation_1h_tokens: creation_1h,
@@ -705,11 +758,12 @@ fn build_cache_breakpoints(
             );
             return false;
         };
-        breakpoint.tokens = if aws_b40_compat {
-            tokens.max(0)
-        } else {
-            tokens.min(total_input_tokens).max(0)
-        };
+        // A cache breakpoint is a prefix of this request. It therefore cannot
+        // exceed the request total under any profile. Keeping the same bound
+        // for AWS-B also prevents a cached prefix estimator from turning
+        // discarded media bytes or an extrapolated calibration into billable
+        // cache usage.
+        breakpoint.tokens = tokens.min(total_input_tokens).max(0);
         true
     });
 
@@ -841,7 +895,13 @@ fn collect_message_prefix(
                     .push(Value::Array(vec![item_without_cache]));
                 remember_read_candidate(state);
                 if has_direct_cache_control(item) {
-                    let readable = aws_b40_compat && super::compat::is_opus_4_8(&req.model);
+                    let model = req.model.to_ascii_lowercase();
+                    let sonnet_4_6_image = item.get("type").and_then(Value::as_str)
+                        == Some("image")
+                        && model.contains("sonnet")
+                        && (model.contains("4-6") || model.contains("4.6"));
+                    let readable = aws_b40_compat
+                        && (super::compat::is_opus_4_8(&req.model) || sonnet_4_6_image);
                     let warm_on_first_use =
                         readable && cache_control_is_global(item.get("cache_control"));
                     push_breakpoint(
@@ -1337,6 +1397,41 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn cache_read_and_creation_share_the_current_request_budget() {
+        let text = "shared-cache-budget-regression ".repeat(2_000);
+        let req = parse_request(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "system": [{
+                "type": "text",
+                "text": text,
+                "cache_control": {"type": "ephemeral", "scope": "global"}
+            }],
+            "messages": [{"role": "user", "content": "continue"}]
+        }));
+
+        for total in [1_i32, 64, 1_024, 5_000] {
+            let usage = compute_request_usage_breakdown_with_profile(total, &req, true).await;
+            assert_eq!(
+                usage.total(),
+                total,
+                "cache parts must share one request-total budget"
+            );
+            assert!(
+                usage
+                    .cache_read_input_tokens
+                    .saturating_add(usage.cache_creation_input_tokens)
+                    <= total
+            );
+            assert_eq!(
+                usage
+                    .cache_creation_5m_input_tokens
+                    .saturating_add(usage.cache_creation_1h_input_tokens),
+                usage.cache_creation_input_tokens
+            );
+        }
+    }
+
     /// 边缘情况：极小请求带 cache_control，不得报出巨额缓存写。
     #[tokio::test]
     async fn tiny_request_with_cache_control_reports_tiny_cache_creation() {
@@ -1363,8 +1458,8 @@ mod tests {
         assert_eq!(clamp_cache_creation(0, 0, 0), (0, 0), "全零安全");
         assert_eq!(
             clamp_cache_creation(500, 500, 0),
-            (500, 500),
-            "预算<=0 视为不限制"
+            (0, 0),
+            "零预算不得保留缓存写入"
         );
         let (a, b) = clamp_cache_creation(800, 200, 100);
         assert_eq!(a + b, 100, "缩放后两档之和必须恰为预算");
@@ -1373,6 +1468,15 @@ mod tests {
         assert_eq!((a, b), (1_000, 0), "单档超限时全部归该档");
         let (a, b) = clamp_cache_creation(-5, -5, 100);
         assert_eq!((a, b), (0, 0), "负值归零");
+    }
+
+    #[test]
+    fn cache_creation_zero_budget_is_empty_and_positive_budget_preserves_ratio() {
+        assert_eq!(clamp_cache_creation(500, 500, 0), (0, 0));
+        assert_eq!(clamp_cache_creation(100, 50, 1_000), (100, 50));
+        assert_eq!(clamp_cache_creation(800, 200, 100), (80, 20));
+        assert_eq!(clamp_cache_creation(999_999, 0, 1_000), (1_000, 0));
+        assert_eq!(clamp_cache_creation(-5, -5, 100), (0, 0));
     }
 
     #[test]
@@ -1437,7 +1541,7 @@ mod tests {
     }
 
     #[test]
-    fn clamp_caps_incident_scale_usage_to_context_window() {
+    fn clamp_holds_incident_scale_usage_instead_of_charging_the_window_limit() {
         // 2026-07-25 上游故障期间真实上报的 usage：三项分量各自都远超 1M 上下文窗口。
         let inflated = UsageBreakdown {
             input_tokens: 5_122_021,
@@ -1447,19 +1551,7 @@ mod tests {
             cache_creation_1h_input_tokens: 0,
         };
         let clamped = inflated.clamp_for_model("claude-opus-4-8");
-        assert!(
-            clamped.input_tokens
-                + clamped.cache_read_input_tokens
-                + clamped.cache_creation_input_tokens
-                <= 1_000_000
-        );
-        assert!(clamped.input_tokens >= 1);
-        // 分量失配时以 5m/1h 分量为准重建总量，避免下游混用两个事件的数值。
-        assert_eq!(clamped.cache_creation_input_tokens, 182_611);
-        assert_eq!(
-            clamped.cache_creation_5m_input_tokens + clamped.cache_creation_1h_input_tokens,
-            clamped.cache_creation_input_tokens
-        );
+        assert_eq!(clamped, UsageBreakdown::flat(1));
     }
 
     #[test]
@@ -1488,40 +1580,114 @@ mod tests {
         };
         // haiku 走 200K 窗口。
         let clamped = inflated.clamp_for_model("claude-haiku-4-5");
-        assert!(
-            clamped.input_tokens
-                + clamped.cache_read_input_tokens
-                + clamped.cache_creation_input_tokens
-                <= 200_000
-        );
-        assert!(clamped.input_tokens >= 1);
+        assert_eq!(clamped, UsageBreakdown::flat(1));
     }
 
     #[test]
-    fn with_additional_input_preserves_cache_and_bills_continuation_rounds() {
-        // 缓存命中：input=100, cache_read=3954, total=4054。
-        let cached = UsageBreakdown {
-            input_tokens: 100,
-            cache_read_input_tokens: 3954,
-            cache_creation_input_tokens: 0,
-            cache_creation_5m_input_tokens: 0,
+    fn finalizer_holds_cached_estimate_without_authoritative_context() {
+        let estimated = UsageBreakdown {
+            input_tokens: 7,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 522_472,
+            cache_creation_5m_input_tokens: 522_472,
             cache_creation_1h_input_tokens: 0,
         };
-        // final=8000 表示本地估算累计了后续轮次；新增的 3946 只进入普通 input。
-        let out = with_additional_input(cached, 4054, 8000);
-        assert_eq!(out.input_tokens, 4046);
-        assert_eq!(out.cache_read_input_tokens, 3954);
-        assert_eq!(out.total(), 8000, "input+cr+cc 必须覆盖所有上游轮次");
+
+        let usage = finalize_request_usage(
+            estimated,
+            None,
+            estimated.total(),
+            &[],
+            0,
+            "claude-opus-4-8",
+            true,
+        );
+
+        assert_eq!(
+            usage,
+            UsageBreakdown::flat(1),
+            "a plausible in-window virtual-cache estimate is still not authoritative"
+        );
     }
 
     #[test]
-    fn with_additional_input_accumulates_flat_multiround() {
-        // 无缓存：多轮累计的额外 input 叠加进来（成本回收）。final 来自本地估算累加。
-        let flat = UsageBreakdown::flat(2000);
-        let out = with_additional_input(flat, 2000, 9000);
-        assert_eq!(out.input_tokens, 9000);
-        assert_eq!(out.cache_read_input_tokens, 0);
-        assert_eq!(out.cache_creation_input_tokens, 0);
+    fn finalizer_does_not_authorize_catalog_sized_cache_without_context_event() {
+        let locally_calibrated_catalog = UsageBreakdown {
+            input_tokens: 77,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 34_250,
+            cache_creation_5m_input_tokens: 34_250,
+            cache_creation_1h_input_tokens: 0,
+        };
+
+        let usage = finalize_request_usage(
+            locally_calibrated_catalog,
+            None,
+            locally_calibrated_catalog.total(),
+            &[],
+            0,
+            "claude-opus-4-8",
+            true,
+        );
+
+        assert_eq!(
+            usage,
+            UsageBreakdown::flat(1),
+            "a client-reproducible catalog shape cannot authorize upstream cache billing"
+        );
+    }
+
+    #[test]
+    fn finalizer_validates_each_continuation_without_clamping_legitimate_aggregate() {
+        let initial = UsageBreakdown {
+            input_tokens: 100,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 699_900,
+            cache_creation_5m_input_tokens: 699_900,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let usage = finalize_request_usage(
+            initial,
+            Some(700_000),
+            initial.total(),
+            &[600_000, 500_000],
+            0,
+            "claude-opus-4-8",
+            true,
+        );
+
+        assert_eq!(usage.total(), 1_800_000);
+        assert_eq!(usage.cache_creation_input_tokens, 699_900);
+
+        let with_impossible_round = finalize_request_usage(
+            initial,
+            Some(700_000),
+            initial.total(),
+            &[1_200_000],
+            0,
+            "claude-opus-4-8",
+            true,
+        );
+        assert_eq!(
+            with_impossible_round.total(),
+            700_001,
+            "only the impossible continuation round is held"
+        );
+
+        let impossible_initial = finalize_request_usage(
+            UsageBreakdown::flat(1_200_000),
+            Some(1_200_000),
+            1_200_000,
+            &[100_000],
+            0,
+            "claude-opus-4-8",
+            true,
+        );
+        assert_eq!(
+            impossible_initial.total(),
+            100_001,
+            "an impossible first round is held without erasing a valid continuation"
+        );
     }
 
     #[test]
@@ -1935,6 +2101,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sonnet_4_6_image_breakpoint_reads_same_image_and_changed_bytes_miss() {
+        use base64::Engine;
+
+        let image_data = |marker: u8| {
+            let mut bytes = vec![0u8; 25];
+            bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+            bytes[12..16].copy_from_slice(b"IHDR");
+            bytes[16..20].copy_from_slice(&1_075u32.to_be_bytes());
+            bytes[20..24].copy_from_slice(&1_520u32.to_be_bytes());
+            bytes[24] = marker;
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        };
+        let request_with = |data: String| {
+            parse_request(serde_json::json!({
+                "model": "claude-sonnet-4-6",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": data
+                        },
+                        "cache_control": {"type": "ephemeral"}
+                    }]
+                }]
+            }))
+        };
+        let usage_for = |request: &MessagesRequest| {
+            let base = super::super::compat::estimate_input_tokens(request);
+            super::super::bedrock::calibrated_input_tokens(request, base)
+        };
+
+        let first_request = request_with(image_data(0x41));
+        let first_total = usage_for(&first_request);
+        let first =
+            compute_request_usage_breakdown_with_profile(first_total, &first_request, true).await;
+        assert_eq!(first.cache_read_input_tokens, 0);
+        assert!(first.cache_creation_input_tokens > 0);
+        assert_eq!(
+            first.cache_creation_input_tokens,
+            first
+                .cache_creation_5m_input_tokens
+                .saturating_add(first.cache_creation_1h_input_tokens)
+        );
+        assert_eq!(first.total(), first_total);
+
+        let second_total = usage_for(&first_request);
+        let second =
+            compute_request_usage_breakdown_with_profile(second_total, &first_request, true).await;
+        assert!(second.cache_read_input_tokens > 0);
+        assert_eq!(second.cache_creation_input_tokens, 0);
+        assert_eq!(
+            second.cache_creation_input_tokens,
+            second
+                .cache_creation_5m_input_tokens
+                .saturating_add(second.cache_creation_1h_input_tokens)
+        );
+        assert_eq!(second.total(), second_total);
+
+        let changed_request = request_with(image_data(0x42));
+        let changed_total = usage_for(&changed_request);
+        let changed =
+            compute_request_usage_breakdown_with_profile(changed_total, &changed_request, true)
+                .await;
+        assert_eq!(changed.cache_read_input_tokens, 0);
+        assert!(changed.cache_creation_input_tokens > 0);
+        assert_eq!(
+            changed.cache_creation_input_tokens,
+            changed
+                .cache_creation_5m_input_tokens
+                .saturating_add(changed.cache_creation_1h_input_tokens)
+        );
+        assert_eq!(changed.total(), changed_total);
+    }
+
+    #[tokio::test]
+    async fn sonnet_4_6_text_message_breakpoint_remains_creation_only() {
+        let request = parse_request(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "sonnet text breakpoint remains create only ".repeat(800),
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }]
+        }));
+        let total = super::super::bedrock::calibrated_input_tokens(
+            &request,
+            super::super::compat::estimate_input_tokens(&request),
+        );
+
+        let first = compute_request_usage_breakdown_with_profile(total, &request, true).await;
+        let second = compute_request_usage_breakdown_with_profile(total, &request, true).await;
+
+        assert_eq!(first.cache_read_input_tokens, 0);
+        assert_eq!(second.cache_read_input_tokens, 0);
+        assert!(first.cache_creation_input_tokens > 0);
+        assert!(second.cache_creation_input_tokens > 0);
+        assert_eq!(first.total(), total);
+        assert_eq!(second.total(), total);
+    }
+
+    #[tokio::test]
     async fn bedrock_message_breakpoint_reads_the_previous_turn_prefix() {
         let tools = (0..8)
             .map(|index| {
@@ -2021,10 +2294,14 @@ mod tests {
         let second_usage =
             compute_request_usage_breakdown_with_profile(second_total, &second, true).await;
 
-        assert_eq!(second_usage.cache_read_input_tokens, first_cached);
-        assert!(second_usage.cache_creation_input_tokens > 0);
+        assert_eq!(
+            second_usage.cache_read_input_tokens,
+            first_cached.min(second_total.saturating_sub(2)),
+            "a previous cache prefix remains readable but cannot exceed the current request total"
+        );
+        assert!(second_usage.cache_read_input_tokens <= second_total);
         assert_eq!(second_usage.input_tokens, 2);
-        assert!(second_usage.cache_creation_input_tokens < first_usage.cache_creation_input_tokens);
+        assert_eq!(second_usage.total(), second_total);
     }
 
     #[tokio::test]

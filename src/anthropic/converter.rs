@@ -211,6 +211,30 @@ pub enum ConversionError {
     EmptyMessages,
 }
 
+#[derive(Debug)]
+struct ForwardedImage {
+    image: KiroImage,
+    tool_result_index: Option<usize>,
+}
+
+pub(crate) const TOOL_RESULT_IMAGE_MARKER: &str = "[Image attached to this tool result]";
+
+impl ForwardedImage {
+    fn direct(image: KiroImage) -> Self {
+        Self {
+            image,
+            tool_result_index: None,
+        }
+    }
+
+    fn from_tool_result(tool_result_index: usize, image: KiroImage) -> Self {
+        Self {
+            image,
+            tool_result_index: Some(tool_result_index),
+        }
+    }
+}
+
 impl std::fmt::Display for ConversionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -339,7 +363,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
     let last_message = messages.last().unwrap();
-    let (text_content, images, documents, tool_results) =
+    let (text_content, forwarded_images, documents, tool_results) =
         process_message_content(&last_message.content)?;
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
@@ -352,8 +376,17 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
     // 同时返回孤立的 tool_use_id 集合，用于后续清理
-    let (validated_tool_results, orphaned_tool_use_ids) =
+    let (validated_tool_results, orphaned_tool_use_ids, validated_tool_result_indices) =
         validate_tool_pairing(&history, &tool_results);
+    let images = forwarded_images
+        .into_iter()
+        .filter(|forwarded| {
+            forwarded
+                .tool_result_index
+                .is_none_or(|index| validated_tool_result_indices.contains(&index))
+        })
+        .map(|forwarded| forwarded.image)
+        .collect::<Vec<_>>();
 
     // 9. 从历史中移除孤立的 tool_use（Kiro API 要求 tool_use 必须有对应的 tool_result）
     remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
@@ -435,7 +468,15 @@ fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
 /// 处理消息内容，提取文本、图片和工具结果
 fn process_message_content(
     content: &serde_json::Value,
-) -> Result<(String, Vec<KiroImage>, Vec<KiroDocument>, Vec<ToolResult>), ConversionError> {
+) -> Result<
+    (
+        String,
+        Vec<ForwardedImage>,
+        Vec<KiroDocument>,
+        Vec<ToolResult>,
+    ),
+    ConversionError,
+> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
     let mut documents = Vec::new();
@@ -461,7 +502,9 @@ fn process_message_content(
                                         (source.media_type.as_deref(), source.data)
                                     {
                                         if let Some(format) = get_image_format(media_type) {
-                                            images.push(KiroImage::from_base64(format, data));
+                                            images.push(ForwardedImage::direct(
+                                                KiroImage::from_base64(format, data),
+                                            ));
                                         }
                                     }
                                 }
@@ -469,7 +512,12 @@ fn process_message_content(
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
-                                let result_content = extract_tool_result_content(&block.content);
+                                let (result_content, result_images) =
+                                    extract_tool_result_content(&block.content);
+                                let tool_result_index = tool_results.len();
+                                images.extend(result_images.into_iter().map(|image| {
+                                    ForwardedImage::from_tool_result(tool_result_index, image)
+                                }));
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mut result = if is_error {
@@ -657,21 +705,48 @@ fn get_image_format(media_type: &str) -> Option<String> {
     }
 }
 
-/// 提取工具结果内容
-fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
+/// 将 Anthropic tool_result 的内容投影到 Kiro 支持的表示。
+///
+/// Kiro 的 ToolResultContentBlock 仅支持 text/json，图片必须放在同一条 user
+/// message 的 images 字段。这里保留原始文本，并返回需要提升的图片；关联标记使
+/// image-only 结果保持非空，也让模型知道这些 message-level 图片属于该工具结果。
+fn extract_tool_result_content(content: &Option<serde_json::Value>) -> (String, Vec<KiroImage>) {
     match content {
-        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::String(s)) => (s.clone(), Vec::new()),
         Some(serde_json::Value::Array(arr)) => {
             let mut parts = Vec::new();
+            let mut images = Vec::new();
             for item in arr {
                 if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                     parts.push(text.to_string());
                 }
+                if item.get("type").and_then(|v| v.as_str()) != Some("image") {
+                    continue;
+                }
+                let Some(source) = item.get("source") else {
+                    continue;
+                };
+                if source.get("type").and_then(|v| v.as_str()) != Some("base64") {
+                    continue;
+                }
+                let (Some(media_type), Some(data)) = (
+                    source.get("media_type").and_then(|v| v.as_str()),
+                    source.get("data").and_then(|v| v.as_str()),
+                ) else {
+                    continue;
+                };
+                if let Some(format) = get_image_format(media_type) {
+                    images.push(KiroImage::from_base64(format, data));
+                    // Keep one marker at the original media position. Repeating
+                    // the marker for multiple images preserves attachment order
+                    // after Kiro flattens them into message-level `images[]`.
+                    parts.push(TOOL_RESULT_IMAGE_MARKER.to_string());
+                }
             }
-            parts.join("\n")
+            (parts.join("\n"), images)
         }
-        Some(v) => v.to_string(),
-        None => String::new(),
+        Some(v) => (v.to_string(), Vec::new()),
+        None => (String::new(), Vec::new()),
     }
 }
 
@@ -685,11 +760,16 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
 /// * `tool_results` - 当前消息中的 tool_result 列表
 ///
 /// # Returns
-/// 元组：(经过验证和过滤后的 tool_result 列表, 孤立的 tool_use_id 集合)
+/// 元组：(经过验证和过滤后的 tool_result 列表, 孤立的 tool_use_id 集合,
+/// 经过验证的当前 tool_result 原始下标集合)
 fn validate_tool_pairing(
     history: &[Message],
     tool_results: &[ToolResult],
-) -> (Vec<ToolResult>, std::collections::HashSet<String>) {
+) -> (
+    Vec<ToolResult>,
+    std::collections::HashSet<String>,
+    std::collections::HashSet<usize>,
+) {
     use std::collections::HashSet;
 
     // 1. 收集所有历史中的 tool_use_id
@@ -727,11 +807,13 @@ fn validate_tool_pairing(
 
     // 4. 过滤并验证当前消息的 tool_results
     let mut filtered_results = Vec::new();
+    let mut filtered_result_indices = HashSet::new();
 
-    for result in tool_results {
+    for (index, result) in tool_results.iter().enumerate() {
         if unpaired_tool_use_ids.contains(&result.tool_use_id) {
             // 配对成功
             filtered_results.push(result.clone());
+            filtered_result_indices.insert(index);
             unpaired_tool_use_ids.remove(&result.tool_use_id);
         } else if all_tool_use_ids.contains(&result.tool_use_id) {
             // tool_use 存在但已经在历史中配对过了，这是重复的 tool_result
@@ -756,7 +838,11 @@ fn validate_tool_pairing(
         );
     }
 
-    (filtered_results, unpaired_tool_use_ids)
+    (
+        filtered_results,
+        unpaired_tool_use_ids,
+        filtered_result_indices,
+    )
 }
 
 /// 从历史消息中移除孤立的 tool_use
@@ -1134,7 +1220,7 @@ fn build_history(
         } else if msg.role == "assistant" {
             // 先处理累积的 user 消息
             if !user_buffer.is_empty() {
-                let merged_user = merge_user_messages(&user_buffer, model_id)?;
+                let merged_user = merge_user_messages(&user_buffer, model_id, &history)?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
             }
@@ -1151,7 +1237,7 @@ fn build_history(
 
     // 处理结尾的孤立 user 消息
     if !user_buffer.is_empty() {
-        let merged_user = merge_user_messages(&user_buffer, model_id)?;
+        let merged_user = merge_user_messages(&user_buffer, model_id, &history)?;
         history.push(Message::User(merged_user));
 
         // 自动配对一个 "OK" 的 assistant 响应
@@ -1166,26 +1252,49 @@ fn build_history(
 fn merge_user_messages(
     messages: &[&super::types::Message],
     model_id: &str,
+    history: &[Message],
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
-    let mut all_images = Vec::new();
+    let mut forwarded_images = Vec::new();
     let mut all_documents = Vec::new();
     let mut all_tool_results = Vec::new();
 
     for msg in messages {
-        let (text, images, documents, tool_results) = process_message_content(&msg.content)?;
+        let (text, mut images, documents, tool_results) = process_message_content(&msg.content)?;
         if !text.is_empty() {
             content_parts.push(text);
         }
-        all_images.extend(images);
+        let tool_result_index_offset = all_tool_results.len();
+        for image in &mut images {
+            if let Some(index) = &mut image.tool_result_index {
+                *index = index.saturating_add(tool_result_index_offset);
+            }
+        }
+        forwarded_images.extend(images);
         all_documents.extend(documents);
         all_tool_results.extend(tool_results);
     }
 
+    let (validated_tool_results, validated_tool_result_indices) = if all_tool_results.is_empty() {
+        (Vec::new(), std::collections::HashSet::new())
+    } else {
+        let (results, _, indices) = validate_tool_pairing(history, &all_tool_results);
+        (results, indices)
+    };
+    let all_images = forwarded_images
+        .into_iter()
+        .filter(|forwarded| {
+            forwarded
+                .tool_result_index
+                .is_none_or(|index| validated_tool_result_indices.contains(&index))
+        })
+        .map(|forwarded| forwarded.image)
+        .collect::<Vec<_>>();
+
     let joined = content_parts.join("\n");
     // 保留文本内容，即使有工具结果也不丢弃用户文本；但仅有 tool_result、无文本时用占位空格兜底
     // （Kiro 对携带 toolResults 的消息要求 content 非空）。
-    let content = if joined.trim().is_empty() && !all_tool_results.is_empty() {
+    let content = if joined.trim().is_empty() && !validated_tool_results.is_empty() {
         " ".to_string()
     } else {
         joined
@@ -1200,9 +1309,9 @@ fn merge_user_messages(
         user_msg = user_msg.with_documents(all_documents);
     }
 
-    if !all_tool_results.is_empty() {
+    if !validated_tool_results.is_empty() {
         let mut ctx = UserInputMessageContext::new();
-        ctx = ctx.with_tool_results(all_tool_results);
+        ctx = ctx.with_tool_results(validated_tool_results);
         user_msg = user_msg.with_context(ctx);
     }
 
@@ -1325,6 +1434,397 @@ fn merge_assistant_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_result_images_are_promoted_once_and_preserve_text_status_and_order() {
+        let direct_image = "ZGlyZWN0LWltYWdl";
+        let first_tool_image = "Zmlyc3QtdG9vbC1pbWFnZQ==";
+        let second_tool_image = "c2Vjb25kLXRvb2wtaW1hZ2U=";
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [
+                {"role": "user", "content": "Capture the screen"},
+                {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_screen",
+                    "name": "capture_screen",
+                    "input": {}
+                }]},
+                {"role": "user", "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": direct_image
+                        }
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_screen",
+                        "is_error": true,
+                        "content": [
+                            {"type": "text", "text": "capture completed with warnings"},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": first_tool_image
+                                }
+                            },
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/webp",
+                                    "data": second_tool_image
+                                }
+                            }
+                        ]
+                    }
+                ]}
+            ]
+        }))
+        .expect("request");
+
+        let converted = convert_request(&request).expect("conversion");
+        let current = &converted
+            .conversation_state
+            .current_message
+            .user_input_message;
+        assert_eq!(current.images.len(), 3);
+        assert_eq!(current.images[0].source.bytes, direct_image);
+        assert_eq!(current.images[1].source.bytes, first_tool_image);
+        assert_eq!(current.images[2].source.bytes, second_tool_image);
+
+        let result = &current.user_input_message_context.tool_results[0];
+        assert_eq!(result.tool_use_id, "toolu_screen");
+        assert_eq!(result.status.as_deref(), Some("error"));
+        assert!(result.is_error);
+        let result_text = result.content[0]["text"].as_str().expect("result text");
+        assert!(result_text.contains("capture completed with warnings"));
+        assert_eq!(result_text.matches(TOOL_RESULT_IMAGE_MARKER).count(), 2);
+        assert_eq!(
+            result_text.lines().collect::<Vec<_>>(),
+            vec![
+                "capture completed with warnings",
+                TOOL_RESULT_IMAGE_MARKER,
+                TOOL_RESULT_IMAGE_MARKER,
+            ]
+        );
+
+        let tool_result_wire = serde_json::to_string(result).expect("tool result wire");
+        assert!(!tool_result_wire.contains(first_tool_image));
+        assert!(!tool_result_wire.contains(second_tool_image));
+        let request_wire =
+            serde_json::to_string(&converted.conversation_state).expect("request wire");
+        for encoded in [direct_image, first_tool_image, second_tool_image] {
+            assert_eq!(
+                request_wire.matches(encoded).count(),
+                1,
+                "each image payload must occur exactly once on the Kiro wire"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_tool_result_does_not_forward_the_discarded_blocks_images() {
+        let kept_image = "a2VwdC10b29sLWltYWdl";
+        let discarded_image = "ZGlzY2FyZGVkLXRvb2wtaW1hZ2U=";
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [
+                {"role": "user", "content": "Capture the screen"},
+                {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_duplicate",
+                    "name": "capture_screen",
+                    "input": {}
+                }]},
+                {"role": "user", "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_duplicate",
+                        "content": [{
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": kept_image
+                            }
+                        }]
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_duplicate",
+                        "content": [{
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": discarded_image
+                            }
+                        }]
+                    }
+                ]}
+            ]
+        }))
+        .expect("request");
+
+        let converted = convert_request(&request).expect("conversion");
+        let current = &converted
+            .conversation_state
+            .current_message
+            .user_input_message;
+        assert_eq!(current.user_input_message_context.tool_results.len(), 1);
+        assert_eq!(current.images.len(), 1);
+        assert_eq!(current.images[0].source.bytes, kept_image);
+        let request_wire =
+            serde_json::to_string(&converted.conversation_state).expect("request wire");
+        assert_eq!(request_wire.matches(kept_image).count(), 1);
+        assert!(
+            !request_wire.contains(discarded_image),
+            "an image from a rejected duplicate tool_result must not reach Kiro"
+        );
+    }
+
+    #[test]
+    fn historical_duplicate_and_orphan_tool_results_drop_their_images() {
+        let kept_image = "aGlzdG9yeS1rZXB0LWltYWdl";
+        let duplicate_image = "aGlzdG9yeS1kdXBsaWNhdGUtaW1hZ2U=";
+        let orphan_image = "aGlzdG9yeS1vcnBoYW4taW1hZ2U=";
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [
+                {"role": "user", "content": "Capture the screen"},
+                {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_history",
+                    "name": "capture_screen",
+                    "input": {}
+                }]},
+                {"role": "user", "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_history",
+                        "content": [{
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": kept_image
+                            }
+                        }]
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_history",
+                        "content": [{
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": duplicate_image
+                            }
+                        }]
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_orphan",
+                        "content": [{
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": orphan_image
+                            }
+                        }]
+                    }
+                ]},
+                {"role": "assistant", "content": "Captured"},
+                {"role": "user", "content": "Continue"}
+            ]
+        }))
+        .expect("request");
+
+        let converted = convert_request(&request).expect("conversion");
+        let history_result_turn = converted
+            .conversation_state
+            .history
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(user)
+                    if !user
+                        .user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .is_empty() =>
+                {
+                    Some(&user.user_input_message)
+                }
+                _ => None,
+            })
+            .next()
+            .expect("historical tool-result turn");
+        assert_eq!(
+            history_result_turn
+                .user_input_message_context
+                .tool_results
+                .len(),
+            1
+        );
+        assert_eq!(history_result_turn.images.len(), 1);
+        assert_eq!(history_result_turn.images[0].source.bytes, kept_image);
+        let request_wire =
+            serde_json::to_string(&converted.conversation_state).expect("request wire");
+        assert_eq!(request_wire.matches(kept_image).count(), 1);
+        assert!(!request_wire.contains(duplicate_image));
+        assert!(!request_wire.contains(orphan_image));
+    }
+
+    #[test]
+    fn image_only_tool_result_gets_deterministic_nonempty_marker() {
+        let image = "aW1hZ2Utb25seS10b29sLXJlc3VsdA==";
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "messages": [
+                {"role": "user", "content": "Take a screenshot"},
+                {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_image_only",
+                    "name": "screenshot",
+                    "input": {}
+                }]},
+                {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_image_only",
+                    "content": [{
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": image
+                        }
+                    }]
+                }]}
+            ]
+        }))
+        .expect("request");
+
+        let converted = convert_request(&request).expect("conversion");
+        let current = &converted
+            .conversation_state
+            .current_message
+            .user_input_message;
+        assert_eq!(current.content, " ");
+        assert_eq!(current.images.len(), 1);
+        assert_eq!(current.images[0].source.bytes, image);
+        let result = &current.user_input_message_context.tool_results[0];
+        assert_eq!(result.content[0]["text"], TOOL_RESULT_IMAGE_MARKER);
+        assert_eq!(result.status.as_deref(), Some("success"));
+        assert!(!result.is_error);
+    }
+
+    #[test]
+    fn historical_tool_result_image_is_promoted_into_the_same_history_user_turn() {
+        let image = "aGlzdG9yeS10b29sLXJlc3VsdC1pbWFnZQ==";
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [
+                {"role": "user", "content": "Inspect the image"},
+                {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_history_image",
+                    "name": "read_image",
+                    "input": {}
+                }]},
+                {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_history_image",
+                    "content": [{
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/gif",
+                            "data": image
+                        }
+                    }]
+                }]},
+                {"role": "assistant", "content": "I inspected it."},
+                {"role": "user", "content": "What did it show?"}
+            ]
+        }))
+        .expect("request");
+
+        let converted = convert_request(&request).expect("conversion");
+        let history_user = converted
+            .conversation_state
+            .history
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(user)
+                    if user
+                        .user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .iter()
+                        .any(|result| result.tool_use_id == "toolu_history_image") =>
+                {
+                    Some(user)
+                }
+                _ => None,
+            })
+            .next()
+            .expect("history tool-result user turn");
+
+        assert_eq!(history_user.user_input_message.images.len(), 1);
+        assert_eq!(
+            history_user.user_input_message.images[0].source.bytes,
+            image
+        );
+        assert_eq!(
+            history_user.user_input_message.content, " ",
+            "image-only history tool results retain Kiro's nonempty content requirement"
+        );
+        let request_wire =
+            serde_json::to_string(&converted.conversation_state).expect("request wire");
+        assert_eq!(request_wire.matches(image).count(), 1);
+    }
+
+    #[test]
+    fn orphaned_tool_result_does_not_leak_its_promoted_image() {
+        let image = "b3JwaGFuZWQtaW1hZ2U=";
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "missing_tool_use",
+                "content": [{
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": image
+                    }
+                }]
+            }]}]
+        }))
+        .expect("request");
+
+        let converted = convert_request(&request).expect("conversion");
+        let current = &converted
+            .conversation_state
+            .current_message
+            .user_input_message;
+        assert!(current.images.is_empty());
+        assert!(current.user_input_message_context.tool_results.is_empty());
+        assert!(
+            !serde_json::to_string(&converted.conversation_state)
+                .expect("request wire")
+                .contains(image)
+        );
+    }
 
     #[test]
     fn test_extract_pdf_text_uncompressed() {
@@ -2273,7 +2773,7 @@ mod tests {
 
         let tool_results = vec![ToolResult::success("orphan-123", "some result")];
 
-        let (filtered, _) = validate_tool_pairing(&history, &tool_results);
+        let (filtered, _, _) = validate_tool_pairing(&history, &tool_results);
 
         // 孤立的 tool_result 应该被过滤掉
         assert!(filtered.is_empty(), "孤立的 tool_result 应该被过滤");
@@ -2303,7 +2803,7 @@ mod tests {
         // 没有 tool_result
         let tool_results: Vec<ToolResult> = vec![];
 
-        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results);
+        let (filtered, orphaned, _) = validate_tool_pairing(&history, &tool_results);
 
         // 结果应该为空（因为没有 tool_result）
         // 同时应该返回孤立的 tool_use_id
@@ -2334,7 +2834,7 @@ mod tests {
 
         let tool_results = vec![ToolResult::success("tool-1", "file content")];
 
-        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results);
+        let (filtered, orphaned, _) = validate_tool_pairing(&history, &tool_results);
 
         // 配对成功，应该保留，无孤立
         assert_eq!(filtered.len(), 1);
@@ -2366,7 +2866,7 @@ mod tests {
             ToolResult::success("tool-3", "orphan result"), // 孤立
         ];
 
-        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results);
+        let (filtered, orphaned, _) = validate_tool_pairing(&history, &tool_results);
 
         // 只有 tool-1 应该保留
         assert_eq!(filtered.len(), 1);
@@ -2414,7 +2914,7 @@ mod tests {
         // 当前消息没有 tool_results（用户只是继续对话）
         let tool_results: Vec<ToolResult> = vec![];
 
-        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results);
+        let (filtered, orphaned, _) = validate_tool_pairing(&history, &tool_results);
 
         // 结果应该为空，且不应该有孤立 tool_use
         // 因为 tool-1 已经在历史中配对了
@@ -2456,7 +2956,7 @@ mod tests {
         // 当前消息又发送了相同的 tool_result（重复）
         let tool_results = vec![ToolResult::success("tool-1", "file content again")];
 
-        let (filtered, _) = validate_tool_pairing(&history, &tool_results);
+        let (filtered, _, _) = validate_tool_pairing(&history, &tool_results);
 
         // 重复的 tool_result 应该被过滤掉
         assert!(filtered.is_empty(), "重复的 tool_result 应该被过滤");

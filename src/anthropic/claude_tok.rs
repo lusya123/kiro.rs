@@ -87,6 +87,50 @@ pub fn count_claude(text: &str) -> i32 {
     ((raw as f64) * factor).round().max(1.0) as i32
 }
 
+/// Truncate text without exceeding a Claude token budget.
+///
+/// This walks the same greedy vocabulary as `count_tokens` and stops as soon
+/// as the raw token budget is exhausted, so an incident-sized input does not
+/// need to be fully tokenized or copied before it can be bounded. The raw
+/// count is an upper bound for the CJK-calibrated public count.
+pub fn truncate_to_claude_tokens(text: &str, max_tokens: i32) -> String {
+    if text.is_empty() || max_tokens <= 0 {
+        return String::new();
+    }
+
+    let bytes = text.as_bytes();
+    let vocab = vocab();
+    let mut count = 0i32;
+    let mut end = 0usize;
+    while end < bytes.len() && count < max_tokens {
+        end += greedy_token_len(bytes, end, vocab);
+        count += 1;
+    }
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    while end > 0 && count_claude(&text[..end]) > max_tokens {
+        end = text[..end]
+            .char_indices()
+            .next_back()
+            .map_or(0, |(index, _)| index);
+    }
+    text[..end].to_string()
+}
+
+fn greedy_token_len(bytes: &[u8], pos: usize, vocab: &Vocab) -> usize {
+    let cap = vocab.max_len_by_first[bytes[pos] as usize];
+    let hi = (pos + cap).min(bytes.len());
+    let mut end = hi;
+    while end > pos {
+        if vocab.tokens.contains(&bytes[pos..end]) {
+            return end - pos;
+        }
+        end -= 1;
+    }
+    1
+}
+
 /// 贪心字节级最长匹配的 token 数(与 ctoc.cc 一致:未命中的字节按 1 token 兜底)。
 pub fn count_tokens(text: &str) -> i32 {
     let bytes = text.as_bytes();
@@ -97,18 +141,7 @@ pub fn count_tokens(text: &str) -> i32 {
     let mut count = 0i32;
     let mut pos = 0usize;
     while pos < bytes.len() {
-        let cap = v.max_len_by_first[bytes[pos] as usize];
-        let hi = (pos + cap).min(bytes.len());
-        let mut matched = 0usize;
-        let mut end = hi;
-        while end > pos {
-            if v.tokens.contains(&bytes[pos..end]) {
-                matched = end - pos;
-                break;
-            }
-            end -= 1;
-        }
-        pos += if matched == 0 { 1 } else { matched };
+        pos += greedy_token_len(bytes, pos, v);
         count += 1;
     }
     count

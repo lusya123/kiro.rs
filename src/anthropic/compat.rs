@@ -352,12 +352,9 @@ pub fn estimate_prefix_tokens(
     } else {
         SONNET_TOOL_PREFIX_OVERHEAD_TOKENS
     };
-    let mut estimate = calibrated_text(&features.raw_text)
+    let estimate = calibrated_text(&features.raw_text)
         + features.image_tokens
         + (tools.len() as i32 * tool_overhead);
-    if is_opus && features.image_count > 0 {
-        estimate -= 3;
-    }
     estimate.max(1)
 }
 
@@ -405,10 +402,6 @@ fn estimate_input_tokens_parts(
     if thinking.is_some_and(|t| t.thinking_type == "enabled") {
         estimate += 19;
     }
-    if features.image_count > 0 {
-        estimate -= if is_opus { 3 } else { 4 };
-    }
-
     estimate.max(1)
 }
 
@@ -1741,7 +1734,6 @@ struct TokenFeatures {
     /// 末了交给真 BPE 计数，而不是字符比例回归。
     raw_text: String,
     image_tokens: i32,
-    image_count: i32,
     has_system: bool,
 }
 
@@ -1768,17 +1760,68 @@ fn add_message_content_features(
                 if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                     features.add_text(text);
                 }
-                if item.get("type").and_then(|v| v.as_str()) == Some("image") {
-                    features.image_count += 1;
-                    features.image_tokens += estimate_image_block_tokens(model, item);
-                }
             }
+            features.image_tokens = features
+                .image_tokens
+                .saturating_add(message_content_image_tokens(model, value));
         }
         _ => {}
     }
 }
 
-fn estimate_image_block_tokens(model: &str, block: &serde_json::Value) -> i32 {
+const IMAGE_PATCH_EDGE: u32 = 28;
+const TOP_LEVEL_IMAGE_FRAMING_TOKENS: i32 = 4;
+const TOOL_RESULT_IMAGE_FRAMING_TOKENS: i32 = 21;
+const STANDARD_VISION_MAX_EDGE: u32 = 1_568;
+const STANDARD_VISION_MAX_TOKENS: i32 = 1_568;
+const HIGH_RESOLUTION_VISION_MAX_EDGE: u32 = 2_576;
+const HIGH_RESOLUTION_VISION_MAX_TOKENS: i32 = 4_784;
+
+fn message_content_image_tokens(model: &str, value: &serde_json::Value) -> i32 {
+    let Some(items) = value.as_array() else {
+        return 0;
+    };
+
+    let mut tokens = 0i32;
+    for item in items {
+        match item.get("type").and_then(|value| value.as_str()) {
+            Some("image") => {
+                tokens = tokens.saturating_add(estimate_image_block_tokens(
+                    model,
+                    item,
+                    TOP_LEVEL_IMAGE_FRAMING_TOKENS,
+                ));
+            }
+            Some("tool_result") => {
+                let Some(content) = item.get("content").and_then(|value| value.as_array()) else {
+                    continue;
+                };
+                for nested in content {
+                    if nested.get("type").and_then(|value| value.as_str()) == Some("image") {
+                        tokens = tokens.saturating_add(estimate_image_block_tokens(
+                            model,
+                            nested,
+                            TOOL_RESULT_IMAGE_FRAMING_TOKENS,
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    tokens
+}
+
+pub(super) fn estimate_request_image_tokens(payload: &MessagesRequest) -> i32 {
+    payload.messages.iter().fold(0i32, |tokens, message| {
+        tokens.saturating_add(message_content_image_tokens(
+            &payload.model,
+            &message.content,
+        ))
+    })
+}
+
+fn estimate_image_block_tokens(model: &str, block: &serde_json::Value, framing_tokens: i32) -> i32 {
     let Some(source) = block.get("source") else {
         return 0;
     };
@@ -1793,6 +1836,26 @@ fn estimate_image_block_tokens(model: &str, block: &serde_json::Value) -> i32 {
     let Some(data) = source.get("data").and_then(|v| v.as_str()) else {
         return 0;
     };
+    let visual_tokens = estimate_base64_image_visual_tokens(model, data);
+    if visual_tokens == 0 {
+        return 0;
+    }
+    visual_tokens.saturating_add(framing_tokens)
+}
+
+/// Estimate one Kiro `images[]` entry after it has been promoted from the
+/// Anthropic request. Kiro image entries are user-message images, so this
+/// includes the top-level Bedrock framing: `visual patches + 4`.
+pub(crate) fn estimate_base64_image_tokens(model: &str, data: &str) -> i32 {
+    let visual_tokens = estimate_base64_image_visual_tokens(model, data);
+    if visual_tokens == 0 {
+        0
+    } else {
+        visual_tokens.saturating_add(TOP_LEVEL_IMAGE_FRAMING_TOKENS)
+    }
+}
+
+fn estimate_base64_image_visual_tokens(model: &str, data: &str) -> i32 {
     let data = data
         .split_once(',')
         .map(|(_, payload)| payload)
@@ -1803,7 +1866,7 @@ fn estimate_image_block_tokens(model: &str, block: &serde_json::Value) -> i32 {
     let Some((width, height)) = image_dimensions(&bytes) else {
         return 0;
     };
-    visual_image_tokens(model, width, height) + image_token_adjustment()
+    visual_image_tokens(model, width, height)
 }
 
 fn visual_image_tokens(model: &str, width: u32, height: u32) -> i32 {
@@ -1811,36 +1874,115 @@ fn visual_image_tokens(model: &str, width: u32, height: u32) -> i32 {
         return 0;
     }
 
-    let (width, height) = resize_for_vision_tier(model, width as f64, height as f64);
-    let patches_w = (width / 28.0).ceil().max(1.0);
-    let patches_h = (height / 28.0).ceil().max(1.0);
-    (patches_w * patches_h).round() as i32
+    let (width, height) = resize_for_vision_tier(model, width, height);
+    image_patch_tokens(width, height)
 }
 
-fn image_token_adjustment() -> i32 {
-    2
+fn image_patch_tokens(width: u32, height: u32) -> i32 {
+    let patches_w = width.div_ceil(IMAGE_PATCH_EDGE) as u64;
+    let patches_h = height.div_ceil(IMAGE_PATCH_EDGE) as u64;
+    patches_w.saturating_mul(patches_h).min(i32::MAX as u64) as i32
 }
 
-fn resize_for_vision_tier(model: &str, width: f64, height: f64) -> (f64, f64) {
-    let high_resolution = is_opus_4_8(model);
-    let max_long_edge = if high_resolution { 2576.0 } else { 1568.0 };
-    let max_visual_tokens = if high_resolution { 4784.0 } else { 1568.0 };
-
-    let long_edge = width.max(height);
-    let mut scale = if long_edge > max_long_edge {
-        max_long_edge / long_edge
-    } else {
-        1.0
-    };
-
-    let patches_w = (width * scale / 28.0).ceil().max(1.0);
-    let patches_h = (height * scale / 28.0).ceil().max(1.0);
-    let visual_tokens = patches_w * patches_h;
-    if visual_tokens > max_visual_tokens {
-        scale *= (max_visual_tokens / visual_tokens).sqrt();
+fn is_high_resolution_vision_model(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    if !lower.contains("claude") {
+        return false;
     }
 
-    ((width * scale).max(1.0), (height * scale).max(1.0))
+    let Some(version_suffix) = ["opus", "sonnet", "haiku"]
+        .iter()
+        .filter_map(|family| {
+            lower
+                .find(family)
+                .map(|position| &lower[position + family.len()..])
+        })
+        .next()
+    else {
+        return false;
+    };
+    let mut version_parts = version_suffix
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u32>().ok());
+    let Some(major) = version_parts.next() else {
+        return false;
+    };
+    // Older model IDs put the family before a release date. A model major is
+    // deliberately bounded so `claude-3-5-sonnet-20241022` stays standard.
+    if major > 99 {
+        return false;
+    }
+    let minor = version_parts
+        .next()
+        .filter(|minor| *minor <= 99)
+        .unwrap_or(0);
+    major > 4 || (major == 4 && minor >= 7)
+}
+
+fn vision_tier_limits(model: &str) -> (u32, i32) {
+    if is_high_resolution_vision_model(model) {
+        (
+            HIGH_RESOLUTION_VISION_MAX_EDGE,
+            HIGH_RESOLUTION_VISION_MAX_TOKENS,
+        )
+    } else {
+        (STANDARD_VISION_MAX_EDGE, STANDARD_VISION_MAX_TOKENS)
+    }
+}
+
+fn image_dimensions_fit(width: u32, height: u32, max_edge: u32, max_tokens: i32) -> bool {
+    width
+        .div_ceil(IMAGE_PATCH_EDGE)
+        .saturating_mul(IMAGE_PATCH_EDGE)
+        <= max_edge
+        && height
+            .div_ceil(IMAGE_PATCH_EDGE)
+            .saturating_mul(IMAGE_PATCH_EDGE)
+            <= max_edge
+        && image_patch_tokens(width, height) <= max_tokens
+}
+
+fn rounded_scaled_short_edge(long_edge: u32, original_long: u32, original_short: u32) -> u32 {
+    let numerator = (long_edge as u64).saturating_mul(original_short as u64);
+    let denominator = original_long.max(1) as u64;
+    let quotient = numerator / denominator;
+    let remainder = numerator % denominator;
+    let doubled_remainder = remainder.saturating_mul(2);
+    let rounded = if doubled_remainder > denominator
+        || (doubled_remainder == denominator && quotient % 2 == 1)
+    {
+        quotient.saturating_add(1)
+    } else {
+        quotient
+    };
+    rounded.max(1).min(u32::MAX as u64) as u32
+}
+
+fn resize_for_vision_tier(model: &str, width: u32, height: u32) -> (u32, u32) {
+    let (max_edge, max_tokens) = vision_tier_limits(model);
+    if image_dimensions_fit(width, height, max_edge, max_tokens) {
+        return (width, height);
+    }
+    if height > width {
+        let (resized_height, resized_width) = resize_for_vision_tier(model, height, width);
+        return (resized_width, resized_height);
+    }
+
+    // Integer version of Anthropic's reference binary search. The long edge
+    // is monotonic, and the short edge is rounded to the nearest pixel.
+    let mut low = 1u32;
+    let mut high = width;
+    while low + 1 < high {
+        let middle = low + (high - low) / 2;
+        let resized_height = rounded_scaled_short_edge(middle, width, height);
+        if image_dimensions_fit(middle, resized_height, max_edge, max_tokens) {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    (low, rounded_scaled_short_edge(low, width, height))
 }
 
 fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
@@ -2017,6 +2159,173 @@ mod tests {
     use super::*;
     use crate::anthropic::types::MessagesRequest;
     use serde_json::json;
+
+    fn fake_png_base64(width: u32, height: u32, trailing_bytes: usize) -> String {
+        let mut bytes = vec![0u8; 24 + trailing_bytes];
+        bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        bytes[12..16].copy_from_slice(b"IHDR");
+        bytes[16..20].copy_from_slice(&width.to_be_bytes());
+        bytes[20..24].copy_from_slice(&height.to_be_bytes());
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn image_request(model: &str, content: serde_json::Value) -> MessagesRequest {
+        serde_json::from_value(json!({
+            "model": model,
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": content}]
+        }))
+        .expect("valid image request")
+    }
+
+    #[test]
+    fn vision_resize_matrix_matches_both_official_resolution_tiers() {
+        let dimensions = [
+            ((100, 100), ((100, 100), 16), ((100, 100), 16)),
+            ((640, 360), ((640, 360), 299), ((640, 360), 299)),
+            (
+                (1_075, 1_520),
+                ((924, 1_307), 1_551),
+                ((1_075, 1_520), 2_145),
+            ),
+            (
+                (1_920, 1_080),
+                ((1_456, 819), 1_560),
+                ((1_920, 1_080), 2_691),
+            ),
+            (
+                (2_000, 1_500),
+                ((1_270, 952), 1_564),
+                ((2_000, 1_500), 3_888),
+            ),
+            (
+                (3_840, 2_160),
+                ((1_456, 819), 1_560),
+                ((2_576, 1_449), 4_784),
+            ),
+            (
+                (8_000, 8_000),
+                ((1_092, 1_092), 1_521),
+                ((1_932, 1_932), 4_761),
+            ),
+        ];
+        let model_groups: [(&[&str], bool); 7] = [
+            (&["claude-opus-4-6", "claude-opus-4.6"], false),
+            (&["claude-opus-4-7", "claude-opus-4.7"], true),
+            (&["claude-opus-4-8", "claude-opus-4.8"], true),
+            (
+                &["claude-opus-5", "claude-opus-5-0", "claude-opus-5.0"],
+                true,
+            ),
+            (&["claude-sonnet-4-6", "claude-sonnet-4.6"], false),
+            (
+                &[
+                    "claude-sonnet-4-7",
+                    "claude-sonnet-5",
+                    "claude-sonnet-5-0",
+                    "claude-sonnet-5.0",
+                ],
+                true,
+            ),
+            (&["claude-haiku-4-5", "claude-haiku-4.5"], false),
+        ];
+
+        for (aliases, high_resolution) in model_groups {
+            for model in aliases {
+                assert_eq!(
+                    is_high_resolution_vision_model(model),
+                    high_resolution,
+                    "wrong vision tier for {model}"
+                );
+                for ((width, height), standard, high) in dimensions {
+                    let (expected_size, expected_tokens) =
+                        if high_resolution { high } else { standard };
+                    assert_eq!(
+                        resize_for_vision_tier(model, width, height),
+                        expected_size,
+                        "wrong resize for {model} at {width}x{height}"
+                    );
+                    assert_eq!(
+                        visual_image_tokens(model, width, height),
+                        expected_tokens,
+                        "wrong visual tokens for {model} at {width}x{height}"
+                    );
+                }
+            }
+        }
+
+        assert!(is_high_resolution_vision_model("claude haiku 5"));
+        assert!(is_high_resolution_vision_model("claude sonnet 4 7"));
+        assert!(!is_high_resolution_vision_model(
+            "anthropic.claude-3-5-sonnet-20241022-v2:0"
+        ));
+        assert!(!is_high_resolution_vision_model(
+            "anthropic.claude-sonnet-4-20250514-v1:0"
+        ));
+    }
+
+    #[test]
+    fn scaled_image_edges_use_round_half_to_even() {
+        assert_eq!(rounded_scaled_short_edge(57, 114, 57), 28);
+        assert_eq!(rounded_scaled_short_edge(59, 118, 59), 30);
+    }
+
+    #[test]
+    fn image_tokens_depend_on_dimensions_not_compressed_byte_length() {
+        let compact = fake_png_base64(640, 360, 0);
+        let padded = fake_png_base64(640, 360, 16_384);
+
+        assert_ne!(compact.len(), padded.len());
+        assert_eq!(
+            estimate_base64_image_tokens("claude-opus-4-8", &compact),
+            303
+        );
+        assert_eq!(
+            estimate_base64_image_tokens("claude-opus-4-8", &padded),
+            303
+        );
+    }
+
+    #[test]
+    fn top_level_and_tool_result_image_framing_is_exact_and_linear() {
+        let data = fake_png_base64(640, 360, 0);
+        let image = json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": data}
+        });
+        let empty = image_request("claude-opus-4-8", json!([]));
+        let top_one = image_request("claude-opus-4-8", json!([image.clone()]));
+        let top_two = image_request("claude-opus-4-8", json!([image.clone(), image.clone()]));
+        let nested_one = image_request(
+            "claude-opus-4-8",
+            json!([{
+                "type": "tool_result",
+                "tool_use_id": "toolu_image",
+                "content": [image.clone()]
+            }]),
+        );
+        let nested_two = image_request(
+            "claude-opus-4-8",
+            json!([{
+                "type": "tool_result",
+                "tool_use_id": "toolu_image",
+                "content": [image.clone(), image]
+            }]),
+        );
+        let baseline = estimate_input_tokens(&empty);
+
+        assert_eq!(estimate_input_tokens(&top_one) - baseline, 299 + 4);
+        assert_eq!(estimate_input_tokens(&top_two) - baseline, 2 * (299 + 4));
+        assert_eq!(estimate_input_tokens(&nested_one) - baseline, 299 + 21);
+        assert_eq!(
+            estimate_input_tokens(&nested_two) - baseline,
+            2 * (299 + 21)
+        );
+        assert_eq!(
+            estimate_request_image_tokens(&nested_one) - estimate_request_image_tokens(&top_one),
+            17
+        );
+    }
 
     #[test]
     fn request_id_uses_official_011c_prefix() {
