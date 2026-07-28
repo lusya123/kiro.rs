@@ -1245,6 +1245,29 @@ impl StreamContext {
             events.push(event);
         }
 
+        if self.native_anthropic_stream_envelope {
+            // The strictly gated native Sonnet probe exposes its initial text
+            // block together with message_start and ping in one transport
+            // frame. Pre-opening the block here lets the wire layer serialize
+            // that exact prefix atomically; the first real assistant content
+            // then produces only content_block_delta.
+            let index = self.state_manager.next_block_index();
+            self.text_block_index = Some(index);
+            events.extend(self.state_manager.handle_content_block_start(
+                index,
+                "text",
+                json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {
+                        "type": "text",
+                        "text": ""
+                    }
+                }),
+            ));
+            return events;
+        }
+
         // 首块一律惰性创建:不在这里急切发出空文本块。
         // 首个真实内容到达时才创建对应的首块——
         //   文本 -> emit_text_delta_events 会创建 text 块;
@@ -3464,7 +3487,13 @@ mod tests {
         ctx.enable_native_anthropic_stream_envelope();
 
         let events = ctx.generate_initial_events();
-        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            ["message_start", "content_block_start", "ping"]
+        );
         assert_eq!(events[0].event, "message_start");
         let usage = &events[0].data["message"]["usage"];
         assert_eq!(usage["input_tokens"], 79);
@@ -3472,6 +3501,15 @@ mod tests {
         assert_eq!(usage["cache_read_input_tokens"], 0);
         assert_eq!(usage["output_tokens"], 1);
         assert_eq!(usage["inference_geo"], "global");
+
+        let first_content = ctx.process_assistant_response("1+1=2");
+        assert_eq!(
+            first_content
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            ["content_block_delta"]
+        );
     }
 
     #[test]

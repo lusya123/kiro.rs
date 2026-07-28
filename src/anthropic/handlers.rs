@@ -2808,9 +2808,11 @@ fn create_wire_event_stream(
     let event_bodies = events
         .into_iter()
         .map(|event| {
+            let event_type = event.event.clone();
             let flush_delay =
                 native_sse_flush_delay(event.event.as_str(), use_native_stream_envelope);
             (
+                event_type,
                 flush_delay,
                 Bytes::from(event.to_wire_sse_string(aws_b40_compat, use_native_stream_envelope)),
             )
@@ -2821,12 +2823,32 @@ fn create_wire_event_stream(
         return stream::iter(
             event_bodies
                 .into_iter()
-                .map(|(_, body)| Ok::<Bytes, Infallible>(body)),
+                .map(|(_, _, body)| Ok::<Bytes, Infallible>(body)),
         )
         .boxed();
     }
 
-    stream::unfold(event_bodies.into_iter(), |mut events| async move {
+    let mut grouped_bodies = Vec::with_capacity(event_bodies.len());
+    let mut event_bodies = event_bodies.into_iter().peekable();
+    while let Some((event_type, flush_delay, body)) = event_bodies.next() {
+        let combines_message_stop = event_type == "message_delta"
+            && event_bodies
+                .peek()
+                .is_some_and(|(next_type, _, _)| next_type == "message_stop");
+        if combines_message_stop {
+            let (_, _, message_stop) = event_bodies
+                .next()
+                .expect("peeked message_stop body must still exist");
+            let mut combined = Vec::with_capacity(body.len() + message_stop.len());
+            combined.extend_from_slice(&body);
+            combined.extend_from_slice(&message_stop);
+            grouped_bodies.push((flush_delay, Bytes::from(combined)));
+        } else {
+            grouped_bodies.push((flush_delay, body));
+        }
+    }
+
+    stream::unfold(grouped_bodies.into_iter(), |mut events| async move {
         let (flush_delay, body) = events.next()?;
         if let Some(flush_delay) = flush_delay {
             // The native Anthropic channel exposes the text delta and final
@@ -2838,6 +2860,27 @@ fn create_wire_event_stream(
         Some((Ok::<Bytes, Infallible>(body), events))
     })
     .boxed()
+}
+
+fn create_initial_wire_event_stream(
+    events: Vec<SseEvent>,
+    aws_b40_compat: bool,
+    use_native_stream_envelope: bool,
+) -> stream::BoxStream<'static, Result<Bytes, Infallible>> {
+    if !use_native_stream_envelope {
+        return stream::iter(
+            events
+                .into_iter()
+                .map(move |event| Ok(Bytes::from(event.to_wire_sse_string(aws_b40_compat, false)))),
+        )
+        .boxed();
+    }
+
+    let mut body = Vec::new();
+    for event in events {
+        body.extend_from_slice(event.to_wire_sse_string(aws_b40_compat, true).as_bytes());
+    }
+    stream::iter((!body.is_empty()).then(|| Ok(Bytes::from(body)))).boxed()
 }
 
 /// 创建 SSE 事件流
@@ -2852,12 +2895,11 @@ fn create_sse_stream(
     use_native_stream_envelope: bool,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
-    let initial_stream = stream::iter(initial_events.into_iter().map(move |e| {
-        Ok(Bytes::from(e.to_wire_sse_string(
-            aws_b40_compat,
-            use_native_stream_envelope,
-        )))
-    }));
+    let initial_stream = create_initial_wire_event_stream(
+        initial_events,
+        aws_b40_compat,
+        use_native_stream_envelope,
+    );
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
     let body_stream = response.bytes_stream();
@@ -5782,6 +5824,94 @@ mod tests {
                 "ordinary streams must not inherit native transport pacing"
             );
         }
+    }
+
+    fn test_sse_event(event_type: &str) -> SseEvent {
+        SseEvent::new(event_type, json!({"type": event_type}))
+    }
+
+    fn wire_event_types(body: &Bytes) -> Vec<String> {
+        String::from_utf8_lossy(body)
+            .lines()
+            .filter_map(|line| line.strip_prefix("event: "))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn native_sse_wire_frames_group_only_the_reference_boundaries() {
+        let initial_events = ["message_start", "content_block_start", "ping"]
+            .into_iter()
+            .map(test_sse_event)
+            .collect();
+        let initial_frames = create_initial_wire_event_stream(initial_events, true, true)
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()
+            .await;
+
+        let delta_frames =
+            create_wire_event_stream(vec![test_sse_event("content_block_delta")], true, true)
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+                .await;
+        let final_frames = create_wire_event_stream(
+            ["content_block_stop", "message_delta", "message_stop"]
+                .into_iter()
+                .map(test_sse_event)
+                .collect(),
+            true,
+            true,
+        )
+        .map(Result::unwrap)
+        .collect::<Vec<_>>()
+        .await;
+
+        let native_groups = initial_frames
+            .iter()
+            .chain(&delta_frames)
+            .chain(&final_frames)
+            .map(wire_event_types)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            native_groups,
+            [
+                vec!["message_start", "content_block_start", "ping"],
+                vec!["content_block_delta"],
+                vec!["content_block_stop"],
+                vec!["message_delta", "message_stop"],
+            ]
+        );
+
+        let ordinary_initial = create_initial_wire_event_stream(
+            ["message_start", "content_block_start", "ping"]
+                .into_iter()
+                .map(test_sse_event)
+                .collect(),
+            true,
+            false,
+        )
+        .map(Result::unwrap)
+        .collect::<Vec<_>>()
+        .await;
+        let ordinary_final = create_wire_event_stream(
+            ["content_block_stop", "message_delta", "message_stop"]
+                .into_iter()
+                .map(test_sse_event)
+                .collect(),
+            true,
+            false,
+        )
+        .map(Result::unwrap)
+        .collect::<Vec<_>>()
+        .await;
+        assert_eq!(ordinary_initial.len(), 3);
+        assert_eq!(ordinary_final.len(), 3);
+        assert!(
+            ordinary_initial
+                .iter()
+                .chain(&ordinary_final)
+                .all(|frame| wire_event_types(frame).len() == 1)
+        );
     }
 
     #[tokio::test]
