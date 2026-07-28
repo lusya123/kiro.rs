@@ -2438,7 +2438,7 @@ impl StreamContext {
                     .cache_input_adjustment(self.initial_input_tokens, first_round_input_tokens)
             })
             .unwrap_or(0);
-        super::cache::finalize_request_usage(
+        let usage = super::cache::finalize_request_usage(
             self.initial_usage_breakdown,
             authoritative_first_round_input_tokens,
             self.initial_input_tokens,
@@ -2446,7 +2446,17 @@ impl StreamContext {
             ordinary_input_adjustment,
             &self.model,
             self.aws_b40_compat,
-        )
+        );
+        if self.aws_b40_compat && !self.continuation_started && !self.upstream_fatal_event {
+            self.input_context_calibration
+                .calibrate_authoritative_direct_catalog_usage(
+                    &self.model,
+                    usage,
+                    authoritative_first_round_input_tokens.is_some(),
+                )
+        } else {
+            usage
+        }
     }
 
     /// 生成最终事件序列
@@ -3993,17 +4003,17 @@ mod tests {
                     "text": super::super::bedrock::TOOL_PREAMBLE_HINT
                 }
             ],
-            "messages": [{"role": "user", "content": "1+1"}],
+            "messages": [{"role": "user", "content": "1+1=?"}],
             "stream": true
         }))
         .expect("request");
         payload.tools = Some(tools);
         let calibration = super::super::bedrock::InputContextCalibration::for_request(&payload);
         let raw = super::super::cache::UsageBreakdown {
-            input_tokens: 39,
+            input_tokens: 32,
             cache_read_input_tokens: 0,
-            cache_creation_input_tokens: 36_975,
-            cache_creation_5m_input_tokens: 36_975,
+            cache_creation_input_tokens: 37_317,
+            cache_creation_5m_input_tokens: 37_317,
             cache_creation_1h_input_tokens: 0,
         };
         let local_only_calibration =
@@ -4031,6 +4041,24 @@ mod tests {
             ctx.final_usage_breakdown(),
             super::super::cache::UsageBreakdown::flat(1),
             "tool_0..27 and matching byte size are not upstream usage authority"
+        );
+
+        // This fixture has no >10k-character tool descriptions, so its Kiro
+        // context envelope is the visible total plus the fixed/tool-wire
+        // overhead. The context event authorizes the narrow historical
+        // catalog reconciliation only for the final usage.
+        ctx.context_input_tokens = Some(45_515);
+        let final_usage = ctx.final_usage_breakdown();
+        assert_eq!(final_usage.input_tokens, 89);
+        assert_eq!(final_usage.cache_creation_input_tokens, 34_250);
+        assert_eq!(final_usage.cache_creation_5m_input_tokens, 34_250);
+        assert_eq!(final_usage.cache_read_input_tokens, 0);
+
+        ctx.mark_upstream_fatal_event();
+        assert_eq!(
+            ctx.final_usage_breakdown(),
+            raw,
+            "an upstream fatal event must disable authoritative catalog rewriting"
         );
     }
 

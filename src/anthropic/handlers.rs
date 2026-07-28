@@ -3347,6 +3347,18 @@ async fn handle_non_stream_request(
         model,
         aws_b40_compat,
     );
+    let usage_breakdown = if aws_b40_compat
+        && additional_round_input_tokens.is_empty()
+        && upstream_fatal_error.is_none()
+    {
+        input_context_calibration.calibrate_authoritative_direct_catalog_usage(
+            model,
+            usage_breakdown,
+            first_round_authoritative_input_tokens.is_some(),
+        )
+    } else {
+        usage_breakdown
+    };
 
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();

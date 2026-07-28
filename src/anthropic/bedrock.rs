@@ -35,6 +35,7 @@ const KIRO_OPUS_48_DIRECT_CATALOG_CACHE_TOKENS: i32 = 34_250;
 const KIRO_OPUS_48_DIRECT_CATALOG_MIN_ESTIMATED_CACHE_TOKENS: i32 = 30_000;
 const KIRO_OPUS_48_DIRECT_CATALOG_MAX_ESTIMATED_CACHE_TOKENS: i32 = 45_000;
 const KIRO_OPUS_48_DIRECT_CATALOG_SUFFIX_TOKENS: i32 = 68;
+const KIRO_OPUS_48_DIRECT_CATALOG_MIN_MESSAGE_TOKENS: i32 = 21;
 const KIRO_TOOL_DESCRIPTION_LIMIT_CHARS: usize = 10_000;
 const BEDROCK_TOOL_BASELINE_CORRECTION_PER_TOOL: i32 = 8;
 const BEDROCK_TRUNCATED_TOOL_CACHE_SUFFIX_CORRECTION: i32 = -17;
@@ -74,6 +75,7 @@ pub struct InputContextCalibration {
     has_truncated_tool_descriptions: bool,
     local_direct_catalog: bool,
     direct_catalog_ordinary_input_tokens: i32,
+    authoritative_direct_catalog_usage: bool,
 }
 
 impl InputContextCalibration {
@@ -109,6 +111,8 @@ impl InputContextCalibration {
                 tool.description.clear();
             }
         }
+        let direct_catalog_ordinary_usage =
+            direct_catalog_ordinary_usage(payload, serialized_tool_bytes);
 
         Self {
             enabled: true,
@@ -121,11 +125,11 @@ impl InputContextCalibration {
             ),
             has_truncated_tool_descriptions,
             local_direct_catalog: local_direct_catalog_profile(payload, serialized_tool_bytes),
-            direct_catalog_ordinary_input_tokens: direct_catalog_ordinary_input_tokens(
-                payload,
-                serialized_tool_bytes,
-            )
-            .unwrap_or(0),
+            direct_catalog_ordinary_input_tokens: direct_catalog_ordinary_usage
+                .map(|usage| usage.input_tokens)
+                .unwrap_or(0),
+            authoritative_direct_catalog_usage: direct_catalog_ordinary_usage
+                .is_some_and(|usage| usage.authoritative_profile),
         }
     }
 
@@ -199,6 +203,43 @@ impl InputContextCalibration {
         model: &str,
         usage: UsageBreakdown,
     ) -> UsageBreakdown {
+        self.calibrate_direct_catalog_usage(model, usage)
+    }
+
+    /// Reconcile the observed Claude Code catalog only after the real Kiro
+    /// request supplied an authoritative context-usage event. Unlike the local
+    /// compatibility path, a real upstream response may not use the structured
+    /// output fallback or rewrite usage that is materially different from the
+    /// same-request catalog capture.
+    pub(super) fn calibrate_authoritative_direct_catalog_usage(
+        self,
+        model: &str,
+        usage: UsageBreakdown,
+        authoritative_context_observed: bool,
+    ) -> UsageBreakdown {
+        if !authoritative_context_observed
+            || !self.authoritative_direct_catalog_usage
+            || self.direct_catalog_ordinary_input_tokens <= 0
+        {
+            return usage;
+        }
+
+        let calibrated = self.calibrate_direct_catalog_usage(model, usage);
+        if calibrated == usage {
+            return usage;
+        }
+
+        let observed_total = i64::from(usage.total().max(1));
+        let calibrated_total = i64::from(calibrated.total().max(1));
+        let drift = (observed_total - calibrated_total).abs();
+        if drift.saturating_mul(10_000) > observed_total.saturating_mul(1_000) {
+            return usage;
+        }
+
+        calibrated
+    }
+
+    fn calibrate_direct_catalog_usage(self, model: &str, usage: UsageBreakdown) -> UsageBreakdown {
         let cached_tokens = usage
             .cache_read_input_tokens
             .saturating_add(usage.cache_creation_input_tokens);
@@ -345,10 +386,24 @@ fn local_direct_catalog_profile(payload: &MessagesRequest, serialized_tool_bytes
     }
 }
 
+#[cfg(test)]
 fn direct_catalog_ordinary_input_tokens(
     payload: &MessagesRequest,
     serialized_tool_bytes: i32,
 ) -> Option<i32> {
+    direct_catalog_ordinary_usage(payload, serialized_tool_bytes).map(|usage| usage.input_tokens)
+}
+
+#[derive(Clone, Copy)]
+struct DirectCatalogOrdinaryUsage {
+    input_tokens: i32,
+    authoritative_profile: bool,
+}
+
+fn direct_catalog_ordinary_usage(
+    payload: &MessagesRequest,
+    serialized_tool_bytes: i32,
+) -> Option<DirectCatalogOrdinaryUsage> {
     if !local_direct_catalog_profile(payload, serialized_tool_bytes)
         || payload
             .output_config
@@ -372,12 +427,25 @@ fn direct_catalog_ordinary_input_tokens(
     } else {
         message_tokens.saturating_mul(3) / 2 + 5
     };
+    let uses_short_message_floor =
+        public_message_tokens < KIRO_OPUS_48_DIRECT_CATALOG_MIN_MESSAGE_TOKENS;
+    let authoritative_profile = uses_short_message_floor
+        || payload
+            .output_config
+            .as_ref()
+            .is_some_and(|config| config.format.is_none());
 
-    Some(
-        public_message_tokens
-            .max(1)
+    Some(DirectCatalogOrdinaryUsage {
+        input_tokens: public_message_tokens
+            // Bedrock's public message envelope has a floor confirmed by
+            // very-short symbolic same-request captures.
+            .max(KIRO_OPUS_48_DIRECT_CATALOG_MIN_MESSAGE_TOKENS)
             .saturating_add(KIRO_OPUS_48_DIRECT_CATALOG_SUFFIX_TOKENS),
-    )
+        // Real-upstream calibration is limited to captured effort profiles or
+        // the observed short-message envelope. Local compatibility responses
+        // can still use the broader deterministic estimate.
+        authoritative_profile,
+    })
 }
 
 fn is_ascii_numbered_list_line(line: &str) -> bool {
@@ -2760,6 +2828,7 @@ mod tests {
                 has_truncated_tool_descriptions: false,
                 local_direct_catalog: false,
                 direct_catalog_ordinary_input_tokens: 0,
+                authoritative_direct_catalog_usage: false,
             };
             let actual = calibration.calibrate("claude-opus-4-8", 30_000, Some(context_tokens));
             assert!(
@@ -2874,6 +2943,112 @@ mod tests {
             plain_calibration.calibrate_local_direct_compat_usage("claude-opus-4-8", plain_raw),
             "the same cached input must reconcile identically across response modes"
         );
+        assert_eq!(
+            adaptive_calibration.calibrate_authoritative_direct_catalog_usage(
+                "claude-opus-4-8",
+                adaptive_raw,
+                true
+            ),
+            adaptive_raw,
+            "an ordinary no-effort chat must not use the real-upstream catalog calibration"
+        );
+        assert_eq!(
+            plain_calibration.calibrate_authoritative_direct_catalog_usage(
+                "claude-opus-4-8",
+                plain_raw,
+                true
+            ),
+            plain_raw,
+            "an ordinary no-effort code/chat request must keep authoritative upstream usage"
+        );
+
+        let mut adaptive_token_inject = request("1+1=?");
+        adaptive_token_inject.output_config = None;
+        let mut plain_token_inject = adaptive_token_inject.clone();
+        plain_token_inject.thinking = None;
+        let adaptive_token_calibration =
+            InputContextCalibration::for_request(&adaptive_token_inject);
+        let plain_token_calibration = InputContextCalibration::for_request(&plain_token_inject);
+        assert_eq!(
+            adaptive_token_calibration.direct_catalog_ordinary_input_tokens,
+            89
+        );
+        assert_eq!(
+            plain_token_calibration.direct_catalog_ordinary_input_tokens,
+            89
+        );
+        let adaptive_token_raw = UsageBreakdown {
+            input_tokens: 32,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 37_317,
+            cache_creation_5m_input_tokens: 37_317,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let plain_token_raw = UsageBreakdown {
+            cache_creation_input_tokens: 37_276,
+            cache_creation_5m_input_tokens: 37_276,
+            ..adaptive_token_raw
+        };
+        for (calibration, raw) in [
+            (adaptive_token_calibration, adaptive_token_raw),
+            (plain_token_calibration, plain_token_raw),
+        ] {
+            assert_eq!(
+                calibration.calibrate_authoritative_direct_catalog_usage(
+                    "claude-opus-4-8",
+                    raw,
+                    false
+                ),
+                raw,
+                "catalog shape alone must not authorize real upstream usage"
+            );
+            let calibrated = calibration.calibrate_authoritative_direct_catalog_usage(
+                "claude-opus-4-8",
+                raw,
+                true,
+            );
+            assert_eq!(calibrated.input_tokens, 89);
+            assert_eq!(
+                calibrated.cache_creation_input_tokens,
+                KIRO_OPUS_48_DIRECT_CATALOG_CACHE_TOKENS
+            );
+            assert_eq!(
+                calibrated.cache_creation_5m_input_tokens,
+                KIRO_OPUS_48_DIRECT_CATALOG_CACHE_TOKENS
+            );
+            assert_eq!(calibrated.cache_read_input_tokens, 0);
+        }
+        let token_read_raw = UsageBreakdown {
+            input_tokens: 32,
+            cache_read_input_tokens: 37_317,
+            cache_creation_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let token_read_calibrated = adaptive_token_calibration
+            .calibrate_authoritative_direct_catalog_usage("claude-opus-4-8", token_read_raw, true);
+        assert_eq!(token_read_calibrated.input_tokens, 89);
+        assert_eq!(
+            token_read_calibrated.cache_read_input_tokens,
+            KIRO_OPUS_48_DIRECT_CATALOG_CACHE_TOKENS
+        );
+        assert_eq!(token_read_calibrated.cache_creation_input_tokens, 0);
+        let out_of_drift_usage = UsageBreakdown {
+            input_tokens: 32,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 30_000,
+            cache_creation_5m_input_tokens: 30_000,
+            cache_creation_1h_input_tokens: 0,
+        };
+        assert_eq!(
+            adaptive_token_calibration.calibrate_authoritative_direct_catalog_usage(
+                "claude-opus-4-8",
+                out_of_drift_usage,
+                true
+            ),
+            out_of_drift_usage,
+            "a context-backed but materially different catalog must remain unchanged"
+        );
 
         let mut enabled_thinking = short_english.clone();
         enabled_thinking.thinking.as_mut().unwrap().thinking_type = "enabled".to_string();
@@ -2936,6 +3111,15 @@ mod tests {
         assert_eq!(
             structured_calibrated.cache_creation_5m_input_tokens,
             KIRO_OPUS_48_DIRECT_CATALOG_CACHE_TOKENS
+        );
+        assert_eq!(
+            structured_calibration.calibrate_authoritative_direct_catalog_usage(
+                "claude-opus-4-8",
+                structured_raw,
+                true
+            ),
+            structured_raw,
+            "structured output fallback remains local-only"
         );
         assert_eq!(
             direct_catalog_ordinary_input_tokens(&short_english, 4_096),
@@ -3037,6 +3221,7 @@ mod tests {
             has_truncated_tool_descriptions: true,
             local_direct_catalog: true,
             direct_catalog_ordinary_input_tokens: 499,
+            authoritative_direct_catalog_usage: false,
         };
         let creation = UsageBreakdown {
             input_tokens: 532,
@@ -3089,6 +3274,7 @@ mod tests {
         let unknown_profile = InputContextCalibration {
             local_direct_catalog: false,
             direct_catalog_ordinary_input_tokens: 0,
+            authoritative_direct_catalog_usage: false,
             ..calibration
         };
         assert_eq!(
