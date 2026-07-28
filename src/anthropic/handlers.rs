@@ -6571,7 +6571,7 @@ mod tests {
         )
         .expect("UTF-8 SSE");
 
-        assert_eq!(streamed_text(&body), "2025-01");
+        assert_eq!(streamed_text(&body), "2025-08");
         assert!(body.contains("\"input_tokens\":62"));
         assert!(body.contains("amazon-bedrock-invocationMetrics"));
     }
