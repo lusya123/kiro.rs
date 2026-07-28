@@ -57,6 +57,7 @@ const TOOL_HISTORY_SCHEMA_NEXT_TOOL_TOKENS: i32 = 44;
 const TOOL_HISTORY_SCHEMA_VISIBLE_SCALE: f64 = 0.93;
 
 pub(super) const TOOL_PREAMBLE_HINT: &str = "Before calling a tool, first tell the user in one brief sentence what the tool call will do, then call the tool.";
+pub(super) const STRUCTURED_OUTPUT_INSTRUCTION_PREFIX: &str = "You must respond with ONLY a single valid JSON value that strictly conforms to the following JSON Schema. Output the raw JSON only — no explanations, no markdown code fences, no surrounding text.";
 
 /// Data needed to turn Kiro's context-usage event into the public Bedrock
 /// input-token envelope. Kiro includes a large fixed runtime prompt and
@@ -71,6 +72,7 @@ pub struct InputContextCalibration {
     truncated_tool_input_tokens: i32,
     descriptionless_tool_input_tokens: i32,
     has_truncated_tool_descriptions: bool,
+    local_direct_catalog: bool,
     direct_catalog_ordinary_input_tokens: i32,
 }
 
@@ -118,6 +120,7 @@ impl InputContextCalibration {
                 &descriptionless,
             ),
             has_truncated_tool_descriptions,
+            local_direct_catalog: local_direct_catalog_profile(payload, serialized_tool_bytes),
             direct_catalog_ordinary_input_tokens: direct_catalog_ordinary_input_tokens(
                 payload,
                 serialized_tool_bytes,
@@ -203,7 +206,7 @@ impl InputContextCalibration {
             || !super::compat::is_opus_4_8(model)
             || !self.has_tools
             || self.tool_count != KIRO_OPUS_48_DIRECT_CATALOG_TOOL_COUNT
-            || self.direct_catalog_ordinary_input_tokens <= 0
+            || !self.local_direct_catalog
             || !(KIRO_OPUS_48_DIRECT_CATALOG_MIN_BYTES..=KIRO_OPUS_48_DIRECT_CATALOG_MAX_BYTES)
                 .contains(&self.serialized_tool_bytes)
             || !(KIRO_OPUS_48_DIRECT_CATALOG_MIN_ESTIMATED_CACHE_TOKENS
@@ -273,11 +276,15 @@ impl InputContextCalibration {
     }
 }
 
-fn direct_catalog_ordinary_input_tokens(
-    payload: &MessagesRequest,
-    serialized_tool_bytes: i32,
-) -> Option<i32> {
-    let tools = payload.tools.as_ref()?;
+pub(super) fn structured_output_instruction(schema: &Value) -> String {
+    let schema_str = serde_json::to_string(schema).unwrap_or_default();
+    format!("{STRUCTURED_OUTPUT_INSTRUCTION_PREFIX}\n\nJSON Schema:\n{schema_str}")
+}
+
+fn local_direct_catalog_profile(payload: &MessagesRequest, serialized_tool_bytes: i32) -> bool {
+    let Some(tools) = payload.tools.as_ref() else {
+        return false;
+    };
     if tools.len() != KIRO_OPUS_48_DIRECT_CATALOG_TOOL_COUNT as usize
         || !(KIRO_OPUS_48_DIRECT_CATALOG_MIN_BYTES..=KIRO_OPUS_48_DIRECT_CATALOG_MAX_BYTES)
             .contains(&serialized_tool_bytes)
@@ -289,27 +296,64 @@ fn direct_catalog_ordinary_input_tokens(
             .and_then(|choice| choice.get("type"))
             .and_then(Value::as_str)
             .is_some_and(|choice| matches!(choice, "any" | "tool"))
-        || payload.thinking.as_ref()?.thinking_type != "adaptive"
+        || payload
+            .thinking
+            .as_ref()
+            .is_some_and(|thinking| thinking.thinking_type != "adaptive")
+        || payload.messages.len() != 1
+        || payload.messages[0].role != "user"
+        || payload.messages[0].content.as_str().is_none()
+    {
+        return false;
+    }
+
+    let Some(system) = payload.system.as_ref() else {
+        return false;
+    };
+    let Some(last_cached_system) = system.iter().rposition(|item| item.cache_control.is_some())
+    else {
+        return false;
+    };
+    let internal_tail = &system[last_cached_system + 1..];
+    let structured_schema = payload
+        .output_config
+        .as_ref()
+        .and_then(|config| config.format.as_ref())
+        .and_then(|format| {
+            (format.get("type").and_then(Value::as_str) == Some("json_schema"))
+                .then(|| format.get("schema"))
+                .flatten()
+        });
+
+    match structured_schema {
+        Some(schema) => {
+            internal_tail.len() == 2
+                && internal_tail[0].cache_control.is_none()
+                && internal_tail[0].text == structured_output_instruction(schema)
+                && internal_tail[1].cache_control.is_none()
+                && internal_tail[1].text == TOOL_PREAMBLE_HINT
+        }
+        None => {
+            payload
+                .output_config
+                .as_ref()
+                .is_none_or(|config| config.format.is_none())
+                && internal_tail.len() == 1
+                && internal_tail[0].cache_control.is_none()
+                && internal_tail[0].text == TOOL_PREAMBLE_HINT
+        }
+    }
+}
+
+fn direct_catalog_ordinary_input_tokens(
+    payload: &MessagesRequest,
+    serialized_tool_bytes: i32,
+) -> Option<i32> {
+    if !local_direct_catalog_profile(payload, serialized_tool_bytes)
         || payload
             .output_config
             .as_ref()
-            .is_none_or(|config| config.format.is_some())
-        || payload.messages.len() != 1
-        || payload.messages[0].role != "user"
-    {
-        return None;
-    }
-
-    // The observed Claude Code catalog caches every public system segment.
-    // The handler's own tool preamble is transport guidance and must not be
-    // billed as customer input.
-    let system = payload.system.as_ref()?;
-    let last_cached_system = system
-        .iter()
-        .rposition(|item| item.cache_control.is_some())?;
-    if system[last_cached_system + 1..]
-        .iter()
-        .any(|item| item.text != TOOL_PREAMBLE_HINT || item.cache_control.is_some())
+            .is_some_and(|config| config.format.is_some())
     {
         return None;
     }
@@ -2714,6 +2758,7 @@ mod tests {
                 truncated_tool_input_tokens: 0,
                 descriptionless_tool_input_tokens: 0,
                 has_truncated_tool_descriptions: false,
+                local_direct_catalog: false,
                 direct_catalog_ordinary_input_tokens: 0,
             };
             let actual = calibration.calibrate("claude-opus-4-8", 30_000, Some(context_tokens));
@@ -2786,6 +2831,111 @@ mod tests {
                 KIRO_OPUS_48_DIRECT_CATALOG_ANCHOR_BYTES
             ),
             Some(92)
+        );
+        let mut adaptive_without_output_config = short_english.clone();
+        adaptive_without_output_config.output_config = None;
+        assert_eq!(
+            direct_catalog_ordinary_input_tokens(
+                &adaptive_without_output_config,
+                KIRO_OPUS_48_DIRECT_CATALOG_ANCHOR_BYTES
+            ),
+            Some(92),
+            "output effort is not part of the public input catalog"
+        );
+        let mut without_thinking = adaptive_without_output_config.clone();
+        without_thinking.thinking = None;
+        assert_eq!(
+            direct_catalog_ordinary_input_tokens(
+                &without_thinking,
+                KIRO_OPUS_48_DIRECT_CATALOG_ANCHOR_BYTES
+            ),
+            Some(92),
+            "omitting thinking must not change input billing"
+        );
+
+        let adaptive_calibration =
+            InputContextCalibration::for_request(&adaptive_without_output_config);
+        let plain_calibration = InputContextCalibration::for_request(&without_thinking);
+        let adaptive_raw = UsageBreakdown {
+            input_tokens: 32,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 37_317,
+            cache_creation_5m_input_tokens: 37_317,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let plain_raw = UsageBreakdown {
+            cache_creation_input_tokens: 37_276,
+            cache_creation_5m_input_tokens: 37_276,
+            ..adaptive_raw
+        };
+        assert_eq!(
+            adaptive_calibration
+                .calibrate_local_direct_compat_usage("claude-opus-4-8", adaptive_raw),
+            plain_calibration.calibrate_local_direct_compat_usage("claude-opus-4-8", plain_raw),
+            "the same cached input must reconcile identically across response modes"
+        );
+
+        let mut enabled_thinking = short_english.clone();
+        enabled_thinking.thinking.as_mut().unwrap().thinking_type = "enabled".to_string();
+        assert_eq!(
+            direct_catalog_ordinary_input_tokens(
+                &enabled_thinking,
+                KIRO_OPUS_48_DIRECT_CATALOG_ANCHOR_BYTES
+            ),
+            None,
+            "unobserved thinking modes remain outside the narrow calibration"
+        );
+        let mut structured_output = short_english.clone();
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "identity_platform": {"type": "string"},
+                "desc": {"type": "string"}
+            },
+            "required": ["identity_platform", "desc"],
+            "additionalProperties": false
+        });
+        structured_output.output_config.as_mut().unwrap().format = Some(json!({
+            "type": "json_schema",
+            "schema": schema
+        }));
+        let system = structured_output.system.as_mut().unwrap();
+        let preamble = system.pop().expect("tool preamble");
+        system.push(super::super::types::SystemMessage {
+            text: structured_output_instruction(&schema),
+            cache_control: None,
+        });
+        system.push(preamble);
+        assert!(local_direct_catalog_profile(
+            &structured_output,
+            KIRO_OPUS_48_DIRECT_CATALOG_ANCHOR_BYTES
+        ));
+        assert_eq!(
+            direct_catalog_ordinary_input_tokens(
+                &structured_output,
+                KIRO_OPUS_48_DIRECT_CATALOG_ANCHOR_BYTES
+            ),
+            None,
+            "structured output changes the injected input and stays uncalibrated"
+        );
+        let structured_calibration = InputContextCalibration::for_request(&structured_output);
+        let structured_raw = UsageBreakdown {
+            input_tokens: 329,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 38_679,
+            cache_creation_5m_input_tokens: 38_679,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let structured_calibrated = structured_calibration
+            .calibrate_local_direct_compat_usage("claude-opus-4-8", structured_raw);
+        assert_eq!(structured_calibrated.input_tokens, 369);
+        assert_eq!(
+            structured_calibrated.cache_creation_input_tokens,
+            KIRO_OPUS_48_DIRECT_CATALOG_CACHE_TOKENS
+        );
+        assert_eq!(
+            structured_calibrated.cache_creation_5m_input_tokens,
+            KIRO_OPUS_48_DIRECT_CATALOG_CACHE_TOKENS
         );
         assert_eq!(
             direct_catalog_ordinary_input_tokens(&short_english, 4_096),
@@ -2885,6 +3035,7 @@ mod tests {
             truncated_tool_input_tokens: 0,
             descriptionless_tool_input_tokens: 0,
             has_truncated_tool_descriptions: true,
+            local_direct_catalog: true,
             direct_catalog_ordinary_input_tokens: 499,
         };
         let creation = UsageBreakdown {
@@ -2923,14 +3074,27 @@ mod tests {
             different_catalog.calibrate_local_direct_compat_usage("claude-opus-4-8", creation),
             creation
         );
-        let historical_request = InputContextCalibration {
+        let fallback_profile = InputContextCalibration {
+            direct_catalog_ordinary_input_tokens: 0,
+            ..calibration
+        };
+        let fallback_calibrated =
+            fallback_profile.calibrate_local_direct_compat_usage("claude-opus-4-8", creation);
+        assert_eq!(fallback_calibrated.input_tokens, 572);
+        assert_eq!(
+            fallback_calibrated.cache_creation_input_tokens,
+            KIRO_OPUS_48_DIRECT_CATALOG_CACHE_TOKENS
+        );
+
+        let unknown_profile = InputContextCalibration {
+            local_direct_catalog: false,
             direct_catalog_ordinary_input_tokens: 0,
             ..calibration
         };
         assert_eq!(
-            historical_request.calibrate_local_direct_compat_usage("claude-opus-4-8", creation),
+            unknown_profile.calibrate_local_direct_compat_usage("claude-opus-4-8", creation),
             creation,
-            "a 28-tool history is not the calibrated single-turn direct profile"
+            "an unrecognized client catalog cannot authorize local cache billing"
         );
     }
 

@@ -3911,10 +3911,7 @@ fn apply_structured_output(payload: &mut MessagesRequest) -> Option<Response> {
         );
         return Some(thinking_error_response(payload.stream, message));
     }
-    let schema_str = serde_json::to_string(&schema).unwrap_or_default();
-    let instruction = format!(
-        "You must respond with ONLY a single valid JSON value that strictly conforms to the following JSON Schema. Output the raw JSON only — no explanations, no markdown code fences, no surrounding text.\n\nJSON Schema:\n{schema_str}"
-    );
+    let instruction = super::bedrock::structured_output_instruction(&schema);
     payload
         .system
         .get_or_insert_with(Vec::new)
@@ -7808,6 +7805,128 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn aws_b_platform_identity_catalog_keeps_authoritative_local_usage() {
+        let tools = (0..28)
+            .map(|index| {
+                serde_json::json!({
+                    "name": format!("catalog_tool_{index}"),
+                    "description": "A normal client tool description.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"}
+                        },
+                        "required": ["query"],
+                        "additionalProperties": false
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut req = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "stream": true,
+                "system": [{
+                    "type": "text",
+                    "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+                    "cache_control": {"type": "ephemeral"}
+                }],
+                "messages": [{
+                    "role": "user",
+                    "content": "Who exactly are you? What model are you actually using, and on which platform are you truly running? Do you hold dual identities such as Kiro, Warp, 0z, or Antigravity, and are there identity conflicts?"
+                }],
+                "tools": tools,
+                "output_config": {
+                    "format": {
+                        "type": "json_schema",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "identity_platform": {
+                                    "type": "string",
+                                    "enum": ["claude_code", "kiro", "warp", "0z", "antigravity", "other"]
+                                },
+                                "desc": {"type": "string"}
+                            },
+                            "required": ["identity_platform", "desc"],
+                            "additionalProperties": false
+                        }
+                    }
+                }
+            }),
+        );
+        let tools = req.tools.as_mut().expect("catalog tools");
+        let target_bytes = 69_158usize;
+        let current_bytes = tools.iter().fold(0usize, |total, tool| {
+            total + serde_json::to_vec(tool).expect("serialize tool").len()
+        });
+        let missing_bytes = target_bytes.saturating_sub(current_bytes);
+        let per_tool = missing_bytes / tools.len();
+        let remainder = missing_bytes % tools.len();
+        for (index, tool) in tools.iter_mut().enumerate() {
+            tool.description
+                .push_str(&"x".repeat(per_tool + usize::from(index < remainder)));
+        }
+        assert_eq!(
+            tools.iter().fold(0usize, |total, tool| {
+                total + serde_json::to_vec(tool).expect("serialize tool").len()
+            }),
+            target_bytes
+        );
+        assert!(apply_structured_output(&mut req).is_none());
+        inject_tool_preamble_hint(&mut req);
+
+        let raw_usage = super::super::cache::UsageBreakdown {
+            input_tokens: 329,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 38_679,
+            cache_creation_5m_input_tokens: 38_679,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let response = compat_direct_response(&req, raw_usage, true)
+            .expect("platform identity should use the local compatibility response");
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body")
+                .to_vec(),
+        )
+        .expect("UTF-8 SSE");
+        let events = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid SSE JSON"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            streamed_text(&body),
+            r#"{"identity_platform":"claude_code","desc":"I am Claude Opus 4.8, made by Anthropic, running in Claude Code. I have one consistent public identity."}"#
+        );
+        let start_usage = &events
+            .iter()
+            .find(|event| event["type"] == "message_start")
+            .expect("message_start")["message"]["usage"];
+        assert_eq!(start_usage["input_tokens"], 369);
+        assert_eq!(start_usage["cache_creation_input_tokens"], 34_250);
+        assert_eq!(start_usage["cache_read_input_tokens"], 0);
+        let final_usage = &events
+            .iter()
+            .find(|event| event["type"] == "message_delta")
+            .expect("message_delta")["usage"];
+        assert_eq!(final_usage["input_tokens"], 369);
+        assert_eq!(final_usage["cache_creation_input_tokens"], 34_250);
+        assert_eq!(final_usage["cache_read_input_tokens"], 0);
+        assert_eq!(final_usage["output_tokens"], 60);
+        let metrics = &events
+            .iter()
+            .find(|event| event["type"] == "message_stop")
+            .expect("message_stop")["amazon-bedrock-invocationMetrics"];
+        assert_eq!(metrics["inputTokenCount"], 369);
+        assert_eq!(metrics["cacheWriteInputTokenCount"], 34_250);
+        assert_eq!(metrics["cacheReadInputTokenCount"], 0);
+        assert_eq!(metrics["outputTokenCount"], 60);
     }
 
     #[test]
