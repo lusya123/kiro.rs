@@ -2637,56 +2637,29 @@ pub async fn post_messages(
     let tool_name_map = conversion_result.tool_name_map;
 
     if payload.stream {
-        if use_sonnet_5_native_stream_envelope {
-            // This one native Anthropic envelope needs the authoritative
-            // context usage in message_start, so buffer the short real-model
-            // response exactly as the /cc path does.
-            handle_stream_request_buffered(
-                provider,
-                &request_body,
-                &payload.model,
-                input_tokens,
-                initial_usage_breakdown,
-                input_context_calibration,
-                thinking_enabled,
-                expose_thinking,
-                thinking_wants_summary,
-                tool_name_map,
-                payload.max_tokens,
-                identity_sanitization,
-                identity_sanitization_context,
-                forced_application_identity_reply,
-                tool_choice_forces_tool(&payload),
-                aws_b40_compat,
-                aws_b40_adaptive_signature,
-                aws_b40_thinking_requested,
-                true,
-            )
-            .await
-        } else {
-            // 流式响应
-            handle_stream_request(
-                provider,
-                &request_body,
-                &payload.model,
-                input_tokens,
-                initial_usage_breakdown,
-                input_context_calibration,
-                thinking_enabled,
-                expose_thinking,
-                thinking_wants_summary,
-                tool_name_map,
-                payload.max_tokens,
-                identity_sanitization,
-                identity_sanitization_context,
-                forced_application_identity_reply,
-                tool_choice_forces_tool(&payload),
-                aws_b40_compat,
-                aws_b40_adaptive_signature,
-                aws_b40_thinking_requested,
-            )
-            .await
-        }
+        // 流式响应
+        handle_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            initial_usage_breakdown,
+            input_context_calibration,
+            thinking_enabled,
+            expose_thinking,
+            thinking_wants_summary,
+            tool_name_map,
+            payload.max_tokens,
+            identity_sanitization,
+            identity_sanitization_context,
+            forced_application_identity_reply,
+            tool_choice_forces_tool(&payload),
+            aws_b40_compat,
+            aws_b40_adaptive_signature,
+            aws_b40_thinking_requested,
+            use_sonnet_5_native_stream_envelope,
+        )
+        .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
@@ -2734,6 +2707,7 @@ async fn handle_stream_request(
     aws_b40_compat: bool,
     aws_b40_adaptive_signature: bool,
     aws_b40_thinking_requested: bool,
+    use_native_stream_envelope: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let upstream_started = Instant::now();
@@ -2756,6 +2730,9 @@ async fn handle_stream_request(
         ctx.set_aws_b40_thinking_requested(aws_b40_thinking_requested);
         ctx.set_thinking_text_visible(thinking_wants_summary);
         ctx.set_input_context_calibration(input_context_calibration);
+        if use_native_stream_envelope {
+            ctx.enable_native_anthropic_stream_envelope();
+        }
     }
     ctx.set_upstream_request_latency(upstream_request_latency);
     // tool_choice 强制工具(any/tool):只发 tool_use,抑制夹带的解释性文本。

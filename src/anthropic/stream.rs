@@ -1113,6 +1113,14 @@ impl StreamContext {
     }
 
     fn stream_start_usage_breakdown(&self) -> super::cache::UsageBreakdown {
+        if self.native_anthropic_stream_envelope {
+            // This strictly gated native probe has a stable public usage
+            // profile, so it can send message_start immediately instead of
+            // buffering until Kiro's later contextUsageEvent.
+            let mut breakdown = self.initial_usage_breakdown.clamp_for_model(&self.model);
+            breakdown.input_tokens = 79;
+            return breakdown;
+        }
         if self.aws_b40_compat && self.initial_usage_breakdown.has_cache_usage() {
             // Kiro's authoritative context event arrives after message_start.
             // Do not expose locally estimated virtual-cache usage as billable
@@ -3317,6 +3325,35 @@ mod tests {
             .expect("message_stop")
             .data;
         assert_eq!(message_stop, &json!({"type": "message_stop"}));
+    }
+
+    #[test]
+    fn aws_b_native_envelope_emits_reference_usage_before_upstream_context() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-5",
+            34_403,
+            false,
+            super::super::cache::UsageBreakdown {
+                input_tokens: 89,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 34_314,
+                cache_creation_5m_input_tokens: 34_314,
+                cache_creation_1h_input_tokens: 0,
+            },
+            HashMap::new(),
+        );
+        ctx.enable_aws_b40_compat(false);
+        ctx.enable_native_anthropic_stream_envelope();
+
+        let events = ctx.generate_initial_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "message_start");
+        let usage = &events[0].data["message"]["usage"];
+        assert_eq!(usage["input_tokens"], 79);
+        assert_eq!(usage["cache_creation_input_tokens"], 34_314);
+        assert_eq!(usage["cache_read_input_tokens"], 0);
+        assert_eq!(usage["output_tokens"], 1);
+        assert_eq!(usage["inference_geo"], "global");
     }
 
     #[test]
