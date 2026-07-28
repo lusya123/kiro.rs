@@ -478,6 +478,27 @@ impl SseEvent {
             terminator
         )
     }
+
+    pub fn to_wire_sse_string(
+        &self,
+        aws_b40_compat: bool,
+        native_anthropic_stream_envelope: bool,
+    ) -> String {
+        if !native_anthropic_stream_envelope {
+            return self.to_profile_sse_string(aws_b40_compat);
+        }
+
+        let mut data = if self.event == "ping" {
+            r#"{"type": "ping"}"#.to_string()
+        } else {
+            serde_json::to_string(&self.data).unwrap_or_default()
+        };
+        if self.event != "ping" && data.ends_with('}') {
+            let padding = " ".repeat(fastrand::usize(..16));
+            data.insert_str(data.len() - 1, &padding);
+        }
+        format!("event: {}\ndata: {}\n\n\n", self.event, data)
+    }
 }
 
 /// 内容块状态
@@ -2762,9 +2783,17 @@ impl StreamContext {
                         usage_thinking_tokens,
                     );
                     if self.native_anthropic_stream_envelope {
-                        event.data["usage"]["output_tokens_details"] = json!({
-                            "thinking_tokens": thinking_usage_tokens.max(0)
-                        });
+                        let usage = event.data["usage"]
+                            .as_object_mut()
+                            .expect("stream delta usage must be an object");
+                        let cache_creation = usage.remove("cache_creation");
+                        usage.insert(
+                            "output_tokens_details".to_string(),
+                            json!({"thinking_tokens": thinking_usage_tokens.max(0)}),
+                        );
+                        if let Some(cache_creation) = cache_creation {
+                            usage.insert("cache_creation".to_string(), cache_creation);
+                        }
                     }
                 } else if event.event == "message_stop" && include_bedrock_invocation_metrics {
                     event.data = json!({
@@ -3246,6 +3275,42 @@ mod tests {
     }
 
     #[test]
+    fn native_anthropic_wire_uses_reference_json_whitespace_profile() {
+        let event = SseEvent::new("message_stop", json!({"type": "message_stop"}));
+        for _ in 0..64 {
+            let wire = event.to_wire_sse_string(true, true);
+            assert!(wire.starts_with("event: message_stop\ndata: "));
+            assert!(wire.ends_with("\n\n\n"));
+            let payload = wire
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .expect("data line");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(payload).expect("valid padded json"),
+                json!({"type": "message_stop"})
+            );
+            let before_closing_brace = payload.strip_suffix('}').expect("outer closing brace");
+            let padding = before_closing_brace
+                .chars()
+                .rev()
+                .take_while(|ch| *ch == ' ')
+                .count();
+            assert!(padding <= 15);
+        }
+
+        let ping = SseEvent::new("ping", json!({"type": "ping"}));
+        assert_eq!(
+            ping.to_wire_sse_string(true, true),
+            "event: ping\ndata: {\"type\": \"ping\"}\n\n\n"
+        );
+        assert_eq!(
+            ping.to_wire_sse_string(true, false),
+            ping.to_profile_sse_string(true),
+            "ordinary streams must keep their existing serializer"
+        );
+    }
+
+    #[test]
     fn aws_b_transport_chunks_preserve_text_and_stay_bounded() {
         let text = "Claude can explain code safely. ".repeat(200);
         let chunks = text_delta_chunks(&text);
@@ -3350,6 +3415,20 @@ mod tests {
         assert_eq!(delta_usage["output_tokens"], 3);
         assert_eq!(start["usage"]["inference_geo"], "global");
         assert_eq!(delta_usage["output_tokens_details"]["thinking_tokens"], 0);
+        let message_delta_wire = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta")
+            .to_wire_sse_string(true, true);
+        assert!(
+            message_delta_wire
+                .find("\"output_tokens_details\"")
+                .expect("output token details")
+                < message_delta_wire
+                    .find("\"cache_creation\":")
+                    .expect("cache creation breakdown"),
+            "native reference orders output token details before the nested cache breakdown"
+        );
         let visible_text = events
             .iter()
             .filter(|event| {

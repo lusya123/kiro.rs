@@ -2769,6 +2769,7 @@ async fn handle_stream_request(
         request_body.to_string(),
         requested_max_tokens,
         aws_b40_compat,
+        use_native_stream_envelope,
     );
 
     // 返回 SSE 响应
@@ -2801,13 +2802,15 @@ fn create_sse_stream(
     request_body: String,
     requested_max_tokens: i32,
     aws_b40_compat: bool,
+    use_native_stream_envelope: bool,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
-    let initial_stream = stream::iter(
-        initial_events
-            .into_iter()
-            .map(move |e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat)))),
-    );
+    let initial_stream = stream::iter(initial_events.into_iter().map(move |e| {
+        Ok(Bytes::from(e.to_wire_sse_string(
+            aws_b40_compat,
+            use_native_stream_envelope,
+        )))
+    }));
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
     let body_stream = response.bytes_stream();
@@ -2881,7 +2884,12 @@ fn create_sse_stream(
                             // 转换为 SSE 字节流
                             let bytes: Vec<Result<Bytes, Infallible>> = events
                                 .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
+                                .map(|e| {
+                                    Ok(Bytes::from(e.to_wire_sse_string(
+                                        aws_b40_compat,
+                                        use_native_stream_envelope,
+                                    )))
+                                })
                                 .collect();
 
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
@@ -2893,7 +2901,12 @@ fn create_sse_stream(
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
+                                .map(|e| {
+                                    Ok(Bytes::from(e.to_wire_sse_string(
+                                        aws_b40_compat,
+                                        use_native_stream_envelope,
+                                    )))
+                                })
                                 .collect();
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
                         }
@@ -2975,7 +2988,12 @@ fn create_sse_stream(
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
+                                .map(|e| {
+                                    Ok(Bytes::from(e.to_wire_sse_string(
+                                        aws_b40_compat,
+                                        use_native_stream_envelope,
+                                    )))
+                                })
                                 .collect();
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
                         }
@@ -5563,7 +5581,12 @@ fn create_buffered_sse_stream(
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
+                                    .map(|e| {
+                                        Ok(Bytes::from(e.to_wire_sse_string(
+                                            aws_b40_compat,
+                                            suppress_prestart_keepalive,
+                                        )))
+                                    })
                                     .collect();
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)));
                             }
@@ -5650,7 +5673,12 @@ fn create_buffered_sse_stream(
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
+                                    .map(|e| {
+                                        Ok(Bytes::from(e.to_wire_sse_string(
+                                            aws_b40_compat,
+                                            suppress_prestart_keepalive,
+                                        )))
+                                    })
                                     .collect();
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)));
                             }
