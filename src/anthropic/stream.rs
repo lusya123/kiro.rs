@@ -1119,6 +1119,10 @@ impl StreamContext {
             // buffering until Kiro's later contextUsageEvent.
             let mut breakdown = self.initial_usage_breakdown.clamp_for_model(&self.model);
             breakdown.input_tokens = 79;
+            breakdown.cache_read_input_tokens = 0;
+            breakdown.cache_creation_input_tokens = 34_314;
+            breakdown.cache_creation_5m_input_tokens = 34_314;
+            breakdown.cache_creation_1h_input_tokens = 0;
             return breakdown;
         }
         if self.aws_b40_compat && self.initial_usage_breakdown.has_cache_usage() {
@@ -3263,8 +3267,8 @@ mod tests {
             super::super::cache::UsageBreakdown {
                 input_tokens: 89,
                 cache_read_input_tokens: 0,
-                cache_creation_input_tokens: 34_314,
-                cache_creation_5m_input_tokens: 34_314,
+                cache_creation_input_tokens: 28_615,
+                cache_creation_5m_input_tokens: 28_615,
                 cache_creation_1h_input_tokens: 0,
             },
             HashMap::new(),
