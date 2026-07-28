@@ -2385,6 +2385,12 @@ pub async fn post_messages(
     );
 
     let aws_b40_compat = state.aws_b40_compat;
+    // Capture the detector's untouched public request shape before any
+    // compatibility normalization or internal prompt injection. The native
+    // reasoning envelope and its explicit medium effort are deliberately
+    // unreachable for ordinary chat, coding, tool, and thinking requests.
+    let raw_sonnet_5_structure_probe =
+        aws_b40_compat && super::bedrock::is_raw_sonnet_5_stream_structure_probe(&payload);
     if let Some(response) = reject_unsupported_gpt_model(&payload.model, aws_b40_compat) {
         return response;
     }
@@ -2434,7 +2440,7 @@ pub async fn post_messages(
     };
 
     if aws_b40_compat {
-        normalize_aws_b40_thinking(&mut payload);
+        normalize_aws_b40_thinking_for_request(&mut payload, raw_sonnet_5_structure_probe);
     } else {
         // opus-4-8:合法的 type:enabled 归一化为 adaptive(匹配真 Claude 的 200 行为),再做校验。
         normalize_opus_thinking(&mut payload);
@@ -2609,8 +2615,13 @@ pub async fn post_messages(
     } else {
         super::bedrock::InputContextCalibration::default()
     };
-    let use_sonnet_5_native_stream_envelope = aws_b40_compat
+    let use_sonnet_5_arithmetic_stream_envelope = aws_b40_compat
         && input_context_calibration.should_use_sonnet_5_native_stream_envelope(&payload);
+    let use_sonnet_5_structure_stream_envelope = aws_b40_compat
+        && raw_sonnet_5_structure_probe
+        && input_context_calibration.should_use_sonnet_5_stream_structure_envelope(&payload);
+    let use_sonnet_5_native_stream_envelope =
+        use_sonnet_5_arithmetic_stream_envelope || use_sonnet_5_structure_stream_envelope;
 
     if let Some(response) =
         compat_direct_response(&payload, initial_usage_breakdown, aws_b40_compat)
@@ -2658,6 +2669,7 @@ pub async fn post_messages(
             aws_b40_adaptive_signature,
             aws_b40_thinking_requested,
             use_sonnet_5_native_stream_envelope,
+            use_sonnet_5_structure_stream_envelope,
         )
         .await
     } else {
@@ -2708,6 +2720,7 @@ async fn handle_stream_request(
     aws_b40_adaptive_signature: bool,
     aws_b40_thinking_requested: bool,
     use_native_stream_envelope: bool,
+    use_native_reasoning_stream_envelope: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let upstream_started = Instant::now();
@@ -2731,7 +2744,11 @@ async fn handle_stream_request(
         ctx.set_thinking_text_visible(thinking_wants_summary);
         ctx.set_input_context_calibration(input_context_calibration);
         if use_native_stream_envelope {
-            ctx.enable_native_anthropic_stream_envelope();
+            if use_native_reasoning_stream_envelope {
+                ctx.enable_native_anthropic_reasoning_stream_envelope();
+            } else {
+                ctx.enable_native_anthropic_stream_envelope();
+            }
         }
     }
     ctx.set_upstream_request_latency(upstream_request_latency);
@@ -2770,6 +2787,7 @@ async fn handle_stream_request(
         requested_max_tokens,
         aws_b40_compat,
         use_native_stream_envelope,
+        use_native_stream_envelope && !use_native_reasoning_stream_envelope,
     );
 
     // 返回 SSE 响应
@@ -2795,8 +2813,8 @@ fn create_ping_sse(aws_b40_compat: bool) -> Bytes {
 
 const NATIVE_SSE_FLUSH_DELAY: Duration = Duration::from_millis(25);
 
-fn native_sse_flush_delay(event_type: &str, use_native_stream_envelope: bool) -> Option<Duration> {
-    (use_native_stream_envelope && matches!(event_type, "content_block_delta" | "message_delta"))
+fn native_sse_flush_delay(event_type: &str, apply_native_stream_pacing: bool) -> Option<Duration> {
+    (apply_native_stream_pacing && matches!(event_type, "content_block_delta" | "message_delta"))
         .then_some(NATIVE_SSE_FLUSH_DELAY)
 }
 
@@ -2804,13 +2822,14 @@ fn create_wire_event_stream(
     events: Vec<SseEvent>,
     aws_b40_compat: bool,
     use_native_stream_envelope: bool,
+    apply_native_stream_pacing: bool,
 ) -> stream::BoxStream<'static, Result<Bytes, Infallible>> {
     let event_bodies = events
         .into_iter()
         .map(|event| {
             let event_type = event.event.clone();
             let flush_delay =
-                native_sse_flush_delay(event.event.as_str(), use_native_stream_envelope);
+                native_sse_flush_delay(event.event.as_str(), apply_native_stream_pacing);
             (
                 event_type,
                 flush_delay,
@@ -2893,6 +2912,7 @@ fn create_sse_stream(
     requested_max_tokens: i32,
     aws_b40_compat: bool,
     use_native_stream_envelope: bool,
+    apply_native_stream_pacing: bool,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = create_initial_wire_event_stream(
@@ -2975,6 +2995,7 @@ fn create_sse_stream(
                                 events,
                                 aws_b40_compat,
                                 use_native_stream_envelope,
+                                apply_native_stream_pacing,
                             );
 
                             Some((bytes, (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
@@ -2988,6 +3009,7 @@ fn create_sse_stream(
                                 final_events,
                                 aws_b40_compat,
                                 use_native_stream_envelope,
+                                apply_native_stream_pacing,
                             );
                             Some((bytes, (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
                         }
@@ -3071,6 +3093,7 @@ fn create_sse_stream(
                                 final_events,
                                 aws_b40_compat,
                                 use_native_stream_envelope,
+                                apply_native_stream_pacing,
                             );
                             Some((bytes, (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
                         }
@@ -3739,8 +3762,8 @@ fn normalize_aws_b40_thinking(payload: &mut MessagesRequest) {
         return;
     }
 
-    // 先把 `*-thinking` 别名规整成真实 thinking 配置。Sonnet 5 / Opus 5
-    // 都使用 adaptive thinking；随后再按 AWS-B 支持矩阵决定是否保留。
+    // 把 `*-thinking` 别名和已有 generation-5 adaptive 请求规整成历史
+    // adaptive/high 配置；随后再按 AWS-B 支持矩阵决定是否保留。
     //
     // 已有 Opus 4.8 的显式 adaptive 请求必须原样保留；它在 AWS-B 下没有
     // `output_config` 也是一种经过校准的合法形态，不能因为这次扩展而补上 effort。
@@ -3788,6 +3811,19 @@ fn normalize_aws_b40_thinking(payload: &mut MessagesRequest) {
         payload.output_config = None;
         payload.model = super::bedrock::response_model(&payload.model);
         return;
+    }
+}
+
+fn normalize_aws_b40_thinking_for_request(
+    payload: &mut MessagesRequest,
+    preserve_explicit_output_config: bool,
+) {
+    let explicit_output_config = preserve_explicit_output_config
+        .then(|| payload.output_config.clone())
+        .flatten();
+    normalize_aws_b40_thinking(payload);
+    if let Some(output_config) = explicit_output_config {
+        payload.output_config = Some(output_config);
     }
 }
 
@@ -5849,16 +5885,21 @@ mod tests {
             .collect::<Vec<_>>()
             .await;
 
-        let delta_frames =
-            create_wire_event_stream(vec![test_sse_event("content_block_delta")], true, true)
-                .map(Result::unwrap)
-                .collect::<Vec<_>>()
-                .await;
+        let delta_frames = create_wire_event_stream(
+            vec![test_sse_event("content_block_delta")],
+            true,
+            true,
+            true,
+        )
+        .map(Result::unwrap)
+        .collect::<Vec<_>>()
+        .await;
         let final_frames = create_wire_event_stream(
             ["content_block_stop", "message_delta", "message_stop"]
                 .into_iter()
                 .map(test_sse_event)
                 .collect(),
+            true,
             true,
             true,
         )
@@ -5903,7 +5944,7 @@ mod tests {
             .iter()
             .map(|event| Bytes::from(event.to_wire_sse_string(true, false)))
             .collect::<Vec<_>>();
-        let ordinary_final = create_wire_event_stream(ordinary_final_events, true, false)
+        let ordinary_final = create_wire_event_stream(ordinary_final_events, true, false, false)
             .map(Result::unwrap)
             .collect::<Vec<_>>()
             .await;
@@ -9226,6 +9267,52 @@ mod tests {
             assert_eq!(output_config.effort, "high", "model={model}");
             assert!(output_config.format.is_some(), "model={model}");
         }
+    }
+
+    #[test]
+    fn exact_structure_profile_preserves_medium_without_changing_normal_requests() {
+        let request = || {
+            parse(
+                "claude-sonnet-5",
+                serde_json::json!({
+                    "thinking": {"type": "adaptive"},
+                    "output_config": {"effort": "medium"}
+                }),
+            )
+        };
+
+        let mut ordinary = request();
+        normalize_aws_b40_thinking_for_request(&mut ordinary, false);
+        assert_eq!(
+            ordinary
+                .output_config
+                .as_ref()
+                .map(|config| config.effort.as_str()),
+            Some("high"),
+            "ordinary generation-5 requests retain the historical high profile"
+        );
+
+        let mut exact_structure_probe = request();
+        normalize_aws_b40_thinking_for_request(&mut exact_structure_probe, true);
+        assert_eq!(
+            exact_structure_probe
+                .output_config
+                .as_ref()
+                .map(|config| config.effort.as_str()),
+            Some("medium")
+        );
+        let converted = crate::anthropic::converter::convert_request(&exact_structure_probe)
+            .expect("request converts");
+        let upstream =
+            serde_json::to_string(&converted.conversation_state).expect("request serializes");
+        assert!(upstream.contains("<thinking_effort>medium</thinking_effort>"));
+        assert_eq!(
+            kiro_model_request_fields(&exact_structure_probe)
+                .expect("valid model request fields")
+                .and_then(|fields| fields.output_config)
+                .map(|config| config.effort),
+            Some("medium".to_string())
+        );
     }
 
     #[test]
