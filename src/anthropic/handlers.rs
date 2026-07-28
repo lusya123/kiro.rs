@@ -2793,6 +2793,53 @@ fn create_ping_sse(aws_b40_compat: bool) -> Bytes {
     ))
 }
 
+const NATIVE_SSE_FLUSH_DELAY: Duration = Duration::from_millis(9);
+
+fn native_sse_flush_delay(event_type: &str, use_native_stream_envelope: bool) -> Option<Duration> {
+    (use_native_stream_envelope && matches!(event_type, "content_block_delta" | "message_delta"))
+        .then_some(NATIVE_SSE_FLUSH_DELAY)
+}
+
+fn create_wire_event_stream(
+    events: Vec<SseEvent>,
+    aws_b40_compat: bool,
+    use_native_stream_envelope: bool,
+) -> stream::BoxStream<'static, Result<Bytes, Infallible>> {
+    let event_bodies = events
+        .into_iter()
+        .map(|event| {
+            let flush_delay =
+                native_sse_flush_delay(event.event.as_str(), use_native_stream_envelope);
+            (
+                flush_delay,
+                Bytes::from(event.to_wire_sse_string(aws_b40_compat, use_native_stream_envelope)),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if !use_native_stream_envelope {
+        return stream::iter(
+            event_bodies
+                .into_iter()
+                .map(|(_, body)| Ok::<Bytes, Infallible>(body)),
+        )
+        .boxed();
+    }
+
+    stream::unfold(event_bodies.into_iter(), |mut events| async move {
+        let (flush_delay, body) = events.next()?;
+        if let Some(flush_delay) = flush_delay {
+            // The native Anthropic channel exposes the text delta and final
+            // usage as separate transport reads. Pausing briefly at those
+            // semantic boundaries prevents HTTP/TLS coalescing while keeping
+            // the strictly gated response genuinely incremental.
+            tokio::time::sleep(flush_delay).await;
+        }
+        Some((Ok::<Bytes, Infallible>(body), events))
+    })
+    .boxed()
+}
+
 /// 创建 SSE 事件流
 fn create_sse_stream(
     response: reqwest::Response,
@@ -2882,33 +2929,25 @@ fn create_sse_stream(
                             }
 
                             // 转换为 SSE 字节流
-                            let bytes: Vec<Result<Bytes, Infallible>> = events
-                                .into_iter()
-                                .map(|e| {
-                                    Ok(Bytes::from(e.to_wire_sse_string(
-                                        aws_b40_compat,
-                                        use_native_stream_envelope,
-                                    )))
-                                })
-                                .collect();
+                            let bytes = create_wire_event_stream(
+                                events,
+                                aws_b40_compat,
+                                use_native_stream_envelope,
+                            );
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
+                            Some((bytes, (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
                             ctx.mark_upstream_fatal_event();
                             // 发送最终事件并结束
                             let final_events = ctx.generate_final_events();
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| {
-                                    Ok(Bytes::from(e.to_wire_sse_string(
-                                        aws_b40_compat,
-                                        use_native_stream_envelope,
-                                    )))
-                                })
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
+                            let bytes = create_wire_event_stream(
+                                final_events,
+                                aws_b40_compat,
+                                use_native_stream_envelope,
+                            );
+                            Some((bytes, (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
                         }
                         None => {
                             let mut continuation_reason = "unknown";
@@ -2964,7 +3003,7 @@ fn create_sse_stream(
                                             );
                                             let next_body_stream = next_response.bytes_stream();
                                             return Some((
-                                                stream::iter(Vec::<Result<Bytes, Infallible>>::new()),
+                                                stream::empty().boxed(),
                                                 (
                                                     next_body_stream,
                                                     ctx,
@@ -2986,16 +3025,12 @@ fn create_sse_stream(
                             }
                             // 流结束，发送最终事件
                             let final_events = ctx.generate_final_events();
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| {
-                                    Ok(Bytes::from(e.to_wire_sse_string(
-                                        aws_b40_compat,
-                                        use_native_stream_envelope,
-                                    )))
-                                })
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
+                            let bytes = create_wire_event_stream(
+                                final_events,
+                                aws_b40_compat,
+                                use_native_stream_envelope,
+                            );
+                            Some((bytes, (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
                         }
                     }
                 }
@@ -3004,7 +3039,7 @@ fn create_sse_stream(
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> =
                         vec![Ok(create_ping_sse(aws_b40_compat))];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
+                    Some((stream::iter(bytes).boxed(), (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
                 }
             }
         },
@@ -5721,6 +5756,32 @@ mod tests {
                     .map(str::to_string)
             })
             .collect()
+    }
+
+    #[test]
+    fn native_sse_flush_pacing_is_strictly_scoped() {
+        for event_type in ["content_block_delta", "message_delta"] {
+            assert_eq!(
+                native_sse_flush_delay(event_type, true),
+                Some(NATIVE_SSE_FLUSH_DELAY)
+            );
+        }
+        for event_type in [
+            "message_start",
+            "content_block_start",
+            "ping",
+            "content_block_stop",
+            "message_stop",
+        ] {
+            assert_eq!(native_sse_flush_delay(event_type, true), None);
+        }
+        for event_type in ["content_block_delta", "message_delta"] {
+            assert_eq!(
+                native_sse_flush_delay(event_type, false),
+                None,
+                "ordinary streams must not inherit native transport pacing"
+            );
+        }
     }
 
     #[tokio::test]
