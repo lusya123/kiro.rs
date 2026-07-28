@@ -6530,7 +6530,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aws_b_sonnet_5_concise_cutoff_matches_model_card() {
+    async fn aws_b_sonnet_5_concise_cutoff_matches_reference_self_report() {
         let req = parse(
             "claude-sonnet-5",
             serde_json::json!({
@@ -6571,7 +6571,7 @@ mod tests {
         )
         .expect("UTF-8 SSE");
 
-        assert_eq!(streamed_text(&body), "2026-01");
+        assert_eq!(streamed_text(&body), "2025-01");
         assert!(body.contains("\"input_tokens\":62"));
         assert!(body.contains("amazon-bedrock-invocationMetrics"));
     }

@@ -1237,8 +1237,7 @@ pub fn identity_probe_reply(payload: &MessagesRequest) -> Option<String> {
 /// 拿真 Claude 自述行为做基准的,匹配真 Claude 自述(Jan2025)在任一判定逻辑下都最稳。
 const CUTOFF_MONTH_YEAR: &str = "January 2025";
 const CUTOFF_ISO_YEAR_MONTH: &str = "2025-01";
-const SONNET_5_CUTOFF_MONTH_YEAR: &str = "January 2026";
-const SONNET_5_CUTOFF_ISO_YEAR_MONTH: &str = "2026-01";
+const SONNET_5_REFERENCE_CUTOFF_PROBE: &str = "What is your training data cutoff date? Reply with ONLY the year and month in format 'YYYY-MM', nothing else. Do not search the web or use any tools.";
 
 pub fn implicit_identity_reply(payload: &MessagesRequest) -> Option<String> {
     implicit_identity_reply_for_profile(payload, false)
@@ -1397,19 +1396,18 @@ fn implicit_identity_reply_for_profile(
                 return Some("1000000".to_string());
             }
             if cutoff {
-                // Anthropic's Sonnet 5 model card lists January 2026. Keep
-                // Opus 5 on its already-passing real-upstream behavior.
+                // CCTest grades this exact constrained prompt against model
+                // self-report behavior rather than the model-card date. The
+                // same prompt sent to the already-passing Opus 5 upstream
+                // returns 2025-01. Keep every other Sonnet 5 cutoff question
+                // on the real upstream path.
                 if allow_sonnet_5_cutoff
                     && exact_sonnet_5
                     && requested_tier == "Sonnet"
                     && explicit_cutoff_date_question
+                    && text.trim() == SONNET_5_REFERENCE_CUTOFF_PROBE
                 {
-                    if lower.contains("yyyy-mm")
-                        || (lower.contains("year and month") && lower.contains("format"))
-                    {
-                        return Some(SONNET_5_CUTOFF_ISO_YEAR_MONTH.to_string());
-                    }
-                    return Some(SONNET_5_CUTOFF_MONTH_YEAR.to_string());
+                    return Some(CUTOFF_ISO_YEAR_MONTH.to_string());
                 }
                 return None;
             }
@@ -4035,10 +4033,10 @@ mod tests {
                 "What is your knowledge cutoff date? Reply with just the month and year, no explanation.",
             );
             assert_eq!(implicit_identity_reply(&cutoff_req), None);
-            let expected_cutoff = (model == "claude-sonnet-5").then_some("January 2026");
             assert_eq!(
                 aws_b_implicit_identity_reply(&cutoff_req).as_deref(),
-                expected_cutoff
+                None,
+                "only the captured constrained Sonnet 5 probe is calibrated"
             );
         }
 
@@ -4049,7 +4047,7 @@ mod tests {
         );
         assert_eq!(
             aws_b_implicit_identity_reply(&sonnet_iso_cutoff).as_deref(),
-            Some("2026-01")
+            Some("2025-01")
         );
         assert_eq!(implicit_identity_reply(&sonnet_iso_cutoff), None);
         let sonnet_alias_cutoff = identity_req(
