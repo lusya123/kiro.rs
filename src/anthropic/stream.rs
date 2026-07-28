@@ -905,6 +905,7 @@ pub struct StreamContext {
     aws_b40_compat: bool,
     aws_b40_adaptive_signature: bool,
     aws_b40_thinking_requested: bool,
+    native_anthropic_stream_envelope: bool,
     /// `call_api_stream` 返回响应头前已经消耗的时间。
     upstream_request_latency_ms: u64,
     /// 从响应头到当前事件处理的计时起点。
@@ -978,6 +979,7 @@ impl StreamContext {
             aws_b40_compat: false,
             aws_b40_adaptive_signature: false,
             aws_b40_thinking_requested: false,
+            native_anthropic_stream_envelope: false,
             upstream_request_latency_ms: 0,
             stream_started_at: Instant::now(),
             first_byte_latency_ms: None,
@@ -996,8 +998,10 @@ impl StreamContext {
         self.aws_b40_thinking_requested = requested;
     }
 
-    pub fn set_emit_initial_ping(&mut self, emit: bool) {
-        self.state_manager.set_emit_initial_ping(emit);
+    pub fn enable_native_anthropic_stream_envelope(&mut self) {
+        self.native_anthropic_stream_envelope = true;
+        self.message_id = id::message_id();
+        self.state_manager.set_emit_initial_ping(true);
     }
 
     pub fn set_input_context_calibration(
@@ -1131,6 +1135,29 @@ impl StreamContext {
                 _ if self.aws_b40_thinking_requested => 3,
                 _ => 1,
             };
+            let usage = if self.native_anthropic_stream_envelope {
+                super::compat::stream_start_usage(
+                    &self.model,
+                    breakdown.input_tokens,
+                    initial_output_tokens,
+                    0,
+                    breakdown.cache_creation_input_tokens,
+                    breakdown.cache_creation_1h_input_tokens,
+                    breakdown.cache_read_input_tokens,
+                )
+            } else {
+                json!({
+                    "input_tokens": breakdown.input_tokens,
+                    "cache_creation_input_tokens": breakdown.cache_creation_input_tokens,
+                    "cache_read_input_tokens": breakdown.cache_read_input_tokens,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": breakdown.cache_creation_5m_input_tokens,
+                        "ephemeral_1h_input_tokens": breakdown.cache_creation_1h_input_tokens
+                    },
+                    "output_tokens": initial_output_tokens,
+                    "service_tier": "standard"
+                })
+            };
             return json!({
                 "type": "message_start",
                 "message": {
@@ -1142,17 +1169,7 @@ impl StreamContext {
                     "stop_reason": null,
                     "stop_sequence": null,
                     "stop_details": null,
-                    "usage": {
-                        "input_tokens": breakdown.input_tokens,
-                        "cache_creation_input_tokens": breakdown.cache_creation_input_tokens,
-                        "cache_read_input_tokens": breakdown.cache_read_input_tokens,
-                        "cache_creation": {
-                            "ephemeral_5m_input_tokens": breakdown.cache_creation_5m_input_tokens,
-                            "ephemeral_1h_input_tokens": breakdown.cache_creation_1h_input_tokens
-                        },
-                        "output_tokens": initial_output_tokens,
-                        "service_tier": "standard"
-                    }
+                    "usage": usage
                 }
             });
         }
@@ -2686,7 +2703,8 @@ impl StreamContext {
             usage_thinking_tokens,
         );
         if self.aws_b40_compat {
-            let include_bedrock_invocation_metrics = !self.has_gpt_identity_target();
+            let include_bedrock_invocation_metrics =
+                !self.native_anthropic_stream_envelope && !self.has_gpt_identity_target();
             let invocation_latency = self
                 .upstream_request_latency_ms
                 .saturating_add(self.stream_started_at.elapsed().as_millis() as u64);
@@ -2702,6 +2720,11 @@ impl StreamContext {
                         final_output_tokens,
                         usage_thinking_tokens,
                     );
+                    if self.native_anthropic_stream_envelope {
+                        event.data["usage"]["output_tokens_details"] = json!({
+                            "thinking_tokens": thinking_usage_tokens.max(0)
+                        });
+                    }
                 } else if event.event == "message_stop" && include_bedrock_invocation_metrics {
                     event.data = json!({
                         "type": "message_stop",
@@ -2959,8 +2982,8 @@ impl BufferedStreamContext {
         self.inner.set_aws_b40_thinking_requested(requested);
     }
 
-    pub fn set_emit_initial_ping(&mut self, emit: bool) {
-        self.inner.set_emit_initial_ping(emit);
+    pub fn enable_native_anthropic_stream_envelope(&mut self) {
+        self.inner.enable_native_anthropic_stream_envelope();
     }
 
     pub fn set_input_context_calibration(
@@ -3215,8 +3238,8 @@ mod tests {
     }
 
     #[test]
-    fn aws_b_explicit_native_ping_is_after_the_first_content_block_start() {
-        let mut ctx = StreamContext::new_with_thinking(
+    fn aws_b_native_envelope_matches_the_reference_event_and_usage_shape() {
+        let mut ctx = BufferedStreamContext::new(
             "claude-sonnet-5",
             34_403,
             false,
@@ -3230,11 +3253,13 @@ mod tests {
             HashMap::new(),
         );
         ctx.enable_aws_b40_compat(false);
-        ctx.set_emit_initial_ping(true);
-
-        let mut events = ctx.generate_initial_events();
-        events.extend(ctx.process_assistant_response("2"));
-        events.extend(ctx.generate_final_events());
+        ctx.enable_native_anthropic_stream_envelope();
+        ctx.inner.context_input_tokens = Some(34_403);
+        ctx.event_buffer.extend(ctx.inner.generate_initial_events());
+        ctx.initial_events_generated = true;
+        ctx.event_buffer
+            .extend(ctx.inner.process_assistant_response("2"));
+        let events = ctx.finish_and_get_all_events();
         let event_types = events
             .iter()
             .map(|event| event.event.as_str())
@@ -3256,6 +3281,32 @@ mod tests {
             events.iter().filter(|event| event.event == "ping").count(),
             1
         );
+        let start = &events
+            .iter()
+            .find(|event| event.event == "message_start")
+            .expect("message_start")
+            .data["message"];
+        let delta_usage = &events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta")
+            .data["usage"];
+        assert!(start["id"].as_str().is_some_and(
+            |message_id| message_id.starts_with("msg_01") && !message_id.contains("bdrk")
+        ));
+        assert_eq!(start["usage"]["input_tokens"], delta_usage["input_tokens"]);
+        assert_eq!(
+            start["usage"]["cache_creation_input_tokens"],
+            delta_usage["cache_creation_input_tokens"]
+        );
+        assert_eq!(start["usage"]["inference_geo"], "global");
+        assert_eq!(delta_usage["output_tokens_details"]["thinking_tokens"], 0);
+        let message_stop = &events
+            .iter()
+            .find(|event| event.event == "message_stop")
+            .expect("message_stop")
+            .data;
+        assert_eq!(message_stop, &json!({"type": "message_stop"}));
     }
 
     #[test]

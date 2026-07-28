@@ -2609,8 +2609,8 @@ pub async fn post_messages(
     } else {
         super::bedrock::InputContextCalibration::default()
     };
-    let emit_sonnet_5_native_ping =
-        aws_b40_compat && input_context_calibration.should_emit_sonnet_5_native_ping(&payload);
+    let use_sonnet_5_native_stream_envelope = aws_b40_compat
+        && input_context_calibration.should_use_sonnet_5_native_stream_envelope(&payload);
 
     if let Some(response) =
         compat_direct_response(&payload, initial_usage_breakdown, aws_b40_compat)
@@ -2637,29 +2637,56 @@ pub async fn post_messages(
     let tool_name_map = conversion_result.tool_name_map;
 
     if payload.stream {
-        // 流式响应
-        handle_stream_request(
-            provider,
-            &request_body,
-            &payload.model,
-            input_tokens,
-            initial_usage_breakdown,
-            input_context_calibration,
-            thinking_enabled,
-            expose_thinking,
-            thinking_wants_summary,
-            tool_name_map,
-            payload.max_tokens,
-            identity_sanitization,
-            identity_sanitization_context,
-            forced_application_identity_reply,
-            tool_choice_forces_tool(&payload),
-            aws_b40_compat,
-            aws_b40_adaptive_signature,
-            aws_b40_thinking_requested,
-            emit_sonnet_5_native_ping,
-        )
-        .await
+        if use_sonnet_5_native_stream_envelope {
+            // This one native Anthropic envelope needs the authoritative
+            // context usage in message_start, so buffer the short real-model
+            // response exactly as the /cc path does.
+            handle_stream_request_buffered(
+                provider,
+                &request_body,
+                &payload.model,
+                input_tokens,
+                initial_usage_breakdown,
+                input_context_calibration,
+                thinking_enabled,
+                expose_thinking,
+                thinking_wants_summary,
+                tool_name_map,
+                payload.max_tokens,
+                identity_sanitization,
+                identity_sanitization_context,
+                forced_application_identity_reply,
+                tool_choice_forces_tool(&payload),
+                aws_b40_compat,
+                aws_b40_adaptive_signature,
+                aws_b40_thinking_requested,
+                true,
+            )
+            .await
+        } else {
+            // 流式响应
+            handle_stream_request(
+                provider,
+                &request_body,
+                &payload.model,
+                input_tokens,
+                initial_usage_breakdown,
+                input_context_calibration,
+                thinking_enabled,
+                expose_thinking,
+                thinking_wants_summary,
+                tool_name_map,
+                payload.max_tokens,
+                identity_sanitization,
+                identity_sanitization_context,
+                forced_application_identity_reply,
+                tool_choice_forces_tool(&payload),
+                aws_b40_compat,
+                aws_b40_adaptive_signature,
+                aws_b40_thinking_requested,
+            )
+            .await
+        }
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
@@ -2707,7 +2734,6 @@ async fn handle_stream_request(
     aws_b40_compat: bool,
     aws_b40_adaptive_signature: bool,
     aws_b40_thinking_requested: bool,
-    emit_sonnet_5_native_ping: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let upstream_started = Instant::now();
@@ -2730,9 +2756,6 @@ async fn handle_stream_request(
         ctx.set_aws_b40_thinking_requested(aws_b40_thinking_requested);
         ctx.set_thinking_text_visible(thinking_wants_summary);
         ctx.set_input_context_calibration(input_context_calibration);
-        if emit_sonnet_5_native_ping {
-            ctx.set_emit_initial_ping(true);
-        }
     }
     ctx.set_upstream_request_latency(upstream_request_latency);
     // tool_choice 强制工具(any/tool):只发 tool_use,抑制夹带的解释性文本。
@@ -5289,8 +5312,8 @@ pub async fn post_messages_cc(
     } else {
         super::bedrock::InputContextCalibration::default()
     };
-    let emit_sonnet_5_native_ping =
-        aws_b40_compat && input_context_calibration.should_emit_sonnet_5_native_ping(&payload);
+    let use_sonnet_5_native_stream_envelope = aws_b40_compat
+        && input_context_calibration.should_use_sonnet_5_native_stream_envelope(&payload);
 
     if let Some(response) =
         compat_direct_response(&payload, initial_usage_breakdown, aws_b40_compat)
@@ -5337,7 +5360,7 @@ pub async fn post_messages_cc(
             aws_b40_compat,
             aws_b40_adaptive_signature,
             aws_b40_thinking_requested,
-            emit_sonnet_5_native_ping,
+            use_sonnet_5_native_stream_envelope,
         )
         .await
     } else {
@@ -5390,7 +5413,7 @@ async fn handle_stream_request_buffered(
     aws_b40_compat: bool,
     aws_b40_adaptive_signature: bool,
     aws_b40_thinking_requested: bool,
-    emit_sonnet_5_native_ping: bool,
+    use_native_stream_envelope: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let upstream_started = Instant::now();
@@ -5413,8 +5436,8 @@ async fn handle_stream_request_buffered(
         ctx.set_aws_b40_thinking_requested(aws_b40_thinking_requested);
         ctx.set_thinking_text_visible(thinking_wants_summary);
         ctx.set_input_context_calibration(input_context_calibration);
-        if emit_sonnet_5_native_ping {
-            ctx.set_emit_initial_ping(true);
+        if use_native_stream_envelope {
+            ctx.enable_native_anthropic_stream_envelope();
         }
     }
     ctx.set_upstream_request_latency(upstream_request_latency);
@@ -5447,6 +5470,7 @@ async fn handle_stream_request_buffered(
         request_body.to_string(),
         requested_max_tokens,
         aws_b40_compat,
+        use_native_stream_envelope,
     );
 
     // 返回 SSE 响应
@@ -5473,6 +5497,7 @@ fn create_buffered_sse_stream(
     request_body: String,
     requested_max_tokens: i32,
     aws_b40_compat: bool,
+    suppress_prestart_keepalive: bool,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
     let requested_max_tokens = effective_auto_continue_max_tokens(requested_max_tokens);
@@ -5515,7 +5540,7 @@ fn create_buffered_sse_stream(
                     biased;
 
                     // 优先检查 ping 保活（等待期间唯一发送的数据）
-                    _ = ping_interval.tick() => {
+                    _ = ping_interval.tick(), if !suppress_prestart_keepalive => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> =
                             vec![Ok(create_ping_sse(aws_b40_compat))];
