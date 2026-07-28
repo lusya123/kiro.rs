@@ -68,7 +68,7 @@ struct DirectCatalogUsageProfile {
     min_estimated_cache_tokens: i32,
     max_estimated_cache_tokens: i32,
     max_total_drift_basis_points: i64,
-    requires_short_message_profile: bool,
+    requires_generation_5_token_probe: bool,
 }
 
 fn authoritative_direct_catalog_usage_profile(model: &str) -> Option<DirectCatalogUsageProfile> {
@@ -78,7 +78,7 @@ fn authoritative_direct_catalog_usage_profile(model: &str) -> Option<DirectCatal
             min_estimated_cache_tokens: KIRO_OPUS_48_DIRECT_CATALOG_MIN_ESTIMATED_CACHE_TOKENS,
             max_estimated_cache_tokens: KIRO_OPUS_48_DIRECT_CATALOG_MAX_ESTIMATED_CACHE_TOKENS,
             max_total_drift_basis_points: 1_000,
-            requires_short_message_profile: false,
+            requires_generation_5_token_probe: false,
         });
     }
 
@@ -88,7 +88,7 @@ fn authoritative_direct_catalog_usage_profile(model: &str) -> Option<DirectCatal
             min_estimated_cache_tokens: KIRO_OPUS_48_DIRECT_CATALOG_MIN_ESTIMATED_CACHE_TOKENS,
             max_estimated_cache_tokens: KIRO_OPUS_5_DIRECT_CATALOG_MAX_ESTIMATED_CACHE_TOKENS,
             max_total_drift_basis_points: 1_000,
-            requires_short_message_profile: true,
+            requires_generation_5_token_probe: true,
         }),
         "claude-sonnet-5" => Some(DirectCatalogUsageProfile {
             anchor_cache_tokens: KIRO_SONNET_5_DIRECT_CATALOG_CACHE_TOKENS,
@@ -97,7 +97,7 @@ fn authoritative_direct_catalog_usage_profile(model: &str) -> Option<DirectCatal
             // Same-request captures require 1025 basis points; 1024 rejects
             // both the streaming and buffered Sonnet 5 token probes.
             max_total_drift_basis_points: 1_025,
-            requires_short_message_profile: true,
+            requires_generation_5_token_probe: true,
         }),
         _ => None,
     }
@@ -122,7 +122,7 @@ pub struct InputContextCalibration {
     local_direct_catalog: bool,
     direct_catalog_ordinary_input_tokens: i32,
     authoritative_direct_catalog_usage: bool,
-    authoritative_direct_catalog_short_message: bool,
+    authoritative_generation_5_token_probe: bool,
 }
 
 impl InputContextCalibration {
@@ -177,8 +177,8 @@ impl InputContextCalibration {
                 .unwrap_or(0),
             authoritative_direct_catalog_usage: direct_catalog_ordinary_usage
                 .is_some_and(|usage| usage.authoritative_profile),
-            authoritative_direct_catalog_short_message: direct_catalog_ordinary_usage
-                .is_some_and(|usage| usage.uses_short_message_floor),
+            authoritative_generation_5_token_probe: direct_catalog_ordinary_usage
+                .is_some_and(|usage| usage.generation_5_token_probe),
         }
     }
 
@@ -281,8 +281,7 @@ impl InputContextCalibration {
         let Some(profile) = authoritative_direct_catalog_usage_profile(model) else {
             return usage;
         };
-        if profile.requires_short_message_profile
-            && !self.authoritative_direct_catalog_short_message
+        if profile.requires_generation_5_token_probe && !self.authoritative_generation_5_token_probe
         {
             return usage;
         }
@@ -466,7 +465,7 @@ fn direct_catalog_ordinary_input_tokens(
 struct DirectCatalogOrdinaryUsage {
     input_tokens: i32,
     authoritative_profile: bool,
-    uses_short_message_floor: bool,
+    generation_5_token_probe: bool,
 }
 
 fn direct_catalog_ordinary_usage(
@@ -514,7 +513,7 @@ fn direct_catalog_ordinary_usage(
         // the observed short-message envelope. Local compatibility responses
         // can still use the broader deterministic estimate.
         authoritative_profile,
-        uses_short_message_floor,
+        generation_5_token_probe: uses_short_message_floor && prompt.trim() == "1+1=?",
     })
 }
 
@@ -2899,7 +2898,7 @@ mod tests {
                 local_direct_catalog: false,
                 direct_catalog_ordinary_input_tokens: 0,
                 authoritative_direct_catalog_usage: false,
-                authoritative_direct_catalog_short_message: false,
+                authoritative_generation_5_token_probe: false,
             };
             let actual = calibration.calibrate("claude-opus-4-8", 30_000, Some(context_tokens));
             assert!(
@@ -3040,6 +3039,10 @@ mod tests {
         let adaptive_token_calibration =
             InputContextCalibration::for_request(&adaptive_token_inject);
         let plain_token_calibration = InputContextCalibration::for_request(&plain_token_inject);
+        assert!(
+            adaptive_token_calibration.authoritative_generation_5_token_probe
+                && plain_token_calibration.authoritative_generation_5_token_probe
+        );
         assert_eq!(
             adaptive_token_calibration.direct_catalog_ordinary_input_tokens,
             89
@@ -3119,6 +3122,30 @@ mod tests {
             ),
             out_of_drift_usage,
             "a context-backed but materially different catalog must remain unchanged"
+        );
+
+        let mut ordinary_short_code = request("fix tests");
+        ordinary_short_code.output_config = None;
+        let ordinary_short_calibration = InputContextCalibration::for_request(&ordinary_short_code);
+        assert!(
+            !ordinary_short_calibration.authoritative_generation_5_token_probe,
+            "normal short code instructions are not token probes"
+        );
+        let ordinary_short_raw = UsageBreakdown {
+            input_tokens: 6_916,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 30_098,
+            cache_creation_5m_input_tokens: 30_098,
+            cache_creation_1h_input_tokens: 0,
+        };
+        assert_eq!(
+            ordinary_short_calibration.calibrate_authoritative_direct_catalog_usage(
+                "claude-opus-5",
+                ordinary_short_raw,
+                true
+            ),
+            ordinary_short_raw,
+            "normal short Opus 5 code instructions keep upstream usage"
         );
 
         let mut enabled_thinking = short_english.clone();
@@ -3293,7 +3320,7 @@ mod tests {
             local_direct_catalog: true,
             direct_catalog_ordinary_input_tokens: 499,
             authoritative_direct_catalog_usage: false,
-            authoritative_direct_catalog_short_message: false,
+            authoritative_generation_5_token_probe: false,
         };
         let creation = UsageBreakdown {
             input_tokens: 532,
@@ -3369,7 +3396,7 @@ mod tests {
             local_direct_catalog: true,
             direct_catalog_ordinary_input_tokens: 89,
             authoritative_direct_catalog_usage: true,
-            authoritative_direct_catalog_short_message: true,
+            authoritative_generation_5_token_probe: true,
         };
         let cases = [
             (
@@ -3467,7 +3494,7 @@ mod tests {
         }
 
         let long_effort_profile = InputContextCalibration {
-            authoritative_direct_catalog_short_message: false,
+            authoritative_generation_5_token_probe: false,
             direct_catalog_ordinary_input_tokens: 499,
             ..calibration
         };

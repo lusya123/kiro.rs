@@ -4333,7 +4333,11 @@ fn compat_direct_response(
             13
         };
         (answer, output_tokens, None)
-    } else if let Some(answer) = super::compat::implicit_identity_reply(probe_payload) {
+    } else if let Some(answer) = if aws_b40_compat {
+        super::compat::aws_b_implicit_identity_reply(probe_payload)
+    } else {
+        super::compat::implicit_identity_reply(probe_payload)
+    } {
         // 隐式身份/规格探针:回答较长,按真实 token 数计量(避免固定计量成为指纹)。
         let output_tokens = if aws_b40_compat
             && payload.model.to_ascii_lowercase().contains("opus")
@@ -6554,6 +6558,11 @@ mod tests {
         let response =
             compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(62), true)
                 .expect("constrained Sonnet 5 cutoff should use the compatibility response");
+        assert!(
+            compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(62), false)
+                .is_none(),
+            "non-AWS-B profiles keep the existing real-upstream behavior"
+        );
         let body = String::from_utf8(
             axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await

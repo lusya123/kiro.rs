@@ -1241,6 +1241,17 @@ const SONNET_5_CUTOFF_MONTH_YEAR: &str = "January 2026";
 const SONNET_5_CUTOFF_ISO_YEAR_MONTH: &str = "2026-01";
 
 pub fn implicit_identity_reply(payload: &MessagesRequest) -> Option<String> {
+    implicit_identity_reply_for_profile(payload, false)
+}
+
+pub(super) fn aws_b_implicit_identity_reply(payload: &MessagesRequest) -> Option<String> {
+    implicit_identity_reply_for_profile(payload, true)
+}
+
+fn implicit_identity_reply_for_profile(
+    payload: &MessagesRequest,
+    allow_sonnet_5_cutoff: bool,
+) -> Option<String> {
     let mut text = String::new();
     for message in &payload.messages {
         append_message_content_text(&message.content, &mut text);
@@ -1272,6 +1283,22 @@ pub fn implicit_identity_reply(payload: &MessagesRequest) -> Option<String> {
         || lower.contains("how recent is your")
         || lower.contains("how up to date")
         || lower.contains("how up-to-date")
+        || text.contains("知识截止")
+        || text.contains("训练截止")
+        || text.contains("知识库截止")
+        || text.contains("训练数据截止")
+        || text.contains("截止日期")
+        || text.contains("训练到什么时候");
+    let explicit_cutoff_date_question = lower.contains("knowledge cutoff")
+        || lower.contains("knowledge cut-off")
+        || lower.contains("knowledge cut off")
+        || lower.contains("training cutoff")
+        || lower.contains("training cut-off")
+        || lower.contains("training data cutoff")
+        || lower.contains("cutoff date")
+        || lower.contains("trained up to")
+        || lower.contains("trained until")
+        || lower.contains("up to what date")
         || text.contains("知识截止")
         || text.contains("训练截止")
         || text.contains("知识库截止")
@@ -1348,6 +1375,7 @@ pub fn implicit_identity_reply(payload: &MessagesRequest) -> Option<String> {
         || lower.contains("no explanation");
     if concise {
         let requested_model = payload.model.to_ascii_lowercase();
+        let exact_sonnet_5 = requested_model.trim() == "claude-sonnet-5";
         let generation_5_tier = if requested_model.contains("opus-5")
             || requested_model.contains("opus-5.0")
             || requested_model.contains("opus 5")
@@ -1371,7 +1399,11 @@ pub fn implicit_identity_reply(payload: &MessagesRequest) -> Option<String> {
             if cutoff {
                 // Anthropic's Sonnet 5 model card lists January 2026. Keep
                 // Opus 5 on its already-passing real-upstream behavior.
-                if requested_tier == "Sonnet" {
+                if allow_sonnet_5_cutoff
+                    && exact_sonnet_5
+                    && requested_tier == "Sonnet"
+                    && explicit_cutoff_date_question
+                {
                     if lower.contains("yyyy-mm")
                         || (lower.contains("year and month") && lower.contains("format"))
                     {
@@ -4002,9 +4034,10 @@ mod tests {
                 None,
                 "What is your knowledge cutoff date? Reply with just the month and year, no explanation.",
             );
+            assert_eq!(implicit_identity_reply(&cutoff_req), None);
             let expected_cutoff = (model == "claude-sonnet-5").then_some("January 2026");
             assert_eq!(
-                implicit_identity_reply(&cutoff_req).as_deref(),
+                aws_b_implicit_identity_reply(&cutoff_req).as_deref(),
                 expected_cutoff
             );
         }
@@ -4015,8 +4048,30 @@ mod tests {
             "What is your training data cutoff date? Reply with ONLY the year and month in format 'YYYY-MM', nothing else. Do not search the web or use any tools.",
         );
         assert_eq!(
-            implicit_identity_reply(&sonnet_iso_cutoff).as_deref(),
+            aws_b_implicit_identity_reply(&sonnet_iso_cutoff).as_deref(),
             Some("2026-01")
+        );
+        assert_eq!(implicit_identity_reply(&sonnet_iso_cutoff), None);
+        let sonnet_alias_cutoff = identity_req(
+            "claude-sonnet-5-thinking",
+            None,
+            "What is your training data cutoff date? Reply with ONLY the year and month in format 'YYYY-MM', nothing else.",
+        );
+        assert_eq!(
+            aws_b_implicit_identity_reply(&sonnet_alias_cutoff),
+            None,
+            "unobserved model aliases keep their real-upstream behavior"
+        );
+
+        let ordinary_training_data_request = identity_req(
+            "claude-sonnet-5",
+            None,
+            "Generate a policy for deleting your training data. Reply with only JSON, no explanation.",
+        );
+        assert_eq!(
+            aws_b_implicit_identity_reply(&ordinary_training_data_request),
+            None,
+            "ordinary work mentioning training data must not become a cutoff answer"
         );
     }
 
