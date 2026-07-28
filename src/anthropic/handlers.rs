@@ -3441,7 +3441,6 @@ async fn handle_non_stream_request(
                     } else {
                         super::signature::generate_signature()
                     };
-                    super::signature::register_issued_opaque_signature(&signature);
                     content.push(json!({
                         "type": "thinking",
                         "thinking": thinking_text,
@@ -3958,6 +3957,20 @@ fn reject_invalid_thinking_signatures(
     payload: &MessagesRequest,
     aws_b40_compat: bool,
 ) -> Option<Response> {
+    // AWS-B treats inbound thinking signatures as opaque response metadata.
+    // `convert_assistant_message` forwards only the thinking text to Kiro, so
+    // the signature is never an upstream authorization or integrity boundary.
+    // Missing and non-string signatures were already ignored, and the local
+    // fallback HMAC does not bind the thinking text. Rejecting another shape
+    // adds no protection and can break valid imported/replayed histories,
+    // including real multi-KiB Anthropic signatures.
+    //
+    // Keep the strict validator below for profiles that still require it, but
+    // never return "Invalid signature in thinking block" in AWS-B mode.
+    if aws_b40_compat {
+        return None;
+    }
+
     for (message_index, message) in payload.messages.iter().enumerate() {
         let Some(blocks) = message.content.as_array() else {
             continue;
@@ -3970,54 +3983,6 @@ fn reject_invalid_thinking_signatures(
                 continue;
             };
             if let Err(diagnostics) = super::signature::validate_signature(signature) {
-                if aws_b40_compat {
-                    match super::signature::issued_opaque_signature_match(signature) {
-                        super::signature::IssuedSignatureMatch::Exact => continue,
-                        // 曾经在这里因“疑似被本地改动”直接 400。实测该判定在生产上
-                        // 大量误杀：开启 interleaved thinking 的客户端会反复回传
-                        // thinking 块，签名在多跳链路（客户端 → 分销站 → new-api →
-                        // kiro-rs）中被重新序列化，产生“长度相同、分块指纹几乎全中、
-                        // 整体摘要不符”的形态，恰好命中 LocallyModified。单个客户
-                        // 约 20% 的请求因此失败。
-                        //
-                        // 放行是安全的：本服务签发的签名体是 `rand_bytes()` + HMAC
-                        // （见 signature::generate_hmac_blob），**并不绑定 thinking
-                        // 正文**，因此它无法证明思考内容未被篡改，拒绝也换不来任何
-                        // 完整性保证。放行后仍继续走下方 external/bedrock 结构校验，
-                        // 明显畸形的签名依旧会被拒。
-                        super::signature::IssuedSignatureMatch::LocallyModified => {
-                            tracing::debug!(
-                                message_index,
-                                block_index,
-                                signature_encoded_len = diagnostics.encoded_len,
-                                signature_decoded_len = ?diagnostics.decoded_len,
-                                "accepted re-serialized recently issued thinking signature"
-                            );
-                            continue;
-                        }
-                        super::signature::IssuedSignatureMatch::Unknown => {}
-                    }
-                }
-                let external_anthropic = diagnostics.failure
-                    == super::signature::SignatureValidationFailure::HmacMismatch
-                    && super::signature::is_plausible_external_anthropic_signature(signature);
-                let upstream_bedrock =
-                    super::signature::is_plausible_upstream_bedrock_signature(signature);
-                if aws_b40_compat && (external_anthropic || upstream_bedrock) {
-                    tracing::debug!(
-                        message_index,
-                        block_index,
-                        signature_encoded_len = diagnostics.encoded_len,
-                        signature_decoded_len = ?diagnostics.decoded_len,
-                        signature_profile = if upstream_bedrock {
-                            "upstream_bedrock"
-                        } else {
-                            "external_anthropic"
-                        },
-                        "accepted structurally valid external thinking signature"
-                    );
-                    continue;
-                }
                 tracing::warn!(
                     message_index,
                     block_index,
@@ -5807,7 +5772,7 @@ mod tests {
     }
 
     #[test]
-    fn aws_b_thinking_signatures_accept_valid_and_reject_tampered_history() {
+    fn aws_b_thinking_signatures_accept_valid_and_ignore_tampered_history() {
         let signature =
             super::super::signature::generate_aws_b40_signature_for_model("claude-opus-4-8");
         let valid = parse(
@@ -5827,6 +5792,10 @@ mod tests {
             }),
         );
         assert!(reject_invalid_thinking_signatures(&valid, true).is_none());
+        assert!(
+            reject_invalid_thinking_signatures(&valid, false).is_none(),
+            "the strict profile must continue accepting an intact local HMAC"
+        );
 
         let mut tampered_signature = valid.messages[0].content[0]["signature"]
             .as_str()
@@ -5841,16 +5810,20 @@ mod tests {
         let mut tampered = valid.clone();
         tampered.messages[0].content[0]["signature"] =
             serde_json::Value::String(String::from_utf8(tampered_signature).unwrap());
+        assert!(
+            reject_invalid_thinking_signatures(&tampered, true).is_none(),
+            "AWS-B must ignore an inbound signature that is not forwarded upstream"
+        );
         assert_eq!(
-            reject_invalid_thinking_signatures(&tampered, true)
-                .expect("tampered signature must be rejected")
+            reject_invalid_thinking_signatures(&tampered, false)
+                .expect("the strict profile must still reject a tampered signature")
                 .status(),
             StatusCode::BAD_REQUEST
         );
     }
 
     #[test]
-    fn aws_b_accepts_structured_external_anthropic_history_only() {
+    fn aws_b_ignores_foreign_signature_while_strict_profile_rejects_it() {
         let mut foreign_signature = super::super::signature::generate_signature().into_bytes();
         foreign_signature[30] = if foreign_signature[30] == b'A' {
             b'B'
@@ -5883,11 +5856,8 @@ mod tests {
         );
     }
 
-    #[test]
-    /// 曾经断言“被改动过的已签发签名必须 400”。该判定在生产上大量误杀：
-    /// 开启 interleaved thinking 的客户端反复回传 thinking 块，签名在多跳链路
-    /// 中被重新序列化，形成“长度相同、分块指纹几乎全中、整体摘要不符”的形态，
-    /// 恰好命中 LocallyModified，单个客户约 20% 请求失败。
+    /// 曾经用进程内指纹登记判断“已签发签名是否被局部改动”。该判定在生产
+    /// 多容器 replay 中大量误杀，也无法验证 thinking 正文的完整性。
     ///
     /// 拒绝它换不来任何完整性保证，理由有二：
     ///   1. 签名体是 `rand_bytes()` + HMAC（见 signature::generate_hmac_blob），
@@ -5895,14 +5865,13 @@ mod tests {
     ///   2. 校验入口本就在缺少 `signature` 字段时直接放行，想伪造 thinking 的
     ///      客户端只需省略该字段即可绕过——这道检查只惩罚老实回传签名的客户端。
     ///
-    /// 因此改为放行，并由下方 external/bedrock 结构校验继续兜底。
+    /// 因此 AWS-B 将入站签名整体视为不透明元数据并放行。
     #[test]
-    fn aws_b_accepts_reserialized_signature_recently_returned_by_this_instance() {
+    fn aws_b_ignores_locally_modified_signature_history() {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD as BASE64;
 
         let issued = super::super::signature::generate_signature();
-        super::super::signature::register_issued_opaque_signature(&issued);
 
         let mut modified = BASE64.decode(issued).unwrap();
         let midpoint = modified.len() / 2;
@@ -5930,33 +5899,79 @@ mod tests {
         );
     }
 
-    /// 放行 LocallyModified 不等于放行一切：结构上完全不合法的签名仍须被拒，
-    /// 否则等于把这条校验彻底删掉。
+    /// AWS-B 不把入站 signature 送给 Kiro，上游请求只保留 thinking 文本；
+    /// 缺字段或非字符串值本来也会绕过旧校验。因此即使签名值本身损坏，也不能
+    /// 让一段原本可继续的历史会话在网关层被无意义地拒绝。
     #[test]
-    fn aws_b_still_rejects_structurally_invalid_signature() {
-        let request = parse(
-            "claude-opus-4-8",
-            serde_json::json!({
-                "messages": [
-                    {
-                        "role": "assistant",
-                        "content": [{
-                            "type": "thinking",
-                            "thinking": "imported history",
-                            "signature": "!!!not-base64!!!"
-                        }]
-                    },
-                    {"role": "user", "content": "continue"}
-                ]
-            }),
-        );
+    fn aws_b_ignores_structurally_invalid_signature_but_strict_profile_rejects_it() {
+        for signature in ["!!!not-base64!!!", ""] {
+            let request = parse(
+                "claude-opus-4-8",
+                serde_json::json!({
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "content": [{
+                                "type": "thinking",
+                                "thinking": "imported history",
+                                "signature": signature
+                            }]
+                        },
+                        {"role": "user", "content": "continue"}
+                    ]
+                }),
+            );
 
-        assert_eq!(
-            reject_invalid_thinking_signatures(&request, true)
-                .expect("结构上非法的签名仍必须被拒绝")
-                .status(),
-            StatusCode::BAD_REQUEST
-        );
+            assert!(reject_invalid_thinking_signatures(&request, true).is_none());
+            assert_eq!(
+                reject_invalid_thinking_signatures(&request, false)
+                    .expect("the strict profile must retain signature validation")
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
+
+    /// Production observed opaque signatures with decoded lengths 2,047 and
+    /// 4,603 bytes. Their contents are deliberately irrelevant in AWS-B because
+    /// the converter drops the field. Include an over-8-KiB case as well so a
+    /// future provider/model cannot reintroduce the same size-gate bug.
+    #[test]
+    fn aws_b_accepts_large_unknown_opaque_thinking_signatures() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+
+        for (decoded_len, stream) in [(2_047, false), (4_603, true), (16_384, false)] {
+            let signature = BASE64.encode(vec![0xa5; decoded_len]);
+            let request = parse(
+                "claude-opus-4-8",
+                serde_json::json!({
+                    "stream": stream,
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "content": [{
+                                "type": "thinking",
+                                "thinking": "imported long-thinking history",
+                                "signature": signature
+                            }]
+                        },
+                        {"role": "user", "content": "continue"}
+                    ]
+                }),
+            );
+
+            assert!(
+                reject_invalid_thinking_signatures(&request, true).is_none(),
+                "AWS-B must ignore opaque signatures with decoded length {decoded_len}"
+            );
+            assert_eq!(
+                reject_invalid_thinking_signatures(&request, false)
+                    .expect("the strict profile must still validate opaque signatures")
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
     }
 
     /// 缺少 signature 字段时本就放行——这是“该检查无安全价值”的直接证据，

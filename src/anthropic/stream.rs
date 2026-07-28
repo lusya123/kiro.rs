@@ -1989,7 +1989,6 @@ impl StreamContext {
         } else {
             super::signature::generate_signature()
         };
-        super::signature::register_issued_opaque_signature(&signature);
         SseEvent::new(
             "content_block_delta",
             json!({

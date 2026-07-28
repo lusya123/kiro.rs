@@ -303,8 +303,8 @@ pub struct ContentBlock {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
-    /// Thinking 块签名（Anthropic 协议字段）。kiro-rs 会验证自己签发的
-    /// 无状态 HMAC 签名；通过后仍由 converter 在转发前移除，不会传给 Kiro 上游。
+    /// Thinking 块签名（Anthropic 协议字段）。AWS-B 将入站值视为不透明
+    /// 历史元数据；converter 在转发前移除，不会传给 Kiro 上游。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
