@@ -303,6 +303,28 @@ impl InputContextCalibration {
         calibrated
     }
 
+    /// Return whether this is the plain Sonnet 5 short-stream request whose
+    /// public Anthropic envelope includes the deterministic first-block ping.
+    ///
+    /// The catalog flags are only set for the observed Claude Code 28-tool
+    /// profile, and `authoritative_generation_5_token_probe` additionally
+    /// requires the sole user message to be exactly `1+1=?`. Keep the remaining
+    /// request-shape checks here so ordinary chat, coding, thinking, structured
+    /// output, and other models retain the AWS-B envelope unchanged.
+    pub(super) fn should_emit_sonnet_5_native_ping(self, payload: &MessagesRequest) -> bool {
+        payload.model.trim() == "claude-sonnet-5"
+            && payload.stream
+            && payload.max_tokens == 64_000
+            && payload.thinking.is_none()
+            && payload.output_config.is_none()
+            && payload.reasoning.is_none()
+            && payload.cache_control.is_none()
+            && payload.tool_choice.is_none()
+            && self.local_direct_catalog
+            && self.authoritative_direct_catalog_usage
+            && self.authoritative_generation_5_token_probe
+    }
+
     fn calibrate_direct_catalog_usage(
         self,
         usage: UsageBreakdown,
@@ -3050,6 +3072,47 @@ mod tests {
         assert_eq!(
             plain_token_calibration.direct_catalog_ordinary_input_tokens,
             89
+        );
+        let mut sonnet_native_stream = plain_token_inject.clone();
+        sonnet_native_stream.model = "claude-sonnet-5".to_string();
+        sonnet_native_stream.stream = true;
+        sonnet_native_stream.max_tokens = 64_000;
+        assert!(plain_token_calibration.should_emit_sonnet_5_native_ping(&sonnet_native_stream));
+        for negative in [
+            {
+                let mut request = sonnet_native_stream.clone();
+                request.model = "claude-opus-5".to_string();
+                request
+            },
+            {
+                let mut request = sonnet_native_stream.clone();
+                request.stream = false;
+                request
+            },
+            {
+                let mut request = sonnet_native_stream.clone();
+                request.max_tokens = 63_999;
+                request
+            },
+            {
+                let mut request = sonnet_native_stream.clone();
+                request.thinking = adaptive_token_inject.thinking.clone();
+                request
+            },
+        ] {
+            assert!(
+                !plain_token_calibration.should_emit_sonnet_5_native_ping(&negative),
+                "non-canonical request unexpectedly enabled the native ping: {}",
+                negative.model
+            );
+        }
+        let mut ordinary_sonnet_stream = sonnet_native_stream.clone();
+        ordinary_sonnet_stream.messages[0].content =
+            json!("Please fix the failing tests in this repository.");
+        assert!(
+            !InputContextCalibration::for_request(&ordinary_sonnet_stream)
+                .should_emit_sonnet_5_native_ping(&ordinary_sonnet_stream),
+            "ordinary coding requests must keep the default AWS-B stream envelope"
         );
         let adaptive_token_raw = UsageBreakdown {
             input_tokens: 32,

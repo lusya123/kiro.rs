@@ -2609,6 +2609,8 @@ pub async fn post_messages(
     } else {
         super::bedrock::InputContextCalibration::default()
     };
+    let emit_sonnet_5_native_ping =
+        aws_b40_compat && input_context_calibration.should_emit_sonnet_5_native_ping(&payload);
 
     if let Some(response) =
         compat_direct_response(&payload, initial_usage_breakdown, aws_b40_compat)
@@ -2655,6 +2657,7 @@ pub async fn post_messages(
             aws_b40_compat,
             aws_b40_adaptive_signature,
             aws_b40_thinking_requested,
+            emit_sonnet_5_native_ping,
         )
         .await
     } else {
@@ -2704,6 +2707,7 @@ async fn handle_stream_request(
     aws_b40_compat: bool,
     aws_b40_adaptive_signature: bool,
     aws_b40_thinking_requested: bool,
+    emit_sonnet_5_native_ping: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let upstream_started = Instant::now();
@@ -2726,6 +2730,9 @@ async fn handle_stream_request(
         ctx.set_aws_b40_thinking_requested(aws_b40_thinking_requested);
         ctx.set_thinking_text_visible(thinking_wants_summary);
         ctx.set_input_context_calibration(input_context_calibration);
+        if emit_sonnet_5_native_ping {
+            ctx.set_emit_initial_ping(true);
+        }
     }
     ctx.set_upstream_request_latency(upstream_request_latency);
     // tool_choice 强制工具(any/tool):只发 tool_use,抑制夹带的解释性文本。
@@ -5282,6 +5289,8 @@ pub async fn post_messages_cc(
     } else {
         super::bedrock::InputContextCalibration::default()
     };
+    let emit_sonnet_5_native_ping =
+        aws_b40_compat && input_context_calibration.should_emit_sonnet_5_native_ping(&payload);
 
     if let Some(response) =
         compat_direct_response(&payload, initial_usage_breakdown, aws_b40_compat)
@@ -5328,6 +5337,7 @@ pub async fn post_messages_cc(
             aws_b40_compat,
             aws_b40_adaptive_signature,
             aws_b40_thinking_requested,
+            emit_sonnet_5_native_ping,
         )
         .await
     } else {
@@ -5380,6 +5390,7 @@ async fn handle_stream_request_buffered(
     aws_b40_compat: bool,
     aws_b40_adaptive_signature: bool,
     aws_b40_thinking_requested: bool,
+    emit_sonnet_5_native_ping: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let upstream_started = Instant::now();
@@ -5402,6 +5413,9 @@ async fn handle_stream_request_buffered(
         ctx.set_aws_b40_thinking_requested(aws_b40_thinking_requested);
         ctx.set_thinking_text_visible(thinking_wants_summary);
         ctx.set_input_context_calibration(input_context_calibration);
+        if emit_sonnet_5_native_ping {
+            ctx.set_emit_initial_ping(true);
+        }
     }
     ctx.set_upstream_request_latency(upstream_request_latency);
     ctx.set_suppress_text_blocks(force_tool_only);

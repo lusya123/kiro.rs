@@ -996,6 +996,10 @@ impl StreamContext {
         self.aws_b40_thinking_requested = requested;
     }
 
+    pub fn set_emit_initial_ping(&mut self, emit: bool) {
+        self.state_manager.set_emit_initial_ping(emit);
+    }
+
     pub fn set_input_context_calibration(
         &mut self,
         calibration: super::bedrock::InputContextCalibration,
@@ -2955,6 +2959,10 @@ impl BufferedStreamContext {
         self.inner.set_aws_b40_thinking_requested(requested);
     }
 
+    pub fn set_emit_initial_ping(&mut self, emit: bool) {
+        self.inner.set_emit_initial_ping(emit);
+    }
+
     pub fn set_input_context_calibration(
         &mut self,
         calibration: super::bedrock::InputContextCalibration,
@@ -3204,6 +3212,66 @@ mod tests {
         assert_eq!(reconstructed, thinking);
         assert_eq!(ctx.thinking_text_acc, thinking);
         assert_eq!(ctx.thinking_tokens, estimate_tokens(thinking));
+    }
+
+    #[test]
+    fn aws_b_explicit_native_ping_is_after_the_first_content_block_start() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-5",
+            34_403,
+            false,
+            super::super::cache::UsageBreakdown {
+                input_tokens: 89,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 34_314,
+                cache_creation_5m_input_tokens: 34_314,
+                cache_creation_1h_input_tokens: 0,
+            },
+            HashMap::new(),
+        );
+        ctx.enable_aws_b40_compat(false);
+        ctx.set_emit_initial_ping(true);
+
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_assistant_response("2"));
+        events.extend(ctx.generate_final_events());
+        let event_types = events
+            .iter()
+            .map(|event| event.event.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            event_types,
+            [
+                "message_start",
+                "content_block_start",
+                "ping",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop"
+            ]
+        );
+        assert_eq!(
+            events.iter().filter(|event| event.event == "ping").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn aws_b_default_stream_still_omits_the_initial_ping() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-5",
+            12,
+            false,
+            super::super::cache::UsageBreakdown::flat(12),
+            HashMap::new(),
+        );
+        ctx.enable_aws_b40_compat(false);
+        let _ = ctx.generate_initial_events();
+        let events = ctx.process_assistant_response("normal response");
+
+        assert!(events.iter().all(|event| event.event != "ping"));
     }
 
     #[test]
