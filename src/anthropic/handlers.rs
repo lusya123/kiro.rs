@@ -3973,19 +3973,27 @@ fn reject_invalid_thinking_signatures(
                 if aws_b40_compat {
                     match super::signature::issued_opaque_signature_match(signature) {
                         super::signature::IssuedSignatureMatch::Exact => continue,
+                        // 曾经在这里因“疑似被本地改动”直接 400。实测该判定在生产上
+                        // 大量误杀：开启 interleaved thinking 的客户端会反复回传
+                        // thinking 块，签名在多跳链路（客户端 → 分销站 → new-api →
+                        // kiro-rs）中被重新序列化，产生“长度相同、分块指纹几乎全中、
+                        // 整体摘要不符”的形态，恰好命中 LocallyModified。单个客户
+                        // 约 20% 的请求因此失败。
+                        //
+                        // 放行是安全的：本服务签发的签名体是 `rand_bytes()` + HMAC
+                        // （见 signature::generate_hmac_blob），**并不绑定 thinking
+                        // 正文**，因此它无法证明思考内容未被篡改，拒绝也换不来任何
+                        // 完整性保证。放行后仍继续走下方 external/bedrock 结构校验，
+                        // 明显畸形的签名依旧会被拒。
                         super::signature::IssuedSignatureMatch::LocallyModified => {
-                            tracing::warn!(
+                            tracing::debug!(
                                 message_index,
                                 block_index,
                                 signature_encoded_len = diagnostics.encoded_len,
                                 signature_decoded_len = ?diagnostics.decoded_len,
-                                "rejected modified recently issued thinking signature"
+                                "accepted re-serialized recently issued thinking signature"
                             );
-                            let message = format!(
-                                "messages.{}.content.{}: Invalid signature in thinking block",
-                                message_index, block_index
-                            );
-                            return Some(thinking_error_response(payload.stream, message));
+                            continue;
                         }
                         super::signature::IssuedSignatureMatch::Unknown => {}
                     }
@@ -5876,7 +5884,20 @@ mod tests {
     }
 
     #[test]
-    fn aws_b_rejects_modified_signature_recently_returned_by_this_instance() {
+    /// 曾经断言“被改动过的已签发签名必须 400”。该判定在生产上大量误杀：
+    /// 开启 interleaved thinking 的客户端反复回传 thinking 块，签名在多跳链路
+    /// 中被重新序列化，形成“长度相同、分块指纹几乎全中、整体摘要不符”的形态，
+    /// 恰好命中 LocallyModified，单个客户约 20% 请求失败。
+    ///
+    /// 拒绝它换不来任何完整性保证，理由有二：
+    ///   1. 签名体是 `rand_bytes()` + HMAC（见 signature::generate_hmac_blob），
+    ///      **不绑定 thinking 正文**，无法证明思考内容未被篡改；
+    ///   2. 校验入口本就在缺少 `signature` 字段时直接放行，想伪造 thinking 的
+    ///      客户端只需省略该字段即可绕过——这道检查只惩罚老实回传签名的客户端。
+    ///
+    /// 因此改为放行，并由下方 external/bedrock 结构校验继续兜底。
+    #[test]
+    fn aws_b_accepts_reserialized_signature_recently_returned_by_this_instance() {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD as BASE64;
 
@@ -5903,12 +5924,59 @@ mod tests {
             }),
         );
 
+        assert!(
+            reject_invalid_thinking_signatures(&request, true).is_none(),
+            "重新序列化的已签发签名应放行，不应再返回 400"
+        );
+    }
+
+    /// 放行 LocallyModified 不等于放行一切：结构上完全不合法的签名仍须被拒，
+    /// 否则等于把这条校验彻底删掉。
+    #[test]
+    fn aws_b_still_rejects_structurally_invalid_signature() {
+        let request = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "thinking",
+                            "thinking": "imported history",
+                            "signature": "!!!not-base64!!!"
+                        }]
+                    },
+                    {"role": "user", "content": "continue"}
+                ]
+            }),
+        );
+
         assert_eq!(
             reject_invalid_thinking_signatures(&request, true)
-                .expect("a modified issued signature must be rejected")
+                .expect("结构上非法的签名仍必须被拒绝")
                 .status(),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    /// 缺少 signature 字段时本就放行——这是“该检查无安全价值”的直接证据，
+    /// 固化下来避免以后有人误以为它能防伪造。
+    #[test]
+    fn aws_b_accepts_thinking_block_without_signature() {
+        let request = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "thinking", "thinking": "no signature at all"}]
+                    },
+                    {"role": "user", "content": "continue"}
+                ]
+            }),
+        );
+
+        assert!(reject_invalid_thinking_signatures(&request, true).is_none());
     }
 
     #[test]
