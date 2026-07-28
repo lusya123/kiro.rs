@@ -2793,7 +2793,7 @@ fn create_ping_sse(aws_b40_compat: bool) -> Bytes {
     ))
 }
 
-const NATIVE_SSE_FLUSH_DELAY: Duration = Duration::from_millis(9);
+const NATIVE_SSE_FLUSH_DELAY: Duration = Duration::from_millis(25);
 
 fn native_sse_flush_delay(event_type: &str, use_native_stream_envelope: bool) -> Option<Duration> {
     (use_native_stream_envelope && matches!(event_type, "content_block_delta" | "message_delta"))
