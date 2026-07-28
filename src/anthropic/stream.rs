@@ -1241,11 +1241,13 @@ impl StreamContext {
 
         // message_start
         let msg_start = self.create_message_start_event();
+        let mut message_started_now = false;
         if let Some(event) = self.state_manager.handle_message_start(msg_start) {
             events.push(event);
+            message_started_now = true;
         }
 
-        if self.native_anthropic_stream_envelope {
+        if self.native_anthropic_stream_envelope && message_started_now {
             // The strictly gated native Sonnet probe exposes its initial text
             // block together with message_start and ping in one transport
             // frame. Pre-opening the block here lets the wire layer serialize
@@ -1268,7 +1270,7 @@ impl StreamContext {
             return events;
         }
 
-        // 首块一律惰性创建:不在这里急切发出空文本块。
+        // 其余请求首块一律惰性创建:不在这里急切发出空文本块。
         // 首个真实内容到达时才创建对应的首块——
         //   文本 -> emit_text_delta_events 会创建 text 块;
         //   工具 -> process_tool_use 创建 tool_use 块;
@@ -3502,6 +3504,10 @@ mod tests {
         assert_eq!(usage["output_tokens"], 1);
         assert_eq!(usage["inference_geo"], "global");
 
+        assert!(
+            ctx.generate_initial_events().is_empty(),
+            "repeated initial generation must remain idempotent"
+        );
         let first_content = ctx.process_assistant_response("1+1=2");
         assert_eq!(
             first_content
@@ -3509,6 +3515,14 @@ mod tests {
                 .map(|event| event.event.as_str())
                 .collect::<Vec<_>>(),
             ["content_block_delta"]
+        );
+        let final_events = ctx.generate_final_events();
+        assert_eq!(
+            final_events
+                .iter()
+                .filter(|event| event.event == "content_block_stop")
+                .count(),
+            1
         );
     }
 

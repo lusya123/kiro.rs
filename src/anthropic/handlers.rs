@@ -5882,30 +5882,33 @@ mod tests {
             ]
         );
 
-        let ordinary_initial = create_initial_wire_event_stream(
-            ["message_start", "content_block_start", "ping"]
-                .into_iter()
-                .map(test_sse_event)
-                .collect(),
-            true,
-            false,
-        )
-        .map(Result::unwrap)
-        .collect::<Vec<_>>()
-        .await;
-        let ordinary_final = create_wire_event_stream(
-            ["content_block_stop", "message_delta", "message_stop"]
-                .into_iter()
-                .map(test_sse_event)
-                .collect(),
-            true,
-            false,
-        )
-        .map(Result::unwrap)
-        .collect::<Vec<_>>()
-        .await;
-        assert_eq!(ordinary_initial.len(), 3);
-        assert_eq!(ordinary_final.len(), 3);
+        let ordinary_initial_events = ["message_start", "content_block_start", "ping"]
+            .into_iter()
+            .map(test_sse_event)
+            .collect::<Vec<_>>();
+        let expected_ordinary_initial = ordinary_initial_events
+            .iter()
+            .map(|event| Bytes::from(event.to_wire_sse_string(true, false)))
+            .collect::<Vec<_>>();
+        let ordinary_initial =
+            create_initial_wire_event_stream(ordinary_initial_events, true, false)
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+                .await;
+        let ordinary_final_events = ["content_block_stop", "message_delta", "message_stop"]
+            .into_iter()
+            .map(test_sse_event)
+            .collect::<Vec<_>>();
+        let expected_ordinary_final = ordinary_final_events
+            .iter()
+            .map(|event| Bytes::from(event.to_wire_sse_string(true, false)))
+            .collect::<Vec<_>>();
+        let ordinary_final = create_wire_event_stream(ordinary_final_events, true, false)
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(ordinary_initial, expected_ordinary_initial);
+        assert_eq!(ordinary_final, expected_ordinary_final);
         assert!(
             ordinary_initial
                 .iter()
