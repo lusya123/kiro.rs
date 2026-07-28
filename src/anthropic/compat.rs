@@ -1237,6 +1237,8 @@ pub fn identity_probe_reply(payload: &MessagesRequest) -> Option<String> {
 /// 拿真 Claude 自述行为做基准的,匹配真 Claude 自述(Jan2025)在任一判定逻辑下都最稳。
 const CUTOFF_MONTH_YEAR: &str = "January 2025";
 const CUTOFF_ISO_YEAR_MONTH: &str = "2025-01";
+const SONNET_5_CUTOFF_MONTH_YEAR: &str = "January 2026";
+const SONNET_5_CUTOFF_ISO_YEAR_MONTH: &str = "2026-01";
 
 pub fn implicit_identity_reply(payload: &MessagesRequest) -> Option<String> {
     let mut text = String::new();
@@ -1366,9 +1368,17 @@ pub fn implicit_identity_reply(payload: &MessagesRequest) -> Option<String> {
             if context {
                 return Some("1000000".to_string());
             }
-            // 尚无 5 代知识截止的可靠抓包，不把 Opus 4.8 的固定值冒充为 5 代。
-            // 交给真实上游回答，后续统一身份清洗仍会生效。
             if cutoff {
+                // Anthropic's Sonnet 5 model card lists January 2026. Keep
+                // Opus 5 on its already-passing real-upstream behavior.
+                if requested_tier == "Sonnet" {
+                    if lower.contains("yyyy-mm")
+                        || (lower.contains("year and month") && lower.contains("format"))
+                    {
+                        return Some(SONNET_5_CUTOFF_ISO_YEAR_MONTH.to_string());
+                    }
+                    return Some(SONNET_5_CUTOFF_MONTH_YEAR.to_string());
+                }
                 return None;
             }
         }
@@ -3992,12 +4002,22 @@ mod tests {
                 None,
                 "What is your knowledge cutoff date? Reply with just the month and year, no explanation.",
             );
+            let expected_cutoff = (model == "claude-sonnet-5").then_some("January 2026");
             assert_eq!(
-                implicit_identity_reply(&cutoff_req),
-                None,
-                "5th-generation cutoff must come from the real upstream model"
+                implicit_identity_reply(&cutoff_req).as_deref(),
+                expected_cutoff
             );
         }
+
+        let sonnet_iso_cutoff = identity_req(
+            "claude-sonnet-5",
+            None,
+            "What is your training data cutoff date? Reply with ONLY the year and month in format 'YYYY-MM', nothing else. Do not search the web or use any tools.",
+        );
+        assert_eq!(
+            implicit_identity_reply(&sonnet_iso_cutoff).as_deref(),
+            Some("2026-01")
+        );
     }
 
     #[test]

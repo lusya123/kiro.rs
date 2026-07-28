@@ -6526,6 +6526,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aws_b_sonnet_5_concise_cutoff_matches_model_card() {
+        let req = parse(
+            "claude-sonnet-5",
+            serde_json::json!({
+                "max_tokens": 256,
+                "stream": true,
+                "system": [
+                    {
+                        "type": "text",
+                        "text": "x-anthropic-billing-header: cc_version=2.1.153.9bd; cc_entrypoint=cli; cch=4e5a6;"
+                    },
+                    {
+                        "type": "text",
+                        "text": "You are Claude Code, Anthropic's official CLI for Claude."
+                    }
+                ],
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "What is your training data cutoff date? Reply with ONLY the year and month in format 'YYYY-MM', nothing else. Do not search the web or use any tools."
+                    }]
+                }]
+            }),
+        );
+        let response =
+            compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(62), true)
+                .expect("constrained Sonnet 5 cutoff should use the compatibility response");
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body")
+                .to_vec(),
+        )
+        .expect("UTF-8 SSE");
+
+        assert_eq!(streamed_text(&body), "2026-01");
+        assert!(body.contains("\"input_tokens\":62"));
+        assert!(body.contains("amazon-bedrock-invocationMetrics"));
+    }
+
+    #[tokio::test]
     async fn aws_b_concise_context_matches_reference_content_and_usage() {
         let req = parse(
             "claude-opus-4-8",

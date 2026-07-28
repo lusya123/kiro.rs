@@ -32,8 +32,13 @@ const KIRO_OPUS_48_DIRECT_CATALOG_MIN_BYTES: i32 = 60_000;
 const KIRO_OPUS_48_DIRECT_CATALOG_MAX_BYTES: i32 = 80_000;
 const KIRO_OPUS_48_DIRECT_CATALOG_ANCHOR_BYTES: i32 = 69_158;
 const KIRO_OPUS_48_DIRECT_CATALOG_CACHE_TOKENS: i32 = 34_250;
+const KIRO_OPUS_5_DIRECT_CATALOG_CACHE_TOKENS: i32 = 34_246;
+const KIRO_SONNET_5_DIRECT_CATALOG_CACHE_TOKENS: i32 = 34_314;
 const KIRO_OPUS_48_DIRECT_CATALOG_MIN_ESTIMATED_CACHE_TOKENS: i32 = 30_000;
 const KIRO_OPUS_48_DIRECT_CATALOG_MAX_ESTIMATED_CACHE_TOKENS: i32 = 45_000;
+const KIRO_OPUS_5_DIRECT_CATALOG_MAX_ESTIMATED_CACHE_TOKENS: i32 = 32_000;
+const KIRO_SONNET_5_DIRECT_CATALOG_MIN_ESTIMATED_CACHE_TOKENS: i32 = 28_000;
+const KIRO_SONNET_5_DIRECT_CATALOG_MAX_ESTIMATED_CACHE_TOKENS: i32 = 30_000;
 const KIRO_OPUS_48_DIRECT_CATALOG_SUFFIX_TOKENS: i32 = 68;
 const KIRO_OPUS_48_DIRECT_CATALOG_MIN_MESSAGE_TOKENS: i32 = 21;
 const KIRO_TOOL_DESCRIPTION_LIMIT_CHARS: usize = 10_000;
@@ -57,6 +62,47 @@ const TOOL_HISTORY_SCHEMA_BASE_TOKENS: i32 = 327;
 const TOOL_HISTORY_SCHEMA_NEXT_TOOL_TOKENS: i32 = 44;
 const TOOL_HISTORY_SCHEMA_VISIBLE_SCALE: f64 = 0.93;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirectCatalogUsageProfile {
+    anchor_cache_tokens: i32,
+    min_estimated_cache_tokens: i32,
+    max_estimated_cache_tokens: i32,
+    max_total_drift_basis_points: i64,
+    requires_short_message_profile: bool,
+}
+
+fn authoritative_direct_catalog_usage_profile(model: &str) -> Option<DirectCatalogUsageProfile> {
+    if super::compat::is_opus_4_8(model) {
+        return Some(DirectCatalogUsageProfile {
+            anchor_cache_tokens: KIRO_OPUS_48_DIRECT_CATALOG_CACHE_TOKENS,
+            min_estimated_cache_tokens: KIRO_OPUS_48_DIRECT_CATALOG_MIN_ESTIMATED_CACHE_TOKENS,
+            max_estimated_cache_tokens: KIRO_OPUS_48_DIRECT_CATALOG_MAX_ESTIMATED_CACHE_TOKENS,
+            max_total_drift_basis_points: 1_000,
+            requires_short_message_profile: false,
+        });
+    }
+
+    match model.trim().to_ascii_lowercase().as_str() {
+        "claude-opus-5" => Some(DirectCatalogUsageProfile {
+            anchor_cache_tokens: KIRO_OPUS_5_DIRECT_CATALOG_CACHE_TOKENS,
+            min_estimated_cache_tokens: KIRO_OPUS_48_DIRECT_CATALOG_MIN_ESTIMATED_CACHE_TOKENS,
+            max_estimated_cache_tokens: KIRO_OPUS_5_DIRECT_CATALOG_MAX_ESTIMATED_CACHE_TOKENS,
+            max_total_drift_basis_points: 1_000,
+            requires_short_message_profile: true,
+        }),
+        "claude-sonnet-5" => Some(DirectCatalogUsageProfile {
+            anchor_cache_tokens: KIRO_SONNET_5_DIRECT_CATALOG_CACHE_TOKENS,
+            min_estimated_cache_tokens: KIRO_SONNET_5_DIRECT_CATALOG_MIN_ESTIMATED_CACHE_TOKENS,
+            max_estimated_cache_tokens: KIRO_SONNET_5_DIRECT_CATALOG_MAX_ESTIMATED_CACHE_TOKENS,
+            // Same-request captures require 1025 basis points; 1024 rejects
+            // both the streaming and buffered Sonnet 5 token probes.
+            max_total_drift_basis_points: 1_025,
+            requires_short_message_profile: true,
+        }),
+        _ => None,
+    }
+}
+
 pub(super) const TOOL_PREAMBLE_HINT: &str = "Before calling a tool, first tell the user in one brief sentence what the tool call will do, then call the tool.";
 pub(super) const STRUCTURED_OUTPUT_INSTRUCTION_PREFIX: &str = "You must respond with ONLY a single valid JSON value that strictly conforms to the following JSON Schema. Output the raw JSON only — no explanations, no markdown code fences, no surrounding text.";
 
@@ -76,6 +122,7 @@ pub struct InputContextCalibration {
     local_direct_catalog: bool,
     direct_catalog_ordinary_input_tokens: i32,
     authoritative_direct_catalog_usage: bool,
+    authoritative_direct_catalog_short_message: bool,
 }
 
 impl InputContextCalibration {
@@ -130,6 +177,8 @@ impl InputContextCalibration {
                 .unwrap_or(0),
             authoritative_direct_catalog_usage: direct_catalog_ordinary_usage
                 .is_some_and(|usage| usage.authoritative_profile),
+            authoritative_direct_catalog_short_message: direct_catalog_ordinary_usage
+                .is_some_and(|usage| usage.uses_short_message_floor),
         }
     }
 
@@ -203,7 +252,13 @@ impl InputContextCalibration {
         model: &str,
         usage: UsageBreakdown,
     ) -> UsageBreakdown {
-        self.calibrate_direct_catalog_usage(model, usage)
+        if !super::compat::is_opus_4_8(model) {
+            return usage;
+        }
+        let Some(profile) = authoritative_direct_catalog_usage_profile(model) else {
+            return usage;
+        };
+        self.calibrate_direct_catalog_usage(usage, profile)
     }
 
     /// Reconcile the observed Claude Code catalog only after the real Kiro
@@ -223,8 +278,16 @@ impl InputContextCalibration {
         {
             return usage;
         }
+        let Some(profile) = authoritative_direct_catalog_usage_profile(model) else {
+            return usage;
+        };
+        if profile.requires_short_message_profile
+            && !self.authoritative_direct_catalog_short_message
+        {
+            return usage;
+        }
 
-        let calibrated = self.calibrate_direct_catalog_usage(model, usage);
+        let calibrated = self.calibrate_direct_catalog_usage(usage, profile);
         if calibrated == usage {
             return usage;
         }
@@ -232,26 +295,30 @@ impl InputContextCalibration {
         let observed_total = i64::from(usage.total().max(1));
         let calibrated_total = i64::from(calibrated.total().max(1));
         let drift = (observed_total - calibrated_total).abs();
-        if drift.saturating_mul(10_000) > observed_total.saturating_mul(1_000) {
+        if drift.saturating_mul(10_000)
+            > observed_total.saturating_mul(profile.max_total_drift_basis_points)
+        {
             return usage;
         }
 
         calibrated
     }
 
-    fn calibrate_direct_catalog_usage(self, model: &str, usage: UsageBreakdown) -> UsageBreakdown {
+    fn calibrate_direct_catalog_usage(
+        self,
+        usage: UsageBreakdown,
+        profile: DirectCatalogUsageProfile,
+    ) -> UsageBreakdown {
         let cached_tokens = usage
             .cache_read_input_tokens
             .saturating_add(usage.cache_creation_input_tokens);
         if !self.enabled
-            || !super::compat::is_opus_4_8(model)
             || !self.has_tools
             || self.tool_count != KIRO_OPUS_48_DIRECT_CATALOG_TOOL_COUNT
             || !self.local_direct_catalog
             || !(KIRO_OPUS_48_DIRECT_CATALOG_MIN_BYTES..=KIRO_OPUS_48_DIRECT_CATALOG_MAX_BYTES)
                 .contains(&self.serialized_tool_bytes)
-            || !(KIRO_OPUS_48_DIRECT_CATALOG_MIN_ESTIMATED_CACHE_TOKENS
-                ..=KIRO_OPUS_48_DIRECT_CATALOG_MAX_ESTIMATED_CACHE_TOKENS)
+            || !(profile.min_estimated_cache_tokens..=profile.max_estimated_cache_tokens)
                 .contains(&cached_tokens)
         {
             return usage;
@@ -270,7 +337,8 @@ impl InputContextCalibration {
         } else {
             magnitude.min(i32::MAX as u64) as i32
         };
-        let target_cached_tokens = KIRO_OPUS_48_DIRECT_CATALOG_CACHE_TOKENS
+        let target_cached_tokens = profile
+            .anchor_cache_tokens
             .saturating_add(token_delta)
             .max(1);
         let target_ordinary_input_tokens = if self.direct_catalog_ordinary_input_tokens > 0 {
@@ -398,6 +466,7 @@ fn direct_catalog_ordinary_input_tokens(
 struct DirectCatalogOrdinaryUsage {
     input_tokens: i32,
     authoritative_profile: bool,
+    uses_short_message_floor: bool,
 }
 
 fn direct_catalog_ordinary_usage(
@@ -445,6 +514,7 @@ fn direct_catalog_ordinary_usage(
         // the observed short-message envelope. Local compatibility responses
         // can still use the broader deterministic estimate.
         authoritative_profile,
+        uses_short_message_floor,
     })
 }
 
@@ -2829,6 +2899,7 @@ mod tests {
                 local_direct_catalog: false,
                 direct_catalog_ordinary_input_tokens: 0,
                 authoritative_direct_catalog_usage: false,
+                authoritative_direct_catalog_short_message: false,
             };
             let actual = calibration.calibrate("claude-opus-4-8", 30_000, Some(context_tokens));
             assert!(
@@ -3222,6 +3293,7 @@ mod tests {
             local_direct_catalog: true,
             direct_catalog_ordinary_input_tokens: 499,
             authoritative_direct_catalog_usage: false,
+            authoritative_direct_catalog_short_message: false,
         };
         let creation = UsageBreakdown {
             input_tokens: 532,
@@ -3281,6 +3353,187 @@ mod tests {
             unknown_profile.calibrate_local_direct_compat_usage("claude-opus-4-8", creation),
             creation,
             "an unrecognized client catalog cannot authorize local cache billing"
+        );
+    }
+
+    #[test]
+    fn authoritative_direct_catalog_usage_uses_narrow_generation_5_profiles() {
+        let calibration = InputContextCalibration {
+            enabled: true,
+            has_tools: true,
+            tool_count: KIRO_OPUS_48_DIRECT_CATALOG_TOOL_COUNT,
+            serialized_tool_bytes: KIRO_OPUS_48_DIRECT_CATALOG_ANCHOR_BYTES,
+            truncated_tool_input_tokens: 0,
+            descriptionless_tool_input_tokens: 0,
+            has_truncated_tool_descriptions: true,
+            local_direct_catalog: true,
+            direct_catalog_ordinary_input_tokens: 89,
+            authoritative_direct_catalog_usage: true,
+            authoritative_direct_catalog_short_message: true,
+        };
+        let cases = [
+            (
+                "claude-opus-5",
+                UsageBreakdown {
+                    input_tokens: 6_916,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 30_098,
+                    cache_creation_5m_input_tokens: 30_098,
+                    cache_creation_1h_input_tokens: 0,
+                },
+                KIRO_OPUS_5_DIRECT_CATALOG_CACHE_TOKENS,
+            ),
+            (
+                "claude-sonnet-5",
+                UsageBreakdown {
+                    input_tokens: 9_716,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 28_615,
+                    cache_creation_5m_input_tokens: 28_615,
+                    cache_creation_1h_input_tokens: 0,
+                },
+                KIRO_SONNET_5_DIRECT_CATALOG_CACHE_TOKENS,
+            ),
+            (
+                "claude-sonnet-5",
+                UsageBreakdown {
+                    input_tokens: 9_716,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 28_613,
+                    cache_creation_5m_input_tokens: 28_613,
+                    cache_creation_1h_input_tokens: 0,
+                },
+                KIRO_SONNET_5_DIRECT_CATALOG_CACHE_TOKENS,
+            ),
+        ];
+
+        for (model, raw, expected_cache) in cases {
+            assert_eq!(
+                calibration.calibrate_authoritative_direct_catalog_usage(model, raw, false),
+                raw,
+                "model={model}: a catalog shape without context authority must stay raw"
+            );
+            let calibrated =
+                calibration.calibrate_authoritative_direct_catalog_usage(model, raw, true);
+            assert_eq!(calibrated.input_tokens, 89, "model={model}");
+            assert_eq!(
+                calibrated.cache_creation_input_tokens, expected_cache,
+                "model={model}"
+            );
+            assert_eq!(
+                calibrated.cache_creation_5m_input_tokens, expected_cache,
+                "model={model}"
+            );
+            assert_eq!(calibrated.total(), 89 + expected_cache, "model={model}");
+
+            let read_raw = UsageBreakdown {
+                cache_read_input_tokens: raw.cache_creation_input_tokens,
+                cache_creation_input_tokens: 0,
+                cache_creation_5m_input_tokens: 0,
+                ..raw
+            };
+            let read_calibrated =
+                calibration.calibrate_authoritative_direct_catalog_usage(model, read_raw, true);
+            assert_eq!(read_calibrated.input_tokens, 89, "model={model}");
+            assert_eq!(
+                read_calibrated.cache_read_input_tokens, expected_cache,
+                "model={model}"
+            );
+            assert_eq!(read_calibrated.cache_creation_input_tokens, 0);
+        }
+
+        let opus_raw = cases[0].1;
+        let sonnet_raw = cases[1].1;
+        for alias in [
+            "claude-opus-5-thinking",
+            "claude-opus-5-20260725",
+            "claude-opus-5.0",
+            "foo-claude-opus-5",
+            "claude-sonnet-5-thinking",
+            "claude-sonnet-5-20260701",
+            "claude-sonnet-5.0",
+            "foo-claude-sonnet-5",
+        ] {
+            let raw = if alias.contains("sonnet") {
+                sonnet_raw
+            } else {
+                opus_raw
+            };
+            assert_eq!(
+                calibration.calibrate_authoritative_direct_catalog_usage(alias, raw, true),
+                raw,
+                "unobserved alias {alias} must not authorize usage rewriting"
+            );
+        }
+
+        let long_effort_profile = InputContextCalibration {
+            authoritative_direct_catalog_short_message: false,
+            direct_catalog_ordinary_input_tokens: 499,
+            ..calibration
+        };
+        assert_eq!(
+            long_effort_profile.calibrate_authoritative_direct_catalog_usage(
+                "claude-sonnet-5",
+                sonnet_raw,
+                true
+            ),
+            sonnet_raw,
+            "ordinary Sonnet 5 reasoning and coding prompts keep upstream usage"
+        );
+        assert_eq!(
+            long_effort_profile.calibrate_authoritative_direct_catalog_usage(
+                "claude-opus-5",
+                opus_raw,
+                true
+            ),
+            opus_raw,
+            "ordinary Opus 5 reasoning and coding prompts keep upstream usage"
+        );
+
+        for out_of_range in [
+            UsageBreakdown {
+                cache_creation_input_tokens: 27_999,
+                cache_creation_5m_input_tokens: 27_999,
+                ..sonnet_raw
+            },
+            UsageBreakdown {
+                cache_creation_input_tokens: 30_001,
+                cache_creation_5m_input_tokens: 30_001,
+                ..sonnet_raw
+            },
+        ] {
+            assert_eq!(
+                calibration.calibrate_authoritative_direct_catalog_usage(
+                    "claude-sonnet-5",
+                    out_of_range,
+                    true
+                ),
+                out_of_range
+            );
+        }
+        let opus_out_of_range = UsageBreakdown {
+            cache_creation_input_tokens: 32_001,
+            cache_creation_5m_input_tokens: 32_001,
+            ..opus_raw
+        };
+        assert_eq!(
+            calibration.calibrate_authoritative_direct_catalog_usage(
+                "claude-opus-5",
+                opus_out_of_range,
+                true
+            ),
+            opus_out_of_range
+        );
+
+        assert_eq!(
+            calibration.calibrate_local_direct_compat_usage("claude-opus-5", opus_raw),
+            opus_raw,
+            "generation 5 local compatibility usage stays untouched"
+        );
+        assert_eq!(
+            calibration.calibrate("claude-sonnet-5", 40_000, Some(35_000)),
+            40_000,
+            "generic generation 5 context accounting stays untouched"
         );
     }
 
