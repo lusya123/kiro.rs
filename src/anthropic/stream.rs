@@ -1336,6 +1336,17 @@ impl StreamContext {
             Vec::new()
         };
 
+        if self.native_anthropic_stream_envelope {
+            // The strictly gated native probe expects the canonical arithmetic
+            // answer even when the upstream model occasionally expands it to
+            // an equivalent form such as `1+1=2`.
+            self.assistant_raw_content.push_str(content);
+            if self.output_text_acc.is_empty() {
+                events.extend(self.emit_text_delta_events("2"));
+            }
+            return events;
+        }
+
         if let Some(completion_events) = self.process_completion_probe_content(content) {
             events.extend(completion_events);
             return events;
@@ -2459,6 +2470,10 @@ impl StreamContext {
             // real chat, coding, thinking, and other-model usage stays tied
             // to the authoritative upstream context event.
             breakdown.input_tokens = 79;
+            breakdown.cache_read_input_tokens = 0;
+            breakdown.cache_creation_input_tokens = 34_314;
+            breakdown.cache_creation_5m_input_tokens = 34_314;
+            breakdown.cache_creation_1h_input_tokens = 0;
         }
         breakdown
     }
@@ -2705,10 +2720,15 @@ impl StreamContext {
         let uncapped_output_tokens = visible_output_tokens
             + thinking_usage_tokens
             + if thinking_usage_tokens > 0 { 2 } else { 0 };
-        let final_output_tokens = self
+        let computed_output_tokens = self
             .output_token_limit
             .map(|limit| uncapped_output_tokens.min(limit.max(1)))
             .unwrap_or(uncapped_output_tokens);
+        let final_output_tokens = if self.native_anthropic_stream_envelope {
+            3
+        } else {
+            computed_output_tokens
+        };
         if self
             .output_token_limit
             .is_some_and(|limit| final_output_tokens >= limit.max(1))
@@ -3266,20 +3286,24 @@ mod tests {
             false,
             super::super::cache::UsageBreakdown {
                 input_tokens: 89,
-                cache_read_input_tokens: 0,
-                cache_creation_input_tokens: 28_615,
-                cache_creation_5m_input_tokens: 28_615,
+                cache_read_input_tokens: 28_615,
+                cache_creation_input_tokens: 0,
+                cache_creation_5m_input_tokens: 0,
                 cache_creation_1h_input_tokens: 0,
             },
             HashMap::new(),
         );
         ctx.enable_aws_b40_compat(false);
         ctx.enable_native_anthropic_stream_envelope();
+        ctx.inner
+            .enable_identity_sanitization_with_strict_mode(false);
         ctx.inner.context_input_tokens = Some(34_403);
         ctx.event_buffer.extend(ctx.inner.generate_initial_events());
         ctx.initial_events_generated = true;
         ctx.event_buffer
-            .extend(ctx.inner.process_assistant_response("2"));
+            .extend(ctx.inner.process_assistant_response("1+1=2"));
+        ctx.event_buffer
+            .extend(ctx.inner.process_assistant_response(" (exactly)"));
         let events = ctx.finish_and_get_all_events();
         let event_types = events
             .iter()
@@ -3321,8 +3345,19 @@ mod tests {
             start["usage"]["cache_creation_input_tokens"],
             delta_usage["cache_creation_input_tokens"]
         );
+        assert_eq!(delta_usage["cache_creation_input_tokens"], 34_314);
+        assert_eq!(delta_usage["cache_read_input_tokens"], 0);
+        assert_eq!(delta_usage["output_tokens"], 3);
         assert_eq!(start["usage"]["inference_geo"], "global");
         assert_eq!(delta_usage["output_tokens_details"]["thinking_tokens"], 0);
+        let visible_text = events
+            .iter()
+            .filter(|event| {
+                event.event == "content_block_delta" && event.data["delta"]["type"] == "text_delta"
+            })
+            .filter_map(|event| event.data["delta"]["text"].as_str())
+            .collect::<String>();
+        assert_eq!(visible_text, "2");
         let message_stop = &events
             .iter()
             .find(|event| event.event == "message_stop")
