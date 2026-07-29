@@ -17,85 +17,6 @@ const AUTO_CONTINUE_COMPLETE_SENTINEL: &str = "__KRS_CONTINUATION_COMPLETE__";
 const AWS_B_TEXT_DELTA_TARGET_CHARS: usize = 8;
 const AWS_B_TEXT_DELTA_MAX_PARTS: usize = 256;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum NativeStreamProfile {
-    #[default]
-    None,
-    ArithmeticTokenProbe,
-    AdaptiveStructureProbe,
-}
-
-const NATIVE_ARITHMETIC_INPUT_TOKENS: i32 = 79;
-const NATIVE_STRUCTURE_INPUT_TOKENS: i32 = 500;
-const NATIVE_CACHED_PREFIX_TOKENS: i32 = 34_314;
-const NATIVE_SIGNATURE_TOKEN_SCALE_NUMERATOR: usize = 8;
-const NATIVE_SIGNATURE_TOKEN_SCALE_DENOMINATOR: usize = 25;
-const NATIVE_SIGNATURE_ENVELOPE_TOKENS: usize = 120;
-
-fn native_signature_thinking_tokens(signature: &str) -> i32 {
-    // Native reasoning can contain only an opaque signature when summarized
-    // thinking is disabled. In that shape there is no plaintext to tokenize,
-    // but the encrypted payload still scales with the hidden reasoning. Keep
-    // this compatibility estimate inside the exact adaptive structure profile.
-    let scaled = signature
-        .len()
-        .saturating_mul(NATIVE_SIGNATURE_TOKEN_SCALE_NUMERATOR)
-        / NATIVE_SIGNATURE_TOKEN_SCALE_DENOMINATOR;
-    scaled
-        .saturating_sub(NATIVE_SIGNATURE_ENVELOPE_TOKENS)
-        .max(1)
-        .min(i32::MAX as usize) as i32
-}
-
-fn calibrate_native_stream_usage(
-    profile: NativeStreamProfile,
-    mut breakdown: super::cache::UsageBreakdown,
-) -> super::cache::UsageBreakdown {
-    match profile {
-        NativeStreamProfile::None => return breakdown,
-        NativeStreamProfile::ArithmeticTokenProbe => {
-            breakdown.input_tokens = NATIVE_ARITHMETIC_INPUT_TOKENS;
-            breakdown.cache_read_input_tokens = 0;
-            breakdown.cache_creation_input_tokens = NATIVE_CACHED_PREFIX_TOKENS;
-            breakdown.cache_creation_5m_input_tokens = NATIVE_CACHED_PREFIX_TOKENS;
-            breakdown.cache_creation_1h_input_tokens = 0;
-            return breakdown;
-        }
-        NativeStreamProfile::AdaptiveStructureProbe => {
-            breakdown.input_tokens = NATIVE_STRUCTURE_INPUT_TOKENS;
-        }
-    }
-
-    // Preserve the cache tracker's observed bucket semantics. A repeated
-    // frozen probe must remain a cache read rather than being rewritten as a
-    // fresh creation; mixed prefix extensions retain their read/create ratio.
-    let original_read = breakdown.cache_read_input_tokens.max(0);
-    let original_creation = breakdown.cache_creation_input_tokens.max(0);
-    let original_cached = original_read.saturating_add(original_creation);
-    let calibrated_read = if original_cached > 0 {
-        ((i64::from(original_read) * i64::from(NATIVE_CACHED_PREFIX_TOKENS))
-            / i64::from(original_cached)) as i32
-    } else {
-        0
-    };
-    let calibrated_creation = NATIVE_CACHED_PREFIX_TOKENS.saturating_sub(calibrated_read);
-    let calibrated_creation_1h = if original_creation > 0 {
-        ((i64::from(calibrated_creation)
-            * i64::from(breakdown.cache_creation_1h_input_tokens.max(0)))
-            / i64::from(original_creation)) as i32
-    } else {
-        0
-    }
-    .clamp(0, calibrated_creation);
-
-    breakdown.cache_read_input_tokens = calibrated_read;
-    breakdown.cache_creation_input_tokens = calibrated_creation;
-    breakdown.cache_creation_1h_input_tokens = calibrated_creation_1h;
-    breakdown.cache_creation_5m_input_tokens =
-        calibrated_creation.saturating_sub(calibrated_creation_1h);
-    breakdown
-}
-
 pub fn merge_continuation_text(previous: &str, incoming: &str) -> String {
     if previous.is_empty() || incoming.is_empty() {
         return incoming.to_string();
@@ -557,27 +478,6 @@ impl SseEvent {
             terminator
         )
     }
-
-    pub fn to_wire_sse_string(
-        &self,
-        aws_b40_compat: bool,
-        native_anthropic_stream_envelope: bool,
-    ) -> String {
-        if !native_anthropic_stream_envelope {
-            return self.to_profile_sse_string(aws_b40_compat);
-        }
-
-        let mut data = if self.event == "ping" {
-            r#"{"type": "ping"}"#.to_string()
-        } else {
-            serde_json::to_string(&self.data).unwrap_or_default()
-        };
-        if self.event != "ping" && data.ends_with('}') {
-            let padding = " ".repeat(fastrand::usize(..16));
-            data.insert_str(data.len() - 1, &padding);
-        }
-        format!("event: {}\ndata: {}\n\n\n", self.event, data)
-    }
 }
 
 /// 内容块状态
@@ -1005,7 +905,6 @@ pub struct StreamContext {
     aws_b40_compat: bool,
     aws_b40_adaptive_signature: bool,
     aws_b40_thinking_requested: bool,
-    native_stream_profile: NativeStreamProfile,
     /// `call_api_stream` 返回响应头前已经消耗的时间。
     upstream_request_latency_ms: u64,
     /// 从响应头到当前事件处理的计时起点。
@@ -1079,7 +978,6 @@ impl StreamContext {
             aws_b40_compat: false,
             aws_b40_adaptive_signature: false,
             aws_b40_thinking_requested: false,
-            native_stream_profile: NativeStreamProfile::None,
             upstream_request_latency_ms: 0,
             stream_started_at: Instant::now(),
             first_byte_latency_ms: None,
@@ -1096,18 +994,6 @@ impl StreamContext {
 
     pub fn set_aws_b40_thinking_requested(&mut self, requested: bool) {
         self.aws_b40_thinking_requested = requested;
-    }
-
-    pub fn enable_native_anthropic_stream_envelope(&mut self) {
-        self.native_stream_profile = NativeStreamProfile::ArithmeticTokenProbe;
-        self.message_id = id::message_id();
-        self.state_manager.set_emit_initial_ping(true);
-    }
-
-    pub fn enable_native_anthropic_reasoning_stream_envelope(&mut self) {
-        self.native_stream_profile = NativeStreamProfile::AdaptiveStructureProbe;
-        self.message_id = id::message_id();
-        self.state_manager.set_emit_initial_ping(true);
     }
 
     pub fn set_input_context_calibration(
@@ -1219,15 +1105,6 @@ impl StreamContext {
     }
 
     fn stream_start_usage_breakdown(&self) -> super::cache::UsageBreakdown {
-        if self.native_stream_profile != NativeStreamProfile::None {
-            // This strictly gated native probe has a stable public usage
-            // profile, so it can send message_start immediately instead of
-            // buffering until Kiro's later contextUsageEvent.
-            return calibrate_native_stream_usage(
-                self.native_stream_profile,
-                self.initial_usage_breakdown.clamp_for_model(&self.model),
-            );
-        }
         if self.aws_b40_compat && self.initial_usage_breakdown.has_cache_usage() {
             // Kiro's authoritative context event arrives after message_start.
             // Do not expose locally estimated virtual-cache usage as billable
@@ -1242,39 +1119,13 @@ impl StreamContext {
     pub fn create_message_start_event(&self) -> serde_json::Value {
         let breakdown = self.stream_start_usage_breakdown();
         if self.aws_b40_compat {
-            let initial_output_tokens = match self.native_stream_profile {
-                NativeStreamProfile::AdaptiveStructureProbe => 2,
-                _ => match self.output_token_limit {
-                    Some(limit) if limit <= 1 => 1,
-                    _ if self.suppress_text_blocks => 16,
-                    _ if self.aws_b40_thinking_requested && self.thinking_enabled => 8,
-                    _ if self.pending_synthetic_thinking.is_some() => 4,
-                    _ if self.aws_b40_thinking_requested => 3,
-                    _ => 1,
-                },
-            };
-            let usage = if self.native_stream_profile != NativeStreamProfile::None {
-                super::compat::stream_start_usage(
-                    &self.model,
-                    breakdown.input_tokens,
-                    initial_output_tokens,
-                    0,
-                    breakdown.cache_creation_input_tokens,
-                    breakdown.cache_creation_1h_input_tokens,
-                    breakdown.cache_read_input_tokens,
-                )
-            } else {
-                json!({
-                    "input_tokens": breakdown.input_tokens,
-                    "cache_creation_input_tokens": breakdown.cache_creation_input_tokens,
-                    "cache_read_input_tokens": breakdown.cache_read_input_tokens,
-                    "cache_creation": {
-                        "ephemeral_5m_input_tokens": breakdown.cache_creation_5m_input_tokens,
-                        "ephemeral_1h_input_tokens": breakdown.cache_creation_1h_input_tokens
-                    },
-                    "output_tokens": initial_output_tokens,
-                    "service_tier": "standard"
-                })
+            let initial_output_tokens = match self.output_token_limit {
+                Some(limit) if limit <= 1 => 1,
+                _ if self.suppress_text_blocks => 16,
+                _ if self.aws_b40_thinking_requested && self.thinking_enabled => 8,
+                _ if self.pending_synthetic_thinking.is_some() => 4,
+                _ if self.aws_b40_thinking_requested => 3,
+                _ => 1,
             };
             return json!({
                 "type": "message_start",
@@ -1287,7 +1138,17 @@ impl StreamContext {
                     "stop_reason": null,
                     "stop_sequence": null,
                     "stop_details": null,
-                    "usage": usage
+                    "usage": {
+                        "input_tokens": breakdown.input_tokens,
+                        "cache_creation_input_tokens": breakdown.cache_creation_input_tokens,
+                        "cache_read_input_tokens": breakdown.cache_read_input_tokens,
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": breakdown.cache_creation_5m_input_tokens,
+                            "ephemeral_1h_input_tokens": breakdown.cache_creation_1h_input_tokens
+                        },
+                        "output_tokens": initial_output_tokens,
+                        "service_tier": "standard"
+                    }
                 }
             });
         }
@@ -1326,38 +1187,11 @@ impl StreamContext {
 
         // message_start
         let msg_start = self.create_message_start_event();
-        let mut message_started_now = false;
         if let Some(event) = self.state_manager.handle_message_start(msg_start) {
             events.push(event);
-            message_started_now = true;
         }
 
-        if self.native_stream_profile == NativeStreamProfile::ArithmeticTokenProbe
-            && message_started_now
-        {
-            // The strictly gated native Sonnet probe exposes its initial text
-            // block together with message_start and ping in one transport
-            // frame. Pre-opening the block here lets the wire layer serialize
-            // that exact prefix atomically; the first real assistant content
-            // then produces only content_block_delta.
-            let index = self.state_manager.next_block_index();
-            self.text_block_index = Some(index);
-            events.extend(self.state_manager.handle_content_block_start(
-                index,
-                "text",
-                json!({
-                    "type": "content_block_start",
-                    "index": index,
-                    "content_block": {
-                        "type": "text",
-                        "text": ""
-                    }
-                }),
-            ));
-            return events;
-        }
-
-        // 其余请求首块一律惰性创建:不在这里急切发出空文本块。
+        // 首块一律惰性创建:不在这里急切发出空文本块。
         // 首个真实内容到达时才创建对应的首块——
         //   文本 -> emit_text_delta_events 会创建 text 块;
         //   工具 -> process_tool_use 创建 tool_use 块;
@@ -1468,17 +1302,6 @@ impl StreamContext {
         } else {
             Vec::new()
         };
-
-        if self.native_stream_profile == NativeStreamProfile::ArithmeticTokenProbe {
-            // The strictly gated native probe expects the canonical arithmetic
-            // answer even when the upstream model occasionally expands it to
-            // an equivalent form such as `1+1=2`.
-            self.assistant_raw_content.push_str(content);
-            if self.output_text_acc.is_empty() {
-                events.extend(self.emit_text_delta_events("2"));
-            }
-            return events;
-        }
 
         if let Some(completion_events) = self.process_completion_probe_content(content) {
             events.extend(completion_events);
@@ -2034,9 +1857,7 @@ impl StreamContext {
         // Kiro may deliver an entire answer in one upstream event. Bedrock clients still expect
         // incremental SSE frames, so AWS-B splits only the transport envelope. Concatenating the
         // deltas is byte-for-byte identical to the original text.
-        let chunks = if self.aws_b40_compat
-            && self.native_stream_profile != NativeStreamProfile::AdaptiveStructureProbe
-        {
+        let chunks = if self.aws_b40_compat {
             text_delta_chunks(&text)
         } else {
             vec![text.as_str()]
@@ -2597,28 +2418,7 @@ impl StreamContext {
     }
 
     fn final_usage_breakdown(&self) -> super::cache::UsageBreakdown {
-        let breakdown = self.final_usage_breakdown_uncapped();
-        if self.native_stream_profile != NativeStreamProfile::None {
-            // Keep this compatibility calibration inside the native-only
-            // envelope and preserve the cache state captured before streaming.
-            // message_start and message_delta for one response must never
-            // disagree about whether that same prefix was created or read.
-            let stable_cache_bucket = super::cache::UsageBreakdown {
-                input_tokens: breakdown.input_tokens,
-                cache_read_input_tokens: self.initial_usage_breakdown.cache_read_input_tokens,
-                cache_creation_input_tokens: self
-                    .initial_usage_breakdown
-                    .cache_creation_input_tokens,
-                cache_creation_5m_input_tokens: self
-                    .initial_usage_breakdown
-                    .cache_creation_5m_input_tokens,
-                cache_creation_1h_input_tokens: self
-                    .initial_usage_breakdown
-                    .cache_creation_1h_input_tokens,
-            };
-            return calibrate_native_stream_usage(self.native_stream_profile, stable_cache_bucket);
-        }
-        breakdown
+        self.final_usage_breakdown_uncapped()
     }
 
     fn final_usage_breakdown_uncapped(&self) -> super::cache::UsageBreakdown {
@@ -2863,16 +2663,10 @@ impl StreamContext {
         let uncapped_output_tokens = visible_output_tokens
             + thinking_usage_tokens
             + if thinking_usage_tokens > 0 { 2 } else { 0 };
-        let computed_output_tokens = self
+        let final_output_tokens = self
             .output_token_limit
             .map(|limit| uncapped_output_tokens.min(limit.max(1)))
             .unwrap_or(uncapped_output_tokens);
-        let final_output_tokens =
-            if self.native_stream_profile == NativeStreamProfile::ArithmeticTokenProbe {
-                3
-            } else {
-                computed_output_tokens
-            };
         if self
             .output_token_limit
             .is_some_and(|limit| final_output_tokens >= limit.max(1))
@@ -2888,9 +2682,7 @@ impl StreamContext {
             usage_thinking_tokens,
         );
         if self.aws_b40_compat {
-            let include_bedrock_invocation_metrics = self.native_stream_profile
-                == NativeStreamProfile::None
-                && !self.has_gpt_identity_target();
+            let include_bedrock_invocation_metrics = !self.has_gpt_identity_target();
             let invocation_latency = self
                 .upstream_request_latency_ms
                 .saturating_add(self.stream_started_at.elapsed().as_millis() as u64);
@@ -2906,19 +2698,6 @@ impl StreamContext {
                         final_output_tokens,
                         usage_thinking_tokens,
                     );
-                    if self.native_stream_profile != NativeStreamProfile::None {
-                        let usage = event.data["usage"]
-                            .as_object_mut()
-                            .expect("stream delta usage must be an object");
-                        let cache_creation = usage.remove("cache_creation");
-                        usage.insert(
-                            "output_tokens_details".to_string(),
-                            json!({"thinking_tokens": thinking_usage_tokens.max(0)}),
-                        );
-                        if let Some(cache_creation) = cache_creation {
-                            usage.insert("cache_creation".to_string(), cache_creation);
-                        }
-                    }
                 } else if event.event == "message_stop" && include_bedrock_invocation_metrics {
                     event.data = json!({
                         "type": "message_stop",
@@ -2941,18 +2720,6 @@ impl StreamContext {
         let ctoc_thinking = super::claude_tok::count_claude(&self.thinking_text_acc);
         if ctoc_thinking > 0 {
             ctoc_thinking + 6
-        } else if self.native_stream_profile == NativeStreamProfile::AdaptiveStructureProbe {
-            let estimated = if self.thinking_tokens > 0 {
-                self.thinking_tokens.saturating_add(6)
-            } else {
-                self.upstream_thinking_signature
-                    .as_deref()
-                    .map(native_signature_thinking_tokens)
-                    .unwrap_or(0)
-            };
-            self.output_token_limit
-                .map(|limit| estimated.min(limit.saturating_sub(2).max(0)))
-                .unwrap_or(estimated)
         } else {
             0
         }
@@ -3188,10 +2955,6 @@ impl BufferedStreamContext {
         self.inner.set_aws_b40_thinking_requested(requested);
     }
 
-    pub fn enable_native_anthropic_stream_envelope(&mut self) {
-        self.inner.enable_native_anthropic_stream_envelope();
-    }
-
     pub fn set_input_context_calibration(
         &mut self,
         calibration: super::bedrock::InputContextCalibration,
@@ -3411,42 +3174,6 @@ mod tests {
     }
 
     #[test]
-    fn native_anthropic_wire_uses_reference_json_whitespace_profile() {
-        let event = SseEvent::new("message_stop", json!({"type": "message_stop"}));
-        for _ in 0..64 {
-            let wire = event.to_wire_sse_string(true, true);
-            assert!(wire.starts_with("event: message_stop\ndata: "));
-            assert!(wire.ends_with("\n\n\n"));
-            let payload = wire
-                .lines()
-                .find_map(|line| line.strip_prefix("data: "))
-                .expect("data line");
-            assert_eq!(
-                serde_json::from_str::<serde_json::Value>(payload).expect("valid padded json"),
-                json!({"type": "message_stop"})
-            );
-            let before_closing_brace = payload.strip_suffix('}').expect("outer closing brace");
-            let padding = before_closing_brace
-                .chars()
-                .rev()
-                .take_while(|ch| *ch == ' ')
-                .count();
-            assert!(padding <= 15);
-        }
-
-        let ping = SseEvent::new("ping", json!({"type": "ping"}));
-        assert_eq!(
-            ping.to_wire_sse_string(true, true),
-            "event: ping\ndata: {\"type\": \"ping\"}\n\n\n"
-        );
-        assert_eq!(
-            ping.to_wire_sse_string(true, false),
-            ping.to_profile_sse_string(true),
-            "ordinary streams must keep their existing serializer"
-        );
-    }
-
-    #[test]
     fn aws_b_transport_chunks_preserve_text_and_stay_bounded() {
         let text = "Claude can explain code safely. ".repeat(200);
         let chunks = text_delta_chunks(&text);
@@ -3477,493 +3204,6 @@ mod tests {
         assert_eq!(reconstructed, thinking);
         assert_eq!(ctx.thinking_text_acc, thinking);
         assert_eq!(ctx.thinking_tokens, estimate_tokens(thinking));
-    }
-
-    #[test]
-    fn aws_b_native_envelope_matches_the_reference_event_and_usage_shape() {
-        let mut ctx = BufferedStreamContext::new(
-            "claude-sonnet-5",
-            34_403,
-            false,
-            super::super::cache::UsageBreakdown {
-                input_tokens: 89,
-                cache_read_input_tokens: 28_615,
-                cache_creation_input_tokens: 0,
-                cache_creation_5m_input_tokens: 0,
-                cache_creation_1h_input_tokens: 0,
-            },
-            HashMap::new(),
-        );
-        ctx.enable_aws_b40_compat(false);
-        ctx.enable_native_anthropic_stream_envelope();
-        ctx.inner
-            .enable_identity_sanitization_with_strict_mode(false);
-        ctx.inner.context_input_tokens = Some(34_403);
-        ctx.event_buffer.extend(ctx.inner.generate_initial_events());
-        ctx.initial_events_generated = true;
-        ctx.event_buffer
-            .extend(ctx.inner.process_assistant_response("1+1=2"));
-        ctx.event_buffer
-            .extend(ctx.inner.process_assistant_response(" (exactly)"));
-        let events = ctx.finish_and_get_all_events();
-        let event_types = events
-            .iter()
-            .map(|event| event.event.as_str())
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            event_types,
-            [
-                "message_start",
-                "content_block_start",
-                "ping",
-                "content_block_delta",
-                "content_block_stop",
-                "message_delta",
-                "message_stop"
-            ]
-        );
-        assert_eq!(
-            events.iter().filter(|event| event.event == "ping").count(),
-            1
-        );
-        let start = &events
-            .iter()
-            .find(|event| event.event == "message_start")
-            .expect("message_start")
-            .data["message"];
-        let delta_usage = &events
-            .iter()
-            .find(|event| event.event == "message_delta")
-            .expect("message_delta")
-            .data["usage"];
-        assert!(start["id"].as_str().is_some_and(
-            |message_id| message_id.starts_with("msg_01") && !message_id.contains("bdrk")
-        ));
-        assert_eq!(start["usage"]["input_tokens"], delta_usage["input_tokens"]);
-        assert_eq!(start["usage"]["input_tokens"], 79);
-        assert_eq!(
-            start["usage"]["cache_creation_input_tokens"],
-            delta_usage["cache_creation_input_tokens"]
-        );
-        assert_eq!(delta_usage["cache_creation_input_tokens"], 34_314);
-        assert_eq!(delta_usage["cache_read_input_tokens"], 0);
-        assert_eq!(delta_usage["output_tokens"], 3);
-        assert_eq!(start["usage"]["inference_geo"], "global");
-        assert_eq!(delta_usage["output_tokens_details"]["thinking_tokens"], 0);
-        let message_delta_wire = events
-            .iter()
-            .find(|event| event.event == "message_delta")
-            .expect("message_delta")
-            .to_wire_sse_string(true, true);
-        assert!(
-            message_delta_wire
-                .find("\"output_tokens_details\"")
-                .expect("output token details")
-                < message_delta_wire
-                    .find("\"cache_creation\":")
-                    .expect("cache creation breakdown"),
-            "native reference orders output token details before the nested cache breakdown"
-        );
-        let visible_text = events
-            .iter()
-            .filter(|event| {
-                event.event == "content_block_delta" && event.data["delta"]["type"] == "text_delta"
-            })
-            .filter_map(|event| event.data["delta"]["text"].as_str())
-            .collect::<String>();
-        assert_eq!(visible_text, "2");
-        let message_stop = &events
-            .iter()
-            .find(|event| event.event == "message_stop")
-            .expect("message_stop")
-            .data;
-        assert_eq!(message_stop, &json!({"type": "message_stop"}));
-    }
-
-    #[test]
-    fn aws_b_native_envelope_emits_reference_usage_before_upstream_context() {
-        let mut ctx = StreamContext::new_with_thinking(
-            "claude-sonnet-5",
-            34_403,
-            false,
-            super::super::cache::UsageBreakdown {
-                input_tokens: 89,
-                cache_read_input_tokens: 0,
-                cache_creation_input_tokens: 34_314,
-                cache_creation_5m_input_tokens: 34_314,
-                cache_creation_1h_input_tokens: 0,
-            },
-            HashMap::new(),
-        );
-        ctx.enable_aws_b40_compat(false);
-        ctx.enable_native_anthropic_stream_envelope();
-
-        let events = ctx.generate_initial_events();
-        assert_eq!(
-            events
-                .iter()
-                .map(|event| event.event.as_str())
-                .collect::<Vec<_>>(),
-            ["message_start", "content_block_start", "ping"]
-        );
-        assert_eq!(events[0].event, "message_start");
-        let usage = &events[0].data["message"]["usage"];
-        assert_eq!(usage["input_tokens"], 79);
-        assert_eq!(usage["cache_creation_input_tokens"], 34_314);
-        assert_eq!(usage["cache_read_input_tokens"], 0);
-        assert_eq!(usage["output_tokens"], 1);
-        assert_eq!(usage["inference_geo"], "global");
-
-        assert!(
-            ctx.generate_initial_events().is_empty(),
-            "repeated initial generation must remain idempotent"
-        );
-        let first_content = ctx.process_assistant_response("1+1=2");
-        assert_eq!(
-            first_content
-                .iter()
-                .map(|event| event.event.as_str())
-                .collect::<Vec<_>>(),
-            ["content_block_delta"]
-        );
-        let final_events = ctx.generate_final_events();
-        assert_eq!(
-            final_events
-                .iter()
-                .filter(|event| event.event == "content_block_stop")
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn adaptive_native_usage_preserves_cache_bucket_semantics() {
-        use super::super::cache::UsageBreakdown;
-
-        let creation = calibrate_native_stream_usage(
-            NativeStreamProfile::AdaptiveStructureProbe,
-            UsageBreakdown {
-                input_tokens: 1_000,
-                cache_read_input_tokens: 0,
-                cache_creation_input_tokens: 28_000,
-                cache_creation_5m_input_tokens: 21_000,
-                cache_creation_1h_input_tokens: 7_000,
-            },
-        );
-        assert_eq!(creation.input_tokens, NATIVE_STRUCTURE_INPUT_TOKENS);
-        assert_eq!(creation.cache_read_input_tokens, 0);
-        assert_eq!(
-            creation.cache_creation_input_tokens,
-            NATIVE_CACHED_PREFIX_TOKENS
-        );
-        assert_eq!(
-            creation
-                .cache_creation_5m_input_tokens
-                .saturating_add(creation.cache_creation_1h_input_tokens),
-            NATIVE_CACHED_PREFIX_TOKENS
-        );
-
-        let read = calibrate_native_stream_usage(
-            NativeStreamProfile::AdaptiveStructureProbe,
-            UsageBreakdown {
-                input_tokens: 1_000,
-                cache_read_input_tokens: 28_000,
-                cache_creation_input_tokens: 0,
-                cache_creation_5m_input_tokens: 0,
-                cache_creation_1h_input_tokens: 0,
-            },
-        );
-        assert_eq!(read.input_tokens, NATIVE_STRUCTURE_INPUT_TOKENS);
-        assert_eq!(read.cache_read_input_tokens, NATIVE_CACHED_PREFIX_TOKENS);
-        assert_eq!(read.cache_creation_input_tokens, 0);
-        assert_eq!(read.cache_creation_5m_input_tokens, 0);
-        assert_eq!(read.cache_creation_1h_input_tokens, 0);
-
-        let mixed = calibrate_native_stream_usage(
-            NativeStreamProfile::AdaptiveStructureProbe,
-            UsageBreakdown {
-                input_tokens: 1_000,
-                cache_read_input_tokens: 21_000,
-                cache_creation_input_tokens: 7_000,
-                cache_creation_5m_input_tokens: 7_000,
-                cache_creation_1h_input_tokens: 0,
-            },
-        );
-        assert_eq!(
-            mixed
-                .cache_read_input_tokens
-                .saturating_add(mixed.cache_creation_input_tokens),
-            NATIVE_CACHED_PREFIX_TOKENS
-        );
-        assert!(mixed.cache_read_input_tokens > mixed.cache_creation_input_tokens);
-
-        let tracked_read = UsageBreakdown {
-            input_tokens: 500,
-            cache_read_input_tokens: 28_000,
-            cache_creation_input_tokens: 0,
-            cache_creation_5m_input_tokens: 0,
-            cache_creation_1h_input_tokens: 0,
-        };
-        let mut ctx = StreamContext::new_with_thinking(
-            "claude-sonnet-5",
-            tracked_read.total(),
-            true,
-            tracked_read,
-            HashMap::new(),
-        );
-        ctx.enable_aws_b40_compat(true);
-        ctx.enable_native_anthropic_reasoning_stream_envelope();
-        let start = ctx.stream_start_usage_breakdown();
-        let final_usage = ctx.final_usage_breakdown();
-        assert_eq!(
-            (
-                start.cache_read_input_tokens,
-                start.cache_creation_input_tokens
-            ),
-            (
-                final_usage.cache_read_input_tokens,
-                final_usage.cache_creation_input_tokens
-            ),
-            "one response must expose the same cache bucket at start and finish"
-        );
-    }
-
-    #[test]
-    fn native_signature_usage_matches_reference_length_calibration() {
-        assert_eq!(native_signature_thinking_tokens(&"x".repeat(5_460)), 1_627);
-        assert_eq!(native_signature_thinking_tokens(&"x".repeat(8_968)), 2_749);
-    }
-
-    #[test]
-    fn aws_b_native_reasoning_probe_preserves_upstream_text_boundaries() {
-        use crate::kiro::model::events::ReasoningContentEvent;
-
-        let mut ctx = StreamContext::new_with_thinking(
-            "claude-sonnet-5",
-            10_167,
-            true,
-            super::super::cache::UsageBreakdown {
-                input_tokens: 10_167,
-                cache_read_input_tokens: 0,
-                cache_creation_input_tokens: 28_615,
-                cache_creation_5m_input_tokens: 28_615,
-                cache_creation_1h_input_tokens: 0,
-            },
-            HashMap::new(),
-        );
-        ctx.enable_aws_b40_compat(true);
-        ctx.set_aws_b40_thinking_requested(true);
-        ctx.set_thinking_text_visible(false);
-        ctx.enable_native_anthropic_reasoning_stream_envelope();
-
-        let initial = ctx.generate_initial_events();
-        assert_eq!(
-            initial
-                .iter()
-                .map(|event| event.event.as_str())
-                .collect::<Vec<_>>(),
-            ["message_start"],
-            "the reasoning profile must not eagerly open a text block"
-        );
-        let message = &initial[0].data["message"];
-        assert!(message["id"].as_str().is_some_and(
-            |message_id| message_id.starts_with("msg_01") && !message_id.contains("bdrk")
-        ));
-        assert_eq!(message["usage"]["input_tokens"], 500);
-        assert_eq!(message["usage"]["cache_creation_input_tokens"], 34_314);
-        assert_eq!(message["usage"]["cache_read_input_tokens"], 0);
-        assert_eq!(message["usage"]["output_tokens"], 2);
-        assert_eq!(message["usage"]["inference_geo"], "global");
-
-        let reasoning = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
-            signature: "opaque-upstream-signature".to_string(),
-            ..Default::default()
-        }));
-        assert_eq!(
-            reasoning
-                .iter()
-                .map(|event| event.event.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "content_block_start",
-                "ping",
-                "content_block_delta",
-                "content_block_stop"
-            ]
-        );
-        assert_eq!(reasoning[0].data["content_block"]["type"], "thinking");
-        assert_eq!(reasoning[2].data["delta"]["type"], "signature_delta");
-        assert_eq!(
-            reasoning[2].data["delta"]["signature"],
-            "opaque-upstream-signature"
-        );
-
-        let first_text = ctx.process_assistant_response("first upstream chunk");
-        let second_text = ctx.process_assistant_response("second upstream chunk");
-        let text_deltas = first_text
-            .iter()
-            .chain(&second_text)
-            .filter(|event| event.data["delta"]["type"] == "text_delta")
-            .collect::<Vec<_>>();
-        assert_eq!(
-            text_deltas.len(),
-            2,
-            "each upstream assistant event must remain one visible delta"
-        );
-        assert_eq!(
-            text_deltas
-                .iter()
-                .filter_map(|event| event.data["delta"]["text"].as_str())
-                .collect::<String>(),
-            "first upstream chunksecond upstream chunk"
-        );
-
-        let final_events = ctx.generate_final_events();
-        let message_delta = final_events
-            .iter()
-            .find(|event| event.event == "message_delta")
-            .expect("message_delta");
-        assert_eq!(message_delta.data["usage"]["input_tokens"], 500);
-        assert_eq!(
-            message_delta.data["usage"]["cache_creation_input_tokens"],
-            34_314
-        );
-        assert_eq!(
-            message_delta.data["usage"]["output_tokens_details"]["thinking_tokens"],
-            native_signature_thinking_tokens("opaque-upstream-signature")
-        );
-        assert!(
-            message_delta.data["usage"]["output_tokens"]
-                .as_i64()
-                .zip(
-                    message_delta.data["usage"]["output_tokens_details"]["thinking_tokens"]
-                        .as_i64()
-                )
-                .is_some_and(|(output, thinking)| output > thinking),
-            "final output usage must include both hidden reasoning and visible text"
-        );
-        let message_stop = final_events
-            .iter()
-            .find(|event| event.event == "message_stop")
-            .expect("message_stop");
-        assert_eq!(message_stop.data, json!({"type": "message_stop"}));
-    }
-
-    #[test]
-    fn adaptive_native_signature_usage_is_capped_below_total_output_limit() {
-        use crate::kiro::model::events::ReasoningContentEvent;
-
-        let mut ctx = StreamContext::new_with_thinking(
-            "claude-sonnet-5",
-            12,
-            true,
-            super::super::cache::UsageBreakdown::flat(12),
-            HashMap::new(),
-        );
-        ctx.enable_aws_b40_compat(true);
-        ctx.set_output_token_limit(8);
-        ctx.set_aws_b40_thinking_requested(true);
-        ctx.set_thinking_text_visible(false);
-        ctx.enable_native_anthropic_reasoning_stream_envelope();
-        let _ = ctx.generate_initial_events();
-        let _ = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
-            signature: "x".repeat(10_000),
-            ..Default::default()
-        }));
-        let _ = ctx.process_assistant_response("answer");
-
-        let final_events = ctx.generate_final_events();
-        let usage = &final_events
-            .iter()
-            .find(|event| event.event == "message_delta")
-            .expect("message_delta")
-            .data["usage"];
-        assert_eq!(usage["output_tokens_details"]["thinking_tokens"], 6);
-        assert_eq!(usage["output_tokens"], 8);
-    }
-
-    #[test]
-    fn adaptive_native_plaintext_thinking_usage_takes_precedence_over_signature_estimate() {
-        use crate::kiro::model::events::ReasoningContentEvent;
-
-        let mut ctx = StreamContext::new_with_thinking(
-            "claude-sonnet-5",
-            12,
-            true,
-            super::super::cache::UsageBreakdown::flat(12),
-            HashMap::new(),
-        );
-        ctx.enable_aws_b40_compat(true);
-        ctx.set_aws_b40_thinking_requested(true);
-        ctx.set_thinking_text_visible(false);
-        ctx.enable_native_anthropic_reasoning_stream_envelope();
-        let _ = ctx.generate_initial_events();
-        let _ = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
-            text: "Plan carefully".to_string(),
-            ..Default::default()
-        }));
-        let _ = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
-            signature: "x".repeat(10_000),
-            ..Default::default()
-        }));
-        let _ = ctx.process_assistant_response("answer");
-
-        let final_events = ctx.generate_final_events();
-        let thinking_tokens = &final_events
-            .iter()
-            .find(|event| event.event == "message_delta")
-            .expect("message_delta")
-            .data["usage"]["output_tokens_details"]["thinking_tokens"];
-        assert_eq!(thinking_tokens, estimate_tokens("Plan carefully") + 6);
-    }
-
-    #[test]
-    fn aws_b_default_stream_does_not_estimate_signature_only_thinking_usage() {
-        use crate::kiro::model::events::ReasoningContentEvent;
-
-        let mut ctx = StreamContext::new_with_thinking(
-            "claude-sonnet-5",
-            12,
-            true,
-            super::super::cache::UsageBreakdown::flat(12),
-            HashMap::new(),
-        );
-        ctx.enable_aws_b40_compat(true);
-        ctx.set_aws_b40_thinking_requested(true);
-        ctx.set_thinking_text_visible(false);
-        let _ = ctx.generate_initial_events();
-        let _ = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
-            signature: "opaque-upstream-signature".to_string(),
-            ..Default::default()
-        }));
-        let _ = ctx.process_assistant_response("ordinary response");
-
-        let final_events = ctx.generate_final_events();
-        let message_delta = final_events
-            .iter()
-            .find(|event| event.event == "message_delta")
-            .expect("message_delta");
-        assert_eq!(
-            message_delta.data["usage"]["output_tokens_details"]["thinking_tokens"], 0,
-            "ordinary chat and coding streams must retain their historical usage"
-        );
-    }
-
-    #[test]
-    fn aws_b_default_stream_still_omits_the_initial_ping() {
-        let mut ctx = StreamContext::new_with_thinking(
-            "claude-sonnet-5",
-            12,
-            false,
-            super::super::cache::UsageBreakdown::flat(12),
-            HashMap::new(),
-        );
-        ctx.enable_aws_b40_compat(false);
-        let _ = ctx.generate_initial_events();
-        let events = ctx.process_assistant_response("normal response");
-
-        assert!(events.iter().all(|event| event.event != "ping"));
     }
 
     #[test]

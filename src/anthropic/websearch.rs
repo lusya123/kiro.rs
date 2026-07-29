@@ -106,10 +106,15 @@ pub struct WebSearchResult {
 
 /// 检查请求是否为纯 WebSearch 请求
 ///
-/// 条件：tools 有且只有一个，且 name 为 web_search
+/// 条件：tools 有且只有一个，且为 Anthropic 官方 WebSearch server tool。
+/// 普通客户端可以合法定义一个同名 `web_search` 工具；不能把它劫持到本地 MCP 路径。
 pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
     req.tools.as_ref().is_some_and(|tools| {
-        tools.len() == 1 && tools.first().is_some_and(|t| t.name == "web_search")
+        tools.len() == 1
+            && tools.first().is_some_and(|tool| {
+                tool.name == "web_search"
+                    && tool.tool_type.as_deref() == Some("web_search_20250305")
+            })
     })
 }
 
@@ -1048,6 +1053,44 @@ mod tests {
 
         // 多个工具时不应该被识别为纯 websearch 请求
         assert!(!has_web_search_tool(&req));
+    }
+
+    #[test]
+    fn test_custom_tool_named_web_search_is_not_intercepted() {
+        use crate::anthropic::types::{Message, Tool};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("search my private index"),
+            }],
+            stream: true,
+            system: None,
+            tools: Some(vec![Tool {
+                tool_type: None,
+                name: "web_search".to_string(),
+                description: "Search the application's private index".to_string(),
+                input_schema: Default::default(),
+                max_uses: None,
+                cache_control: None,
+            }]),
+            tool_choice: Some(serde_json::json!({
+                "type": "tool",
+                "name": "web_search"
+            })),
+            thinking: None,
+            output_config: None,
+            reasoning: None,
+            cache_control: None,
+            metadata: None,
+        };
+
+        assert!(
+            !has_web_search_tool(&req),
+            "a client-defined tool must continue through the normal model/tool path"
+        );
     }
 
     #[test]

@@ -666,24 +666,6 @@ struct CacheBuild {
     token_context: PrefixTokenContext,
 }
 
-const STABLE_STRUCTURE_PROBE_BILLING_HEADER: &str =
-    "x-anthropic-billing-header:<dynamic-transport-metadata>";
-
-fn system_cache_key_text(
-    text: &str,
-    system_index: usize,
-    stabilize_structure_probe_billing_header: bool,
-) -> &str {
-    if stabilize_structure_probe_billing_header
-        && system_index == 0
-        && text.trim_start().starts_with("x-anthropic-billing-header:")
-    {
-        STABLE_STRUCTURE_PROBE_BILLING_HEADER
-    } else {
-        text
-    }
-}
-
 fn build_cache_breakpoints(
     req: &MessagesRequest,
     total_input_tokens: i32,
@@ -691,8 +673,6 @@ fn build_cache_breakpoints(
 ) -> CacheBuild {
     let mut state = PrefixState::new(&req.model);
     let mut breakpoints = Vec::new();
-    let stabilize_structure_probe_billing_header =
-        aws_b40_compat && super::bedrock::should_stabilize_sonnet_5_structure_cache_identity(req);
 
     if let Some(tools) = &req.tools {
         for tool in tools {
@@ -717,16 +697,9 @@ fn build_cache_breakpoints(
     }
 
     if let Some(system) = &req.system {
-        for (system_index, item) in system.iter().enumerate() {
+        for item in system {
             state.system_segments.push(item.text.clone());
-            state.push_key_part(&format!(
-                "system:{}",
-                system_cache_key_text(
-                    &item.text,
-                    system_index,
-                    stabilize_structure_probe_billing_header
-                )
-            ));
+            state.push_key_part(&format!("system:{}", item.text));
             if item.cache_control.is_some() {
                 let warm_on_first_use =
                     aws_b40_compat && cache_control_is_global(item.cache_control.as_ref());
@@ -1304,35 +1277,6 @@ mod tests {
         c.push_key_part("user:hello");
         assert_eq!(a.cache_keys().ephemeral_5m, c.cache_keys().ephemeral_5m);
         assert_ne!(a.cache_keys().ephemeral_5m, a.cache_keys().ephemeral_1h);
-    }
-
-    #[test]
-    fn structure_probe_stabilizes_only_the_gated_billing_metadata() {
-        let first =
-            "x-anthropic-billing-header: cc_version=2.1.153.9bd; cc_entrypoint=cli; cch=a17e1;";
-        let second =
-            "x-anthropic-billing-header: cc_version=9.9.9.zzz; cc_entrypoint=web; cch=b28f2;";
-
-        assert_ne!(
-            system_cache_key_text(first, 0, false),
-            system_cache_key_text(second, 0, false),
-            "ordinary cache identity must retain the full caller system text"
-        );
-        assert_eq!(
-            system_cache_key_text(first, 0, true),
-            system_cache_key_text(second, 0, true),
-            "the strictly gated structure probe treats transport billing metadata as non-semantic"
-        );
-        assert_eq!(
-            system_cache_key_text(first, 1, true),
-            first,
-            "only the leading billing metadata block may be stabilized"
-        );
-        assert_eq!(
-            system_cache_key_text("ordinary system prompt", 0, true),
-            "ordinary system prompt",
-            "non-billing system content always remains part of the cache identity"
-        );
     }
 
     #[test]

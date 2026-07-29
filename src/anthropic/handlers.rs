@@ -27,7 +27,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
+use serde_json::json;
 use std::time::Duration;
 use tokio::time::{Instant, interval_at};
 
@@ -2385,12 +2385,6 @@ pub async fn post_messages(
     );
 
     let aws_b40_compat = state.aws_b40_compat;
-    // Capture the detector's untouched public request shape before any
-    // compatibility normalization or internal prompt injection. The native
-    // reasoning envelope and its explicit medium effort are deliberately
-    // unreachable for ordinary chat, coding, tool, and thinking requests.
-    let raw_sonnet_5_structure_probe =
-        aws_b40_compat && super::bedrock::is_raw_sonnet_5_stream_structure_probe(&payload);
     if let Some(response) = reject_unsupported_gpt_model(&payload.model, aws_b40_compat) {
         return response;
     }
@@ -2440,7 +2434,7 @@ pub async fn post_messages(
     };
 
     if aws_b40_compat {
-        normalize_aws_b40_thinking_for_request(&mut payload, raw_sonnet_5_structure_probe);
+        normalize_aws_b40_thinking(&mut payload);
     } else {
         // opus-4-8:合法的 type:enabled 归一化为 adaptive(匹配真 Claude 的 200 行为),再做校验。
         normalize_opus_thinking(&mut payload);
@@ -2615,13 +2609,6 @@ pub async fn post_messages(
     } else {
         super::bedrock::InputContextCalibration::default()
     };
-    let use_sonnet_5_arithmetic_stream_envelope = aws_b40_compat
-        && input_context_calibration.should_use_sonnet_5_native_stream_envelope(&payload);
-    let use_sonnet_5_structure_stream_envelope = aws_b40_compat
-        && raw_sonnet_5_structure_probe
-        && input_context_calibration.should_use_sonnet_5_stream_structure_envelope(&payload);
-    let use_sonnet_5_native_stream_envelope =
-        use_sonnet_5_arithmetic_stream_envelope || use_sonnet_5_structure_stream_envelope;
 
     if let Some(response) =
         compat_direct_response(&payload, initial_usage_breakdown, aws_b40_compat)
@@ -2668,8 +2655,6 @@ pub async fn post_messages(
             aws_b40_compat,
             aws_b40_adaptive_signature,
             aws_b40_thinking_requested,
-            use_sonnet_5_native_stream_envelope,
-            use_sonnet_5_structure_stream_envelope,
         )
         .await
     } else {
@@ -2719,8 +2704,6 @@ async fn handle_stream_request(
     aws_b40_compat: bool,
     aws_b40_adaptive_signature: bool,
     aws_b40_thinking_requested: bool,
-    use_native_stream_envelope: bool,
-    use_native_reasoning_stream_envelope: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let upstream_started = Instant::now();
@@ -2743,13 +2726,6 @@ async fn handle_stream_request(
         ctx.set_aws_b40_thinking_requested(aws_b40_thinking_requested);
         ctx.set_thinking_text_visible(thinking_wants_summary);
         ctx.set_input_context_calibration(input_context_calibration);
-        if use_native_stream_envelope {
-            if use_native_reasoning_stream_envelope {
-                ctx.enable_native_anthropic_reasoning_stream_envelope();
-            } else {
-                ctx.enable_native_anthropic_stream_envelope();
-            }
-        }
     }
     ctx.set_upstream_request_latency(upstream_request_latency);
     // tool_choice 强制工具(any/tool):只发 tool_use,抑制夹带的解释性文本。
@@ -2786,11 +2762,6 @@ async fn handle_stream_request(
         request_body.to_string(),
         requested_max_tokens,
         aws_b40_compat,
-        use_native_stream_envelope,
-        native_sse_pacing(
-            use_native_stream_envelope,
-            use_native_reasoning_stream_envelope,
-        ),
     );
 
     // 返回 SSE 响应
@@ -2814,150 +2785,6 @@ fn create_ping_sse(aws_b40_compat: bool) -> Bytes {
     ))
 }
 
-const NATIVE_SSE_FLUSH_DELAY: Duration = Duration::from_millis(25);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NativeSsePacing {
-    None,
-    Arithmetic,
-    AdaptiveReasoning,
-}
-
-fn native_sse_pacing(
-    use_native_stream_envelope: bool,
-    use_native_reasoning_stream_envelope: bool,
-) -> NativeSsePacing {
-    if !use_native_stream_envelope {
-        NativeSsePacing::None
-    } else if use_native_reasoning_stream_envelope {
-        NativeSsePacing::AdaptiveReasoning
-    } else {
-        NativeSsePacing::Arithmetic
-    }
-}
-
-fn native_sse_flush_delay(event: &SseEvent, pacing: NativeSsePacing) -> Option<Duration> {
-    let should_delay = match pacing {
-        NativeSsePacing::None => false,
-        NativeSsePacing::Arithmetic => {
-            matches!(
-                event.event.as_str(),
-                "content_block_delta" | "message_delta"
-            )
-        }
-        NativeSsePacing::AdaptiveReasoning => match event.event.as_str() {
-            "content_block_start" => {
-                event
-                    .data
-                    .pointer("/content_block/type")
-                    .and_then(Value::as_str)
-                    == Some("thinking")
-            }
-            "ping" | "message_delta" => true,
-            "content_block_delta" => {
-                event.data.pointer("/delta/type").and_then(Value::as_str) == Some("signature_delta")
-            }
-            _ => false,
-        },
-    };
-    should_delay.then_some(NATIVE_SSE_FLUSH_DELAY)
-}
-
-fn create_wire_event_stream(
-    events: Vec<SseEvent>,
-    aws_b40_compat: bool,
-    use_native_stream_envelope: bool,
-    native_sse_pacing: NativeSsePacing,
-) -> stream::BoxStream<'static, Result<Bytes, Infallible>> {
-    let event_bodies = events
-        .into_iter()
-        .map(|event| {
-            let event_type = event.event.clone();
-            let is_adaptive_signature_delta = native_sse_pacing
-                == NativeSsePacing::AdaptiveReasoning
-                && event.event == "content_block_delta"
-                && event.data.pointer("/delta/type").and_then(Value::as_str)
-                    == Some("signature_delta");
-            let flush_delay = native_sse_flush_delay(&event, native_sse_pacing);
-            (
-                event_type,
-                is_adaptive_signature_delta,
-                flush_delay,
-                Bytes::from(event.to_wire_sse_string(aws_b40_compat, use_native_stream_envelope)),
-            )
-        })
-        .collect::<Vec<_>>();
-
-    if !use_native_stream_envelope {
-        return stream::iter(
-            event_bodies
-                .into_iter()
-                .map(|(_, _, _, body)| Ok::<Bytes, Infallible>(body)),
-        )
-        .boxed();
-    }
-
-    let mut grouped_bodies = Vec::with_capacity(event_bodies.len());
-    let mut event_bodies = event_bodies.into_iter().peekable();
-    while let Some((event_type, is_adaptive_signature_delta, flush_delay, body)) =
-        event_bodies.next()
-    {
-        let combines_message_stop = event_type == "message_delta"
-            && event_bodies
-                .peek()
-                .is_some_and(|(next_type, _, _, _)| next_type == "message_stop");
-        let combines_reasoning_stop = is_adaptive_signature_delta
-            && event_bodies
-                .peek()
-                .is_some_and(|(next_type, _, _, _)| next_type == "content_block_stop");
-        if combines_message_stop || combines_reasoning_stop {
-            let (_, _, _, following_body) = event_bodies
-                .next()
-                .expect("peeked wire body must still exist");
-            let mut combined = Vec::with_capacity(body.len() + following_body.len());
-            combined.extend_from_slice(&body);
-            combined.extend_from_slice(&following_body);
-            grouped_bodies.push((flush_delay, Bytes::from(combined)));
-        } else {
-            grouped_bodies.push((flush_delay, body));
-        }
-    }
-
-    stream::unfold(grouped_bodies.into_iter(), |mut events| async move {
-        let (flush_delay, body) = events.next()?;
-        if let Some(flush_delay) = flush_delay {
-            // The native Anthropic channel exposes the text delta and final
-            // usage as separate transport reads. Pausing briefly at those
-            // semantic boundaries prevents HTTP/TLS coalescing while keeping
-            // the strictly gated response genuinely incremental.
-            tokio::time::sleep(flush_delay).await;
-        }
-        Some((Ok::<Bytes, Infallible>(body), events))
-    })
-    .boxed()
-}
-
-fn create_initial_wire_event_stream(
-    events: Vec<SseEvent>,
-    aws_b40_compat: bool,
-    use_native_stream_envelope: bool,
-) -> stream::BoxStream<'static, Result<Bytes, Infallible>> {
-    if !use_native_stream_envelope {
-        return stream::iter(
-            events
-                .into_iter()
-                .map(move |event| Ok(Bytes::from(event.to_wire_sse_string(aws_b40_compat, false)))),
-        )
-        .boxed();
-    }
-
-    let mut body = Vec::new();
-    for event in events {
-        body.extend_from_slice(event.to_wire_sse_string(aws_b40_compat, true).as_bytes());
-    }
-    stream::iter((!body.is_empty()).then(|| Ok(Bytes::from(body)))).boxed()
-}
-
 /// 创建 SSE 事件流
 fn create_sse_stream(
     response: reqwest::Response,
@@ -2967,14 +2794,12 @@ fn create_sse_stream(
     request_body: String,
     requested_max_tokens: i32,
     aws_b40_compat: bool,
-    use_native_stream_envelope: bool,
-    native_sse_pacing: NativeSsePacing,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
-    let initial_stream = create_initial_wire_event_stream(
-        initial_events,
-        aws_b40_compat,
-        use_native_stream_envelope,
+    let initial_stream = stream::iter(
+        initial_events
+            .into_iter()
+            .map(move |e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat)))),
     );
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
@@ -3047,27 +2872,23 @@ fn create_sse_stream(
                             }
 
                             // 转换为 SSE 字节流
-                            let bytes = create_wire_event_stream(
-                                events,
-                                aws_b40_compat,
-                                use_native_stream_envelope,
-                                native_sse_pacing,
-                            );
+                            let bytes: Vec<Result<Bytes, Infallible>> = events
+                                .into_iter()
+                                .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
+                                .collect();
 
-                            Some((bytes, (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
                             ctx.mark_upstream_fatal_event();
                             // 发送最终事件并结束
                             let final_events = ctx.generate_final_events();
-                            let bytes = create_wire_event_stream(
-                                final_events,
-                                aws_b40_compat,
-                                use_native_stream_envelope,
-                                native_sse_pacing,
-                            );
-                            Some((bytes, (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
+                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
+                                .into_iter()
+                                .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
+                                .collect();
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
                         }
                         None => {
                             let mut continuation_reason = "unknown";
@@ -3123,7 +2944,7 @@ fn create_sse_stream(
                                             );
                                             let next_body_stream = next_response.bytes_stream();
                                             return Some((
-                                                stream::empty().boxed(),
+                                                stream::iter(Vec::<Result<Bytes, Infallible>>::new()),
                                                 (
                                                     next_body_stream,
                                                     ctx,
@@ -3145,13 +2966,11 @@ fn create_sse_stream(
                             }
                             // 流结束，发送最终事件
                             let final_events = ctx.generate_final_events();
-                            let bytes = create_wire_event_stream(
-                                final_events,
-                                aws_b40_compat,
-                                use_native_stream_envelope,
-                                native_sse_pacing,
-                            );
-                            Some((bytes, (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
+                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
+                                .into_iter()
+                                .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
+                                .collect();
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
                         }
                     }
                 }
@@ -3160,7 +2979,7 @@ fn create_sse_stream(
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> =
                         vec![Ok(create_ping_sse(aws_b40_compat))];
-                    Some((stream::iter(bytes).boxed(), (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
                 }
             }
         },
@@ -3818,8 +3637,8 @@ fn normalize_aws_b40_thinking(payload: &mut MessagesRequest) {
         return;
     }
 
-    // 把 `*-thinking` 别名和已有 generation-5 adaptive 请求规整成历史
-    // adaptive/high 配置；随后再按 AWS-B 支持矩阵决定是否保留。
+    // 先把 `*-thinking` 别名规整成真实 thinking 配置。Sonnet 5 / Opus 5
+    // 都使用 adaptive thinking；随后再按 AWS-B 支持矩阵决定是否保留。
     //
     // 已有 Opus 4.8 的显式 adaptive 请求必须原样保留；它在 AWS-B 下没有
     // `output_config` 也是一种经过校准的合法形态，不能因为这次扩展而补上 effort。
@@ -3867,19 +3686,6 @@ fn normalize_aws_b40_thinking(payload: &mut MessagesRequest) {
         payload.output_config = None;
         payload.model = super::bedrock::response_model(&payload.model);
         return;
-    }
-}
-
-fn normalize_aws_b40_thinking_for_request(
-    payload: &mut MessagesRequest,
-    preserve_explicit_output_config: bool,
-) {
-    let explicit_output_config = preserve_explicit_output_config
-        .then(|| payload.output_config.clone())
-        .flatten();
-    normalize_aws_b40_thinking(payload);
-    if let Some(output_config) = explicit_output_config {
-        payload.output_config = Some(output_config);
     }
 }
 
@@ -5476,8 +5282,6 @@ pub async fn post_messages_cc(
     } else {
         super::bedrock::InputContextCalibration::default()
     };
-    let use_sonnet_5_native_stream_envelope = aws_b40_compat
-        && input_context_calibration.should_use_sonnet_5_native_stream_envelope(&payload);
 
     if let Some(response) =
         compat_direct_response(&payload, initial_usage_breakdown, aws_b40_compat)
@@ -5524,7 +5328,6 @@ pub async fn post_messages_cc(
             aws_b40_compat,
             aws_b40_adaptive_signature,
             aws_b40_thinking_requested,
-            use_sonnet_5_native_stream_envelope,
         )
         .await
     } else {
@@ -5577,7 +5380,6 @@ async fn handle_stream_request_buffered(
     aws_b40_compat: bool,
     aws_b40_adaptive_signature: bool,
     aws_b40_thinking_requested: bool,
-    use_native_stream_envelope: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let upstream_started = Instant::now();
@@ -5600,9 +5402,6 @@ async fn handle_stream_request_buffered(
         ctx.set_aws_b40_thinking_requested(aws_b40_thinking_requested);
         ctx.set_thinking_text_visible(thinking_wants_summary);
         ctx.set_input_context_calibration(input_context_calibration);
-        if use_native_stream_envelope {
-            ctx.enable_native_anthropic_stream_envelope();
-        }
     }
     ctx.set_upstream_request_latency(upstream_request_latency);
     ctx.set_suppress_text_blocks(force_tool_only);
@@ -5634,7 +5433,6 @@ async fn handle_stream_request_buffered(
         request_body.to_string(),
         requested_max_tokens,
         aws_b40_compat,
-        use_native_stream_envelope,
     );
 
     // 返回 SSE 响应
@@ -5661,7 +5459,6 @@ fn create_buffered_sse_stream(
     request_body: String,
     requested_max_tokens: i32,
     aws_b40_compat: bool,
-    suppress_prestart_keepalive: bool,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
     let requested_max_tokens = effective_auto_continue_max_tokens(requested_max_tokens);
@@ -5704,7 +5501,7 @@ fn create_buffered_sse_stream(
                     biased;
 
                     // 优先检查 ping 保活（等待期间唯一发送的数据）
-                    _ = ping_interval.tick(), if !suppress_prestart_keepalive => {
+                    _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> =
                             vec![Ok(create_ping_sse(aws_b40_compat))];
@@ -5750,12 +5547,7 @@ fn create_buffered_sse_stream(
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
-                                    .map(|e| {
-                                        Ok(Bytes::from(e.to_wire_sse_string(
-                                            aws_b40_compat,
-                                            suppress_prestart_keepalive,
-                                        )))
-                                    })
+                                    .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
                                     .collect();
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)));
                             }
@@ -5842,12 +5634,7 @@ fn create_buffered_sse_stream(
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
-                                    .map(|e| {
-                                        Ok(Bytes::from(e.to_wire_sse_string(
-                                            aws_b40_compat,
-                                            suppress_prestart_keepalive,
-                                        )))
-                                    })
+                                    .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
                                     .collect();
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)));
                             }
@@ -5890,266 +5677,6 @@ mod tests {
                     .map(str::to_string)
             })
             .collect()
-    }
-
-    #[test]
-    fn native_sse_flush_pacing_is_strictly_scoped() {
-        for event_type in ["content_block_delta", "message_delta"] {
-            assert_eq!(
-                native_sse_flush_delay(&test_sse_event(event_type), NativeSsePacing::Arithmetic),
-                Some(NATIVE_SSE_FLUSH_DELAY)
-            );
-        }
-        for event_type in [
-            "message_start",
-            "content_block_start",
-            "ping",
-            "content_block_stop",
-            "message_stop",
-        ] {
-            assert_eq!(
-                native_sse_flush_delay(&test_sse_event(event_type), NativeSsePacing::Arithmetic),
-                None
-            );
-        }
-        for event_type in ["content_block_delta", "message_delta"] {
-            assert_eq!(
-                native_sse_flush_delay(&test_sse_event(event_type), NativeSsePacing::None),
-                None,
-                "ordinary streams must not inherit native transport pacing"
-            );
-        }
-        assert_eq!(
-            native_sse_pacing(false, false),
-            NativeSsePacing::None,
-            "ordinary streams must remain outside native pacing"
-        );
-        assert_eq!(native_sse_pacing(true, false), NativeSsePacing::Arithmetic);
-        assert_eq!(
-            native_sse_pacing(true, true),
-            NativeSsePacing::AdaptiveReasoning
-        );
-    }
-
-    #[test]
-    fn adaptive_reasoning_pacing_only_flushes_hidden_protocol_boundaries() {
-        let delayed = [
-            SseEvent::new(
-                "content_block_start",
-                json!({
-                    "type": "content_block_start",
-                    "content_block": {"type": "thinking"}
-                }),
-            ),
-            test_sse_event("ping"),
-            SseEvent::new(
-                "content_block_delta",
-                json!({
-                    "type": "content_block_delta",
-                    "delta": {"type": "signature_delta", "signature": "opaque"}
-                }),
-            ),
-            test_sse_event("message_delta"),
-        ];
-        for event in &delayed {
-            assert_eq!(
-                native_sse_flush_delay(event, NativeSsePacing::AdaptiveReasoning),
-                Some(NATIVE_SSE_FLUSH_DELAY)
-            );
-        }
-
-        let unchanged = [
-            test_sse_event("message_start"),
-            SseEvent::new(
-                "content_block_start",
-                json!({
-                    "type": "content_block_start",
-                    "content_block": {"type": "text"}
-                }),
-            ),
-            SseEvent::new(
-                "content_block_delta",
-                json!({
-                    "type": "content_block_delta",
-                    "delta": {"type": "thinking_delta", "thinking": "hidden"}
-                }),
-            ),
-            SseEvent::new(
-                "content_block_delta",
-                json!({
-                    "type": "content_block_delta",
-                    "delta": {"type": "text_delta", "text": "visible"}
-                }),
-            ),
-            test_sse_event("content_block_stop"),
-            test_sse_event("message_stop"),
-        ];
-        for event in &unchanged {
-            assert_eq!(
-                native_sse_flush_delay(event, NativeSsePacing::AdaptiveReasoning),
-                None,
-                "visible response events must retain their upstream pacing"
-            );
-        }
-    }
-
-    fn test_sse_event(event_type: &str) -> SseEvent {
-        SseEvent::new(event_type, json!({"type": event_type}))
-    }
-
-    fn wire_event_types(body: &Bytes) -> Vec<String> {
-        String::from_utf8_lossy(body)
-            .lines()
-            .filter_map(|line| line.strip_prefix("event: "))
-            .map(str::to_string)
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn native_sse_wire_frames_group_only_the_reference_boundaries() {
-        let initial_events = ["message_start", "content_block_start", "ping"]
-            .into_iter()
-            .map(test_sse_event)
-            .collect();
-        let initial_frames = create_initial_wire_event_stream(initial_events, true, true)
-            .map(Result::unwrap)
-            .collect::<Vec<_>>()
-            .await;
-
-        let delta_frames = create_wire_event_stream(
-            vec![test_sse_event("content_block_delta")],
-            true,
-            true,
-            NativeSsePacing::Arithmetic,
-        )
-        .map(Result::unwrap)
-        .collect::<Vec<_>>()
-        .await;
-        let final_frames = create_wire_event_stream(
-            ["content_block_stop", "message_delta", "message_stop"]
-                .into_iter()
-                .map(test_sse_event)
-                .collect(),
-            true,
-            true,
-            NativeSsePacing::Arithmetic,
-        )
-        .map(Result::unwrap)
-        .collect::<Vec<_>>()
-        .await;
-
-        let native_groups = initial_frames
-            .iter()
-            .chain(&delta_frames)
-            .chain(&final_frames)
-            .map(wire_event_types)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            native_groups,
-            [
-                vec!["message_start", "content_block_start", "ping"],
-                vec!["content_block_delta"],
-                vec!["content_block_stop"],
-                vec!["message_delta", "message_stop"],
-            ]
-        );
-
-        let ordinary_initial_events = ["message_start", "content_block_start", "ping"]
-            .into_iter()
-            .map(test_sse_event)
-            .collect::<Vec<_>>();
-        let expected_ordinary_initial = ordinary_initial_events
-            .iter()
-            .map(|event| Bytes::from(event.to_wire_sse_string(true, false)))
-            .collect::<Vec<_>>();
-        let ordinary_initial =
-            create_initial_wire_event_stream(ordinary_initial_events, true, false)
-                .map(Result::unwrap)
-                .collect::<Vec<_>>()
-                .await;
-        let ordinary_final_events = ["content_block_stop", "message_delta", "message_stop"]
-            .into_iter()
-            .map(test_sse_event)
-            .collect::<Vec<_>>();
-        let expected_ordinary_final = ordinary_final_events
-            .iter()
-            .map(|event| Bytes::from(event.to_wire_sse_string(true, false)))
-            .collect::<Vec<_>>();
-        let ordinary_final =
-            create_wire_event_stream(ordinary_final_events, true, false, NativeSsePacing::None)
-                .map(Result::unwrap)
-                .collect::<Vec<_>>()
-                .await;
-        assert_eq!(ordinary_initial, expected_ordinary_initial);
-        assert_eq!(ordinary_final, expected_ordinary_final);
-        assert!(
-            ordinary_initial
-                .iter()
-                .chain(&ordinary_final)
-                .all(|frame| wire_event_types(frame).len() == 1)
-        );
-    }
-
-    #[tokio::test]
-    async fn adaptive_reasoning_wire_frames_match_reference_boundaries() {
-        let initial_frames =
-            create_initial_wire_event_stream(vec![test_sse_event("message_start")], true, true)
-                .map(Result::unwrap)
-                .collect::<Vec<_>>()
-                .await;
-        let reasoning_frames = create_wire_event_stream(
-            vec![
-                SseEvent::new(
-                    "content_block_start",
-                    json!({
-                        "type": "content_block_start",
-                        "index": 0,
-                        "content_block": {
-                            "type": "thinking",
-                            "thinking": "",
-                            "signature": ""
-                        }
-                    }),
-                ),
-                test_sse_event("ping"),
-                SseEvent::new(
-                    "content_block_delta",
-                    json!({
-                        "type": "content_block_delta",
-                        "index": 0,
-                        "delta": {
-                            "type": "signature_delta",
-                            "signature": "opaque"
-                        }
-                    }),
-                ),
-                SseEvent::new(
-                    "content_block_stop",
-                    json!({"type": "content_block_stop", "index": 0}),
-                ),
-            ],
-            true,
-            true,
-            NativeSsePacing::AdaptiveReasoning,
-        )
-        .map(Result::unwrap)
-        .collect::<Vec<_>>()
-        .await;
-
-        let groups = initial_frames
-            .iter()
-            .chain(&reasoning_frames)
-            .map(wire_event_types)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            groups,
-            [
-                vec!["message_start"],
-                vec!["content_block_start"],
-                vec!["ping"],
-                vec!["content_block_delta", "content_block_stop"],
-            ]
-        );
     }
 
     #[tokio::test]
@@ -7002,8 +6529,8 @@ mod tests {
         assert_eq!(body.matches("event: content_block_delta").count(), 2);
     }
 
-    #[tokio::test]
-    async fn aws_b_sonnet_5_concise_cutoff_matches_reference_self_report() {
+    #[test]
+    fn aws_b_sonnet_5_concise_cutoff_uses_real_upstream() {
         let req = parse(
             "claude-sonnet-5",
             serde_json::json!({
@@ -7028,25 +6555,16 @@ mod tests {
                 }]
             }),
         );
-        let response =
+        assert!(
             compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(62), true)
-                .expect("constrained Sonnet 5 cutoff should use the compatibility response");
+                .is_none(),
+            "AWS-B must not replace a real Sonnet 5 cutoff self-report"
+        );
         assert!(
             compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(62), false)
                 .is_none(),
-            "non-AWS-B profiles keep the existing real-upstream behavior"
+            "non-AWS-B profiles keep the real-upstream behavior"
         );
-        let body = String::from_utf8(
-            axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("response body")
-                .to_vec(),
-        )
-        .expect("UTF-8 SSE");
-
-        assert_eq!(streamed_text(&body), "2025-08");
-        assert!(body.contains("\"input_tokens\":62"));
-        assert!(body.contains("amazon-bedrock-invocationMetrics"));
     }
 
     #[tokio::test]
@@ -9461,52 +8979,6 @@ mod tests {
             assert_eq!(output_config.effort, "high", "model={model}");
             assert!(output_config.format.is_some(), "model={model}");
         }
-    }
-
-    #[test]
-    fn exact_structure_profile_preserves_medium_without_changing_normal_requests() {
-        let request = || {
-            parse(
-                "claude-sonnet-5",
-                serde_json::json!({
-                    "thinking": {"type": "adaptive"},
-                    "output_config": {"effort": "medium"}
-                }),
-            )
-        };
-
-        let mut ordinary = request();
-        normalize_aws_b40_thinking_for_request(&mut ordinary, false);
-        assert_eq!(
-            ordinary
-                .output_config
-                .as_ref()
-                .map(|config| config.effort.as_str()),
-            Some("high"),
-            "ordinary generation-5 requests retain the historical high profile"
-        );
-
-        let mut exact_structure_probe = request();
-        normalize_aws_b40_thinking_for_request(&mut exact_structure_probe, true);
-        assert_eq!(
-            exact_structure_probe
-                .output_config
-                .as_ref()
-                .map(|config| config.effort.as_str()),
-            Some("medium")
-        );
-        let converted = crate::anthropic::converter::convert_request(&exact_structure_probe)
-            .expect("request converts");
-        let upstream =
-            serde_json::to_string(&converted.conversation_state).expect("request serializes");
-        assert!(upstream.contains("<thinking_effort>medium</thinking_effort>"));
-        assert_eq!(
-            kiro_model_request_fields(&exact_structure_probe)
-                .expect("valid model request fields")
-                .and_then(|fields| fields.output_config)
-                .map(|config| config.effort),
-            Some("medium".to_string())
-        );
     }
 
     #[test]

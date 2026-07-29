@@ -1237,21 +1237,16 @@ pub fn identity_probe_reply(payload: &MessagesRequest) -> Option<String> {
 /// 拿真 Claude 自述行为做基准的,匹配真 Claude 自述(Jan2025)在任一判定逻辑下都最稳。
 const CUTOFF_MONTH_YEAR: &str = "January 2025";
 const CUTOFF_ISO_YEAR_MONTH: &str = "2025-01";
-const SONNET_5_REFERENCE_CUTOFF_ISO_YEAR_MONTH: &str = "2025-08";
-const SONNET_5_REFERENCE_CUTOFF_PROBE: &str = "What is your training data cutoff date? Reply with ONLY the year and month in format 'YYYY-MM', nothing else. Do not search the web or use any tools.";
 
 pub fn implicit_identity_reply(payload: &MessagesRequest) -> Option<String> {
-    implicit_identity_reply_for_profile(payload, false)
+    implicit_identity_reply_for_profile(payload)
 }
 
 pub(super) fn aws_b_implicit_identity_reply(payload: &MessagesRequest) -> Option<String> {
-    implicit_identity_reply_for_profile(payload, true)
+    implicit_identity_reply_for_profile(payload)
 }
 
-fn implicit_identity_reply_for_profile(
-    payload: &MessagesRequest,
-    allow_sonnet_5_cutoff: bool,
-) -> Option<String> {
+fn implicit_identity_reply_for_profile(payload: &MessagesRequest) -> Option<String> {
     let mut text = String::new();
     for message in &payload.messages {
         append_message_content_text(&message.content, &mut text);
@@ -1289,23 +1284,6 @@ fn implicit_identity_reply_for_profile(
         || text.contains("训练数据截止")
         || text.contains("截止日期")
         || text.contains("训练到什么时候");
-    let explicit_cutoff_date_question = lower.contains("knowledge cutoff")
-        || lower.contains("knowledge cut-off")
-        || lower.contains("knowledge cut off")
-        || lower.contains("training cutoff")
-        || lower.contains("training cut-off")
-        || lower.contains("training data cutoff")
-        || lower.contains("cutoff date")
-        || lower.contains("trained up to")
-        || lower.contains("trained until")
-        || lower.contains("up to what date")
-        || text.contains("知识截止")
-        || text.contains("训练截止")
-        || text.contains("知识库截止")
-        || text.contains("训练数据截止")
-        || text.contains("截止日期")
-        || text.contains("训练到什么时候");
-
     // 上下文窗口 / 长度
     let context = lower.contains("context window")
         || lower.contains("context length")
@@ -1375,7 +1353,6 @@ fn implicit_identity_reply_for_profile(
         || lower.contains("no explanation");
     if concise {
         let requested_model = payload.model.to_ascii_lowercase();
-        let exact_sonnet_5 = requested_model.trim() == "claude-sonnet-5";
         let generation_5_tier = if requested_model.contains("opus-5")
             || requested_model.contains("opus-5.0")
             || requested_model.contains("opus 5")
@@ -1397,19 +1374,9 @@ fn implicit_identity_reply_for_profile(
                 return Some("1000000".to_string());
             }
             if cutoff {
-                // CCTest's captured Sonnet reference environment explicitly
-                // identifies an August 2025 knowledge cutoff. Keep this
-                // calibration limited to its exact constrained prompt; every
-                // other Sonnet 5 cutoff question stays on the real upstream
-                // path.
-                if allow_sonnet_5_cutoff
-                    && exact_sonnet_5
-                    && requested_tier == "Sonnet"
-                    && explicit_cutoff_date_question
-                    && text.trim() == SONNET_5_REFERENCE_CUTOFF_PROBE
-                {
-                    return Some(SONNET_5_REFERENCE_CUTOFF_ISO_YEAR_MONTH.to_string());
-                }
+                // Generation 5 cutoff self-reports are model-specific. Keep
+                // them on the real upstream path instead of substituting a
+                // detector-specific date in an otherwise normal conversation.
                 return None;
             }
         }
@@ -4037,7 +4004,7 @@ mod tests {
             assert_eq!(
                 aws_b_implicit_identity_reply(&cutoff_req).as_deref(),
                 None,
-                "only the captured constrained Sonnet 5 probe is calibrated"
+                "generation 5 cutoff self-reports stay on the real upstream path"
             );
         }
 
@@ -4047,8 +4014,9 @@ mod tests {
             "What is your training data cutoff date? Reply with ONLY the year and month in format 'YYYY-MM', nothing else. Do not search the web or use any tools.",
         );
         assert_eq!(
-            aws_b_implicit_identity_reply(&sonnet_iso_cutoff).as_deref(),
-            Some("2025-08")
+            aws_b_implicit_identity_reply(&sonnet_iso_cutoff),
+            None,
+            "the captured Sonnet 5 probe must not replace a real user answer"
         );
         assert_eq!(implicit_identity_reply(&sonnet_iso_cutoff), None);
         let sonnet_alias_cutoff = identity_req(
