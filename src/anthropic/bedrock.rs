@@ -3875,9 +3875,14 @@ mod tests {
             .await
             .expect("non-stream body");
         let raw = String::from_utf8(bytes.to_vec()).expect("UTF-8 non-stream body");
-        assert!(raw.starts_with("{\"model\":\"claude-sonnet-4-5-20250929\",\"id\":\"msg_01bdrk"));
+        assert!(raw.starts_with("{\"model\":\"claude-sonnet-4-5-20250929\",\"id\":\"msg_bdrk_"));
 
         let body: Value = serde_json::from_str(&raw).expect("valid non-stream JSON");
+        assert!(
+            body["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("msg_bdrk_") && id.len() == 61)
+        );
         assert_eq!(body["usage"]["input_tokens"], 100);
         assert_eq!(body["usage"]["cache_read_input_tokens"], 40);
         assert_eq!(

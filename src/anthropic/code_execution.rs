@@ -826,6 +826,11 @@ mod tests {
             super::super::cache::UsageBreakdown::flat(42),
             8,
         );
+        assert!(
+            events[0].data["message"]["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("msg_bdrk_") && id.len() == 61)
+        );
         let starts = events
             .iter()
             .filter(|event| event.event == "content_block_start")
@@ -942,6 +947,11 @@ mod tests {
             .expect("non-stream response body");
         let body: serde_json::Value =
             serde_json::from_slice(&bytes).expect("code execution JSON response");
+        assert!(
+            body["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("msg_bdrk_") && id.len() == 61)
+        );
         assert_eq!(body["usage"]["input_tokens"], 1);
         assert_eq!(body["usage"]["cache_creation_input_tokens"], 0);
         assert_eq!(body["usage"]["cache_read_input_tokens"], 0);

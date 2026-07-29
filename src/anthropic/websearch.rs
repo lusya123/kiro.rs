@@ -1332,7 +1332,7 @@ mod tests {
         assert!(
             message_start.data["message"]["id"]
                 .as_str()
-                .is_some_and(|id| id.starts_with("msg_01bdrk") && id.len() == 28)
+                .is_some_and(|id| id.starts_with("msg_bdrk_") && id.len() == 61)
         );
 
         let result_start = events

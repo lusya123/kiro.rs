@@ -379,17 +379,12 @@ RUST_LOG=debug ./target/release/kiro-rs
 `KIRO_CLUSTER_CACHE_ADDR=host1:46379,host2:46379` 配置共享候选地址，或设为
 `off`、`local`、`disabled` 关闭集群共享并退回进程内缓存。
 
-AWS-B 的 Claude 响应默认使用 Anthropic 客户端兼容的
-`msg_01bdrk` + 18 位 Base62 消息 ID。若需要复现当前参考网关原生
-Bedrock 路由实测到的 `msg_bdrk_` + 52 位小写字母数字 ID，可在启动时显式设置：
-
-```bash
-KIRO_NATIVE_BEDROCK_MESSAGE_IDS=1 ./target/release/kiro-rs
-```
-
-该选项只改变 AWS-B Claude 响应的公开消息 ID，不改变模型路由、对话内容、
-Thinking、Token 统计或 GPT 响应。默认保持关闭，以兼容会校验 Anthropic
-`msg_` 后缀形态和长度的现有客户端。
+AWS-B 会根据模型自动生成公开消息 ID，不需要额外的容器启动参数。Claude
+（Opus、Sonnet、Haiku）响应使用当前参考网关原生 Bedrock 路由实测到的
+`msg_bdrk_` + 52 位小写字母数字 ID。GPT 保持 Anthropic 兼容的 `msg_01…`
+形态；其他兼容模型保持现有 ID 形态，Mantle 原生代理继续透传上游 ID。该自动
+选择只改变公开消息 ID，不改变模型路由、对话内容、Thinking、Token 统计或
+工具调用。
 
 ## API 端点
 
