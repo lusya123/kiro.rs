@@ -27,7 +27,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use serde::de::DeserializeOwned;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::time::{Instant, interval_at};
 
@@ -2787,7 +2787,10 @@ async fn handle_stream_request(
         requested_max_tokens,
         aws_b40_compat,
         use_native_stream_envelope,
-        use_native_stream_envelope && !use_native_reasoning_stream_envelope,
+        native_sse_pacing(
+            use_native_stream_envelope,
+            use_native_reasoning_stream_envelope,
+        ),
     );
 
     // 返回 SSE 响应
@@ -2813,25 +2816,72 @@ fn create_ping_sse(aws_b40_compat: bool) -> Bytes {
 
 const NATIVE_SSE_FLUSH_DELAY: Duration = Duration::from_millis(25);
 
-fn native_sse_flush_delay(event_type: &str, apply_native_stream_pacing: bool) -> Option<Duration> {
-    (apply_native_stream_pacing && matches!(event_type, "content_block_delta" | "message_delta"))
-        .then_some(NATIVE_SSE_FLUSH_DELAY)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeSsePacing {
+    None,
+    Arithmetic,
+    AdaptiveReasoning,
+}
+
+fn native_sse_pacing(
+    use_native_stream_envelope: bool,
+    use_native_reasoning_stream_envelope: bool,
+) -> NativeSsePacing {
+    if !use_native_stream_envelope {
+        NativeSsePacing::None
+    } else if use_native_reasoning_stream_envelope {
+        NativeSsePacing::AdaptiveReasoning
+    } else {
+        NativeSsePacing::Arithmetic
+    }
+}
+
+fn native_sse_flush_delay(event: &SseEvent, pacing: NativeSsePacing) -> Option<Duration> {
+    let should_delay = match pacing {
+        NativeSsePacing::None => false,
+        NativeSsePacing::Arithmetic => {
+            matches!(
+                event.event.as_str(),
+                "content_block_delta" | "message_delta"
+            )
+        }
+        NativeSsePacing::AdaptiveReasoning => match event.event.as_str() {
+            "content_block_start" => {
+                event
+                    .data
+                    .pointer("/content_block/type")
+                    .and_then(Value::as_str)
+                    == Some("thinking")
+            }
+            "ping" | "message_delta" => true,
+            "content_block_delta" => {
+                event.data.pointer("/delta/type").and_then(Value::as_str) == Some("signature_delta")
+            }
+            _ => false,
+        },
+    };
+    should_delay.then_some(NATIVE_SSE_FLUSH_DELAY)
 }
 
 fn create_wire_event_stream(
     events: Vec<SseEvent>,
     aws_b40_compat: bool,
     use_native_stream_envelope: bool,
-    apply_native_stream_pacing: bool,
+    native_sse_pacing: NativeSsePacing,
 ) -> stream::BoxStream<'static, Result<Bytes, Infallible>> {
     let event_bodies = events
         .into_iter()
         .map(|event| {
             let event_type = event.event.clone();
-            let flush_delay =
-                native_sse_flush_delay(event.event.as_str(), apply_native_stream_pacing);
+            let is_adaptive_signature_delta = native_sse_pacing
+                == NativeSsePacing::AdaptiveReasoning
+                && event.event == "content_block_delta"
+                && event.data.pointer("/delta/type").and_then(Value::as_str)
+                    == Some("signature_delta");
+            let flush_delay = native_sse_flush_delay(&event, native_sse_pacing);
             (
                 event_type,
+                is_adaptive_signature_delta,
                 flush_delay,
                 Bytes::from(event.to_wire_sse_string(aws_b40_compat, use_native_stream_envelope)),
             )
@@ -2842,25 +2892,31 @@ fn create_wire_event_stream(
         return stream::iter(
             event_bodies
                 .into_iter()
-                .map(|(_, _, body)| Ok::<Bytes, Infallible>(body)),
+                .map(|(_, _, _, body)| Ok::<Bytes, Infallible>(body)),
         )
         .boxed();
     }
 
     let mut grouped_bodies = Vec::with_capacity(event_bodies.len());
     let mut event_bodies = event_bodies.into_iter().peekable();
-    while let Some((event_type, flush_delay, body)) = event_bodies.next() {
+    while let Some((event_type, is_adaptive_signature_delta, flush_delay, body)) =
+        event_bodies.next()
+    {
         let combines_message_stop = event_type == "message_delta"
             && event_bodies
                 .peek()
-                .is_some_and(|(next_type, _, _)| next_type == "message_stop");
-        if combines_message_stop {
-            let (_, _, message_stop) = event_bodies
+                .is_some_and(|(next_type, _, _, _)| next_type == "message_stop");
+        let combines_reasoning_stop = is_adaptive_signature_delta
+            && event_bodies
+                .peek()
+                .is_some_and(|(next_type, _, _, _)| next_type == "content_block_stop");
+        if combines_message_stop || combines_reasoning_stop {
+            let (_, _, _, following_body) = event_bodies
                 .next()
-                .expect("peeked message_stop body must still exist");
-            let mut combined = Vec::with_capacity(body.len() + message_stop.len());
+                .expect("peeked wire body must still exist");
+            let mut combined = Vec::with_capacity(body.len() + following_body.len());
             combined.extend_from_slice(&body);
-            combined.extend_from_slice(&message_stop);
+            combined.extend_from_slice(&following_body);
             grouped_bodies.push((flush_delay, Bytes::from(combined)));
         } else {
             grouped_bodies.push((flush_delay, body));
@@ -2912,7 +2968,7 @@ fn create_sse_stream(
     requested_max_tokens: i32,
     aws_b40_compat: bool,
     use_native_stream_envelope: bool,
-    apply_native_stream_pacing: bool,
+    native_sse_pacing: NativeSsePacing,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = create_initial_wire_event_stream(
@@ -2995,7 +3051,7 @@ fn create_sse_stream(
                                 events,
                                 aws_b40_compat,
                                 use_native_stream_envelope,
-                                apply_native_stream_pacing,
+                                native_sse_pacing,
                             );
 
                             Some((bytes, (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
@@ -3009,7 +3065,7 @@ fn create_sse_stream(
                                 final_events,
                                 aws_b40_compat,
                                 use_native_stream_envelope,
-                                apply_native_stream_pacing,
+                                native_sse_pacing,
                             );
                             Some((bytes, (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
                         }
@@ -3093,7 +3149,7 @@ fn create_sse_stream(
                                 final_events,
                                 aws_b40_compat,
                                 use_native_stream_envelope,
-                                apply_native_stream_pacing,
+                                native_sse_pacing,
                             );
                             Some((bytes, (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
                         }
@@ -5840,7 +5896,7 @@ mod tests {
     fn native_sse_flush_pacing_is_strictly_scoped() {
         for event_type in ["content_block_delta", "message_delta"] {
             assert_eq!(
-                native_sse_flush_delay(event_type, true),
+                native_sse_flush_delay(&test_sse_event(event_type), NativeSsePacing::Arithmetic),
                 Some(NATIVE_SSE_FLUSH_DELAY)
             );
         }
@@ -5851,13 +5907,88 @@ mod tests {
             "content_block_stop",
             "message_stop",
         ] {
-            assert_eq!(native_sse_flush_delay(event_type, true), None);
+            assert_eq!(
+                native_sse_flush_delay(&test_sse_event(event_type), NativeSsePacing::Arithmetic),
+                None
+            );
         }
         for event_type in ["content_block_delta", "message_delta"] {
             assert_eq!(
-                native_sse_flush_delay(event_type, false),
+                native_sse_flush_delay(&test_sse_event(event_type), NativeSsePacing::None),
                 None,
                 "ordinary streams must not inherit native transport pacing"
+            );
+        }
+        assert_eq!(
+            native_sse_pacing(false, false),
+            NativeSsePacing::None,
+            "ordinary streams must remain outside native pacing"
+        );
+        assert_eq!(native_sse_pacing(true, false), NativeSsePacing::Arithmetic);
+        assert_eq!(
+            native_sse_pacing(true, true),
+            NativeSsePacing::AdaptiveReasoning
+        );
+    }
+
+    #[test]
+    fn adaptive_reasoning_pacing_only_flushes_hidden_protocol_boundaries() {
+        let delayed = [
+            SseEvent::new(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "content_block": {"type": "thinking"}
+                }),
+            ),
+            test_sse_event("ping"),
+            SseEvent::new(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "delta": {"type": "signature_delta", "signature": "opaque"}
+                }),
+            ),
+            test_sse_event("message_delta"),
+        ];
+        for event in &delayed {
+            assert_eq!(
+                native_sse_flush_delay(event, NativeSsePacing::AdaptiveReasoning),
+                Some(NATIVE_SSE_FLUSH_DELAY)
+            );
+        }
+
+        let unchanged = [
+            test_sse_event("message_start"),
+            SseEvent::new(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "content_block": {"type": "text"}
+                }),
+            ),
+            SseEvent::new(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "delta": {"type": "thinking_delta", "thinking": "hidden"}
+                }),
+            ),
+            SseEvent::new(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "visible"}
+                }),
+            ),
+            test_sse_event("content_block_stop"),
+            test_sse_event("message_stop"),
+        ];
+        for event in &unchanged {
+            assert_eq!(
+                native_sse_flush_delay(event, NativeSsePacing::AdaptiveReasoning),
+                None,
+                "visible response events must retain their upstream pacing"
             );
         }
     }
@@ -5889,7 +6020,7 @@ mod tests {
             vec![test_sse_event("content_block_delta")],
             true,
             true,
-            true,
+            NativeSsePacing::Arithmetic,
         )
         .map(Result::unwrap)
         .collect::<Vec<_>>()
@@ -5901,7 +6032,7 @@ mod tests {
                 .collect(),
             true,
             true,
-            true,
+            NativeSsePacing::Arithmetic,
         )
         .map(Result::unwrap)
         .collect::<Vec<_>>()
@@ -5944,10 +6075,11 @@ mod tests {
             .iter()
             .map(|event| Bytes::from(event.to_wire_sse_string(true, false)))
             .collect::<Vec<_>>();
-        let ordinary_final = create_wire_event_stream(ordinary_final_events, true, false, false)
-            .map(Result::unwrap)
-            .collect::<Vec<_>>()
-            .await;
+        let ordinary_final =
+            create_wire_event_stream(ordinary_final_events, true, false, NativeSsePacing::None)
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+                .await;
         assert_eq!(ordinary_initial, expected_ordinary_initial);
         assert_eq!(ordinary_final, expected_ordinary_final);
         assert!(
@@ -5955,6 +6087,68 @@ mod tests {
                 .iter()
                 .chain(&ordinary_final)
                 .all(|frame| wire_event_types(frame).len() == 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn adaptive_reasoning_wire_frames_match_reference_boundaries() {
+        let initial_frames =
+            create_initial_wire_event_stream(vec![test_sse_event("message_start")], true, true)
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+                .await;
+        let reasoning_frames = create_wire_event_stream(
+            vec![
+                SseEvent::new(
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {
+                            "type": "thinking",
+                            "thinking": "",
+                            "signature": ""
+                        }
+                    }),
+                ),
+                test_sse_event("ping"),
+                SseEvent::new(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {
+                            "type": "signature_delta",
+                            "signature": "opaque"
+                        }
+                    }),
+                ),
+                SseEvent::new(
+                    "content_block_stop",
+                    json!({"type": "content_block_stop", "index": 0}),
+                ),
+            ],
+            true,
+            true,
+            NativeSsePacing::AdaptiveReasoning,
+        )
+        .map(Result::unwrap)
+        .collect::<Vec<_>>()
+        .await;
+
+        let groups = initial_frames
+            .iter()
+            .chain(&reasoning_frames)
+            .map(wire_event_types)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            groups,
+            [
+                vec!["message_start"],
+                vec!["content_block_start"],
+                vec!["ping"],
+                vec!["content_block_delta", "content_block_stop"],
+            ]
         );
     }
 
