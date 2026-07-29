@@ -28,6 +28,24 @@ enum NativeStreamProfile {
 const NATIVE_ARITHMETIC_INPUT_TOKENS: i32 = 79;
 const NATIVE_STRUCTURE_INPUT_TOKENS: i32 = 500;
 const NATIVE_CACHED_PREFIX_TOKENS: i32 = 34_314;
+const NATIVE_SIGNATURE_TOKEN_SCALE_NUMERATOR: usize = 8;
+const NATIVE_SIGNATURE_TOKEN_SCALE_DENOMINATOR: usize = 25;
+const NATIVE_SIGNATURE_ENVELOPE_TOKENS: usize = 120;
+
+fn native_signature_thinking_tokens(signature: &str) -> i32 {
+    // Native reasoning can contain only an opaque signature when summarized
+    // thinking is disabled. In that shape there is no plaintext to tokenize,
+    // but the encrypted payload still scales with the hidden reasoning. Keep
+    // this compatibility estimate inside the exact adaptive structure profile.
+    let scaled = signature
+        .len()
+        .saturating_mul(NATIVE_SIGNATURE_TOKEN_SCALE_NUMERATOR)
+        / NATIVE_SIGNATURE_TOKEN_SCALE_DENOMINATOR;
+    scaled
+        .saturating_sub(NATIVE_SIGNATURE_ENVELOPE_TOKENS)
+        .max(1)
+        .min(i32::MAX as usize) as i32
+}
 
 fn calibrate_native_stream_usage(
     profile: NativeStreamProfile,
@@ -2923,6 +2941,18 @@ impl StreamContext {
         let ctoc_thinking = super::claude_tok::count_claude(&self.thinking_text_acc);
         if ctoc_thinking > 0 {
             ctoc_thinking + 6
+        } else if self.native_stream_profile == NativeStreamProfile::AdaptiveStructureProbe {
+            let estimated = if self.thinking_tokens > 0 {
+                self.thinking_tokens.saturating_add(6)
+            } else {
+                self.upstream_thinking_signature
+                    .as_deref()
+                    .map(native_signature_thinking_tokens)
+                    .unwrap_or(0)
+            };
+            self.output_token_limit
+                .map(|limit| estimated.min(limit.saturating_sub(2).max(0)))
+                .unwrap_or(estimated)
         } else {
             0
         }
@@ -3700,6 +3730,12 @@ mod tests {
     }
 
     #[test]
+    fn native_signature_usage_matches_reference_length_calibration() {
+        assert_eq!(native_signature_thinking_tokens(&"x".repeat(5_460)), 1_627);
+        assert_eq!(native_signature_thinking_tokens(&"x".repeat(8_968)), 2_749);
+    }
+
+    #[test]
     fn aws_b_native_reasoning_probe_preserves_upstream_text_boundaries() {
         use crate::kiro::model::events::ReasoningContentEvent;
 
@@ -3793,11 +3829,125 @@ mod tests {
             message_delta.data["usage"]["cache_creation_input_tokens"],
             34_314
         );
+        assert_eq!(
+            message_delta.data["usage"]["output_tokens_details"]["thinking_tokens"],
+            native_signature_thinking_tokens("opaque-upstream-signature")
+        );
+        assert!(
+            message_delta.data["usage"]["output_tokens"]
+                .as_i64()
+                .zip(
+                    message_delta.data["usage"]["output_tokens_details"]["thinking_tokens"]
+                        .as_i64()
+                )
+                .is_some_and(|(output, thinking)| output > thinking),
+            "final output usage must include both hidden reasoning and visible text"
+        );
         let message_stop = final_events
             .iter()
             .find(|event| event.event == "message_stop")
             .expect("message_stop");
         assert_eq!(message_stop.data, json!({"type": "message_stop"}));
+    }
+
+    #[test]
+    fn adaptive_native_signature_usage_is_capped_below_total_output_limit() {
+        use crate::kiro::model::events::ReasoningContentEvent;
+
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-5",
+            12,
+            true,
+            super::super::cache::UsageBreakdown::flat(12),
+            HashMap::new(),
+        );
+        ctx.enable_aws_b40_compat(true);
+        ctx.set_output_token_limit(8);
+        ctx.set_aws_b40_thinking_requested(true);
+        ctx.set_thinking_text_visible(false);
+        ctx.enable_native_anthropic_reasoning_stream_envelope();
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            signature: "x".repeat(10_000),
+            ..Default::default()
+        }));
+        let _ = ctx.process_assistant_response("answer");
+
+        let final_events = ctx.generate_final_events();
+        let usage = &final_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta")
+            .data["usage"];
+        assert_eq!(usage["output_tokens_details"]["thinking_tokens"], 6);
+        assert_eq!(usage["output_tokens"], 8);
+    }
+
+    #[test]
+    fn adaptive_native_plaintext_thinking_usage_takes_precedence_over_signature_estimate() {
+        use crate::kiro::model::events::ReasoningContentEvent;
+
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-5",
+            12,
+            true,
+            super::super::cache::UsageBreakdown::flat(12),
+            HashMap::new(),
+        );
+        ctx.enable_aws_b40_compat(true);
+        ctx.set_aws_b40_thinking_requested(true);
+        ctx.set_thinking_text_visible(false);
+        ctx.enable_native_anthropic_reasoning_stream_envelope();
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            text: "Plan carefully".to_string(),
+            ..Default::default()
+        }));
+        let _ = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            signature: "x".repeat(10_000),
+            ..Default::default()
+        }));
+        let _ = ctx.process_assistant_response("answer");
+
+        let final_events = ctx.generate_final_events();
+        let thinking_tokens = &final_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta")
+            .data["usage"]["output_tokens_details"]["thinking_tokens"];
+        assert_eq!(thinking_tokens, estimate_tokens("Plan carefully") + 6);
+    }
+
+    #[test]
+    fn aws_b_default_stream_does_not_estimate_signature_only_thinking_usage() {
+        use crate::kiro::model::events::ReasoningContentEvent;
+
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-5",
+            12,
+            true,
+            super::super::cache::UsageBreakdown::flat(12),
+            HashMap::new(),
+        );
+        ctx.enable_aws_b40_compat(true);
+        ctx.set_aws_b40_thinking_requested(true);
+        ctx.set_thinking_text_visible(false);
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            signature: "opaque-upstream-signature".to_string(),
+            ..Default::default()
+        }));
+        let _ = ctx.process_assistant_response("ordinary response");
+
+        let final_events = ctx.generate_final_events();
+        let message_delta = final_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+        assert_eq!(
+            message_delta.data["usage"]["output_tokens_details"]["thinking_tokens"], 0,
+            "ordinary chat and coding streams must retain their historical usage"
+        );
     }
 
     #[test]
