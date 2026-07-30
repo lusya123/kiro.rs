@@ -729,6 +729,12 @@ fn tools_to_anthropic(request: &Value) -> Result<Option<Vec<Tool>>, String> {
             Some(Value::String(value)) => value.clone(),
             Some(_) => return Err(format!("tool {index} `description` must be a string")),
         };
+        // 同 `openai_compat`:上游拒绝空 description 的工具,回退到工具名。
+        let description = if description.trim().is_empty() {
+            name.to_string()
+        } else {
+            description
+        };
         let parameters = object
             .get("parameters")
             .and_then(Value::as_object)

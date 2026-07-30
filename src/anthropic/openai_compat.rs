@@ -152,6 +152,13 @@ fn openai_tools_to_anthropic(oai: &Value) -> Result<Option<Vec<Tool>>, String> {
                 ));
             }
         };
+        // Kiro 上游对空 description 的工具直接返回 400 `Invalid tool use format`,
+        // 而 OpenAI 允许省略 description。回退到工具名以保持可用且不引入额外语义。
+        let description = if description.trim().is_empty() {
+            name.to_string()
+        } else {
+            description
+        };
         let input_schema = match function.get("parameters") {
             None => HashMap::new(),
             Some(Value::Object(parameters)) => parameters
@@ -550,7 +557,6 @@ fn openai_reasoning_config(oai: &Value) -> Result<Option<ReasoningConfig>, Strin
 fn validate_gpt_chat_reasoning_compatibility(
     model: &str,
     reasoning: Option<&ReasoningConfig>,
-    has_function_tools: bool,
 ) -> Result<(), String> {
     if !is_gpt_model(model) {
         return Ok(());
@@ -565,18 +571,10 @@ fn validate_gpt_chat_reasoning_compatibility(
         );
     }
 
-    if has_function_tools {
-        let effective_effort = reasoning
-            .map(|config| config.effort.trim().to_ascii_lowercase())
-            .unwrap_or_else(|| "medium".to_string());
-        if effective_effort != "none" {
-            return Err(
-                "GPT-5.6 Chat Completions function tools require `reasoning_effort: \"none\"`; use `/v1/responses` for tools with reasoning"
-                    .to_string(),
-            );
-        }
-    }
-
+    // 函数工具与 reasoning 可以共存:本端点并不真的转发到 OpenAI Chat Completions,
+    // 而是复用 `post_messages` 走 Kiro 上游(与 `/v1/messages` 同一条路径),该路径对
+    // "tools + 非 none reasoning" 组合返回正常的 tool_use。此前照搬 OpenAI 官方
+    // 契约拒绝该组合,导致经 sub2api 转换而来的工具调用请求全部 400。
     Ok(())
 }
 
@@ -1291,9 +1289,7 @@ pub async fn post_chat_completions(
                 return finish_openai_response(openai_invalid_request(message), gpt_openai_shape);
             }
         };
-    if let Err(message) =
-        validate_gpt_chat_reasoning_compatibility(&model, reasoning.as_ref(), tools.is_some())
-    {
+    if let Err(message) = validate_gpt_chat_reasoning_compatibility(&model, reasoning.as_ref()) {
         return finish_openai_response(openai_invalid_request(message), gpt_openai_shape);
     }
     if oai.get("tool_choice").and_then(Value::as_str) == Some("none") {
@@ -1999,7 +1995,7 @@ mod tests {
     }
 
     #[test]
-    fn gpt_chat_reasoning_efforts_and_tool_boundary_match_official_contract() {
+    fn gpt_chat_reasoning_allows_function_tools_at_every_effort() {
         for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
             for effort in ["none", "low", "medium", "high", "xhigh", "max"] {
                 let reasoning = openai_reasoning_config(&json!({
@@ -2008,22 +2004,16 @@ mod tests {
                 .expect("valid Chat reasoning")
                 .expect("reasoning config");
                 assert_eq!(reasoning.effort, effort);
+                // 工具与 reasoning 可共存:底层复用 post_messages,与 /v1/messages 同路径。
                 assert!(
-                    validate_gpt_chat_reasoning_compatibility(model, Some(&reasoning), false)
-                        .is_ok(),
-                    "{model}/{effort} without tools"
-                );
-                assert_eq!(
-                    validate_gpt_chat_reasoning_compatibility(model, Some(&reasoning), true)
-                        .is_ok(),
-                    effort == "none",
+                    validate_gpt_chat_reasoning_compatibility(model, Some(&reasoning)).is_ok(),
                     "{model}/{effort} with function tools"
                 );
             }
 
             assert!(
-                validate_gpt_chat_reasoning_compatibility(model, None, true).is_err(),
-                "{model} tools must not inherit the medium default"
+                validate_gpt_chat_reasoning_compatibility(model, None).is_ok(),
+                "{model} tools inherit the medium default without error"
             );
             for mode in ["standard", "pro"] {
                 let reasoning = ReasoningConfig {
@@ -2031,45 +2021,25 @@ mod tests {
                     mode: Some(mode.to_string()),
                 };
                 assert!(
-                    validate_gpt_chat_reasoning_compatibility(model, Some(&reasoning), false)
-                        .is_err(),
+                    validate_gpt_chat_reasoning_compatibility(model, Some(&reasoning)).is_err(),
                     "{model}/{mode} mode belongs to Responses"
                 );
             }
         }
     }
 
-    #[tokio::test]
-    async fn gpt_chat_tool_choice_none_cannot_bypass_reasoning_tool_boundary() {
-        let state = AppState::new("test-key", true, true);
-        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
-            let response = post_chat_completions(
-                State(state.clone()),
-                OpenAiChatJson(json!({
-                    "model": model,
-                    "messages": [{"role": "user", "content": "hello"}],
-                    "reasoning_effort": "high",
-                    "tools": [{
-                        "type": "function",
-                        "function": {
-                            "name": "weather",
-                            "parameters": {"type": "object"}
-                        }
-                    }],
-                    "tool_choice": "none"
-                })),
-            )
-            .await;
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{model}");
-            let (_, body) = response_json(response).await;
-            assert!(
-                body["error"]["message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains("reasoning_effort: \"none\"")),
-                "{body}"
-            );
-            assert_standard_clean_openai_error(&body);
-        }
+    #[test]
+    fn tool_without_description_falls_back_to_its_name() {
+        let tools = openai_tools_to_anthropic(&json!({
+            "tools": [{
+                "type": "function",
+                "function": {"name": "get_weather", "parameters": {"type": "object"}}
+            }]
+        }))
+        .expect("tools convert")
+        .expect("tools present");
+        // 上游对空 description 返回 400 Invalid tool use format。
+        assert_eq!(tools[0].description, "get_weather");
     }
 
     #[test]
