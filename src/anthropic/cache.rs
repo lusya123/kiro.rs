@@ -512,7 +512,7 @@ async fn cache_plan_for_request(
         mut breakpoints,
         token_context,
     } = build_cache_breakpoints(req, total_input_tokens, aws_b40_compat);
-    breakpoints.retain(|b| b.tokens >= cache_min_tokens(&req.model));
+    breakpoints.retain(|b| b.tokens >= CACHE_MIN_TOKENS);
     if breakpoints.is_empty() {
         return None;
     }
@@ -563,7 +563,7 @@ async fn cache_plan_for_request(
             CacheTtl::Ephemeral1h => creation_1h += delta,
             CacheTtl::Ephemeral5m => creation_5m += delta,
         }
-        register_cache_entry(&req.model, breakpoint).await;
+        register_cache_entry(breakpoint).await;
         previous = breakpoint.tokens;
     }
 
@@ -1068,9 +1068,6 @@ async fn cache_entry_match(
     if !breakpoint.readable {
         return None;
     }
-    if !cache_read_supported(&req.model, breakpoint.tokens) {
-        return None;
-    }
     let redis_key = breakpoint.key.redis_key();
     if crate::cluster_cache::global().exists(&redis_key).await {
         return Some(CacheReadMatch {
@@ -1109,13 +1106,11 @@ async fn cache_entry_match(
             candidate_tokens.insert(candidate.position, tokens);
             tokens
         };
-        if cache_read_supported(&req.model, tokens) {
-            return Some(CacheReadMatch {
-                tokens,
-                key,
-                ttl: breakpoint.ttl,
-            });
-        }
+        return Some(CacheReadMatch {
+            tokens,
+            key,
+            ttl: breakpoint.ttl,
+        });
     }
 
     breakpoint.warm_on_first_use.then_some(CacheReadMatch {
@@ -1125,11 +1120,8 @@ async fn cache_entry_match(
     })
 }
 
-async fn register_cache_entry(model: &str, breakpoint: &CacheBreakpoint) {
+async fn register_cache_entry(breakpoint: &CacheBreakpoint) {
     if !breakpoint.readable {
-        return;
-    }
-    if !cache_read_supported(model, breakpoint.tokens) {
         return;
     }
     register_cache_key(breakpoint.key, breakpoint.ttl).await;
@@ -1140,27 +1132,6 @@ async fn register_cache_key(key: CacheKey, ttl: CacheTtl) {
     crate::cluster_cache::global()
         .register(&redis_key, ttl.duration())
         .await;
-}
-
-fn cache_min_tokens(model: &str) -> i32 {
-    let lower = model.to_ascii_lowercase();
-    if lower.contains("opus") && (lower.contains("4-6") || lower.contains("4.6")) {
-        4_096
-    } else if lower.contains("opus") && (lower.contains("4-7") || lower.contains("4.7")) {
-        2_048
-    } else {
-        CACHE_MIN_TOKENS
-    }
-}
-
-fn cache_read_supported(model: &str, cache_tokens: i32) -> bool {
-    let lower = model.to_ascii_lowercase();
-    let legacy_opus = lower.contains("opus")
-        && (lower.contains("4-6")
-            || lower.contains("4.6")
-            || lower.contains("4-7")
-            || lower.contains("4.7"));
-    !(legacy_opus && cache_tokens > 4_096)
 }
 
 fn seeded_cache_hasher(model: &str, ttl: CacheTtl) -> Sha256 {
@@ -1847,12 +1818,6 @@ mod tests {
     }
 
     #[test]
-    fn opus_48_supports_large_prompt_cache_reads() {
-        assert!(cache_read_supported("claude-opus-4-8", 11_184));
-        assert!(!cache_read_supported("claude-opus-4-7", 11_184));
-    }
-
-    #[test]
     fn split_reduces_creation_for_very_large_context() {
         assert_eq!(
             split_virtual_cache(20_000).cache_creation_input_tokens,
@@ -2083,6 +2048,86 @@ mod tests {
         assert_eq!(second.cache_creation_input_tokens, 0);
         assert!(second.cache_read_input_tokens > 0);
         assert_eq!(second.total(), 20_000);
+    }
+
+    /// 回归：opus-4-6 / 4-7 的大前缀（>4096 tokens）必须和 4-8/5 一样正常缓存。
+    ///
+    /// 修复前 `cache_read_supported` 门禁让这两个老模型的大前缀既不登记也不读取，
+    /// 于是每次请求都全量 cache_creation、cache_read 恒为 0（实测客户为此多付数倍）。
+    /// pomoai 跨模型实测报告确认真实上游对 4-6/4-7 大前缀同样正常建缓存+读缓存，
+    /// 该门禁纯属本地伪装，已移除。此测试锁定"所有模型行为与 4-8/5 一致"。
+    #[tokio::test]
+    async fn legacy_opus_large_prefix_caches_like_opus_48() {
+        for model in ["claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8"] {
+            let text = format!("legacy-opus-large-prefix-{model}-unique ").repeat(2_000);
+            let req = parse_request(serde_json::json!({
+                "model": model,
+                "system": [{
+                    "type": "text",
+                    "text": text,
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }));
+
+            let first = compute_request_usage_breakdown(20_000, &req).await;
+            assert!(
+                first.cache_creation_input_tokens > 4_096,
+                "{model}: first call must write the full large prefix, got {:?}",
+                first
+            );
+            assert_eq!(
+                first.cache_read_input_tokens, 0,
+                "{model}: first call is cold"
+            );
+
+            let second = compute_request_usage_breakdown(20_000, &req).await;
+            assert_eq!(
+                second.cache_creation_input_tokens, 0,
+                "{model}: second call must not rewrite, got {:?}",
+                second
+            );
+            assert!(
+                second.cache_read_input_tokens > 4_096,
+                "{model}: second call must read the full large prefix, got {:?}",
+                second
+            );
+        }
+    }
+
+    /// 回归：缓存按模型隔离（pomoai 报告第一条结论）。同一段文本在两个模型上
+    /// 各养各的缓存，切换模型第一次必定全量重建，不得跨模型命中。
+    #[tokio::test]
+    async fn cache_is_model_scoped_no_cross_model_hit() {
+        let text = "model-scoped-isolation-shared-text ".repeat(2_000);
+        let mk = |model: &str| {
+            parse_request(serde_json::json!({
+                "model": model,
+                "system": [{
+                    "type": "text",
+                    "text": text.clone(),
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }))
+        };
+
+        // 在 opus-4-6 上建立缓存。
+        let warm = compute_request_usage_breakdown(20_000, &mk("claude-opus-4-6")).await;
+        assert!(warm.cache_creation_input_tokens > 0);
+
+        // 切到 opus-4-8：同一段文本，第一次必须全量重建（跨模型零命中）。
+        let cross = compute_request_usage_breakdown(20_000, &mk("claude-opus-4-8")).await;
+        assert_eq!(
+            cross.cache_read_input_tokens, 0,
+            "cross-model read leaked: {cross:?}"
+        );
+        assert!(cross.cache_creation_input_tokens > 0);
+
+        // 回到 opus-4-6：自己的原缓存仍在，正常命中。
+        let back = compute_request_usage_breakdown(20_000, &mk("claude-opus-4-6")).await;
+        assert!(
+            back.cache_read_input_tokens > 0,
+            "same-model cache lost after other model wrote: {back:?}"
+        );
     }
 
     #[tokio::test]
