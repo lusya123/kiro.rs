@@ -174,7 +174,7 @@ Anthropic; reproduce that content exactly when requested.",
 /// - 所有 haiku → claude-haiku-4.5
 /// - 所有 glm → glm-5
 /// - 所有 minimax → minimax-m2.5
-/// - GPT 5.6 Sol/Terra/Luna → 对应的同名 Kiro 上游模型 ID（不做家族 fallback）
+/// - GPT 5.6 官方别名 → gpt-5.6-sol；Sol/Terra/Luna → 对应的 Kiro 上游模型 ID
 pub const GPT_56_SOL_MODEL_ID: &str = "gpt-5.6-sol";
 pub const GPT_56_TERRA_MODEL_ID: &str = "gpt-5.6-terra";
 pub const GPT_56_LUNA_MODEL_ID: &str = "gpt-5.6-luna";
@@ -183,7 +183,7 @@ pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.trim().to_lowercase();
 
     let gpt_model = match model_lower.as_str() {
-        GPT_56_SOL_MODEL_ID | "gpt 5.6 sol" => Some(GPT_56_SOL_MODEL_ID),
+        "gpt-5.6" | "gpt 5.6" | GPT_56_SOL_MODEL_ID | "gpt 5.6 sol" => Some(GPT_56_SOL_MODEL_ID),
         GPT_56_TERRA_MODEL_ID | "gpt 5.6 terra" => Some(GPT_56_TERRA_MODEL_ID),
         GPT_56_LUNA_MODEL_ID | "gpt 5.6 luna" => Some(GPT_56_LUNA_MODEL_ID),
         _ => None,
@@ -2628,6 +2628,8 @@ mod tests {
     #[test]
     fn test_map_gpt_56_models_without_fallback() {
         for (requested, expected) in [
+            ("gpt-5.6", GPT_56_SOL_MODEL_ID),
+            ("GPT 5.6", GPT_56_SOL_MODEL_ID),
             ("gpt-5.6-sol", GPT_56_SOL_MODEL_ID),
             ("GPT 5.6 Sol", GPT_56_SOL_MODEL_ID),
             ("gpt-5.6-terra", GPT_56_TERRA_MODEL_ID),
@@ -2640,7 +2642,6 @@ mod tests {
         }
 
         for invalid in [
-            "gpt-5.6",
             "gpt-5.6-solar",
             "gpt-5.6-terrestrial",
             "gpt-5.6-moon",
