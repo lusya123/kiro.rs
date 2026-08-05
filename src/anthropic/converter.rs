@@ -1300,7 +1300,14 @@ fn convert_tools(
     tools
         .iter()
         .map(|t| {
-            let mut description = t.description.clone();
+            // Kiro rejects tools with an empty description as
+            // `400 Invalid tool use format`. Anthropic clients may omit the
+            // field, so use the tool name as a neutral compatibility fallback.
+            let mut description = if t.description.trim().is_empty() {
+                t.name.clone()
+            } else {
+                t.description.clone()
+            };
 
             // 对 Write/Edit 工具追加自定义描述后缀
             let suffix = if apply_claude_code_policy {
@@ -2852,6 +2859,29 @@ mod tests {
     }
 
     #[test]
+    fn blank_tool_descriptions_fall_back_to_the_tool_name() {
+        use super::super::types::Tool as AnthropicTool;
+
+        for description in ["", "   \n\t"] {
+            let tools = Some(vec![AnthropicTool {
+                tool_type: None,
+                name: "get_weather".to_string(),
+                description: description.to_string(),
+                input_schema: HashMap::from([("type".to_string(), serde_json::json!("object"))]),
+                strict: None,
+                max_uses: None,
+                cache_control: None,
+            }]);
+            let mut tool_name_map = HashMap::new();
+
+            let converted = convert_tools(&tools, &mut tool_name_map, false);
+
+            assert_eq!(converted.len(), 1);
+            assert_eq!(converted[0].tool_specification.description, "get_weather");
+        }
+    }
+
+    #[test]
     fn test_shorten_tool_name_deterministic() {
         let long_name =
             "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
@@ -2902,6 +2932,7 @@ mod tests {
             description: "Report public identity".to_string(),
             input_schema: HashMap::from([("type".to_string(), serde_json::json!("object"))]),
             tool_type: None,
+            strict: None,
             max_uses: None,
             cache_control: None,
         };
@@ -2975,6 +3006,7 @@ mod tests {
                 description: "A test tool".to_string(),
                 input_schema: schema,
                 tool_type: None,
+                strict: None,
                 max_uses: None,
                 cache_control: None,
             }]),
@@ -3046,6 +3078,7 @@ mod tests {
                 description: "A test tool".to_string(),
                 input_schema: schema,
                 tool_type: None,
+                strict: None,
                 max_uses: None,
                 cache_control: None,
             }]),

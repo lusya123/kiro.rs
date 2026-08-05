@@ -5,8 +5,9 @@
 //! 支持多凭据故障转移和重试
 //! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -25,6 +26,48 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
+
+/// A non-retryable HTTP rejection returned by the Kiro upstream.
+///
+/// Keep the status typed until the Anthropic handler builds its response. A
+/// plain `anyhow!("400 ...")` loses this information and previously caused
+/// client request errors to be exposed as gateway failures.
+#[derive(Debug)]
+pub(crate) struct UpstreamHttpError {
+    status: StatusCode,
+    body: String,
+    api_type: &'static str,
+}
+
+impl UpstreamHttpError {
+    pub(crate) fn new(status: StatusCode, body: String, api_type: &'static str) -> Self {
+        Self {
+            status,
+            body,
+            api_type,
+        }
+    }
+
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub(crate) fn body(&self) -> &str {
+        &self.body
+    }
+}
+
+impl fmt::Display for UpstreamHttpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} API 请求失败: {} {}",
+            self.api_type, self.status, self.body
+        )
+    }
+}
+
+impl std::error::Error for UpstreamHttpError {}
 
 /// Kiro API Provider
 ///
@@ -462,7 +505,7 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                return Err(UpstreamHttpError::new(status, body, api_type).into());
             }
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移

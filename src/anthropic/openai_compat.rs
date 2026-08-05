@@ -190,6 +190,7 @@ fn openai_tools_to_anthropic(oai: &Value) -> Result<Option<Vec<Tool>>, String> {
             name: name.to_string(),
             description,
             input_schema,
+            strict: None,
             max_uses: None,
             cache_control: None,
         });

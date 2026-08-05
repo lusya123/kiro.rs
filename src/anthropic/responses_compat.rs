@@ -747,6 +747,7 @@ fn tools_to_anthropic(request: &Value) -> Result<Option<Vec<Tool>>, String> {
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
+            strict: None,
             max_uses: None,
             cache_control: None,
         });

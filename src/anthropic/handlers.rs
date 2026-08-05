@@ -12,6 +12,7 @@ use crate::kiro::model::requests::kiro::{
     AdditionalModelRequestFields, KiroOutputConfig, KiroReasoningConfig, KiroRequest,
 };
 use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::kiro::provider::UpstreamHttpError;
 use crate::token;
 use anyhow::Error;
 use axum::{
@@ -472,6 +473,26 @@ fn build_continuation_request_body(
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
+    if let Some(upstream) = err.downcast_ref::<UpstreamHttpError>() {
+        let status =
+            StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let error_type = if status.is_client_error() {
+            "invalid_request_error"
+        } else {
+            "api_error"
+        };
+        tracing::warn!(
+            status = status.as_u16(),
+            error = %upstream,
+            "Kiro upstream returned a non-retryable HTTP rejection"
+        );
+        return (
+            status,
+            Json(ErrorResponse::new(error_type, upstream.body().to_string())),
+        )
+            .into_response();
+    }
+
     let err_str = err.to_string();
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
@@ -2411,10 +2432,8 @@ pub async fn post_messages(
     if let Some(response) = reject_invalid_thinking_signatures(&payload, aws_b40_compat) {
         return response;
     }
-    if aws_b40_compat {
-        if let Some(response) = super::bedrock::request_preflight_error(&payload) {
-            return response;
-        }
+    if let Some(response) = kiro_request_preflight_error(&payload, aws_b40_compat) {
+        return response;
     }
 
     // 检查 KiroProvider 是否可用
@@ -3872,6 +3891,121 @@ fn aws_b40_model_supports_adaptive_thinking(model: &str) -> bool {
     super::compat::is_opus_4_8(model) || model_is_opus_5(model) || model_is_sonnet_5(model)
 }
 
+/// Reject request shapes that the selected legacy Kiro path cannot represent.
+///
+/// This runs only after the optional native provider had a chance to proxy the
+/// raw Anthropic request. The legacy transport must never silently discard a
+/// requested strict or thinking mode and pretend the contract was honored.
+fn kiro_request_preflight_error(
+    payload: &MessagesRequest,
+    aws_b40_compat: bool,
+) -> Option<Response> {
+    if aws_b40_compat && let Some(response) = super::bedrock::request_preflight_error(payload) {
+        return Some(response);
+    }
+
+    if let Some((index, _)) = payload.tools.as_ref().and_then(|tools| {
+        tools
+            .iter()
+            .enumerate()
+            .find(|(_, tool)| tool.strict == Some(true))
+    }) {
+        return Some(thinking_error_response(
+            payload.stream,
+            format!(
+                "tools[{index}].strict: strict schema enforcement is not supported by the Kiro transport"
+            ),
+        ));
+    }
+
+    if aws_b40_compat {
+        return aws_b40_kiro_thinking_preflight_error(payload);
+    }
+
+    None
+}
+
+fn aws_b40_kiro_thinking_preflight_error(payload: &MessagesRequest) -> Option<Response> {
+    // `normalize_aws_b40_thinking` turns `*-thinking` aliases into an explicit
+    // thinking request later. Derive that effective value here without cloning
+    // a potentially very large message body, so aliases cannot bypass checks.
+    let effective_thinking = if payload.model.to_ascii_lowercase().contains("thinking") {
+        Some(Thinking {
+            thinking_type: if payload
+                .thinking
+                .as_ref()
+                .is_some_and(|thinking| thinking.thinking_type == "adaptive")
+                || model_uses_adaptive_thinking(&payload.model)
+            {
+                "adaptive".to_string()
+            } else {
+                "enabled".to_string()
+            },
+            budget_tokens: 20000,
+            display: payload
+                .thinking
+                .as_ref()
+                .and_then(|thinking| thinking.display.clone()),
+        })
+    } else {
+        payload.thinking.clone()
+    };
+
+    let Some(thinking) = effective_thinking.as_ref() else {
+        return None;
+    };
+
+    if thinking.is_enabled() && tool_choice_forces_tool(payload) {
+        let choice = payload
+            .tool_choice
+            .as_ref()
+            .and_then(|value| value.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        return Some(thinking_error_response(
+            payload.stream,
+            format!(
+                "tool_choice.type \"{choice}\" is incompatible with enabled thinking; use auto or none"
+            ),
+        ));
+    }
+
+    match thinking.thinking_type.as_str() {
+        "disabled" => None,
+        "enabled" if thinking.budget_tokens < 1024 => Some(thinking_error_response(
+            payload.stream,
+            "thinking.enabled.budget_tokens must be greater than or equal to 1024",
+        )),
+        "enabled" if payload.max_tokens <= thinking.budget_tokens => Some(thinking_error_response(
+            payload.stream,
+            "max_tokens must be greater than thinking.budget_tokens",
+        )),
+        "enabled" if !aws_b40_model_supports_enabled_thinking(&payload.model) => {
+            Some(thinking_error_response(
+                payload.stream,
+                format!(
+                    "thinking.type \"enabled\" is not supported for model \"{}\" by the Kiro transport; use adaptive on a supported model",
+                    payload.model
+                ),
+            ))
+        }
+        "adaptive" if !aws_b40_model_supports_adaptive_thinking(&payload.model) => {
+            Some(thinking_error_response(
+                payload.stream,
+                format!(
+                    "thinking.type \"adaptive\" is not supported for model \"{}\" by the Kiro transport",
+                    payload.model
+                ),
+            ))
+        }
+        "enabled" | "adaptive" => None,
+        other => Some(thinking_error_response(
+            payload.stream,
+            format!("thinking.type \"{other}\" is not supported"),
+        )),
+    }
+}
+
 /// 工具调用前导文本。
 ///
 /// 真 Claude(及真 Claude Code,其系统提示本就要求用工具前先简述一句)返回 `[text, tool_use]`;
@@ -5092,10 +5226,8 @@ pub async fn post_messages_cc(
     if let Some(response) = reject_invalid_thinking_signatures(&payload, aws_b40_compat) {
         return response;
     }
-    if aws_b40_compat {
-        if let Some(response) = super::bedrock::request_preflight_error(&payload) {
-            return response;
-        }
+    if let Some(response) = kiro_request_preflight_error(&payload, aws_b40_compat) {
+        return response;
     }
 
     // 检查 KiroProvider 是否可用
@@ -5664,6 +5796,185 @@ mod tests {
             }
         }
         serde_json::from_value(body).expect("valid request body")
+    }
+
+    #[tokio::test]
+    async fn kiro_preflight_rejects_strict_true_without_silently_dropping_it() {
+        for (aws_b40_compat, stream) in [(false, false), (true, false), (true, true)] {
+            let request = parse(
+                "claude-sonnet-4-6",
+                serde_json::json!({
+                    "stream": stream,
+                    "tools": [{
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "input_schema": {"type": "object", "properties": {}},
+                        "strict": true
+                    }]
+                }),
+            );
+
+            let response = kiro_request_preflight_error(&request, aws_b40_compat)
+                .expect("strict:true must be rejected on Kiro");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body");
+            let body = String::from_utf8(body.to_vec()).expect("UTF-8 response");
+            assert!(body.contains("tools[0].strict"));
+            assert!(body.contains("not supported by the Kiro transport"));
+        }
+
+        let strict_false = parse(
+            "claude-sonnet-4-6",
+            serde_json::json!({
+                "tools": [{
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "strict": false
+                }]
+            }),
+        );
+        assert!(kiro_request_preflight_error(&strict_false, false).is_none());
+        assert!(kiro_request_preflight_error(&strict_false, true).is_none());
+    }
+
+    #[test]
+    fn kiro_preflight_rejects_invalid_manual_thinking_instead_of_downgrading_it() {
+        let forced_tool = parse(
+            "claude-sonnet-4-6",
+            serde_json::json!({
+                "thinking": {"type": "enabled", "budget_tokens": 2048},
+                "tool_choice": {"type": "any"},
+                "tools": [{
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "input_schema": {"type": "object", "properties": {}}
+                }]
+            }),
+        );
+        assert_eq!(
+            kiro_request_preflight_error(&forced_tool, true)
+                .expect("thinking plus forced tool choice must be rejected")
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        for extra in [
+            serde_json::json!({
+                "thinking": {"type": "enabled", "budget_tokens": 512}
+            }),
+            serde_json::json!({
+                "max_tokens": 2048,
+                "thinking": {"type": "enabled", "budget_tokens": 2048}
+            }),
+            serde_json::json!({
+                "thinking": {"type": "enabled", "budget_tokens": 2048}
+            }),
+        ] {
+            let model = if extra["thinking"]["budget_tokens"] == 2048
+                && extra.get("max_tokens").is_none()
+            {
+                "claude-opus-4-8"
+            } else {
+                "claude-sonnet-4-6"
+            };
+            assert_eq!(
+                kiro_request_preflight_error(&parse(model, extra), true)
+                    .expect("unsupported manual thinking must be rejected")
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        let supported_enabled = parse(
+            "claude-sonnet-4-6",
+            serde_json::json!({
+                "thinking": {"type": "enabled", "budget_tokens": 2048}
+            }),
+        );
+        assert!(kiro_request_preflight_error(&supported_enabled, true).is_none());
+
+        let supported_adaptive = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "high"}
+            }),
+        );
+        assert!(kiro_request_preflight_error(&supported_adaptive, true).is_none());
+    }
+
+    #[test]
+    fn kiro_preflight_evaluates_effective_thinking_from_model_aliases() {
+        let unsupported_alias = parse("claude-opus-4-7-thinking", serde_json::json!({}));
+        assert_eq!(
+            kiro_request_preflight_error(&unsupported_alias, true)
+                .expect("unsupported adaptive alias must not be silently removed")
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let explicit_adaptive_alias = parse(
+            "claude-sonnet-4-6-thinking",
+            serde_json::json!({
+                "thinking": {"type": "adaptive"}
+            }),
+        );
+        assert_eq!(
+            kiro_request_preflight_error(&explicit_adaptive_alias, true)
+                .expect("explicit adaptive must win over the model alias default")
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        for model in ["claude-sonnet-4-6-thinking", "claude-opus-5-thinking"] {
+            let forced_tool = parse(
+                model,
+                serde_json::json!({
+                    "tool_choice": {"type": "tool", "name": "get_weather"},
+                    "tools": [{
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "input_schema": {"type": "object", "properties": {}}
+                    }]
+                }),
+            );
+            assert_eq!(
+                kiro_request_preflight_error(&forced_tool, true)
+                    .expect("thinking alias plus forced tool choice must be rejected")
+                    .status(),
+                StatusCode::BAD_REQUEST,
+                "model={model}"
+            );
+
+            let automatic = parse(model, serde_json::json!({}));
+            assert!(
+                kiro_request_preflight_error(&automatic, true).is_none(),
+                "model={model}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_bad_request_remains_an_http_bad_request() {
+        let response = map_provider_error(anyhow::Error::new(UpstreamHttpError::new(
+            reqwest::StatusCode::BAD_REQUEST,
+            "Invalid tool use format".to_string(),
+            "streaming",
+        )));
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON response");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["message"], "Invalid tool use format");
+
+        let generic = map_provider_error(anyhow::anyhow!("network transport failed"));
+        assert_eq!(generic.status(), StatusCode::BAD_GATEWAY);
     }
 
     fn streamed_text(body: &str) -> String {
