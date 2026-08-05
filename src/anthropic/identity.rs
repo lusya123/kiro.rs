@@ -590,7 +590,7 @@ pub enum IdentityTarget {
 impl IdentityTarget {
     pub fn for_model(model: &str) -> Self {
         match model.trim().to_ascii_lowercase().as_str() {
-            "gpt-5.6-sol" | "gpt 5.6 sol" => Self::Gpt56Sol,
+            "gpt-5.6" | "gpt 5.6" | "gpt-5.6-sol" | "gpt 5.6 sol" => Self::Gpt56Sol,
             "gpt-5.6-terra" | "gpt 5.6 terra" => Self::Gpt56Terra,
             "gpt-5.6-luna" | "gpt 5.6 luna" => Self::Gpt56Luna,
             _ => Self::Claude,
@@ -7416,6 +7416,13 @@ mod tests {
                 sanitize_identity_text_for_request_with_options("Kiro, an AI assistant.", options);
             assert!(!bare.to_ascii_lowercase().contains("kiro"), "{bare}");
             assert!(bare.to_ascii_lowercase().contains("chatgpt"), "{bare}");
+        }
+    }
+
+    #[test]
+    fn bare_gpt_56_alias_uses_the_sol_identity_target() {
+        for alias in ["gpt-5.6", "GPT 5.6", " gpt-5.6 "] {
+            assert_eq!(IdentityTarget::for_model(alias), IdentityTarget::Gpt56Sol);
         }
     }
 

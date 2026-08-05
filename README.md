@@ -454,6 +454,7 @@ AWS-B 会根据模型自动生成公开消息 ID，不需要额外的容器启�
 
 | 客户端模型 | Kiro 模型 |
 |----------------|-----------|
+| `gpt-5.6` / `GPT 5.6` | `gpt-5.6-sol` |
 | `gpt-5.6-sol` / `GPT 5.6 Sol` | `gpt-5.6-sol` |
 | `gpt-5.6-terra` / `GPT 5.6 Terra` | `gpt-5.6-terra` |
 | `gpt-5.6-luna` / `GPT 5.6 Luna` | `gpt-5.6-luna` |
@@ -467,8 +468,10 @@ AWS-B 会根据模型自动生成公开消息 ID，不需要额外的容器启�
 | `*opus*`（其他） | `claude-opus-4.6` |
 | `*haiku*` | `claude-haiku-4.5` |
 
-GPT 5.6 仅接受上表中的精确模型名，并原样透传到上游；不会回退到 Claude
-或其他 GPT 模型，也不会使用本地兼容回复。身份探测使用独立的 GPT 策略：
+GPT 5.6 仅接受上表中的精确名称或别名；裸 `gpt-5.6` 会规范化为 Sol，
+其余三档原样透传到上游。它们不会回退到 Claude
+或其他 GPT 模型，也不会使用本地兼容回复。`GET /v1/models` 会同时列出裸别名及
+Sol/Terra/Luna 三档，便于客户端发现。身份探测使用独立的 GPT 策略：
 公开助手为 ChatGPT，精确模型为请求中的 Sol/Terra/Luna，开发者与模型提供方为
 OpenAI，私有宿主/运行时返回 `unknown`。该策略复用跨分片检测和结构化防泄漏框架，
 但不注入 Claude/Anthropic 身份；普通第三方讨论、引用、代码、字符串字面量和业务
@@ -503,6 +506,8 @@ OpenAI Chat Completions 兼容端点可使用顶层
 `"reasoning_effort": "xhigh"`，并可选传入
 `"reasoning_mode": "standard"`；也接受上面相同的嵌套 `reasoning` 对象。
 不支持的档位会在本地返回 400，不会静默降级到默认值。
+其 `parallel_tool_calls: false` 也会加入串行工具提示，但受下述相同的
+best-effort 限制。
 
 OpenAI Responses 兼容端点使用标准嵌套字段：
 
@@ -519,6 +524,38 @@ OpenAI Responses 兼容端点使用标准嵌套字段：
 
 该入口位于 `/v1/responses`，支持 GPT 5.6 的文本、图片、base64 文档、
 函数工具、非流式响应和 canonical Responses SSE。
+`store` 省略时按 Responses 契约默认为 `true`；服务会在单进程内以内存保存
+最多 30 分钟的有限可见对话状态，供 `previous_response_id` 续接。状态池最多
+256 项、总计 32 MiB、单项 4 MiB。省略 `store` 的请求若超过单项容量，会尽可能
+降为 `store: false` 并明确反映在响应中；显式 `store: true` 超限会返回容量错误。
+流式响应若直到输出结束后才越过容量，仍可能以 `response_store_error` 终止。
+Codex 显式发送的 `store: false` 始终保持无状态，不受此限制。
+
+`parallel_tool_calls: false` 会向上游加入“本轮最多调用一个工具”的串行约束。
+当前上游没有原生的硬开关；若它违反约束，服务会记录 warning 并完整返回所有调用，
+避免静默丢失工具请求。因此该字段在此兼容层中属于 best-effort，而非硬保证。
+
+AWS-B/Kiro 当前不提供 OpenAI 的不透明加密推理项。为兼容 Codex，请求可以携带
+`include: ["reasoning.encrypted_content"]` 及 `reasoning.context/summary`，但服务不会
+伪造 `encrypted_content`，也无法在 `store: false` 的后续轮次回放隐藏推理状态；
+可见消息和工具结果仍可正常多轮续接。`prompt_cache_key`、`client_metadata`、
+`service_tier`、`stream_options` 与 `defer_loading` 同样属于请求形状兼容字段，
+不代表上游缓存、服务等级或延迟加载已生效。
+
+Codex 0.146 默认还会声明 `{"type":"web_search","external_web_access":false}`；该值
+表示 cached hosted search，而不是完全禁用搜索。为使普通 Codex 编程请求可用，这个
+默认声明会原样回显但不会下发给 Kiro，也不会伪造搜索结果；Codex 的可选
+`search_content_types` 元数据只严格接受 `text`/`image`。启用外网或带筛选、位置、
+上下文等实际搜索参数的 hosted Web Search 会明确报错，因为当前 GPT Responses 路径
+没有可验证的搜索结果与引用事件。若不需要搜索，可在 Codex 配置中设
+`web_search = "disabled"`；若任务必须搜索，请使用独立搜索工具或支持 hosted search
+的上游。这与 Anthropic Messages 的内置 WebSearch 转换逻辑不是同一个协议。
+
+Codex 建议直接配置官方目录中的 `gpt-5.6-sol`、`gpt-5.6-terra` 或
+`gpt-5.6-luna`。裸 `gpt-5.6` 仍可调用并会映射到 Sol，但 Codex 客户端会因其内置
+目录没有该别名而显示 fallback metadata 警告。带 `client_version` 的模型目录请求会
+返回合法的 Codex 空覆盖目录，使客户端继续使用与自身版本匹配的内置模型元数据；
+不带该参数的 `/v1/models` 仍返回标准 OpenAI 模型列表。
 
 ## Admin（可选）
 
@@ -531,7 +568,8 @@ OpenAI Responses 兼容端点使用标准嵌套字段：
   - `POST /api/admin/credentials/:id/disabled` - 设置凭据禁用状态
   - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
   - `POST /api/admin/credentials/:id/reset` - 重置失败计数
-  - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
+  - `GET /api/admin/credentials/:id/balance` - 获取凭据余额（默认服务端缓存 5 分钟）
+  - `GET /api/admin/credentials/:id/balance?fresh=true` - 绕过本地缓存查询上游，适合调用前后用量差值实验；上游账本仍可能延迟更新
 
 - **Admin UI**
   - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）
@@ -540,7 +578,7 @@ OpenAI Responses 兼容端点使用标准嵌套字段：
 
 1. **凭证安全**: 请妥善保管 `credentials.json` 文件，不要提交到版本控制
 2. **Token 刷新**: 服务会自动刷新过期的 Token，无需手动干预
-3. **WebSearch 工具**: 当 `tools` 列表仅包含一个 `web_search` 工具时，会走内置 WebSearch 转换逻辑
+3. **Anthropic WebSearch 工具**: Messages 请求中仅包含一个 `web_search_20250305` 工具时，会走内置 WebSearch 转换逻辑；OpenAI Responses 的 hosted `web_search` 目前仅接受 `external_web_access: false` 的禁用态声明
 
 ## 项目结构
 

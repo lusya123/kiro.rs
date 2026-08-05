@@ -1515,6 +1515,7 @@ pub fn models_response() -> Response {
     const MODEL_IDS: &[&str] = &[
         "claude-haiku-4-5",
         "claude-haiku-4-5-20251001",
+        super::converter::GPT_56_MODEL_ALIAS,
         super::converter::GPT_56_SOL_MODEL_ID,
         super::converter::GPT_56_TERRA_MODEL_ID,
         super::converter::GPT_56_LUNA_MODEL_ID,
@@ -1557,6 +1558,12 @@ pub fn models_response() -> Response {
         .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
         .body(Body::from(body))
         .unwrap()
+}
+
+/// Codex app/CLI sends `client_version` and expects its private model-catalog schema rather than
+/// the public OpenAI model list. An empty override keeps Codex's bundled, version-matched metadata.
+pub fn codex_models_response() -> Response {
+    (StatusCode::OK, Json(json!({ "models": [] }))).into_response()
 }
 
 pub fn head_models_response() -> Response {
@@ -3821,12 +3828,13 @@ mod tests {
         assert!(body.contains("\"id\":\"claude-opus-5-thinking\""));
         assert!(body.contains("\"id\":\"claude-sonnet-5\""));
         assert!(body.contains("\"id\":\"claude-sonnet-5-thinking\""));
+        assert!(body.contains("\"id\":\"gpt-5.6\""));
         assert!(body.contains("\"id\":\"gpt-5.6-sol\""));
         assert!(body.contains("\"id\":\"gpt-5.6-terra\""));
         assert!(body.contains("\"id\":\"gpt-5.6-luna\""));
 
         let catalog: Value = serde_json::from_str(&body).expect("valid models JSON");
-        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+        for model in ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
             let entry = catalog["data"]
                 .as_array()
                 .and_then(|models| models.iter().find(|entry| entry["id"] == model))

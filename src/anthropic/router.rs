@@ -176,9 +176,22 @@ mod tests {
         assert!(body.contains("\"supported_endpoint_types\":[\"anthropic\",\"openai\"]"));
         assert!(body.contains("claude-opus-5"));
         assert!(body.contains("claude-sonnet-5"));
+        assert!(body.contains("\"id\":\"gpt-5.6\""));
         assert!(body.contains("gpt-5.6-sol"));
         assert!(body.contains("gpt-5.6-terra"));
         assert!(body.contains("gpt-5.6-luna"));
+
+        let response = client
+            .get(format!("{base}/v1/models?client_version=0.146.0"))
+            .header("x-api-key", "test-key")
+            .send()
+            .await
+            .expect("Codex model catalog request");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.json::<Value>().await.expect("Codex models JSON"),
+            json!({"models": []})
+        );
 
         let response = client
             .head(format!("{base}/v1/models"))

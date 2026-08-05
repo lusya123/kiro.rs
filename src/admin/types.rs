@@ -178,6 +178,17 @@ pub struct BalanceResponse {
     pub next_reset_at: Option<f64>,
 }
 
+/// 余额查询参数。
+///
+/// 默认保留 5 分钟服务端缓存；`fresh=true` 仅供需要实时计量的
+/// Admin 调用绕过缓存，并用新结果刷新缓存。
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetBalanceQuery {
+    #[serde(default)]
+    pub fresh: bool,
+}
+
 // ============ 负载均衡配置 ============
 
 /// 负载均衡模式响应

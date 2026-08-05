@@ -324,10 +324,36 @@ fn stream_requested(request: &Value) -> Result<bool, String> {
     }
 }
 
-fn store_requested(request: &Value) -> Result<bool, String> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StoreMode {
+    Disabled,
+    Implicit,
+    Required,
+}
+
+impl StoreMode {
+    fn enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    fn disable_if_implicit(&mut self) -> bool {
+        if matches!(self, Self::Implicit) {
+            *self = Self::Disabled;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn store_requested(request: &Value) -> Result<StoreMode, String> {
     match request.get("store") {
-        None | Some(Value::Null) => Ok(false),
-        Some(Value::Bool(value)) => Ok(*value),
+        // Match the Responses API default. Codex explicitly sends `store: false`,
+        // while clients that omit the field expect the returned response id to be
+        // usable with `previous_response_id`.
+        None | Some(Value::Null) => Ok(StoreMode::Implicit),
+        Some(Value::Bool(true)) => Ok(StoreMode::Required),
+        Some(Value::Bool(false)) => Ok(StoreMode::Disabled),
         Some(_) => Err("`store` must be a boolean".to_string()),
     }
 }
@@ -782,6 +808,46 @@ fn parse_tool_value(
         .as_object()
         .ok_or_else(|| format!("`{path}` must be an object"))?;
     match object.get("type").and_then(Value::as_str) {
+        Some("web_search") if namespace.is_none() => {
+            for key in object.keys() {
+                if !matches!(
+                    key.as_str(),
+                    "type" | "external_web_access" | "search_content_types"
+                ) {
+                    return Err(format!("`{path}.{key}` is not supported"));
+                }
+            }
+            if let Some(content_types) = object.get("search_content_types") {
+                let content_types = content_types
+                    .as_array()
+                    .ok_or_else(|| format!("`{path}.search_content_types` must be an array"))?;
+                if content_types.is_empty()
+                    || content_types.iter().any(|content_type| {
+                        !matches!(content_type.as_str(), Some("text" | "image"))
+                    })
+                {
+                    return Err(format!(
+                        "`{path}.search_content_types` must contain only `text` or `image`"
+                    ));
+                }
+            }
+            match object.get("external_web_access") {
+                Some(Value::Bool(false)) => {
+                    tracing::debug!(
+                        tool_path = path,
+                        "cached Responses hosted web search is unavailable and will not be forwarded to Kiro"
+                    );
+                    Ok(Vec::new())
+                }
+                Some(Value::Bool(true)) => Err(format!(
+                    "`{path}` requests hosted web search, which this endpoint cannot execute"
+                )),
+                Some(_) => Err(format!("`{path}.external_web_access` must be a boolean")),
+                None => Err(format!(
+                    "`{path}.external_web_access` must be false; hosted web search is not supported"
+                )),
+            }
+        }
         Some("function") => Ok(vec![parse_function_tool(
             object,
             path,
@@ -989,6 +1055,27 @@ fn tool_catalog(request: &Value) -> Result<ToolCatalog, String> {
         catalog.by_public_key.insert(tool.key, kiro_name);
     }
     Ok(catalog)
+}
+
+fn response_tool_definitions(request: &Value) -> Value {
+    let mut tools = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(items) = request.get("input").and_then(Value::as_array) {
+        for item in items {
+            if item.get("type").and_then(Value::as_str) == Some("additional_tools") {
+                tools.extend(
+                    item.get("tools")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+            }
+        }
+    }
+    Value::Array(tools)
 }
 
 fn optional_tool_namespace<'a>(
@@ -1325,7 +1412,8 @@ fn tool_choice_to_anthropic(
     };
     if let Some(choice) = choice.as_str() {
         return match choice {
-            "auto" => Ok(Some(json!({"type": "auto"}))),
+            "auto" if !catalog.anthropic_tools.is_empty() => Ok(Some(json!({"type": "auto"}))),
+            "auto" => Ok(None),
             "required" if !catalog.anthropic_tools.is_empty() => Ok(Some(json!({"type": "any"}))),
             "required" => Err("`tool_choice`: `required` requires at least one tool".to_string()),
             "none" => Ok(None),
@@ -1382,7 +1470,7 @@ struct ResponseMeta {
     parallel_tool_calls: bool,
     text: Value,
     tool_catalog: ToolCatalog,
-    store: bool,
+    store: StoreMode,
     previous_response_id: Option<String>,
 }
 
@@ -1393,7 +1481,7 @@ impl ResponseMeta {
         max_output_tokens: i32,
         reasoning: Option<ReasoningConfig>,
         tool_catalog: ToolCatalog,
-        store: bool,
+        store: StoreMode,
         previous_response_id: Option<String>,
     ) -> Self {
         Self {
@@ -1414,7 +1502,7 @@ impl ResponseMeta {
                 .cloned()
                 .filter(Value::is_object)
                 .unwrap_or_else(|| json!({})),
-            tools: request.get("tools").cloned().unwrap_or_else(|| json!([])),
+            tools: response_tool_definitions(request),
             tool_choice: request
                 .get("tool_choice")
                 .cloned()
@@ -1467,7 +1555,7 @@ impl ResponseMeta {
             "tool_choice": self.tool_choice,
             "tools": self.tools,
             "truncation": "disabled",
-            "store": self.store,
+            "store": self.store.enabled(),
             "usage": usage
         })
     }
@@ -1566,10 +1654,9 @@ fn anthropic_to_response(
         .get("content")
         .and_then(Value::as_array)
         .ok_or("model response did not contain a content array")?;
-    let mut text = Vec::new();
     let mut output = Vec::new();
     let mut assistant_blocks = Vec::new();
-    let mut exposed_tool_calls = 0_usize;
+    let mut tool_calls_seen = 0_usize;
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
             Some("text") => {
@@ -1578,14 +1665,18 @@ fn anthropic_to_response(
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                text.push(value.clone());
+                output.push(new_message_output(vec![value.clone()]));
                 assistant_blocks.push(json!({"type": "text", "text": value}));
             }
             Some("tool_use") => {
-                if !meta.parallel_tool_calls && exposed_tool_calls > 0 {
-                    continue;
+                tool_calls_seen += 1;
+                if !meta.parallel_tool_calls && tool_calls_seen > 1 {
+                    tracing::warn!(
+                        response_id = %meta.id,
+                        tool_calls = tool_calls_seen,
+                        "upstream returned multiple tool calls despite parallel_tool_calls=false; preserving every call"
+                    );
                 }
-                exposed_tool_calls += 1;
                 let call_id = format!("call_{}", Uuid::new_v4().simple());
                 output.push(new_tool_output(block, &call_id, &meta.tool_catalog));
                 assistant_blocks.push(json!({
@@ -1598,9 +1689,6 @@ fn anthropic_to_response(
             Some("thinking") | Some("redacted_thinking") => {}
             _ => return Err("model response contained an unsupported output item"),
         }
-    }
-    if !text.is_empty() {
-        output.insert(0, new_message_output(text));
     }
     let incomplete = anthropic.get("stop_reason").and_then(Value::as_str) == Some("max_tokens");
     Ok(MappedResponse {
@@ -1660,6 +1748,7 @@ struct ResponsesStreamState {
 }
 
 impl ResponsesStreamState {
+    #[cfg(test)]
     fn new(meta: ResponseMeta) -> Self {
         Self::with_store(meta, None)
     }
@@ -1767,11 +1856,14 @@ impl ResponsesStreamState {
                 )
             }
             Some("tool_use" | "server_tool_use") => {
-                if !self.meta.parallel_tool_calls && self.tool_calls_started > 0 {
-                    self.next_output_index = self.next_output_index.saturating_sub(1);
-                    return String::new();
-                }
                 self.tool_calls_started += 1;
+                if !self.meta.parallel_tool_calls && self.tool_calls_started > 1 {
+                    tracing::warn!(
+                        response_id = %self.meta.id,
+                        tool_calls = self.tool_calls_started,
+                        "upstream streamed multiple tool calls despite parallel_tool_calls=false; preserving every call"
+                    );
+                }
                 let kiro_name = block
                     .get("name")
                     .and_then(Value::as_str)
@@ -2232,11 +2324,20 @@ fn translated_request(
     let store = store_requested(request)?;
     let previous_response_id = previous_response_id(request)?;
     let catalog = tool_catalog(request)?;
-    let (messages, system) = input_to_messages(request, instructions, &catalog)?;
+    let (messages, mut system) = input_to_messages(request, instructions, &catalog)?;
     let mut tools = catalog.tools();
     let tool_choice = tool_choice_to_anthropic(request, &catalog)?;
     if request.get("tool_choice").and_then(Value::as_str) == Some("none") {
         tools = None;
+    }
+    if request.get("parallel_tool_calls").and_then(Value::as_bool) == Some(false)
+        && tools.as_ref().is_some_and(|tools| !tools.is_empty())
+    {
+        system.get_or_insert_with(Vec::new).push(SystemMessage {
+            text: "Tool-use constraint: Call at most one tool in this assistant response. If more work is needed, wait for the tool result before selecting another tool."
+                .to_string(),
+            cache_control: None,
+        });
     }
     let meta = ResponseMeta::new(
         request,
@@ -2312,7 +2413,7 @@ pub async fn post_responses(
         None => return legacy_non_gpt_response(&state),
     };
 
-    let (mut translated, meta) = match translated_request(&request, &model) {
+    let (mut translated, mut meta) = match translated_request(&request, &model) {
         Ok(translated) => translated,
         Err(message) => return invalid_request(message, true),
     };
@@ -2340,16 +2441,27 @@ pub async fn post_responses(
 
     let session_id = apply_conversation_state(&mut translated, prior);
 
-    let mut stored_messages = meta.store.then(|| translated.messages.clone());
-    if let Some(messages) = stored_messages.as_ref() {
+    let mut stored_messages = meta.store.enabled().then(|| translated.messages.clone());
+    let retention_error = stored_messages.as_ref().and_then(|messages| {
         let candidate = StoredConversation {
             model: model.clone(),
             session_id: session_id.clone(),
             messages: messages.clone(),
         };
-        if let Err(StoreError::EntryTooLarge { max_bytes }) =
-            state.response_store.validate_size(&candidate)
-        {
+        state
+            .response_store
+            .validate_size(&meta.id, &candidate)
+            .err()
+    });
+    if let Some(StoreError::EntryTooLarge { max_bytes }) = retention_error {
+        if meta.store.disable_if_implicit() {
+            tracing::warn!(
+                response_id = %meta.id,
+                max_bytes,
+                "implicit Responses storage disabled because visible conversation state exceeds the retention limit"
+            );
+            stored_messages = None;
+        } else {
             return response_error(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!(
@@ -2408,7 +2520,7 @@ pub async fn post_responses(
             );
         }
     };
-    let mapped = match anthropic_to_response(&anthropic, &meta) {
+    let mut mapped = match anthropic_to_response(&anthropic, &meta) {
         Ok(response) => response,
         Err(_) => {
             return response_error(
@@ -2419,7 +2531,7 @@ pub async fn post_responses(
         }
     };
     if let Some(messages) = stored_messages.as_mut() {
-        if let Some(assistant) = mapped.assistant_message {
+        if let Some(assistant) = mapped.assistant_message.take() {
             messages.push(assistant);
         }
         let stored = StoredConversation {
@@ -2430,13 +2542,22 @@ pub async fn post_responses(
         if let Err(StoreError::EntryTooLarge { max_bytes }) =
             state.response_store.insert(meta.id.clone(), stored)
         {
-            return response_error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!(
-                    "The completed response exceeds the {max_bytes}-byte retention limit required by `store: true`"
-                ),
-                true,
-            );
+            if meta.store.disable_if_implicit() {
+                tracing::warn!(
+                    response_id = %meta.id,
+                    max_bytes,
+                    "implicit Responses storage disabled because completed visible state exceeds the retention limit"
+                );
+                mapped.response["store"] = Value::Bool(false);
+            } else {
+                return response_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!(
+                        "The completed response exceeds the {max_bytes}-byte retention limit required by `store: true`"
+                    ),
+                    true,
+                );
+            }
         }
     }
     mark_gpt_openai_response((StatusCode::OK, Json(mapped.response)).into_response())
@@ -2468,7 +2589,7 @@ mod tests {
             64,
             None,
             ToolCatalog::default(),
-            false,
+            StoreMode::Disabled,
             None,
         )
     }
@@ -2640,6 +2761,12 @@ mod tests {
         );
         assert_eq!(translated.messages.len(), 3);
         assert_eq!(translated.messages[0].content[0]["text"], "Fix the file.");
+        assert_eq!(translated.system.as_ref().unwrap().len(), 2);
+        assert!(
+            translated.system.as_ref().unwrap()[1]
+                .text
+                .contains("at most one tool")
+        );
 
         let custom_name = meta
             .tool_catalog
@@ -2671,12 +2798,147 @@ mod tests {
         );
         assert_eq!(meta.parallel_tool_calls, false);
         assert_eq!(meta.text["verbosity"], "medium");
-        assert_eq!(
-            meta.response("completed", json!([]), json!({}))["text"],
-            request["text"]
-        );
+        let response = meta.response("completed", json!([]), json!({}));
+        assert_eq!(response["text"], request["text"]);
+        assert_eq!(response["tools"], request["input"][0]["tools"]);
+        assert_eq!(response["tools"][1]["type"], "custom");
+        assert_eq!(response["tools"][2]["type"], "namespace");
         super::super::converter::convert_request(&translated)
             .expect("the translated current Codex request must reach the Kiro wire converter");
+    }
+
+    #[test]
+    fn accepts_codex_cached_web_search_declaration_without_forwarding_or_losing_the_echo() {
+        let mut request = realistic_codex_request();
+        request["tools"] = json!([
+            {
+                "type": "function",
+                "name": "read_file",
+                "description": "Read one file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }
+            },
+            {
+                "type": "web_search",
+                "external_web_access": false,
+                "search_content_types": ["text", "image"]
+            }
+        ]);
+
+        let (translated, meta) =
+            translated_request(&request, "gpt-5.6-sol").expect("current Codex web search shape");
+        let forwarded_tools = translated.tools.expect("function tool is forwarded");
+        assert_eq!(forwarded_tools.len(), 5);
+        assert!(forwarded_tools.iter().any(|tool| tool.name == "read_file"));
+        assert!(forwarded_tools.iter().all(|tool| tool.name != "web_search"));
+        assert_eq!(meta.tools.as_array().unwrap().len(), 6);
+        assert_eq!(meta.tools[0], request["tools"][0]);
+        assert_eq!(meta.tools[1], request["tools"][1]);
+        assert_eq!(
+            meta.response("completed", json!([]), json!({}))["tools"],
+            meta.tools
+        );
+    }
+
+    #[test]
+    fn rejects_external_or_parameterized_hosted_web_search() {
+        for tool in [
+            json!({"type": "web_search", "external_web_access": true}),
+            json!({"type": "web_search"}),
+            json!({"type": "web_search", "external_web_access": "false"}),
+            json!({
+                "type": "web_search",
+                "external_web_access": false,
+                "search_content_types": ["text", "video"]
+            }),
+            json!({
+                "type": "web_search",
+                "external_web_access": false,
+                "search_content_types": "text"
+            }),
+            json!({
+                "type": "web_search",
+                "external_web_access": false,
+                "search_context_size": "low"
+            }),
+        ] {
+            let mut request = base_request("gpt-5.6-sol");
+            request["tools"] = json!([tool]);
+            assert!(
+                translated_request(&request, "gpt-5.6-sol").is_err(),
+                "hosted search must fail explicitly instead of being silently disabled"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_web_search_alone_does_not_leave_an_orphaned_auto_tool_choice() {
+        let request = json!({
+            "model": "gpt-5.6-sol",
+            "input": "Reply with exactly OK.",
+            "tools": [{
+                "type": "web_search",
+                "external_web_access": false,
+                "search_content_types": ["text", "image"]
+            }],
+            "tool_choice": "auto",
+            "store": false
+        });
+        let (translated, meta) =
+            translated_request(&request, "gpt-5.6-sol").expect("cached-only search request");
+        assert!(translated.tools.is_none());
+        assert!(translated.tool_choice.is_none());
+        let response = meta.response("completed", json!([]), json!({}));
+        assert_eq!(response["tool_choice"], "auto");
+        assert_eq!(response["tools"], request["tools"]);
+    }
+
+    #[test]
+    fn serial_tool_constraint_is_added_only_when_tools_are_active() {
+        let declared_tools = json!([{
+            "type": "function",
+            "name": "lookup",
+            "description": "Look up one item",
+            "parameters": {"type": "object", "properties": {}}
+        }]);
+
+        let has_constraint = |request: &Value| {
+            let (translated, _) = translated_request(request, "gpt-5.6-sol").unwrap();
+            translated
+                .system
+                .unwrap_or_default()
+                .iter()
+                .any(|message| message.text.contains("at most one tool"))
+        };
+
+        let mut serial = base_request("gpt-5.6-sol");
+        serial["tools"] = declared_tools.clone();
+        serial["parallel_tool_calls"] = json!(false);
+        assert!(has_constraint(&serial));
+
+        let mut parallel = serial.clone();
+        parallel["parallel_tool_calls"] = json!(true);
+        assert!(!has_constraint(&parallel));
+
+        let mut omitted = base_request("gpt-5.6-sol");
+        omitted["tools"] = declared_tools.clone();
+        assert!(!has_constraint(&omitted));
+
+        let mut disabled = serial;
+        disabled["tool_choice"] = json!("none");
+        let (translated, meta) = translated_request(&disabled, "gpt-5.6-sol").unwrap();
+        assert!(translated.tools.is_none());
+        assert!(
+            !translated
+                .system
+                .unwrap_or_default()
+                .iter()
+                .any(|message| message.text.contains("at most one tool"))
+        );
+        assert_eq!(meta.tools, declared_tools);
     }
 
     #[test]
@@ -2913,6 +3175,38 @@ other product, model, or company.";
                 "invalid previous_response_id must not be silently treated as absent"
             );
         }
+    }
+
+    #[test]
+    fn responses_store_defaults_true_and_respects_explicit_false() {
+        assert_eq!(store_requested(&json!({})).unwrap(), StoreMode::Implicit);
+        assert_eq!(
+            store_requested(&json!({"store": null})).unwrap(),
+            StoreMode::Implicit
+        );
+        assert_eq!(
+            store_requested(&json!({"store": true})).unwrap(),
+            StoreMode::Required
+        );
+        assert_eq!(
+            store_requested(&json!({"store": false})).unwrap(),
+            StoreMode::Disabled
+        );
+
+        let mut implicit = StoreMode::Implicit;
+        assert!(implicit.disable_if_implicit());
+        assert_eq!(implicit, StoreMode::Disabled);
+        let mut required = StoreMode::Required;
+        assert!(!required.disable_if_implicit());
+        assert_eq!(required, StoreMode::Required);
+
+        let request = base_request("gpt-5.6-sol");
+        let (_, meta) = translated_request(&request, "gpt-5.6-sol").unwrap();
+        assert!(meta.store.enabled());
+        assert_eq!(
+            meta.response("completed", json!([]), json!({}))["store"],
+            true
+        );
     }
 
     #[test]
@@ -3201,6 +3495,41 @@ other product, model, or company.";
     }
 
     #[test]
+    fn nonstream_preserves_mixed_text_and_tool_output_order() {
+        let meta = base_meta("gpt-5.6-sol");
+        let mapped = anthropic_to_response(
+            &json!({
+                "content": [
+                    {"type": "tool_use", "name": "first", "input": {"n": 1}},
+                    {"type": "text", "text": "Between calls."},
+                    {"type": "tool_use", "name": "second", "input": {"n": 2}},
+                    {"type": "text", "text": "After calls."}
+                ],
+                "stop_reason": "tool_use",
+                "usage": {}
+            }),
+            &meta,
+        )
+        .expect("mixed response mapping");
+
+        let output = mapped.response["output"].as_array().unwrap();
+        assert_eq!(output.len(), 4);
+        assert_eq!(output[0]["type"], "function_call");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["content"][0]["text"], "Between calls.");
+        assert_eq!(output[2]["type"], "function_call");
+        assert_eq!(output[3]["type"], "message");
+        assert_eq!(output[3]["content"][0]["text"], "After calls.");
+
+        let assistant = mapped.assistant_message.expect("stored mixed response");
+        let blocks = assistant.content.as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[1], json!({"type": "text", "text": "Between calls."}));
+        assert_eq!(blocks[2]["type"], "tool_use");
+        assert_eq!(blocks[3], json!({"type": "text", "text": "After calls."}));
+    }
+
+    #[test]
     fn maps_custom_and_namespaced_tool_outputs_back_to_responses_shapes() {
         let mut request = realistic_codex_request();
         request["stream"] = json!(false);
@@ -3265,7 +3594,7 @@ other product, model, or company.";
     }
 
     #[test]
-    fn parallel_tool_calls_false_exposes_only_one_nonstream_tool_call() {
+    fn parallel_tool_calls_false_never_silently_drops_nonstream_tool_calls() {
         let mut request = base_request("gpt-5.6-sol");
         request["parallel_tool_calls"] = json!(false);
         let (_, meta) = translated_request(&request, "gpt-5.6-sol").unwrap();
@@ -3281,8 +3610,9 @@ other product, model, or company.";
             &meta,
         )
         .unwrap();
-        assert_eq!(mapped.response["output"].as_array().unwrap().len(), 1);
+        assert_eq!(mapped.response["output"].as_array().unwrap().len(), 2);
         assert_eq!(mapped.response["output"][0]["name"], "first");
+        assert_eq!(mapped.response["output"][1]["name"], "second");
         assert_eq!(
             mapped
                 .assistant_message
@@ -3291,7 +3621,7 @@ other product, model, or company.";
                 .as_array()
                 .unwrap()
                 .len(),
-            1
+            2
         );
     }
 
@@ -3362,6 +3692,50 @@ other product, model, or company.";
             assert_eq!(event["type"], *event_name, "{event}");
             assert_eq!(event["sequence_number"], sequence, "{event}");
         }
+    }
+
+    #[test]
+    fn stream_lifecycle_preserves_public_request_metadata() {
+        let request = realistic_codex_request();
+        let (_, meta) = translated_request(&request, "gpt-5.6-sol").unwrap();
+        let mut state = ResponsesStreamState::new(meta);
+        let output = [
+            (
+                "message_start",
+                json!({"message": {"usage": {"input_tokens": 4}}}),
+            ),
+            (
+                "content_block_start",
+                json!({"index": 0, "content_block": {"type": "text", "text": ""}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index": 0, "delta": {"type": "text_delta", "text": "OK"}}),
+            ),
+            ("content_block_stop", json!({"index": 0})),
+            ("message_stop", json!({})),
+        ]
+        .iter()
+        .map(|(name, event)| state.transform(name, event))
+        .collect::<String>();
+        let events = parsed_events(&output);
+        let response_for = |event_name: &str| {
+            events
+                .iter()
+                .find(|(name, _)| name == event_name)
+                .map(|(_, event)| event["response"].clone())
+                .unwrap()
+        };
+        let created = response_for("response.created");
+        let in_progress = response_for("response.in_progress");
+        let completed = response_for("response.completed");
+        for field in ["tools", "tool_choice", "parallel_tool_calls", "text"] {
+            assert_eq!(created[field], completed[field], "field {field}");
+            assert_eq!(in_progress[field], completed[field], "field {field}");
+        }
+        assert_eq!(completed["tools"], request["input"][0]["tools"]);
+        assert_eq!(completed["parallel_tool_calls"], false);
+        assert_eq!(completed["text"], request["text"]);
     }
 
     #[test]
@@ -3532,7 +3906,7 @@ other product, model, or company.";
     }
 
     #[test]
-    fn parallel_tool_calls_false_exposes_only_one_streamed_tool_call() {
+    fn parallel_tool_calls_false_never_silently_drops_streamed_tool_calls() {
         let mut request = base_request("gpt-5.6-sol");
         request["parallel_tool_calls"] = json!(false);
         let (_, meta) = translated_request(&request, "gpt-5.6-sol").unwrap();
@@ -3580,21 +3954,21 @@ other product, model, or company.";
                 .iter()
                 .filter(|(name, _)| name == "response.output_item.added")
                 .count(),
-            1
+            2
         );
         assert_eq!(
             events
                 .iter()
                 .filter(|(name, _)| name == "response.output_item.done")
                 .count(),
-            1
+            2
         );
         let completed = events
             .iter()
             .find(|(name, _)| name == "response.completed")
             .map(|(_, event)| event)
             .unwrap();
-        assert_eq!(completed["response"]["output"].as_array().unwrap().len(), 1);
+        assert_eq!(completed["response"]["output"].as_array().unwrap().len(), 2);
         assert_eq!(completed["response"]["parallel_tool_calls"], false);
     }
 
