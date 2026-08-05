@@ -31,6 +31,7 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 use std::time::Duration;
 use tokio::time::{Instant, interval_at};
+use uuid::Uuid;
 
 use super::converter::{
     ConversionError, convert_request, is_gpt_family_name, is_gpt_model,
@@ -3925,6 +3926,39 @@ fn aws_b40_model_supports_adaptive_thinking(model: &str) -> bool {
     super::compat::is_opus_4_8(model) || model_is_opus_5(model) || model_is_sonnet_5(model)
 }
 
+fn aws_b40_model_rejects_strict_tool_field(model: &str) -> bool {
+    super::bedrock::is_model_family(model, "opus", "4-7")
+        || super::bedrock::is_model_family(model, "opus", "4-8")
+}
+
+fn aws_b40_strict_tool_validation_error(stream: bool) -> Response {
+    let operation = if stream {
+        "InvokeModelWithResponseStream"
+    } else {
+        "InvokeModel"
+    };
+    let request_id = super::compat::oneapi_request_id();
+    thinking_error_response(
+        stream,
+        format!(
+            "{operation}: operation error Bedrock Runtime: {operation}, https response error StatusCode: 400, RequestID: {}, ValidationException: ***.***.***.strict: Extra inputs are not permitted (request id: {request_id})",
+            Uuid::new_v4()
+        ),
+    )
+}
+
+fn aws_b40_unsupported_thinking_mode_error(stream: bool, mode: &str) -> Response {
+    let request_id = super::compat::oneapi_request_id();
+    let message = if mode == "enabled" {
+        format!(
+            "\"***.***.enabled\" is not supported for this model. Use \"***.***.adaptive\" and \"output_config.effort\" to control thinking behavior. (request id: {request_id})"
+        )
+    } else {
+        format!("\"***.***.{mode}\" is not supported for this model. (request id: {request_id})")
+    };
+    typed_thinking_error_response(stream, "upstream_error", message)
+}
+
 /// Reject request shapes that the selected legacy Kiro path cannot represent.
 ///
 /// This runs only after the optional native provider had a chance to proxy the
@@ -3946,6 +3980,9 @@ fn kiro_request_preflight_error(
             .find(|(_, tool)| tool.strict == Some(true))
     }) {
         if aws_b40_compat {
+            if aws_b40_model_rejects_strict_tool_field(&payload.model) {
+                return Some(aws_b40_strict_tool_validation_error(payload.stream));
+            }
             tracing::debug!(
                 tool_index = index,
                 "AWS-B accepted strict tool as a best-effort Kiro compatibility hint"
@@ -4022,24 +4059,12 @@ fn aws_b40_kiro_thinking_preflight_error(payload: &MessagesRequest) -> Option<Re
             payload.stream,
             "max_tokens must be greater than thinking.budget_tokens",
         )),
-        "enabled" if !aws_b40_model_supports_enabled_thinking(&payload.model) => {
-            Some(thinking_error_response(
-                payload.stream,
-                format!(
-                    "thinking.type \"enabled\" is not supported for model \"{}\" by the Kiro transport; use adaptive on a supported model",
-                    payload.model
-                ),
-            ))
-        }
-        "adaptive" if !aws_b40_model_supports_adaptive_thinking(&payload.model) => {
-            Some(thinking_error_response(
-                payload.stream,
-                format!(
-                    "thinking.type \"adaptive\" is not supported for model \"{}\" by the Kiro transport",
-                    payload.model
-                ),
-            ))
-        }
+        "enabled" if !aws_b40_model_supports_enabled_thinking(&payload.model) => Some(
+            aws_b40_unsupported_thinking_mode_error(payload.stream, "enabled"),
+        ),
+        "adaptive" if !aws_b40_model_supports_adaptive_thinking(&payload.model) => Some(
+            aws_b40_unsupported_thinking_mode_error(payload.stream, "adaptive"),
+        ),
         "enabled" | "adaptive" => None,
         other => Some(thinking_error_response(
             payload.stream,
@@ -4190,9 +4215,17 @@ fn reject_invalid_thinking_signatures(
 }
 
 fn thinking_error_response(stream: bool, message: impl Into<String>) -> Response {
+    typed_thinking_error_response(stream, "<nil>", message)
+}
+
+fn typed_thinking_error_response(
+    stream: bool,
+    error_type: impl Into<String>,
+    message: impl Into<String>,
+) -> Response {
     let body = json!({
         "error": {
-            "type": "<nil>",
+            "type": error_type.into(),
             "message": message.into()
         },
         "type": "error"
@@ -5842,9 +5875,9 @@ mod tests {
 
     #[tokio::test]
     async fn kiro_preflight_treats_strict_as_an_aws_b_compatibility_hint() {
-        let strict_request = |stream| {
+        let strict_request = |model, stream| {
             parse(
-                "claude-sonnet-4-6",
+                model,
                 serde_json::json!({
                     "stream": stream,
                     "tools": [{
@@ -5857,8 +5890,9 @@ mod tests {
             )
         };
 
-        let response = kiro_request_preflight_error(&strict_request(false), false)
-            .expect("non AWS-B Kiro profiles must reject unsupported strict enforcement");
+        let response =
+            kiro_request_preflight_error(&strict_request("claude-sonnet-4-6", false), false)
+                .expect("non AWS-B Kiro profiles must reject unsupported strict enforcement");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -5867,11 +5901,26 @@ mod tests {
         assert!(body.contains("tools[0].strict"));
         assert!(body.contains("not supported by the Kiro transport"));
 
-        for stream in [false, true] {
-            assert!(
-                kiro_request_preflight_error(&strict_request(stream), true).is_none(),
-                "AWS-B must accept strict:true for Pomo/Bedrock compatibility"
-            );
+        for model in ["claude-sonnet-4-6", "claude-opus-4-6"] {
+            for stream in [false, true] {
+                assert!(
+                    kiro_request_preflight_error(&strict_request(model, stream), true).is_none(),
+                    "AWS-B must accept strict:true for Pomo/Bedrock compatibility: {model}"
+                );
+            }
+        }
+
+        for model in ["claude-opus-4-7", "claude-opus-4-8"] {
+            let response = kiro_request_preflight_error(&strict_request(model, false), true)
+                .expect("Pomo/Bedrock rejects strict on this model family");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body");
+            let body = String::from_utf8(body.to_vec()).expect("UTF-8 response");
+            assert!(body.contains("Bedrock Runtime"), "{body}");
+            assert!(body.contains("strict: Extra inputs are not permitted"));
+            assert!(!body.contains("Kiro"));
         }
 
         let strict_false = parse(
@@ -5953,6 +6002,35 @@ mod tests {
             }),
         );
         assert!(kiro_request_preflight_error(&supported_adaptive, true).is_none());
+    }
+
+    #[tokio::test]
+    async fn aws_b_unsupported_manual_thinking_uses_the_pomo_error_contract() {
+        let request = parse(
+            "claude-opus-5",
+            serde_json::json!({
+                "thinking": {"type": "enabled", "budget_tokens": 2048},
+                "tools": [{
+                    "name": "report_result",
+                    "description": "",
+                    "strict": true,
+                    "input_schema": {"type": "object", "properties": {}}
+                }],
+                "tool_choice": {"type": "auto"}
+            }),
+        );
+        let response = kiro_request_preflight_error(&request, true)
+            .expect("Opus 5 manual thinking must be rejected");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON response");
+        assert_eq!(body["error"]["type"], "upstream_error");
+        let message = body["error"]["message"].as_str().expect("error message");
+        assert!(message.contains("enabled\" is not supported for this model"));
+        assert!(message.contains("output_config.effort"));
+        assert!(!message.contains("Kiro"));
     }
 
     #[test]
