@@ -682,7 +682,10 @@ fn input_to_messages(
     Ok((messages, (!system.is_empty()).then_some(system)))
 }
 
-fn tools_to_anthropic(request: &Value) -> Result<Option<Vec<Tool>>, String> {
+fn tools_to_anthropic(
+    request: &Value,
+    accept_strict_hint: bool,
+) -> Result<Option<Vec<Tool>>, String> {
     let Some(tools) = request.get("tools") else {
         return Ok(None);
     };
@@ -708,7 +711,7 @@ fn tools_to_anthropic(request: &Value) -> Result<Option<Vec<Tool>>, String> {
         if object.get("type").and_then(Value::as_str) != Some("function") {
             return Err(format!("tool {index} must have `type`: `function`"));
         }
-        if object.get("strict").and_then(Value::as_bool) == Some(true) {
+        if object.get("strict").and_then(Value::as_bool) == Some(true) && !accept_strict_hint {
             return Err(format!(
                 "tool {index} strict schema enforcement is not supported"
             ));
@@ -1469,9 +1472,10 @@ fn responses_stream_response(body: Body, meta: ResponseMeta) -> Response {
         .expect("Responses stream response")
 }
 
-fn translated_request(
+fn translated_request_for_profile(
     request: &Value,
     model: &str,
+    accept_strict_hint: bool,
 ) -> Result<(MessagesRequest, ResponseMeta), String> {
     validate_top_level_fields(request)?;
     let instructions = optional_string(request.get("instructions"), "instructions")?;
@@ -1481,7 +1485,7 @@ fn translated_request(
     let store = store_requested(request)?;
     let previous_response_id = previous_response_id(request)?;
     let (messages, system) = input_to_messages(request, instructions)?;
-    let mut tools = tools_to_anthropic(request)?;
+    let mut tools = tools_to_anthropic(request, accept_strict_hint)?;
     let tool_choice = tool_choice_to_anthropic(request, tools.as_deref())?;
     if request.get("tool_choice").and_then(Value::as_str) == Some("none") {
         tools = None;
@@ -1514,6 +1518,14 @@ fn translated_request(
         },
         meta,
     ))
+}
+
+#[cfg(test)]
+fn translated_request(
+    request: &Value,
+    model: &str,
+) -> Result<(MessagesRequest, ResponseMeta), String> {
+    translated_request_for_profile(request, model, false)
 }
 
 fn apply_conversation_state(
@@ -1558,10 +1570,11 @@ pub async fn post_responses(
         return legacy_non_gpt_response(&state);
     }
 
-    let (mut translated, meta) = match translated_request(&request, &model) {
-        Ok(translated) => translated,
-        Err(message) => return invalid_request(message, true),
-    };
+    let (mut translated, meta) =
+        match translated_request_for_profile(&request, &model, state.aws_b40_compat) {
+            Ok(translated) => translated,
+            Err(message) => return invalid_request(message, true),
+        };
     debug_assert_eq!(translated.model, model);
     let stream_requested = translated.stream;
     if stream_requested && (meta.store || meta.previous_response_id.is_some()) {
@@ -1778,6 +1791,31 @@ mod tests {
             Some(json!({"type": "tool", "name": "weather"}))
         );
         assert_eq!(translated.messages.len(), 3);
+    }
+
+    #[test]
+    fn responses_profile_accepts_strict_only_as_an_aws_b_hint() {
+        let mut request = base_request("gpt-5.6-terra");
+        request["tools"] = json!([{
+            "type": "function",
+            "name": "weather",
+            "description": "Get weather",
+            "parameters": {"type": "object"},
+            "strict": true
+        }]);
+        request["tool_choice"] = json!("required");
+
+        assert!(
+            translated_request(&request, "gpt-5.6-terra").is_err(),
+            "non AWS-B profiles keep strict rejection"
+        );
+        let (translated, _) = translated_request_for_profile(&request, "gpt-5.6-terra", true)
+            .expect("AWS-B accepts strict as a hint");
+        assert_eq!(translated.tools.as_ref().unwrap()[0].strict, None);
+
+        request["tools"][0]["strict"] = json!("yes");
+        assert!(translated_request_for_profile(&request, "gpt-5.6-terra", true).is_err());
+        assert!(translated_request(&request, "gpt-5.6-terra").is_err());
     }
 
     #[test]

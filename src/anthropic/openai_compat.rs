@@ -98,7 +98,10 @@ fn openai_content_text(content: &Value) -> String {
     }
 }
 
-fn openai_tools_to_anthropic(oai: &Value) -> Result<Option<Vec<Tool>>, String> {
+fn openai_tools_to_anthropic(
+    oai: &Value,
+    accept_strict_hint: bool,
+) -> Result<Option<Vec<Tool>>, String> {
     let Some(tools) = oai.get("tools") else {
         return Ok(None);
     };
@@ -171,8 +174,9 @@ fn openai_tools_to_anthropic(oai: &Value) -> Result<Option<Vec<Tool>>, String> {
                 ));
             }
         };
-        match function.get("strict") {
-            None | Some(Value::Null | Value::Bool(false)) => {}
+        let strict = match function.get("strict") {
+            None | Some(Value::Null | Value::Bool(false)) => None,
+            Some(Value::Bool(true)) if accept_strict_hint => None,
             Some(Value::Bool(true)) => {
                 return Err(format!(
                     "`tools[{index}].function.strict`: strict schema enforcement is not supported"
@@ -183,14 +187,14 @@ fn openai_tools_to_anthropic(oai: &Value) -> Result<Option<Vec<Tool>>, String> {
                     "`tools[{index}].function.strict` must be a boolean"
                 ));
             }
-        }
+        };
 
         mapped.push(Tool {
             tool_type: None,
             name: name.to_string(),
             description,
             input_schema,
-            strict: None,
+            strict,
             max_uses: None,
             cache_control: None,
         });
@@ -1277,7 +1281,7 @@ pub async fn post_chat_completions(
         );
     }
 
-    let mut tools = match openai_tools_to_anthropic(&oai) {
+    let mut tools = match openai_tools_to_anthropic(&oai, aws_b40_compat) {
         Ok(tools) => tools,
         Err(message) => {
             return finish_openai_response(openai_invalid_request(message), gpt_openai_shape);
@@ -1446,7 +1450,7 @@ mod tests {
                 }
             }]
         });
-        let tools = openai_tools_to_anthropic(&request)
+        let tools = openai_tools_to_anthropic(&request, false)
             .expect("valid tools")
             .expect("mapped tools");
         assert_eq!(tools[0].name, "calculator");
@@ -1516,9 +1520,66 @@ mod tests {
         ];
 
         for (request, expected) in invalid {
-            let error = openai_tools_to_anthropic(&request).expect_err("tools must be rejected");
+            let error =
+                openai_tools_to_anthropic(&request, false).expect_err("tools must be rejected");
             assert!(error.contains(expected), "{request}: {error}");
         }
+    }
+
+    #[test]
+    fn aws_b_accepts_openai_strict_as_a_success_first_hint() {
+        let request = json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "description": "Get weather",
+                    "parameters": {"type": "object"},
+                    "strict": true
+                }
+            }]
+        });
+        let tools = openai_tools_to_anthropic(&request, true)
+            .expect("AWS-B accepts strict as a hint")
+            .expect("mapped tools");
+        assert_eq!(tools[0].strict, None);
+        assert!(openai_tools_to_anthropic(&request, false).is_err());
+    }
+
+    #[tokio::test]
+    async fn chat_profile_accepts_strict_only_for_aws_b() {
+        let request = json!({
+            "model": "claude-opus-4-8",
+            "messages": [{"role": "user", "content": "Call weather for Paris"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "description": "Get weather",
+                    "parameters": {"type": "object"},
+                    "strict": true
+                }
+            }],
+            "tool_choice": "required"
+        });
+
+        let aws_b = post_chat_completions(
+            State(AppState::new("test-key", true, true)),
+            OpenAiChatJson(request.clone()),
+        )
+        .await;
+        assert_ne!(
+            aws_b.status(),
+            StatusCode::BAD_REQUEST,
+            "AWS-B strict hint must reach the backend path"
+        );
+
+        let strict_profile = post_chat_completions(
+            State(AppState::new("test-key", true, false)),
+            OpenAiChatJson(request),
+        )
+        .await;
+        assert_eq!(strict_profile.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -1529,7 +1590,7 @@ mod tests {
                 "function": {"name": "weather"}
             }]
         });
-        let tools = openai_tools_to_anthropic(&request)
+        let tools = openai_tools_to_anthropic(&request, false)
             .expect("valid tools")
             .expect("mapped tools");
 
@@ -2031,12 +2092,15 @@ mod tests {
 
     #[test]
     fn tool_without_description_falls_back_to_its_name() {
-        let tools = openai_tools_to_anthropic(&json!({
-            "tools": [{
-                "type": "function",
-                "function": {"name": "get_weather", "parameters": {"type": "object"}}
-            }]
-        }))
+        let tools = openai_tools_to_anthropic(
+            &json!({
+                "tools": [{
+                    "type": "function",
+                    "function": {"name": "get_weather", "parameters": {"type": "object"}}
+                }]
+            }),
+            false,
+        )
         .expect("tools convert")
         .expect("tools present");
         // 上游对空 description 返回 400 Invalid tool use format。

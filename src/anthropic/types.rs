@@ -287,8 +287,8 @@ pub struct Tool {
     #[serde(default)]
     pub input_schema: HashMap<String, serde_json::Value>,
     /// Require schema-conformant tool arguments on transports that support it.
-    /// The legacy Kiro transport does not expose this capability, so handlers
-    /// must reject `true` explicitly instead of silently discarding it.
+    /// The legacy Kiro transport does not expose this capability. AWS-B treats
+    /// it as a success-first, best-effort hint; stricter profiles reject it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
     /// 最大使用次数（仅 WebSearch 工具）

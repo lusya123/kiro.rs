@@ -2467,6 +2467,10 @@ pub async fn post_messages(
     if let Some(response) = reject_invalid_thinking_signatures(&payload, aws_b40_compat) {
         return response;
     }
+    if aws_b40_compat {
+        normalize_aws_b40_thinking(&mut payload);
+        normalize_aws_b40_tool_choice(&mut payload);
+    }
     if let Some(response) = kiro_request_preflight_error(&payload, aws_b40_compat) {
         return response;
     }
@@ -2487,9 +2491,7 @@ pub async fn post_messages(
         }
     };
 
-    if aws_b40_compat {
-        normalize_aws_b40_thinking(&mut payload);
-    } else {
+    if !aws_b40_compat {
         // opus-4-8:合法的 type:enabled 归一化为 adaptive(匹配真 Claude 的 200 行为),再做校验。
         normalize_opus_thinking(&mut payload);
         if let Some(response) = reject_invalid_thinking_request(&payload) {
@@ -3691,6 +3693,25 @@ fn normalize_aws_b40_thinking(payload: &mut MessagesRequest) {
         return;
     }
 
+    // A `*-thinking` alias must not replace an explicitly invalid client
+    // value with its default 20k profile and accidentally turn a 400 into an
+    // upstream call. Preserve these fields for residual Bedrock validation.
+    let has_irrecoverable_explicit_thinking =
+        payload
+            .thinking
+            .as_ref()
+            .is_some_and(|thinking| match thinking.thinking_type.as_str() {
+                "enabled" => {
+                    thinking.budget_tokens < 1024 || payload.max_tokens <= thinking.budget_tokens
+                }
+                "adaptive" | "disabled" => false,
+                _ => true,
+            });
+    if has_irrecoverable_explicit_thinking {
+        payload.model = super::bedrock::response_model(&payload.model);
+        return;
+    }
+
     // 先把 `*-thinking` 别名规整成真实 thinking 配置。Sonnet 5 / Opus 5
     // 都使用 adaptive thinking；随后再按 AWS-B 支持矩阵决定是否保留。
     //
@@ -3704,42 +3725,81 @@ fn normalize_aws_b40_thinking(payload: &mut MessagesRequest) {
         override_thinking_from_model_name(payload);
     }
 
-    let keep_adaptive = payload
-        .thinking
-        .as_ref()
-        .is_some_and(|thinking| thinking.thinking_type == "adaptive")
-        && aws_b40_model_supports_adaptive_thinking(&payload.model);
-    if keep_adaptive {
+    let Some(thinking) = payload.thinking.clone() else {
         payload.model = super::bedrock::response_model(&payload.model);
         return;
-    }
+    };
 
-    if let Some(thinking) = payload.thinking.as_ref() {
-        match thinking.thinking_type.as_str() {
-            "enabled"
-                if thinking.budget_tokens >= 1024
-                    && payload.max_tokens > thinking.budget_tokens
-                    && aws_b40_model_supports_enabled_thinking(&payload.model) =>
-            {
-                return;
+    match thinking.thinking_type.as_str() {
+        "enabled" if thinking.budget_tokens < 1024 => {
+            // Leave invalid raw input intact for the Bedrock-style residual
+            // validator. Guessing a budget here would silently change cost.
+        }
+        "enabled" if payload.max_tokens <= thinking.budget_tokens => {
+            // Same: this is not a transport capability mismatch and cannot be
+            // repaired without changing the client's explicit token contract.
+        }
+        "enabled" if aws_b40_model_supports_enabled_thinking(&payload.model) => {
+            payload.model = super::bedrock::response_model(&payload.model);
+        }
+        "enabled" if aws_b40_model_supports_adaptive_thinking(&payload.model) => {
+            if let Some(normalized) = payload.thinking.as_mut() {
+                normalized.thinking_type = "adaptive".to_string();
+                normalized.budget_tokens = 20000;
             }
-            "enabled" | "adaptive" => {
-                payload.thinking = None;
-                payload.output_config = None;
-                payload.model = super::bedrock::response_model(&payload.model);
-                return;
+            if let Some(output_config) = payload.output_config.as_mut() {
+                if output_config.effort.trim().is_empty() {
+                    output_config.effort = "high".to_string();
+                }
+            } else {
+                payload.output_config = Some(OutputConfig {
+                    effort: "high".to_string(),
+                    format: None,
+                });
             }
-            _ => {}
+            payload.model = super::bedrock::response_model(&payload.model);
+            tracing::info!(
+                model = %payload.model,
+                "AWS-B converted manual thinking to adaptive so the tool request can proceed"
+            );
+        }
+        "adaptive" if aws_b40_model_supports_adaptive_thinking(&payload.model) => {
+            payload.model = super::bedrock::response_model(&payload.model);
+        }
+        "disabled" => {
+            payload.thinking = None;
+            payload.model = super::bedrock::response_model(&payload.model);
+        }
+        "enabled" | "adaptive" => {
+            tracing::info!(
+                model = %payload.model,
+                thinking_type = %thinking.thinking_type,
+                "AWS-B removed unsupported thinking so the tool request can proceed"
+            );
+            payload.thinking = None;
+            payload.output_config = None;
+            payload.model = super::bedrock::response_model(&payload.model);
+        }
+        _ => {
+            // Preserve unknown types for the residual validator, which returns
+            // a Bedrock ValidationException instead of leaking Kiro details.
         }
     }
+}
 
-    if payload.model.to_ascii_lowercase().contains("thinking")
-        && !super::bedrock::is_model_family(&payload.model, "sonnet", "4-6")
+fn normalize_aws_b40_tool_choice(payload: &mut MessagesRequest) {
+    if payload
+        .tool_choice
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .and_then(|choice| choice.get("type"))
+        .and_then(serde_json::Value::as_str)
+        == Some("none")
     {
-        payload.thinking = None;
-        payload.output_config = None;
-        payload.model = super::bedrock::response_model(&payload.model);
-        return;
+        // Kiro has no native `none` switch. Removing the catalog is the exact
+        // success-first representation: there is no tool the model can call.
+        payload.tools = None;
+        payload.tool_choice = None;
     }
 }
 
@@ -3923,15 +3983,15 @@ fn aws_b40_model_supports_enabled_thinking(model: &str) -> bool {
 }
 
 fn aws_b40_model_supports_adaptive_thinking(model: &str) -> bool {
-    super::compat::is_opus_4_8(model) || model_is_opus_5(model) || model_is_sonnet_5(model)
+    super::bedrock::is_model_family(model, "opus", "4-6")
+        || super::bedrock::is_model_family(model, "opus", "4-7")
+        || super::compat::is_opus_4_8(model)
+        || super::bedrock::is_model_family(model, "sonnet", "4-6")
+        || model_is_opus_5(model)
+        || model_is_sonnet_5(model)
 }
 
-fn aws_b40_model_rejects_strict_tool_field(model: &str) -> bool {
-    super::bedrock::is_model_family(model, "opus", "4-7")
-        || super::bedrock::is_model_family(model, "opus", "4-8")
-}
-
-fn aws_b40_strict_tool_validation_error(stream: bool) -> Response {
+fn aws_b40_validation_error(stream: bool, detail: impl Into<String>) -> Response {
     let operation = if stream {
         "InvokeModelWithResponseStream"
     } else {
@@ -3941,22 +4001,95 @@ fn aws_b40_strict_tool_validation_error(stream: bool) -> Response {
     thinking_error_response(
         stream,
         format!(
-            "{operation}: operation error Bedrock Runtime: {operation}, https response error StatusCode: 400, RequestID: {}, ValidationException: ***.***.***.strict: Extra inputs are not permitted (request id: {request_id})",
-            Uuid::new_v4()
+            "{operation}: operation error Bedrock Runtime: {operation}, https response error StatusCode: 400, RequestID: {}, ValidationException: {} (request id: {request_id})",
+            Uuid::new_v4(),
+            detail.into()
         ),
     )
 }
 
-fn aws_b40_unsupported_thinking_mode_error(stream: bool, mode: &str) -> Response {
-    let request_id = super::compat::oneapi_request_id();
-    let message = if mode == "enabled" {
-        format!(
-            "\"***.***.enabled\" is not supported for this model. Use \"***.***.adaptive\" and \"output_config.effort\" to control thinking behavior. (request id: {request_id})"
-        )
-    } else {
-        format!("\"***.***.{mode}\" is not supported for this model. (request id: {request_id})")
-    };
-    typed_thinking_error_response(stream, "upstream_error", message)
+fn aws_b40_residual_request_error(payload: &MessagesRequest) -> Option<Response> {
+    if let Some(thinking) = payload.thinking.as_ref() {
+        match thinking.thinking_type.as_str() {
+            "enabled" if thinking.budget_tokens < 1024 => {
+                return Some(aws_b40_validation_error(
+                    payload.stream,
+                    "***.enabled.budget_tokens: Input should be greater than or equal to 1024",
+                ));
+            }
+            "enabled" if payload.max_tokens <= thinking.budget_tokens => {
+                return Some(aws_b40_validation_error(
+                    payload.stream,
+                    "`max_tokens` must be greater than `thinking.budget_tokens`",
+                ));
+            }
+            "disabled" | "enabled" | "adaptive" => {}
+            other => {
+                return Some(aws_b40_validation_error(
+                    payload.stream,
+                    format!(
+                        "thinking.type: Input should be 'enabled', 'adaptive', or 'disabled'; got '{other}'"
+                    ),
+                ));
+            }
+        }
+    }
+
+    if let Some(tool_choice) = payload.tool_choice.as_ref() {
+        let Some(choice) = tool_choice.as_object() else {
+            return Some(aws_b40_validation_error(
+                payload.stream,
+                "tool_choice: Input should be an object",
+            ));
+        };
+        let Some(choice_type) = choice.get("type").and_then(serde_json::Value::as_str) else {
+            return Some(aws_b40_validation_error(
+                payload.stream,
+                "tool_choice.type: Input should be 'auto', 'any', 'tool', or 'none'",
+            ));
+        };
+        match choice_type {
+            "auto" => {}
+            "any" => {
+                if payload.tools.as_ref().is_none_or(Vec::is_empty) {
+                    return Some(aws_b40_validation_error(
+                        payload.stream,
+                        "tool_choice.type 'any' requires at least one tool",
+                    ));
+                }
+            }
+            "tool" => {
+                let selected = choice
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let exists = !selected.is_empty()
+                    && payload
+                        .tools
+                        .as_ref()
+                        .is_some_and(|tools| tools.iter().any(|tool| tool.name == selected));
+                if !exists {
+                    return Some(aws_b40_validation_error(
+                        payload.stream,
+                        format!("tool_choice.name: Tool '{selected}' was not found in tools"),
+                    ));
+                }
+            }
+            "none" => {
+                // Normalization removes this choice before residual validation.
+            }
+            other => {
+                return Some(aws_b40_validation_error(
+                    payload.stream,
+                    format!(
+                        "tool_choice.type: Input should be 'auto', 'any', 'tool', or 'none'; got '{other}'"
+                    ),
+                ));
+            }
+        }
+    }
+
+    None
 }
 
 /// Reject request shapes that the selected legacy Kiro path cannot represent.
@@ -3973,22 +4106,30 @@ fn kiro_request_preflight_error(
         return Some(response);
     }
 
+    if aws_b40_compat {
+        if let Some((index, _)) = payload.tools.as_ref().and_then(|tools| {
+            tools
+                .iter()
+                .enumerate()
+                .find(|(_, tool)| tool.strict == Some(true))
+        }) {
+            tracing::debug!(
+                tool_index = index,
+                "AWS-B accepted strict tool for success-first Kiro compatibility"
+            );
+        }
+        // AWS-B repairs or downgrades supported thinking shapes before this
+        // residual validation. Do not turn an optional capability mismatch
+        // into a failed tool call here.
+        return aws_b40_residual_request_error(payload);
+    }
+
     if let Some((index, _)) = payload.tools.as_ref().and_then(|tools| {
         tools
             .iter()
             .enumerate()
             .find(|(_, tool)| tool.strict == Some(true))
     }) {
-        if aws_b40_compat {
-            if aws_b40_model_rejects_strict_tool_field(&payload.model) {
-                return Some(aws_b40_strict_tool_validation_error(payload.stream));
-            }
-            tracing::debug!(
-                tool_index = index,
-                "AWS-B accepted strict tool as a best-effort Kiro compatibility hint"
-            );
-            return aws_b40_kiro_thinking_preflight_error(payload);
-        }
         return Some(thinking_error_response(
             payload.stream,
             format!(
@@ -3997,80 +4138,7 @@ fn kiro_request_preflight_error(
         ));
     }
 
-    if aws_b40_compat {
-        return aws_b40_kiro_thinking_preflight_error(payload);
-    }
-
     None
-}
-
-fn aws_b40_kiro_thinking_preflight_error(payload: &MessagesRequest) -> Option<Response> {
-    // `normalize_aws_b40_thinking` turns `*-thinking` aliases into an explicit
-    // thinking request later. Derive that effective value here without cloning
-    // a potentially very large message body, so aliases cannot bypass checks.
-    let effective_thinking = if payload.model.to_ascii_lowercase().contains("thinking") {
-        Some(Thinking {
-            thinking_type: if payload
-                .thinking
-                .as_ref()
-                .is_some_and(|thinking| thinking.thinking_type == "adaptive")
-                || model_uses_adaptive_thinking(&payload.model)
-            {
-                "adaptive".to_string()
-            } else {
-                "enabled".to_string()
-            },
-            budget_tokens: 20000,
-            display: payload
-                .thinking
-                .as_ref()
-                .and_then(|thinking| thinking.display.clone()),
-        })
-    } else {
-        payload.thinking.clone()
-    };
-
-    let Some(thinking) = effective_thinking.as_ref() else {
-        return None;
-    };
-
-    if thinking.is_enabled() && tool_choice_forces_tool(payload) {
-        let choice = payload
-            .tool_choice
-            .as_ref()
-            .and_then(|value| value.get("type"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown");
-        return Some(thinking_error_response(
-            payload.stream,
-            format!(
-                "tool_choice.type \"{choice}\" is incompatible with enabled thinking; use auto or none"
-            ),
-        ));
-    }
-
-    match thinking.thinking_type.as_str() {
-        "disabled" => None,
-        "enabled" if thinking.budget_tokens < 1024 => Some(thinking_error_response(
-            payload.stream,
-            "thinking.enabled.budget_tokens must be greater than or equal to 1024",
-        )),
-        "enabled" if payload.max_tokens <= thinking.budget_tokens => Some(thinking_error_response(
-            payload.stream,
-            "max_tokens must be greater than thinking.budget_tokens",
-        )),
-        "enabled" if !aws_b40_model_supports_enabled_thinking(&payload.model) => Some(
-            aws_b40_unsupported_thinking_mode_error(payload.stream, "enabled"),
-        ),
-        "adaptive" if !aws_b40_model_supports_adaptive_thinking(&payload.model) => Some(
-            aws_b40_unsupported_thinking_mode_error(payload.stream, "adaptive"),
-        ),
-        "enabled" | "adaptive" => None,
-        other => Some(thinking_error_response(
-            payload.stream,
-            format!("thinking.type \"{other}\" is not supported"),
-        )),
-    }
 }
 
 /// 工具调用前导文本。
@@ -5301,6 +5369,10 @@ pub async fn post_messages_cc(
     if let Some(response) = reject_invalid_thinking_signatures(&payload, aws_b40_compat) {
         return response;
     }
+    if aws_b40_compat {
+        normalize_aws_b40_thinking(&mut payload);
+        normalize_aws_b40_tool_choice(&mut payload);
+    }
     if let Some(response) = kiro_request_preflight_error(&payload, aws_b40_compat) {
         return response;
     }
@@ -5321,9 +5393,7 @@ pub async fn post_messages_cc(
         }
     };
 
-    if aws_b40_compat {
-        normalize_aws_b40_thinking(&mut payload);
-    } else {
+    if !aws_b40_compat {
         normalize_opus_thinking(&mut payload);
         if let Some(response) = reject_invalid_thinking_request(&payload) {
             return response;
@@ -5901,26 +5971,20 @@ mod tests {
         assert!(body.contains("tools[0].strict"));
         assert!(body.contains("not supported by the Kiro transport"));
 
-        for model in ["claude-sonnet-4-6", "claude-opus-4-6"] {
+        for model in [
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-5",
+        ] {
             for stream in [false, true] {
                 assert!(
                     kiro_request_preflight_error(&strict_request(model, stream), true).is_none(),
-                    "AWS-B must accept strict:true for Pomo/Bedrock compatibility: {model}"
+                    "AWS-B must accept strict:true for success-first compatibility: {model}"
                 );
             }
-        }
-
-        for model in ["claude-opus-4-7", "claude-opus-4-8"] {
-            let response = kiro_request_preflight_error(&strict_request(model, false), true)
-                .expect("Pomo/Bedrock rejects strict on this model family");
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("response body");
-            let body = String::from_utf8(body.to_vec()).expect("UTF-8 response");
-            assert!(body.contains("Bedrock Runtime"), "{body}");
-            assert!(body.contains("strict: Extra inputs are not permitted"));
-            assert!(!body.contains("Kiro"));
         }
 
         let strict_false = parse(
@@ -5939,8 +6003,8 @@ mod tests {
     }
 
     #[test]
-    fn kiro_preflight_rejects_invalid_manual_thinking_instead_of_downgrading_it() {
-        let forced_tool = parse(
+    fn aws_b_normalizes_repairable_thinking_before_residual_validation() {
+        let mut forced_tool = parse(
             "claude-sonnet-4-6",
             serde_json::json!({
                 "thinking": {"type": "enabled", "budget_tokens": 2048},
@@ -5952,11 +6016,10 @@ mod tests {
                 }]
             }),
         );
-        assert_eq!(
-            kiro_request_preflight_error(&forced_tool, true)
-                .expect("thinking plus forced tool choice must be rejected")
-                .status(),
-            StatusCode::BAD_REQUEST
+        normalize_aws_b40_thinking(&mut forced_tool);
+        assert!(
+            kiro_request_preflight_error(&forced_tool, true).is_none(),
+            "thinking plus forced tool choice should be attempted"
         );
 
         for extra in [
@@ -5967,97 +6030,198 @@ mod tests {
                 "max_tokens": 2048,
                 "thinking": {"type": "enabled", "budget_tokens": 2048}
             }),
-            serde_json::json!({
-                "thinking": {"type": "enabled", "budget_tokens": 2048}
-            }),
         ] {
-            let model = if extra["thinking"]["budget_tokens"] == 2048
-                && extra.get("max_tokens").is_none()
-            {
-                "claude-opus-4-8"
-            } else {
-                "claude-sonnet-4-6"
-            };
+            let mut request = parse("claude-sonnet-4-6", extra);
+            normalize_aws_b40_thinking(&mut request);
             assert_eq!(
-                kiro_request_preflight_error(&parse(model, extra), true)
-                    .expect("unsupported manual thinking must be rejected")
+                kiro_request_preflight_error(&request, true)
+                    .expect("irrecoverable budget errors must be rejected")
                     .status(),
                 StatusCode::BAD_REQUEST
             );
         }
 
-        let supported_enabled = parse(
+        let mut supported_enabled = parse(
             "claude-sonnet-4-6",
             serde_json::json!({
                 "thinking": {"type": "enabled", "budget_tokens": 2048}
             }),
         );
+        normalize_aws_b40_thinking(&mut supported_enabled);
         assert!(kiro_request_preflight_error(&supported_enabled, true).is_none());
 
-        let supported_adaptive = parse(
+        for model in [
+            "claude-opus-4-7",
             "claude-opus-4-8",
-            serde_json::json!({
-                "thinking": {"type": "adaptive"},
-                "output_config": {"effort": "high"}
-            }),
-        );
-        assert!(kiro_request_preflight_error(&supported_adaptive, true).is_none());
+            "claude-opus-5",
+            "claude-sonnet-5",
+        ] {
+            let mut request = parse(
+                model,
+                serde_json::json!({
+                    "thinking": {"type": "enabled", "budget_tokens": 2048}
+                }),
+            );
+            normalize_aws_b40_thinking(&mut request);
+            assert_eq!(
+                request
+                    .thinking
+                    .as_ref()
+                    .map(|thinking| thinking.thinking_type.as_str()),
+                Some("adaptive"),
+                "model={model}"
+            );
+            assert!(
+                kiro_request_preflight_error(&request, true).is_none(),
+                "model={model}"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn aws_b_unsupported_manual_thinking_uses_the_pomo_error_contract() {
-        let request = parse(
-            "claude-opus-5",
+    async fn aws_b_keeps_irrecoverable_alias_and_tool_choice_errors_as_bedrock_validation() {
+        let cases = [
+            (
+                parse(
+                    "claude-sonnet-4-6-thinking",
+                    serde_json::json!({
+                        "thinking": {"type": "enabled", "budget_tokens": 512}
+                    }),
+                ),
+                "budget_tokens",
+                "InvokeModel:",
+            ),
+            (
+                parse(
+                    "claude-opus-4-7-thinking",
+                    serde_json::json!({
+                        "stream": true,
+                        "max_tokens": 2048,
+                        "thinking": {"type": "enabled", "budget_tokens": 2048}
+                    }),
+                ),
+                "max_tokens",
+                "InvokeModelWithResponseStream:",
+            ),
+            (
+                parse(
+                    "claude-opus-4-8-thinking",
+                    serde_json::json!({
+                        "thinking": {"type": "bogus"}
+                    }),
+                ),
+                "thinking.type",
+                "InvokeModel:",
+            ),
+            (
+                parse(
+                    "claude-opus-4-8",
+                    serde_json::json!({
+                        "tool_choice": {"type": "any"}
+                    }),
+                ),
+                "requires at least one tool",
+                "InvokeModel:",
+            ),
+            (
+                parse(
+                    "claude-opus-4-8",
+                    serde_json::json!({
+                        "tool_choice": {"type": "tool", "name": "missing"},
+                        "tools": [{
+                            "name": "get_weather",
+                            "description": "Get weather",
+                            "input_schema": {"type": "object"}
+                        }]
+                    }),
+                ),
+                "was not found in tools",
+                "InvokeModel:",
+            ),
+            (
+                parse(
+                    "claude-opus-4-8",
+                    serde_json::json!({
+                        "tool_choice": {"type": "unexpected"}
+                    }),
+                ),
+                "tool_choice.type",
+                "InvokeModel:",
+            ),
+        ];
+
+        for (mut request, expected_detail, expected_operation) in cases {
+            normalize_aws_b40_thinking(&mut request);
+            normalize_aws_b40_tool_choice(&mut request);
+            let response = kiro_request_preflight_error(&request, true)
+                .expect("irrecoverable AWS-B input must be rejected");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body");
+            let body: serde_json::Value =
+                serde_json::from_slice(&body).expect("Bedrock validation JSON");
+            assert_eq!(body["type"], "error");
+            assert_eq!(body["error"]["type"], "<nil>");
+            let message = body["error"]["message"]
+                .as_str()
+                .expect("validation message");
+            assert!(message.contains("ValidationException"), "{message}");
+            assert!(message.contains(expected_detail), "{message}");
+            assert!(message.contains(expected_operation), "{message}");
+            assert!(!message.contains("Kiro"), "{message}");
+        }
+
+        let mut none = parse(
+            "claude-opus-4-8",
             serde_json::json!({
-                "thinking": {"type": "enabled", "budget_tokens": 2048},
+                "tool_choice": {"type": "none"},
                 "tools": [{
-                    "name": "report_result",
-                    "description": "",
-                    "strict": true,
-                    "input_schema": {"type": "object", "properties": {}}
-                }],
-                "tool_choice": {"type": "auto"}
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "input_schema": {"type": "object"}
+                }]
             }),
         );
-        let response = kiro_request_preflight_error(&request, true)
-            .expect("Opus 5 manual thinking must be rejected");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("response body");
-        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON response");
-        assert_eq!(body["error"]["type"], "upstream_error");
-        let message = body["error"]["message"].as_str().expect("error message");
-        assert!(message.contains("enabled\" is not supported for this model"));
-        assert!(message.contains("output_config.effort"));
-        assert!(!message.contains("Kiro"));
+        normalize_aws_b40_tool_choice(&mut none);
+        assert!(none.tools.is_none());
+        assert!(none.tool_choice.is_none());
+        assert!(kiro_request_preflight_error(&none, true).is_none());
     }
 
     #[test]
-    fn kiro_preflight_evaluates_effective_thinking_from_model_aliases() {
-        let unsupported_alias = parse("claude-opus-4-7-thinking", serde_json::json!({}));
+    fn aws_b_normalizes_thinking_aliases_before_preflight() {
+        let mut opus_alias = parse("claude-opus-4-7-thinking", serde_json::json!({}));
+        normalize_aws_b40_thinking(&mut opus_alias);
+        assert_eq!(opus_alias.model, "claude-opus-4-7");
         assert_eq!(
-            kiro_request_preflight_error(&unsupported_alias, true)
-                .expect("unsupported adaptive alias must not be silently removed")
-                .status(),
-            StatusCode::BAD_REQUEST
+            opus_alias
+                .thinking
+                .as_ref()
+                .map(|thinking| thinking.thinking_type.as_str()),
+            Some("adaptive")
         );
+        assert!(kiro_request_preflight_error(&opus_alias, true).is_none());
 
-        let explicit_adaptive_alias = parse(
+        let mut explicit_adaptive_alias = parse(
             "claude-sonnet-4-6-thinking",
             serde_json::json!({
                 "thinking": {"type": "adaptive"}
             }),
         );
+        normalize_aws_b40_thinking(&mut explicit_adaptive_alias);
+        assert_eq!(explicit_adaptive_alias.model, "claude-sonnet-4-6");
         assert_eq!(
-            kiro_request_preflight_error(&explicit_adaptive_alias, true)
-                .expect("explicit adaptive must win over the model alias default")
-                .status(),
-            StatusCode::BAD_REQUEST
+            explicit_adaptive_alias
+                .thinking
+                .as_ref()
+                .map(|thinking| thinking.thinking_type.as_str()),
+            Some("adaptive")
         );
+        assert!(kiro_request_preflight_error(&explicit_adaptive_alias, true).is_none());
 
         for model in ["claude-sonnet-4-6-thinking", "claude-opus-5-thinking"] {
-            let forced_tool = parse(
+            let mut forced_tool = parse(
                 model,
                 serde_json::json!({
                     "tool_choice": {"type": "tool", "name": "get_weather"},
@@ -6068,15 +6232,14 @@ mod tests {
                     }]
                 }),
             );
-            assert_eq!(
-                kiro_request_preflight_error(&forced_tool, true)
-                    .expect("thinking alias plus forced tool choice must be rejected")
-                    .status(),
-                StatusCode::BAD_REQUEST,
+            normalize_aws_b40_thinking(&mut forced_tool);
+            assert!(
+                kiro_request_preflight_error(&forced_tool, true).is_none(),
                 "model={model}"
             );
 
-            let automatic = parse(model, serde_json::json!({}));
+            let mut automatic = parse(model, serde_json::json!({}));
+            normalize_aws_b40_thinking(&mut automatic);
             assert!(
                 kiro_request_preflight_error(&automatic, true).is_none(),
                 "model={model}"
@@ -8812,7 +8975,7 @@ mod tests {
     }
 
     #[test]
-    fn aws_b_drops_unsupported_adaptive_thinking_without_losing_model_profile() {
+    fn aws_b_preserves_opus_4_7_adaptive_thinking_for_success_first_tools() {
         let mut req = parse(
             "claude-opus-4-7-thinking",
             serde_json::json!({
@@ -8823,8 +8986,18 @@ mod tests {
 
         normalize_aws_b40_thinking(&mut req);
 
-        assert!(req.thinking.is_none());
-        assert!(req.output_config.is_none());
+        let thinking = req
+            .thinking
+            .as_ref()
+            .expect("Opus 4.7 adaptive thinking should reach the provider");
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.budget_tokens, 20_000);
+        assert_eq!(
+            req.output_config
+                .as_ref()
+                .map(|config| config.effort.as_str()),
+            Some("high")
+        );
         assert_eq!(req.model, "claude-opus-4-7");
     }
 
@@ -9143,7 +9316,7 @@ mod tests {
     }
 
     #[test]
-    fn aws_b_usage_preserves_removed_thinking_request_overhead() {
+    fn aws_b_usage_preserves_converted_thinking_request_overhead() {
         let mut req = parse(
             "claude-opus-4-8",
             serde_json::json!({
@@ -9158,7 +9331,12 @@ mod tests {
         let thinking_requested = req.thinking.is_some();
         normalize_aws_b40_thinking(&mut req);
 
-        assert!(req.thinking.is_none());
+        assert_eq!(
+            req.thinking
+                .as_ref()
+                .map(|thinking| thinking.thinking_type.as_str()),
+            Some("adaptive")
+        );
         assert_eq!(
             estimate_profile_input_tokens(&req, true, thinking_requested),
             33
