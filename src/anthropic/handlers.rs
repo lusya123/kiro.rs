@@ -471,9 +471,43 @@ fn build_continuation_request_body(
     serde_json::to_string(&request).ok()
 }
 
-/// 将 KiroProvider 错误映射为 HTTP 响应
-fn map_provider_error(err: Error) -> Response {
+fn is_kiro_invalid_tool_use_format(upstream: &UpstreamHttpError) -> bool {
+    if upstream.status() != reqwest::StatusCode::BAD_REQUEST {
+        return false;
+    }
+
+    serde_json::from_str::<serde_json::Value>(upstream.body())
+        .ok()
+        .is_some_and(|body| {
+            body.get("message").and_then(serde_json::Value::as_str)
+                == Some("Invalid tool use format.")
+                && body.get("reason").and_then(serde_json::Value::as_str)
+                    == Some("REQUEST_BODY_INVALID")
+        })
+}
+
+/// 将 KiroProvider 错误映射为 HTTP 响应。
+///
+/// AWS-B 对外把 Kiro 的工具格式拒绝视为网关上游故障，保持旧 AWS-B 的
+/// 502 契约；其他明确的上游 4xx 仍按 Pomo/Bedrock 的 400 契约返回。
+fn map_provider_error(err: Error, aws_b40_compat: bool) -> Response {
     if let Some(upstream) = err.downcast_ref::<UpstreamHttpError>() {
+        if aws_b40_compat && is_kiro_invalid_tool_use_format(upstream) {
+            tracing::warn!(
+                status = upstream.status().as_u16(),
+                error = %upstream,
+                "AWS-B upstream rejected an invalid Kiro tool shape"
+            );
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    format!("上游 API 调用失败: {upstream}"),
+                )),
+            )
+                .into_response();
+        }
+
         let status =
             StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let error_type = if status.is_client_error() {
@@ -2728,7 +2762,7 @@ async fn handle_stream_request(
     let upstream_started = Instant::now();
     let response = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => return map_provider_error(e, aws_b40_compat),
     };
     let upstream_request_latency = upstream_started.elapsed();
 
@@ -3065,7 +3099,7 @@ async fn handle_non_stream_request(
 
         let response = match provider.call_api(&current_request_body).await {
             Ok(resp) => resp,
-            Err(e) => return map_provider_error(e),
+            Err(e) => return map_provider_error(e, aws_b40_compat),
         };
 
         let body_bytes = match response.bytes().await {
@@ -3894,8 +3928,9 @@ fn aws_b40_model_supports_adaptive_thinking(model: &str) -> bool {
 /// Reject request shapes that the selected legacy Kiro path cannot represent.
 ///
 /// This runs only after the optional native provider had a chance to proxy the
-/// raw Anthropic request. The legacy transport must never silently discard a
-/// requested strict or thinking mode and pretend the contract was honored.
+/// raw Anthropic request. AWS-B intentionally treats `strict` as a compatibility
+/// hint, matching Pomo/Bedrock's observed acceptance contract while preserving
+/// the schema sent to Kiro. Other profiles keep the explicit rejection.
 fn kiro_request_preflight_error(
     payload: &MessagesRequest,
     aws_b40_compat: bool,
@@ -3910,6 +3945,13 @@ fn kiro_request_preflight_error(
             .enumerate()
             .find(|(_, tool)| tool.strict == Some(true))
     }) {
+        if aws_b40_compat {
+            tracing::debug!(
+                tool_index = index,
+                "AWS-B accepted strict tool as a best-effort Kiro compatibility hint"
+            );
+            return aws_b40_kiro_thinking_preflight_error(payload);
+        }
         return Some(thinking_error_response(
             payload.stream,
             format!(
@@ -5517,7 +5559,7 @@ async fn handle_stream_request_buffered(
     let upstream_started = Instant::now();
     let response = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => return map_provider_error(e, aws_b40_compat),
     };
     let upstream_request_latency = upstream_started.elapsed();
 
@@ -5799,9 +5841,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kiro_preflight_rejects_strict_true_without_silently_dropping_it() {
-        for (aws_b40_compat, stream) in [(false, false), (true, false), (true, true)] {
-            let request = parse(
+    async fn kiro_preflight_treats_strict_as_an_aws_b_compatibility_hint() {
+        let strict_request = |stream| {
+            parse(
                 "claude-sonnet-4-6",
                 serde_json::json!({
                     "stream": stream,
@@ -5812,17 +5854,24 @@ mod tests {
                         "strict": true
                     }]
                 }),
-            );
+            )
+        };
 
-            let response = kiro_request_preflight_error(&request, aws_b40_compat)
-                .expect("strict:true must be rejected on Kiro");
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("response body");
-            let body = String::from_utf8(body.to_vec()).expect("UTF-8 response");
-            assert!(body.contains("tools[0].strict"));
-            assert!(body.contains("not supported by the Kiro transport"));
+        let response = kiro_request_preflight_error(&strict_request(false), false)
+            .expect("non AWS-B Kiro profiles must reject unsupported strict enforcement");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body = String::from_utf8(body.to_vec()).expect("UTF-8 response");
+        assert!(body.contains("tools[0].strict"));
+        assert!(body.contains("not supported by the Kiro transport"));
+
+        for stream in [false, true] {
+            assert!(
+                kiro_request_preflight_error(&strict_request(stream), true).is_none(),
+                "AWS-B must accept strict:true for Pomo/Bedrock compatibility"
+            );
         }
 
         let strict_false = parse(
@@ -5958,22 +6007,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_bad_request_remains_an_http_bad_request() {
-        let response = map_provider_error(anyhow::Error::new(UpstreamHttpError::new(
-            reqwest::StatusCode::BAD_REQUEST,
-            "Invalid tool use format".to_string(),
-            "streaming",
-        )));
+    async fn provider_error_mapping_preserves_the_aws_b_gateway_contract() {
+        let invalid_tool_error = || {
+            anyhow::Error::new(UpstreamHttpError::new(
+                reqwest::StatusCode::BAD_REQUEST,
+                r#"{"message":"Invalid tool use format.","reason":"REQUEST_BODY_INVALID"}"#
+                    .to_string(),
+                "streaming",
+            ))
+        };
 
+        let response = map_provider_error(invalid_tool_error(), true);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON response");
+        assert_eq!(body["error"]["type"], "api_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Invalid tool use format."))
+        );
+
+        let response = map_provider_error(invalid_tool_error(), false);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("response body");
         let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON response");
         assert_eq!(body["error"]["type"], "invalid_request_error");
-        assert_eq!(body["error"]["message"], "Invalid tool use format");
 
-        let generic = map_provider_error(anyhow::anyhow!("network transport failed"));
+        let other_bad_request = anyhow::Error::new(UpstreamHttpError::new(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"message":"Improperly formed request.","reason":"REQUEST_BODY_INVALID"}"#
+                .to_string(),
+            "non-streaming",
+        ));
+        assert_eq!(
+            map_provider_error(other_bad_request, true).status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let generic = map_provider_error(anyhow::anyhow!("network transport failed"), true);
         assert_eq!(generic.status(), StatusCode::BAD_GATEWAY);
     }
 
