@@ -74,8 +74,13 @@ export async function forceRefreshToken(
 }
 
 // 获取凭据余额
-export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
-  const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`)
+export async function getCredentialBalance(
+  id: number,
+  fresh = false
+): Promise<BalanceResponse> {
+  const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`, {
+    params: fresh ? { fresh: true } : undefined,
+  })
   return data
 }
 

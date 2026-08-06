@@ -30,6 +30,7 @@ use super::middleware::{AppState, mark_gpt_openai_response};
 use super::types::{Message, MessagesRequest, Metadata, ReasoningConfig, SystemMessage, Tool};
 
 const OPENAI_CHAT_BODY_LIMIT: usize = 50 * 1024 * 1024;
+const SERIAL_TOOL_CONSTRAINT: &str = "Tool-use constraint: Call at most one tool in this assistant response. If more work is needed, wait for the tool result before selecting another tool.";
 
 pub(super) struct OpenAiChatJson(Value);
 
@@ -557,6 +558,27 @@ fn openai_reasoning_config(oai: &Value) -> Result<Option<ReasoningConfig>, Strin
         effort: effort.unwrap_or_else(|| "medium".to_string()),
         mode,
     }))
+}
+
+fn openai_parallel_tool_calls(oai: &Value) -> Result<bool, String> {
+    match oai.get("parallel_tool_calls") {
+        None | Some(Value::Null) => Ok(true),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err("`parallel_tool_calls` must be a boolean".to_string()),
+    }
+}
+
+fn append_serial_tool_constraint(
+    system: &mut Vec<SystemMessage>,
+    tools: Option<&[Tool]>,
+    parallel_tool_calls: bool,
+) {
+    if !parallel_tool_calls && tools.is_some_and(|tools| !tools.is_empty()) {
+        system.push(SystemMessage {
+            text: SERIAL_TOOL_CONSTRAINT.to_string(),
+            cache_control: None,
+        });
+    }
 }
 
 fn validate_gpt_chat_reasoning_compatibility(
@@ -1199,6 +1221,12 @@ pub async fn post_chat_completions(
             return finish_openai_response(openai_invalid_request(message), gpt_openai_shape);
         }
     };
+    let parallel_tool_calls = match openai_parallel_tool_calls(&oai) {
+        Ok(parallel_tool_calls) => parallel_tool_calls,
+        Err(message) => {
+            return finish_openai_response(openai_invalid_request(message), gpt_openai_shape);
+        }
+    };
 
     // OpenAI messages → Anthropic system + messages。
     let mut system: Vec<SystemMessage> = Vec::new();
@@ -1300,6 +1328,7 @@ pub async fn post_chat_completions(
     if oai.get("tool_choice").and_then(Value::as_str) == Some("none") {
         tools = None;
     }
+    append_serial_tool_constraint(&mut system, tools.as_deref(), parallel_tool_calls);
 
     let mr = MessagesRequest {
         model: model.clone(),
@@ -2088,6 +2117,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn chat_parallel_tool_calls_is_validated_and_adds_serial_constraint() {
+        assert!(openai_parallel_tool_calls(&json!({})).unwrap());
+        assert!(openai_parallel_tool_calls(&json!({"parallel_tool_calls": null})).unwrap());
+        assert!(openai_parallel_tool_calls(&json!({"parallel_tool_calls": true})).unwrap());
+        assert!(!openai_parallel_tool_calls(&json!({"parallel_tool_calls": false})).unwrap());
+        for invalid in [json!("false"), json!(0), json!({})] {
+            assert!(openai_parallel_tool_calls(&json!({"parallel_tool_calls": invalid})).is_err());
+        }
+
+        let tools = openai_tools_to_anthropic(
+            &json!({
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                }]
+            }),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        let mut system = vec![SystemMessage {
+            text: "Existing instruction".to_string(),
+            cache_control: None,
+        }];
+        append_serial_tool_constraint(&mut system, Some(&tools), false);
+        assert_eq!(system.len(), 2);
+        assert!(system[1].text.contains("at most one tool"));
+
+        let mut parallel_system = Vec::new();
+        append_serial_tool_constraint(&mut parallel_system, Some(&tools), true);
+        assert!(parallel_system.is_empty());
+
+        let mut no_tools_system = Vec::new();
+        append_serial_tool_constraint(&mut no_tools_system, None, false);
+        assert!(no_tools_system.is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_rejects_non_boolean_parallel_tool_calls_before_provider() {
+        let response = post_chat_completions(
+            State(AppState::new("test-api-key", true, true)),
+            OpenAiChatJson(json!({
+                "model": "gpt-5.6-sol",
+                "messages": [{"role": "user", "content": "hello"}],
+                "parallel_tool_calls": "false"
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let (_, body) = response_json(response).await;
+        assert_eq!(
+            body["error"]["message"],
+            "`parallel_tool_calls` must be a boolean"
+        );
     }
 
     #[test]

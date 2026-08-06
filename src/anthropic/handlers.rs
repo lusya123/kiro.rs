@@ -18,7 +18,7 @@ use anyhow::Error;
 use axum::{
     Json as AxumJson,
     body::{Body, to_bytes},
-    extract::{FromRequest, Request, State},
+    extract::{FromRequest, RawQuery, Request, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
@@ -2300,10 +2300,18 @@ fn infer_supported_image_media_type(path: &str) -> Option<String> {
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
-pub async fn get_models(State(state): State<AppState>) -> Response {
+pub async fn get_models(State(state): State<AppState>, RawQuery(raw_query): RawQuery) -> Response {
     tracing::info!("Received GET /v1/models request");
 
     if state.aws_b40_compat {
+        if raw_query.as_deref().is_some_and(|query| {
+            query
+                .split('&')
+                .map(|pair| pair.split_once('=').map_or(pair, |(key, _)| key))
+                .any(|key| key == "client_version")
+        }) {
+            return super::bedrock::codex_models_response();
+        }
         return super::bedrock::models_response();
     }
 
@@ -2323,6 +2331,7 @@ pub async fn get_models(State(state): State<AppState>) -> Response {
             "Claude Sonnet 5 (Thinking)",
             1782835200,
         ),
+        (super::converter::GPT_56_MODEL_ALIAS, "GPT 5.6", 1785024000),
         (
             super::converter::GPT_56_SOL_MODEL_ID,
             "GPT 5.6 Sol",
@@ -2418,7 +2427,7 @@ pub async fn head_models(State(state): State<AppState>) -> Response {
     if state.aws_b40_compat {
         super::bedrock::head_models_response()
     } else {
-        let mut response = get_models(State(state)).await;
+        let mut response = get_models(State(state), RawQuery(None)).await;
         *response.body_mut() = Body::empty();
         response
     }

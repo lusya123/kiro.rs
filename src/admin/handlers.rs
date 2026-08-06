@@ -2,15 +2,15 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::IntoResponse,
 };
 
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SidecarConfigUpdateRequest, SuccessResponse,
+        AddCredentialRequest, GetBalanceQuery, SetDisabledRequest, SetLoadBalancingModeRequest,
+        SetPriorityRequest, SidecarConfigUpdateRequest, SuccessResponse,
     },
 };
 
@@ -75,8 +75,15 @@ pub async fn reset_failure_count(
 pub async fn get_credential_balance(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
+    Query(query): Query<GetBalanceQuery>,
 ) -> impl IntoResponse {
-    match state.service.get_balance(id).await {
+    let result = if query.fresh {
+        state.service.get_balance_fresh(id).await
+    } else {
+        state.service.get_balance(id).await
+    };
+
+    match result {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
@@ -100,7 +107,7 @@ pub async fn delete_credential(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
-    match state.service.delete_credential(id) {
+    match state.service.delete_credential(id).await {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 已删除", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

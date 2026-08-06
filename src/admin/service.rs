@@ -7,6 +7,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
@@ -37,6 +38,9 @@ struct CachedBalance {
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
+    /// Serialize refresh/cache/delete operations so an older, slower upstream
+    /// response cannot overwrite a newer value or recreate a deleted entry.
+    balance_refresh_lock: AsyncMutex<()>,
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
@@ -64,6 +68,7 @@ impl AdminService {
         Self {
             token_manager,
             balance_cache: Mutex::new(balance_cache),
+            balance_refresh_lock: AsyncMutex::new(()),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
             sidecar_manager,
@@ -159,7 +164,16 @@ impl AdminService {
             }
         }
 
-        // 缓存未命中或已过期，从上游获取
+        // 缓存未命中或已过期，从上游获取。
+        self.get_balance_fresh(id).await
+    }
+
+    /// 绕过 5 分钟余额缓存，直接查询上游并刷新缓存。
+    ///
+    /// 该方法只通过已鉴权的 Admin API 暴露，用于单次调用前后的
+    /// 用量差值观测；普通 UI 查询仍使用默认缓存。它无法消除上游账本延迟。
+    pub async fn get_balance_fresh(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
+        let _refresh_guard = self.balance_refresh_lock.lock().await;
         let balance = self.fetch_balance(id).await?;
 
         // 更新缓存
@@ -271,7 +285,8 @@ impl AdminService {
     }
 
     /// 删除凭据
-    pub fn delete_credential(&self, id: u64) -> Result<(), AdminServiceError> {
+    pub async fn delete_credential(&self, id: u64) -> Result<(), AdminServiceError> {
+        let _refresh_guard = self.balance_refresh_lock.lock().await;
         self.token_manager
             .delete_credential(id)
             .map_err(|e| self.classify_delete_error(e, id))?;

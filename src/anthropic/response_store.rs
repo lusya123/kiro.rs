@@ -99,9 +99,13 @@ impl ResponseStore {
 
     pub(crate) fn validate_size(
         &self,
+        response_id: &str,
         conversation: &StoredConversation,
     ) -> Result<(), StoreError> {
-        let encoded_len = conversation.encoded_len();
+        // Keep the preflight byte accounting identical to `insert_at`; otherwise
+        // a request can pass validation, consume an upstream call, then fail only
+        // because the response id itself pushed the retained entry over the cap.
+        let encoded_len = conversation.encoded_len().saturating_add(response_id.len());
         if encoded_len > self.max_entry_bytes {
             Err(StoreError::EntryTooLarge {
                 max_bytes: self.max_entry_bytes,
@@ -275,6 +279,28 @@ mod tests {
         let oversized = conversation(&"x".repeat(small_len * 2));
         assert!(matches!(
             store.insert("resp_large".to_string(), oversized),
+            Err(StoreError::EntryTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn size_preflight_includes_the_response_id_like_insert() {
+        let item = conversation("small");
+        let item_len = item.encoded_len();
+        let response_id = "resp_0123456789abcdef0123456789abcdef";
+        let store = ResponseStore::new(
+            Duration::from_secs(60),
+            2,
+            item_len + response_id.len() - 1,
+            item_len + response_id.len() - 1,
+        );
+
+        assert!(matches!(
+            store.validate_size(response_id, &item),
+            Err(StoreError::EntryTooLarge { .. })
+        ));
+        assert!(matches!(
+            store.insert(response_id.to_string(), item),
             Err(StoreError::EntryTooLarge { .. })
         ));
     }

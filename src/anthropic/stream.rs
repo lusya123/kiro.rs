@@ -4430,29 +4430,31 @@ mod tests {
 
     #[test]
     fn aws_b_gpt_stream_omits_bedrock_invocation_metrics_but_claude_keeps_them() {
-        let mut gpt = StreamContext::new_with_thinking(
-            "gpt-5.6-luna",
-            42,
-            false,
-            super::super::cache::UsageBreakdown::flat(42),
-            HashMap::new(),
-        );
-        gpt.enable_aws_b40_compat(false);
-        let _ = gpt.generate_initial_events();
-        let _ = gpt.process_assistant_response("hello");
-        let gpt_events = gpt.generate_final_events();
-        let gpt_stop = gpt_events
-            .iter()
-            .find(|event| event.event == "message_stop")
-            .expect("GPT message_stop");
-        assert_eq!(gpt_stop.data["type"], "message_stop");
-        assert!(
-            gpt_stop
-                .data
-                .get("amazon-bedrock-invocationMetrics")
-                .is_none(),
-            "{gpt_stop:?}"
-        );
+        for model in ["gpt-5.6", "gpt-5.6-luna"] {
+            let mut gpt = StreamContext::new_with_thinking(
+                model,
+                42,
+                false,
+                super::super::cache::UsageBreakdown::flat(42),
+                HashMap::new(),
+            );
+            gpt.enable_aws_b40_compat(false);
+            let _ = gpt.generate_initial_events();
+            let _ = gpt.process_assistant_response("hello");
+            let gpt_events = gpt.generate_final_events();
+            let gpt_stop = gpt_events
+                .iter()
+                .find(|event| event.event == "message_stop")
+                .expect("GPT message_stop");
+            assert_eq!(gpt_stop.data["type"], "message_stop");
+            assert!(
+                gpt_stop
+                    .data
+                    .get("amazon-bedrock-invocationMetrics")
+                    .is_none(),
+                "{model}: {gpt_stop:?}"
+            );
+        }
 
         let mut claude = StreamContext::new_with_thinking(
             "claude-sonnet-4-6",
