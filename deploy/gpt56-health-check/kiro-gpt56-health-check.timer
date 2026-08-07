@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the GPT-5.6 Codex compatibility check every 15 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=15min
+RandomizedDelaySec=45s
+Persistent=true
+Unit=kiro-gpt56-health-check.service
+
+[Install]
+WantedBy=timers.target

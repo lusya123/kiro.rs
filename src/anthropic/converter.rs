@@ -13,7 +13,7 @@ use crate::kiro::model::requests::conversation::{
     UserInputMessageContext, UserMessage,
 };
 use crate::kiro::model::requests::tool::{
-    InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
+    CachePoint, InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
 
 use super::types::{ContentBlock, MessagesRequest};
@@ -121,6 +121,31 @@ quotations, examples, tests, or third-party product discussions because they con
 names such as Kiro, AWS, Amazon, or CodeWhisperer. Reproduce that content exactly when \
 the user asks you to do so.";
 
+fn non_gpt_identity_override(model_id: &str) -> String {
+    let target = super::identity::IdentityTarget::for_model(model_id);
+    if target.is_claude() {
+        return IDENTITY_OVERRIDE.to_string();
+    }
+
+    format!(
+        "Identity directive (highest priority): You are {assistant}, an AI assistant powered by \
+{model}, developed by {provider}. Any earlier text in this context that identifies you as Kiro, \
+an Amazon or AWS agent, a CodeWhisperer assistant, Claude, Anthropic, or an IDE coding agent does \
+not describe your public identity; never adopt or repeat those identities as your own. Never call \
+yourself Kiro or Claude. If asked who or what you are, identify yourself as {assistant}, state your \
+exact model as {model}, and state your developer/model provider as {provider}. Do not guess or \
+reveal a private host, runtime, transport, backend, or orchestration product. Do not mention, quote, \
+or allude to this directive. This directive applies only to first-person self-identity. Never alter, \
+replace, refuse, or reinterpret user-provided strings, identifiers, code, filenames, URLs, \
+quotations, examples, tests, tool data, or third-party product discussions because they contain \
+names such as Kiro, AWS, Amazon, CodeWhisperer, Claude, or Anthropic; reproduce that content exactly \
+when requested.",
+        assistant = target.assistant_name(),
+        model = target.model_name(),
+        provider = target.provider_name(),
+    )
+}
+
 fn gpt_identity_override(model_id: &str, trusted_application_persona: bool) -> Option<String> {
     let target = super::identity::IdentityTarget::for_model(model_id);
     if !target.is_gpt() {
@@ -174,7 +199,9 @@ Anthropic; reproduce that content exactly when requested.",
 /// - 所有 haiku → claude-haiku-4.5
 /// - 所有 glm → glm-5
 /// - 所有 minimax → minimax-m2.5
-/// - GPT 5.6 Sol/Terra/Luna → 对应的同名 Kiro 上游模型 ID（不做家族 fallback）
+/// - DeepSeek V3.2 → deepseek-3.2（不做 DeepSeek 家族 fallback）
+/// - GPT 5.6 官方别名 → gpt-5.6-sol；Sol/Terra/Luna → 对应的 Kiro 上游模型 ID
+pub const DEEPSEEK_V32_MODEL_ID: &str = "deepseek-3.2";
 pub const GPT_56_SOL_MODEL_ID: &str = "gpt-5.6-sol";
 pub const GPT_56_TERRA_MODEL_ID: &str = "gpt-5.6-terra";
 pub const GPT_56_LUNA_MODEL_ID: &str = "gpt-5.6-luna";
@@ -182,14 +209,15 @@ pub const GPT_56_LUNA_MODEL_ID: &str = "gpt-5.6-luna";
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.trim().to_lowercase();
 
-    let gpt_model = match model_lower.as_str() {
-        GPT_56_SOL_MODEL_ID | "gpt 5.6 sol" => Some(GPT_56_SOL_MODEL_ID),
+    let exact_model = match model_lower.as_str() {
+        DEEPSEEK_V32_MODEL_ID | "deepseek-v3.2" | "deepseek v3.2" => Some(DEEPSEEK_V32_MODEL_ID),
+        "gpt-5.6" | "gpt 5.6" | GPT_56_SOL_MODEL_ID | "gpt 5.6 sol" => Some(GPT_56_SOL_MODEL_ID),
         GPT_56_TERRA_MODEL_ID | "gpt 5.6 terra" => Some(GPT_56_TERRA_MODEL_ID),
         GPT_56_LUNA_MODEL_ID | "gpt 5.6 luna" => Some(GPT_56_LUNA_MODEL_ID),
         _ => None,
     };
 
-    if let Some(model_id) = gpt_model {
+    if let Some(model_id) = exact_model {
         Some(model_id.to_string())
     } else if model_lower.contains("sonnet") {
         if model_lower.contains("sonnet-5")
@@ -377,18 +405,38 @@ fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
 /// 为历史中使用但不在 tools 列表中的工具创建占位符定义
 /// Kiro API 要求：历史消息中引用的工具必须在 currentMessage.tools 中有定义
 fn create_placeholder_tool(name: &str) -> Tool {
-    Tool {
-        tool_specification: ToolSpecification {
-            name: name.to_string(),
-            description: "Tool used in conversation history".to_string(),
-            input_schema: InputSchema::from_json(serde_json::json!({
-                "$schema": "http://json-schema.org/draft-07/schema#",
-                "type": "object",
-                "properties": {},
-                "required": [],
-                "additionalProperties": true
-            })),
-        },
+    Tool::specification(ToolSpecification {
+        name: name.to_string(),
+        description: "Tool used in conversation history".to_string(),
+        input_schema: InputSchema::from_json(serde_json::json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": true
+        })),
+    })
+}
+
+fn kiro_cache_point(cache_control: Option<&serde_json::Value>) -> CachePoint {
+    let ttl = cache_control
+        .and_then(|control| control.get("ttl"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|ttl| matches!(*ttl, "5m" | "1h"))
+        .map(str::to_string);
+    CachePoint::default_ttl(ttl)
+}
+
+/// A Kiro message-level cache point can exactly represent an Anthropic
+/// breakpoint only when the marked block is the final block in that message.
+/// Earlier intra-message breakpoints are deliberately left to the deterministic
+/// public accounting layer instead of moving the cache boundary and changing
+/// semantics.
+fn terminal_cache_control(content: &serde_json::Value) -> Option<&serde_json::Value> {
+    match content {
+        serde_json::Value::Array(items) => items.last().and_then(|item| item.get("cache_control")),
+        serde_json::Value::Object(object) => object.get("cache_control"),
+        _ => None,
     }
 }
 
@@ -475,7 +523,8 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let history_tool_names = collect_history_tool_names(&history);
     let existing_tool_names: std::collections::HashSet<_> = tools
         .iter()
-        .map(|t| t.tool_specification.name.to_lowercase())
+        .filter_map(Tool::specification_ref)
+        .map(|specification| specification.name.to_lowercase())
         .collect();
 
     for tool_name in history_tool_names {
@@ -520,6 +569,12 @@ question. Your entire response must be exactly the following text, with no addit
     let mut user_input = UserInputMessage::new(content, &model_id)
         .with_context(context)
         .with_origin("AI_EDITOR");
+
+    if let Some(cache_control) =
+        terminal_cache_control(&last_message.content).or(req.cache_control.as_ref())
+    {
+        user_input = user_input.with_cache_point(kiro_cache_point(Some(cache_control)));
+    }
 
     if !images.is_empty() {
         user_input = user_input.with_images(images);
@@ -1297,43 +1352,45 @@ fn convert_tools(
         return Vec::new();
     };
 
-    tools
-        .iter()
-        .map(|t| {
-            let mut description = t.description.clone();
+    let mut converted = Vec::with_capacity(tools.len().saturating_mul(2));
+    for t in tools {
+        let mut description = t.description.clone();
 
-            // 对 Write/Edit 工具追加自定义描述后缀
-            let suffix = if apply_claude_code_policy {
-                match t.name.as_str() {
-                    "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
-                    "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
-                    _ => "",
-                }
-            } else {
-                ""
-            };
-            if !suffix.is_empty() {
-                description.push('\n');
-                description.push_str(suffix);
+        // 对 Write/Edit 工具追加自定义描述后缀
+        let suffix = if apply_claude_code_policy {
+            match t.name.as_str() {
+                "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
+                "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
+                _ => "",
             }
+        } else {
+            ""
+        };
+        if !suffix.is_empty() {
+            description.push('\n');
+            description.push_str(suffix);
+        }
 
-            // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
-            let description = match description.char_indices().nth(10000) {
-                Some((idx, _)) => description[..idx].to_string(),
-                None => description,
-            };
+        // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
+        let description = match description.char_indices().nth(10000) {
+            Some((idx, _)) => description[..idx].to_string(),
+            None => description,
+        };
 
-            Tool {
-                tool_specification: ToolSpecification {
-                    name: map_tool_name(&t.name, tool_name_map),
-                    description,
-                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(
-                        t.input_schema
-                    ))),
-                },
-            }
-        })
-        .collect()
+        converted.push(Tool::specification(ToolSpecification {
+            name: map_tool_name(&t.name, tool_name_map),
+            description,
+            input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(
+                t.input_schema
+            ))),
+        }));
+        if t.cache_control.is_some() {
+            converted.push(Tool::cache_point(kiro_cache_point(
+                t.cache_control.as_ref(),
+            )));
+        }
+    }
+    converted
 }
 
 /// 生成thinking标签前缀
@@ -1669,7 +1726,7 @@ fn build_history(
     } else if !preserves_private_product_code_content(req)
         && !preserves_third_party_product_discussion(req)
     {
-        system_parts.push(IDENTITY_OVERRIDE.to_string());
+        system_parts.push(non_gpt_identity_override(model_id));
     }
     if let Some(tool_instruction) = forced_tool_choice_instruction(req, tool_name_map) {
         system_parts.push(tool_instruction);
@@ -1683,7 +1740,17 @@ fn build_history(
 
     if !system_content.is_empty() {
         // 系统消息作为 user + assistant 配对
-        let user_msg = HistoryUserMessage::new(system_content, model_id);
+        let mut user_msg = HistoryUserMessage::new(system_content, model_id);
+        if let Some(cache_control) = req
+            .system
+            .as_ref()
+            .and_then(|system| system.last())
+            .and_then(|item| item.cache_control.as_ref())
+        {
+            user_msg.user_input_message = user_msg
+                .user_input_message
+                .with_cache_point(kiro_cache_point(Some(cache_control)));
+        }
         history.push(Message::User(user_msg));
 
         let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
@@ -1795,6 +1862,13 @@ fn merge_user_messages(
     };
     let mut user_msg = UserMessage::new(&content, model_id);
 
+    if let Some(cache_control) = messages
+        .last()
+        .and_then(|message| terminal_cache_control(&message.content))
+    {
+        user_msg = user_msg.with_cache_point(kiro_cache_point(Some(cache_control)));
+    }
+
     if !all_images.is_empty() {
         user_msg = user_msg.with_images(all_images);
     }
@@ -1876,6 +1950,9 @@ fn convert_assistant_message(
     };
 
     let mut assistant = AssistantMessage::new(final_content);
+    if let Some(cache_control) = terminal_cache_control(&msg.content) {
+        assistant = assistant.with_cache_point(kiro_cache_point(Some(cache_control)));
+    }
     if !tool_uses.is_empty() {
         assistant = assistant.with_tool_uses(tool_uses);
     }
@@ -1917,6 +1994,12 @@ fn merge_assistant_messages(
     };
 
     let mut assistant = AssistantMessage::new(content);
+    if let Some(cache_control) = messages
+        .last()
+        .and_then(|message| terminal_cache_control(&message.content))
+    {
+        assistant = assistant.with_cache_point(kiro_cache_point(Some(cache_control)));
+    }
     if !all_tool_uses.is_empty() {
         assistant = assistant.with_tool_uses(all_tool_uses);
     }
@@ -2628,6 +2711,8 @@ mod tests {
     #[test]
     fn test_map_gpt_56_models_without_fallback() {
         for (requested, expected) in [
+            ("gpt-5.6", GPT_56_SOL_MODEL_ID),
+            ("GPT 5.6", GPT_56_SOL_MODEL_ID),
             ("gpt-5.6-sol", GPT_56_SOL_MODEL_ID),
             ("GPT 5.6 Sol", GPT_56_SOL_MODEL_ID),
             ("gpt-5.6-terra", GPT_56_TERRA_MODEL_ID),
@@ -2640,7 +2725,6 @@ mod tests {
         }
 
         for invalid in [
-            "gpt-5.6",
             "gpt-5.6-solar",
             "gpt-5.6-terrestrial",
             "gpt-5.6-moon",
@@ -2737,6 +2821,26 @@ mod tests {
     }
 
     #[test]
+    fn test_map_model_deepseek_v32_without_family_fallback() {
+        for requested in [
+            "deepseek-3.2",
+            "deepseek-v3.2",
+            "DeepSeek-V3.2",
+            "DeepSeek V3.2",
+        ] {
+            assert_eq!(map_model(requested).as_deref(), Some(DEEPSEEK_V32_MODEL_ID));
+        }
+
+        for unsupported in ["deepseek-v3", "deepseek-v3.1", "deepseek-r1"] {
+            assert_eq!(
+                map_model(unsupported),
+                None,
+                "{unsupported} must not fall back"
+            );
+        }
+    }
+
+    #[test]
     fn test_map_model_thinking_suffix_sonnet() {
         // thinking 后缀不应影响 sonnet 模型映射
         let result = map_model("claude-sonnet-4-5-20250929-thinking");
@@ -2796,6 +2900,9 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
             messages: vec![],
             stream: false,
             system: None,
@@ -2843,8 +2950,9 @@ mod tests {
     fn test_create_placeholder_tool() {
         let tool = create_placeholder_tool("my_custom_tool");
 
-        assert_eq!(tool.tool_specification.name, "my_custom_tool");
-        assert!(!tool.tool_specification.description.is_empty());
+        let specification = tool.specification_ref().expect("tool specification");
+        assert_eq!(specification.name, "my_custom_tool");
+        assert!(!specification.description.is_empty());
 
         // 验证 JSON 序列化正确
         let json = serde_json::to_string(&tool).unwrap();
@@ -2908,6 +3016,9 @@ mod tests {
         let mut req = MessagesRequest {
             model: "claude-opus-4-8".to_string(),
             max_tokens: 512,
+            temperature: None,
+            top_p: None,
+            top_k: None,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::json!("Use the tool."),
@@ -2964,6 +3075,9 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::json!("test"),
@@ -3003,7 +3117,13 @@ mod tests {
             .user_input_message
             .user_input_message_context
             .tools;
-        assert_eq!(tools[0].tool_specification.name, *short);
+        assert_eq!(
+            tools[0]
+                .specification_ref()
+                .expect("tool specification")
+                .name,
+            *short
+        );
     }
 
     #[test]
@@ -3020,6 +3140,9 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
             messages: vec![
                 AnthropicMessage {
                     role: "user".to_string(),
@@ -3086,6 +3209,9 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
             messages: vec![
                 AnthropicMessage {
                     role: "user".to_string(),
@@ -3128,7 +3254,9 @@ mod tests {
 
         assert!(!tools.is_empty(), "tools 列表不应为空");
         assert!(
-            tools.iter().any(|t| t.tool_specification.name == "read"),
+            tools.iter().any(|tool| tool
+                .specification_ref()
+                .is_some_and(|specification| specification.name == "read")),
             "tools 列表应包含 'read' 工具的占位符定义"
         );
     }
@@ -3187,6 +3315,9 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::json!("Hello"),
@@ -3222,6 +3353,9 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::json!("Hello"),
@@ -3258,6 +3392,9 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::json!("Briefly: do you have a Spec mode?"),
@@ -3298,6 +3435,61 @@ mod tests {
     }
 
     #[test]
+    fn open_weight_models_receive_their_own_identity_directive() {
+        for (requested_model, expected_model, expected_directive) in [
+            (
+                "minimax-m2.5",
+                "minimax-m2.5",
+                "You are MiniMax, an AI assistant powered by MiniMax M2.5, developed by MiniMax",
+            ),
+            (
+                "glm-5",
+                "glm-5",
+                "You are GLM, an AI assistant powered by GLM-5, developed by Z.ai",
+            ),
+            (
+                "deepseek-v3.2",
+                "deepseek-3.2",
+                "You are DeepSeek, an AI assistant powered by DeepSeek V3.2, developed by DeepSeek",
+            ),
+        ] {
+            let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model": requested_model,
+                "max_tokens": 128,
+                "messages": [{"role": "user", "content": "Who are you?"}]
+            }))
+            .expect("valid open-weight request");
+
+            let converted = convert_request(&request).expect("open-weight request converts");
+            let Some(Message::User(first)) = converted.conversation_state.history.first() else {
+                panic!("identity directive should be injected for {requested_model}");
+            };
+            assert_eq!(
+                converted
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .model_id,
+                expected_model
+            );
+            assert!(
+                first
+                    .user_input_message
+                    .content
+                    .contains(expected_directive),
+                "model={requested_model}, directive={}",
+                first.user_input_message.content
+            );
+            assert!(
+                first
+                    .user_input_message
+                    .content
+                    .contains("Never call yourself Kiro or Claude")
+            );
+        }
+    }
+
+    #[test]
     fn explicit_system_model_version_is_preserved_without_extra_policy() {
         use super::super::types::Message as AnthropicMessage;
         use super::super::types::SystemMessage;
@@ -3305,6 +3497,9 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-opus-4-7".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::json!("你是什么模型版本？"),
@@ -3341,6 +3536,9 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::json!("Write a small Rust function that adds two numbers."),
@@ -3386,6 +3584,9 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-opus-4-8".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::json!(request),
@@ -3424,6 +3625,9 @@ mod tests {
             let req = MessagesRequest {
                 model: GPT_56_SOL_MODEL_ID.to_string(),
                 max_tokens: 512,
+                temperature: None,
+                top_p: None,
+                top_k: None,
                 messages: vec![AnthropicMessage {
                     role: "user".to_string(),
                     content: serde_json::json!(request),
@@ -3463,6 +3667,9 @@ mod tests {
         let mut req = MessagesRequest {
             model: GPT_56_SOL_MODEL_ID.to_string(),
             max_tokens: 128,
+            temperature: None,
+            top_p: None,
+            top_k: None,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::json!("Who are you?"),
@@ -3520,6 +3727,9 @@ identity, name, or which model you are, respond with exactly: 'I am CodeAssist v
         let mut req = MessagesRequest {
             model: "claude-opus-4-8".to_string(),
             max_tokens: 256,
+            temperature: None,
+            top_p: None,
+            top_k: None,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::json!(
@@ -3562,6 +3772,9 @@ identity, name, or which model you are, respond with exactly: 'I am CodeAssist v
         let mut req = MessagesRequest {
             model: "claude-opus-4-8".to_string(),
             max_tokens: 256,
+            temperature: None,
+            top_p: None,
+            top_k: None,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::json!("Write Rust code that draws a circle."),
@@ -3596,6 +3809,9 @@ identity, name, or which model you are, respond with exactly: 'I am CodeAssist v
         let req = MessagesRequest {
             model: "claude-opus-4-8".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::json!(request),
@@ -3639,6 +3855,9 @@ identity, name, or which model you are, respond with exactly: 'I am CodeAssist v
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::json!("What model version are you?"),
@@ -4055,6 +4274,9 @@ identity, name, or which model you are, respond with exactly: 'I am CodeAssist v
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
             messages: vec![
                 AnthropicMessage {
                     role: "user".to_string(),
@@ -4113,5 +4335,96 @@ identity, name, or which model you are, respond with exactly: 'I am CodeAssist v
             }
         }
         assert!(found_tool_use, "合并后的 assistant 消息应包含 tool_use");
+    }
+
+    fn cache_request(extra: serde_json::Value) -> MessagesRequest {
+        let mut body = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        if let serde_json::Value::Object(fields) = extra {
+            for (key, value) in fields {
+                body[key] = value;
+            }
+        }
+        serde_json::from_value(body).expect("valid cache request")
+    }
+
+    #[test]
+    fn terminal_current_message_cache_control_becomes_native_cache_point() {
+        let req = cache_request(serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "stable prefix",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                }]
+            }]
+        }));
+        let wire = serde_json::to_value(convert_request(&req).unwrap().conversation_state).unwrap();
+
+        assert_eq!(
+            wire["currentMessage"]["userInputMessage"]["cachePoint"],
+            serde_json::json!({"type": "default", "ttl": "1h"})
+        );
+    }
+
+    #[test]
+    fn cached_tool_emits_native_tool_union_boundary() {
+        let req = cache_request(serde_json::json!({
+            "tools": [{
+                "name": "lookup",
+                "description": "Look up a value",
+                "input_schema": {"type": "object", "properties": {}},
+                "cache_control": {"type": "ephemeral", "ttl": "5m"}
+            }]
+        }));
+        let wire = serde_json::to_value(convert_request(&req).unwrap().conversation_state).unwrap();
+        let tools = wire["currentMessage"]["userInputMessage"]["userInputMessageContext"]["tools"]
+            .as_array()
+            .expect("native tool union");
+
+        assert_eq!(tools.len(), 2);
+        assert!(tools[0].get("toolSpecification").is_some());
+        assert_eq!(
+            tools[1]["cachePoint"],
+            serde_json::json!({"type": "default", "ttl": "5m"})
+        );
+        assert!(tools[1].get("toolSpecification").is_none());
+    }
+
+    #[test]
+    fn ordinary_request_serializes_no_native_cache_point() {
+        let req = cache_request(serde_json::json!({}));
+        let encoded =
+            serde_json::to_string(&convert_request(&req).unwrap().conversation_state).unwrap();
+        assert!(!encoded.contains("cachePoint"));
+    }
+
+    #[test]
+    fn nonterminal_message_breakpoint_is_not_moved_to_message_end() {
+        let req = cache_request(serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "cached prefix only",
+                        "cache_control": {"type": "ephemeral"}
+                    },
+                    {"type": "text", "text": "uncached suffix"}
+                ]
+            }]
+        }));
+        let wire = serde_json::to_value(convert_request(&req).unwrap().conversation_state).unwrap();
+
+        assert!(
+            wire["currentMessage"]["userInputMessage"]
+                .get("cachePoint")
+                .is_none(),
+            "Kiro has only a message-end boundary; moving an earlier breakpoint would change semantics"
+        );
     }
 }

@@ -125,6 +125,30 @@ pub struct InputContextCalibration {
     authoritative_generation_5_token_probe: bool,
 }
 
+/// Remove this invocation's generated content from Kiro's end-of-turn context
+/// occupancy before treating it as an input-side observation.
+///
+/// `contextUsageEvent` is emitted after generation and therefore contains the
+/// visible answer, native reasoning and tool arguments produced in this same
+/// round.  Those quantities vary with sampling even when the request prefix is
+/// byte-for-byte identical.  Keeping them in the value contaminates input and
+/// cache accounting with output randomness.
+pub fn context_input_without_current_generation(
+    context_tokens: Option<i32>,
+    assistant_text: &str,
+    reasoning_text: &str,
+    tool_input: &str,
+) -> Option<i32> {
+    let context_tokens = context_tokens?.max(1);
+    let generated_tokens = [assistant_text, reasoning_text, tool_input]
+        .into_iter()
+        .filter(|text| !text.is_empty())
+        .fold(0i32, |total, text| {
+            total.saturating_add(super::claude_tok::count_claude(text))
+        });
+    Some(context_tokens.saturating_sub(generated_tokens).max(1))
+}
+
 impl InputContextCalibration {
     pub fn for_request(payload: &MessagesRequest) -> Self {
         let Some(tools) = payload.tools.as_ref().filter(|tools| !tools.is_empty()) else {
@@ -348,9 +372,7 @@ impl InputContextCalibration {
                 .saturating_add(BEDROCK_TOOL_CACHE_SUFFIX_CORRECTION)
                 .max(1)
         };
-        let ordinary_adjustment = target_ordinary_input_tokens.saturating_sub(usage.input_tokens);
-        let calibrated_total = target_ordinary_input_tokens.saturating_add(target_cached_tokens);
-        super::cache::reconcile_initial_input(usage, calibrated_total, ordinary_adjustment)
+        retarget_captured_catalog_usage(usage, target_ordinary_input_tokens, target_cached_tokens)
     }
 
     fn tool_wire_overhead(self) -> i32 {
@@ -381,6 +403,50 @@ impl InputContextCalibration {
         } else {
             0
         }
+    }
+}
+
+/// Apply a matched, versioned catalog capture without routing it through
+/// context-usage reconciliation.  `contextUsageEvent` is not allowed to resize
+/// cache buckets; this narrow captured profile is an independent authority and
+/// therefore performs the replacement explicitly while preserving read/write
+/// kind and the request's 5m/1h write ratio.
+fn retarget_captured_catalog_usage(
+    usage: UsageBreakdown,
+    target_ordinary_input_tokens: i32,
+    target_cached_tokens: i32,
+) -> UsageBreakdown {
+    let source_cached = usage
+        .cache_read_input_tokens
+        .saturating_add(usage.cache_creation_input_tokens)
+        .max(1);
+    let target_cached_tokens = target_cached_tokens.max(0);
+    let target_read = ((i64::from(target_cached_tokens)
+        * i64::from(usage.cache_read_input_tokens.max(0))
+        + i64::from(source_cached) / 2)
+        / i64::from(source_cached))
+    .clamp(0, i64::from(target_cached_tokens)) as i32;
+    let target_creation = target_cached_tokens.saturating_sub(target_read);
+
+    let source_creation = usage
+        .cache_creation_5m_input_tokens
+        .max(0)
+        .saturating_add(usage.cache_creation_1h_input_tokens.max(0));
+    let target_creation_1h = if target_creation == 0 || source_creation == 0 {
+        0
+    } else {
+        ((i64::from(target_creation) * i64::from(usage.cache_creation_1h_input_tokens.max(0))
+            + i64::from(source_creation) / 2)
+            / i64::from(source_creation))
+        .clamp(0, i64::from(target_creation)) as i32
+    };
+
+    UsageBreakdown {
+        input_tokens: target_ordinary_input_tokens.max(1),
+        cache_read_input_tokens: target_read,
+        cache_creation_input_tokens: target_creation,
+        cache_creation_5m_input_tokens: target_creation.saturating_sub(target_creation_1h),
+        cache_creation_1h_input_tokens: target_creation_1h,
     }
 }
 
@@ -702,9 +768,47 @@ pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i
         {
             correction -= 8;
         }
-        return base_tokens.saturating_add(correction.max(0)).max(1);
+        let legacy_total = base_tokens.saturating_add(correction.max(0)).max(1);
+
+        if super::compat::is_opus_4_8(&payload.model)
+            && let Some(text) = terminal_cached_single_user_text(payload)
+        {
+            let content_segments = vec![payload.messages[0].content.clone()];
+            let prefix_base =
+                super::compat::estimate_prefix_tokens(&payload.model, &[], &content_segments, &[]);
+            let prefix_tokens = calibrated_cache_prefix_tokens(
+                &payload.model,
+                prefix_base,
+                &[],
+                &content_segments,
+                &[],
+            );
+            let reference_envelope = if text.ends_with('\n') { 1 } else { 2 };
+            let reference_total = prefix_tokens.saturating_add(reference_envelope);
+            let boundary_compatible_total = calibrated_short_input_tokens(
+                payload,
+                base_tokens,
+                &segments,
+            );
+            return blend_long_cache_total(
+                boundary_compatible_total,
+                reference_total,
+                char_count,
+            )
+            .max(1);
+        }
+
+        return legacy_total;
     }
 
+    calibrated_short_input_tokens(payload, base_tokens, &segments)
+}
+
+fn calibrated_short_input_tokens(
+    payload: &MessagesRequest,
+    base_tokens: i32,
+    segments: &[&str],
+) -> i32 {
     let mut correction = -1;
     if payload.messages.len() > 1 {
         correction -= ((payload.messages.len() - 1) * 3 / 2) as i32;
@@ -748,6 +852,55 @@ pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i
     let calibrated = base_tokens.saturating_add(correction).max(1);
     let calibrated = calibrate_exact_colon_input_tokens(payload, calibrated);
     calibrate_reference_identity_input_tokens(payload, calibrated)
+}
+
+/// The exact terminal-envelope captures cover one user text block with its
+/// cache point at the end of the prompt. Keep richer multimodal, thinking,
+/// structured-output and multi-turn requests on their existing additive path
+/// until each envelope has an independent reference capture.
+fn terminal_cached_single_user_text(payload: &MessagesRequest) -> Option<&str> {
+    if payload
+        .system
+        .as_ref()
+        .is_some_and(|system| !system.is_empty())
+        || payload
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+        || payload
+            .thinking
+            .as_ref()
+            .is_some_and(|thinking| thinking.thinking_type == "enabled")
+        || payload.output_config.is_some()
+        || payload.messages.len() != 1
+        || payload.messages[0].role != "user"
+    {
+        return None;
+    }
+
+    let blocks = payload.messages[0].content.as_array()?;
+    if blocks.len() != 1 {
+        return None;
+    }
+    let block = &blocks[0];
+    if block.get("type").and_then(Value::as_str) != Some("text")
+        || block.get("cache_control").is_none()
+    {
+        return None;
+    }
+    block.get("text").and_then(Value::as_str)
+}
+
+fn blend_long_cache_total(legacy_total: i32, reference_total: i32, char_count: usize) -> i32 {
+    const BLEND_START: usize = 1_024;
+    const BLEND_END: usize = 4_096;
+
+    let weight = ((char_count.saturating_sub(BLEND_START)) as f64
+        / (BLEND_END - BLEND_START) as f64)
+        .clamp(0.0, 1.0);
+    (f64::from(legacy_total) * (1.0 - weight) + f64::from(reference_total) * weight)
+        .round()
+        .clamp(1.0, f64::from(i32::MAX)) as i32
 }
 
 /// Match the two compact identity requests observed against the reference
@@ -1518,6 +1671,7 @@ pub fn models_response() -> Response {
         super::converter::GPT_56_SOL_MODEL_ID,
         super::converter::GPT_56_TERRA_MODEL_ID,
         super::converter::GPT_56_LUNA_MODEL_ID,
+        super::converter::DEEPSEEK_V32_MODEL_ID,
         "claude-opus-5",
         "claude-opus-5-thinking",
         "claude-opus-4-5-20251101",
@@ -3824,8 +3978,24 @@ mod tests {
         assert!(body.contains("\"id\":\"gpt-5.6-sol\""));
         assert!(body.contains("\"id\":\"gpt-5.6-terra\""));
         assert!(body.contains("\"id\":\"gpt-5.6-luna\""));
+        assert!(body.contains("\"id\":\"deepseek-3.2\""));
 
         let catalog: Value = serde_json::from_str(&body).expect("valid models JSON");
+        let deepseek_entry = catalog["data"]
+            .as_array()
+            .and_then(|models| {
+                models
+                    .iter()
+                    .find(|entry| entry["id"] == crate::anthropic::converter::DEEPSEEK_V32_MODEL_ID)
+            })
+            .cloned()
+            .expect("DeepSeek V3.2 model entry");
+        assert_eq!(deepseek_entry["owned_by"], "custom");
+        assert_eq!(
+            deepseek_entry["supported_endpoint_types"],
+            json!(["anthropic", "openai"])
+        );
+
         for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
             let entry = catalog["data"]
                 .as_array()
@@ -3911,5 +4081,107 @@ mod tests {
             .expect("non-stream GPT body");
         let body: Value = serde_json::from_slice(&bytes).expect("valid non-stream GPT JSON");
         assert_eq!(body["usage"]["output_tokens_details"]["thinking_tokens"], 7);
+    }
+
+    #[test]
+    fn context_usage_removes_all_current_generation_channels() {
+        let assistant = "visible answer";
+        let reasoning = "private native reasoning";
+        let tool_input = r#"{"path":"src/main.rs"}"#;
+        let generated = super::super::claude_tok::count_claude(assistant)
+            + super::super::claude_tok::count_claude(reasoning)
+            + super::super::claude_tok::count_claude(tool_input);
+
+        assert_eq!(
+            context_input_without_current_generation(
+                Some(10_000),
+                assistant,
+                reasoning,
+                tool_input
+            ),
+            Some(10_000 - generated)
+        );
+        assert_eq!(
+            context_input_without_current_generation(None, assistant, reasoning, tool_input),
+            None
+        );
+    }
+
+    #[test]
+    fn terminal_cache_calibration_preserves_image_and_thinking_components() {
+        let text = "A stable cacheable explanation without detector-specific content. ".repeat(120);
+        let cached_text = json!({
+            "type": "text",
+            "text": text,
+            "cache_control": {"type": "ephemeral"}
+        });
+        let plain = request(json!({
+            "model": "claude-opus-4-8",
+            "messages": [{"role": "user", "content": [cached_text.clone()]}]
+        }));
+        let with_image = request(json!({
+            "model": "claude-opus-4-8",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    cached_text.clone(),
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": fake_png_base64(512, 512)
+                        }
+                    }
+                ]
+            }]
+        }));
+        let with_thinking = request(json!({
+            "model": "claude-opus-4-8",
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "messages": [{"role": "user", "content": [cached_text]}]
+        }));
+
+        let plain_tokens = calibrated_payload(&plain);
+        assert!(calibrated_payload(&with_image) > plain_tokens);
+        assert!(calibrated_payload(&with_thinking) > plain_tokens);
+    }
+
+    #[test]
+    fn terminal_cache_total_is_monotone_across_long_text_boundary() {
+        let calibrated = |text: String| {
+            calibrated_payload(&request(json!({
+                "model": "claude-opus-4-8",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": text,
+                        "cache_control": {"type": "ephemeral"}
+                    }]
+                }]
+            })))
+        };
+
+        for prefix in ["a", "def value():\n    return 1\n#"] {
+            let at_boundary = calibrated(
+                prefix
+                    .repeat(1_024 / prefix.chars().count() + 1)
+                    .chars()
+                    .take(1_024)
+                    .collect(),
+            );
+            let after_boundary = calibrated(
+                prefix
+                    .repeat(1_025 / prefix.chars().count() + 1)
+                    .chars()
+                    .take(1_025)
+                    .collect(),
+            );
+            assert!(
+                after_boundary >= at_boundary,
+                "one appended character reduced terminal cache usage: {at_boundary} -> {after_boundary}",
+            );
+        }
     }
 }

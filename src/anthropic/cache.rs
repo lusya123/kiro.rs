@@ -13,6 +13,7 @@
 //!   按每个 breakpoint 的 TTL 分拆。
 
 use crate::anthropic::types::{Message, MessagesRequest, Tool};
+use crate::kiro::model::events::TokenUsage;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -99,6 +100,48 @@ impl UsageBreakdown {
         self.cache_read_input_tokens > 0 || self.cache_creation_input_tokens > 0
     }
 
+    /// Map a native runtime token breakdown onto the public Anthropic cache
+    /// buckets.  This is the only path allowed to replace deterministic cache
+    /// estimates: unlike `contextUsageEvent`, these fields explicitly identify
+    /// uncached, cache-read and cache-write input.
+    pub fn from_exact_token_usage(initial: Self, exact: &TokenUsage) -> Option<Self> {
+        if !exact.is_present() {
+            return None;
+        }
+        let fields = [
+            exact.uncached_input_tokens,
+            exact.cache_read_input_tokens,
+            exact.cache_write_input_tokens,
+            exact.output_tokens,
+            exact.total_tokens,
+        ];
+        if fields.iter().any(|value| *value < 0) {
+            return None;
+        }
+
+        let total_input = exact.total_input_tokens();
+        if total_input <= 0 {
+            return None;
+        }
+        let input_and_output = total_input.saturating_add(exact.output_tokens);
+        if exact.total_tokens > 0 && exact.total_tokens < input_and_output {
+            return None;
+        }
+
+        let (creation_5m, creation_1h) = split_exact_cache_creation(
+            exact.cache_write_input_tokens,
+            initial.cache_creation_5m_input_tokens,
+            initial.cache_creation_1h_input_tokens,
+        );
+        Some(Self {
+            input_tokens: exact.ordinary_input_tokens(),
+            cache_read_input_tokens: exact.cache_read_input_tokens,
+            cache_creation_input_tokens: exact.cache_write_input_tokens,
+            cache_creation_5m_input_tokens: creation_5m,
+            cache_creation_1h_input_tokens: creation_1h,
+        })
+    }
+
     /// 把 usage 钳制到物理可能的范围内，供所有对外出口在发出前调用。
     ///
     /// 单个请求的 input + cache_read + cache_creation 不可能超过模型上下文窗口。
@@ -167,6 +210,25 @@ impl UsageBreakdown {
     pub fn clamp_for_model(self, model: &str) -> Self {
         self.clamp_to_context_window(super::converter::get_context_window_size(model))
     }
+}
+
+fn split_exact_cache_creation(total: i32, initial_5m: i32, initial_1h: i32) -> (i32, i32) {
+    let total = total.max(0);
+    let initial_5m = initial_5m.max(0);
+    let initial_1h = initial_1h.max(0);
+    let initial_total = initial_5m.saturating_add(initial_1h);
+    if total == 0 {
+        return (0, 0);
+    }
+    if initial_total == 0 {
+        // Native metadata currently exposes only aggregate cache writes.  In
+        // the absence of a request-side TTL split, Anthropic's default is 5m.
+        return (total, 0);
+    }
+    let creation_1h = ((i64::from(total) * i64::from(initial_1h) + i64::from(initial_total) / 2)
+        / i64::from(initial_total))
+    .clamp(0, i64::from(total)) as i32;
+    (total - creation_1h, creation_1h)
 }
 
 /// 把真实总 token `total_input_tokens` 拆分成高缓存展示口径 (I, CR, CC)。
@@ -444,9 +506,15 @@ pub fn finalize_request_usage(
     }
 }
 
-/// Reconcile the first-round cache split after a profile obtains a more
-/// accurate total from the upstream context-usage event. Continuation rounds
-/// are handled separately by `finalize_request_usage` and remain ordinary input.
+/// Reconcile the first-round cache split after an upstream context event.
+///
+/// A cache prefix is a deterministic function of the model, canonical prompt
+/// prefix and tokenizer/accounting version. Kiro's `contextUsageEvent` is an
+/// end-of-turn context occupancy value: it includes this turn's generated text
+/// and hidden reasoning and it contains no cache read/write breakdown. It may
+/// therefore validate a request envelope, but it must never resize cache-read
+/// or cache-creation buckets. Only an exact upstream token-usage event may
+/// replace those buckets.
 pub fn reconcile_initial_input(
     initial: UsageBreakdown,
     calibrated_total_input_tokens: i32,
@@ -463,26 +531,14 @@ pub fn reconcile_initial_input(
     let ordinary_input = initial
         .input_tokens
         .saturating_add(ordinary_input_adjustment)
-        .clamp(1, calibrated_total_input_tokens);
-    let calibrated_cached = calibrated_total_input_tokens.saturating_sub(ordinary_input);
-    let cache_read = ((calibrated_cached as i64 * initial.cache_read_input_tokens as i64)
-        / initial_cached as i64) as i32;
-    let cache_creation = calibrated_cached.saturating_sub(cache_read);
-    let initial_creation = initial.cache_creation_input_tokens;
-    let cache_creation_1h = if initial_creation > 0 {
-        ((cache_creation as i64 * initial.cache_creation_1h_input_tokens as i64)
-            / initial_creation as i64) as i32
-    } else {
-        0
-    };
-    let cache_creation_5m = cache_creation.saturating_sub(cache_creation_1h);
+        .max(1);
 
     UsageBreakdown {
         input_tokens: ordinary_input,
-        cache_read_input_tokens: cache_read,
-        cache_creation_input_tokens: cache_creation,
-        cache_creation_5m_input_tokens: cache_creation_5m,
-        cache_creation_1h_input_tokens: cache_creation_1h,
+        cache_read_input_tokens: initial.cache_read_input_tokens,
+        cache_creation_input_tokens: initial.cache_creation_input_tokens,
+        cache_creation_5m_input_tokens: initial.cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens: initial.cache_creation_1h_input_tokens,
     }
 }
 
@@ -490,6 +546,62 @@ struct CachePlan {
     cache_read_tokens: i32,
     cache_creation_5m_tokens: i32,
     cache_creation_1h_tokens: i32,
+}
+
+/// Cache-registry mutation prepared from the exact request prefix.
+///
+/// Planning usage is deliberately read-only.  The caller owns this value and
+/// commits it only after the first upstream model invocation has completed
+/// successfully.  This prevents validation failures, local compatibility
+/// replies and failed provider calls from warming the public cache-accounting
+/// registry even though no upstream prompt cache could have been created.
+#[derive(Debug, Default)]
+pub(super) struct CacheCommit {
+    entries: Vec<(CacheKey, CacheTtl)>,
+}
+
+impl CacheCommit {
+    pub(super) async fn commit(self) {
+        for (key, ttl) in self.entries {
+            register_cache_key(key, ttl).await;
+        }
+    }
+}
+
+/// Prepare the registry keys that may become warm after a successful upstream
+/// invocation.  This is intentionally separate from usage planning: the
+/// latter may run for a local short-circuit response and must never mutate
+/// cache state.
+pub(super) fn prepare_cache_commit(
+    total_input_tokens: i32,
+    req: &MessagesRequest,
+    aws_b40_compat: bool,
+) -> CacheCommit {
+    let explicit_breakpoints = request_cache_control_count(req);
+    if (req.cache_control.is_none() && explicit_breakpoints == 0)
+        || explicit_breakpoints > MAX_CACHE_BREAKPOINTS
+    {
+        return CacheCommit::default();
+    }
+
+    let CacheBuild {
+        mut breakpoints, ..
+    } = build_cache_breakpoints(req, total_input_tokens.max(0), aws_b40_compat);
+    breakpoints.retain(|breakpoint| breakpoint.tokens >= CACHE_MIN_TOKENS);
+    breakpoints.sort_by_key(|breakpoint| breakpoint.tokens);
+    breakpoints.truncate(MAX_CACHE_BREAKPOINTS);
+
+    let mut entries = Vec::new();
+    for breakpoint in breakpoints {
+        if breakpoint.readable
+            && !entries
+                .iter()
+                .any(|(key, ttl)| *key == breakpoint.key && *ttl == breakpoint.ttl)
+        {
+            entries.push((breakpoint.key, breakpoint.ttl));
+        }
+    }
+    CacheCommit { entries }
 }
 
 async fn cache_plan_for_request(
@@ -545,11 +657,6 @@ async fn cache_plan_for_request(
         .as_ref()
         .map(|candidate| candidate.tokens.min(max_cache_tokens))
         .unwrap_or(0);
-    // 命中时刷新该前缀 TTL(对齐真 Anthropic 的"每次使用重置缓存有效期"),
-    // 否则持续使用的前缀每到 5m/1h 就会冒出一次 cache_creation,破坏"统一号池"的一致观感。
-    if let Some(candidate) = read_match {
-        register_cache_key(candidate.key, candidate.ttl).await;
-    }
     let mut creation_5m = 0;
     let mut creation_1h = 0;
     let mut previous = read_tokens;
@@ -563,7 +670,6 @@ async fn cache_plan_for_request(
             CacheTtl::Ephemeral1h => creation_1h += delta,
             CacheTtl::Ephemeral5m => creation_5m += delta,
         }
-        register_cache_entry(breakpoint).await;
         previous = breakpoint.tokens;
     }
 
@@ -635,8 +741,6 @@ struct CacheReadCandidate {
 
 struct CacheReadMatch {
     tokens: i32,
-    key: CacheKey,
-    ttl: CacheTtl,
 }
 
 #[derive(Clone, Copy)]
@@ -1072,8 +1176,6 @@ async fn cache_entry_match(
     if crate::cluster_cache::global().exists(&redis_key).await {
         return Some(CacheReadMatch {
             tokens: breakpoint.tokens,
-            key: breakpoint.key,
-            ttl: breakpoint.ttl,
         });
     }
 
@@ -1106,25 +1208,12 @@ async fn cache_entry_match(
             candidate_tokens.insert(candidate.position, tokens);
             tokens
         };
-        return Some(CacheReadMatch {
-            tokens,
-            key,
-            ttl: breakpoint.ttl,
-        });
+        return Some(CacheReadMatch { tokens });
     }
 
     breakpoint.warm_on_first_use.then_some(CacheReadMatch {
         tokens: breakpoint.tokens,
-        key: breakpoint.key,
-        ttl: breakpoint.ttl,
     })
-}
-
-async fn register_cache_entry(breakpoint: &CacheBreakpoint) {
-    if !breakpoint.readable {
-        return;
-    }
-    register_cache_key(breakpoint.key, breakpoint.ttl).await;
 }
 
 async fn register_cache_key(key: CacheKey, ttl: CacheTtl) {
@@ -1150,6 +1239,117 @@ fn finalize_cache_key(hasher: &Sha256) -> CacheKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn detector_cache_prompt() -> String {
+        let seed = concat!(
+            "一句话概况下Python装饰器原理：装饰器本质是在不修改原函数定义的情况下，用高阶函数或可调用对象包装原函数，从而在调用前后注入额外逻辑。\n\n",
+            "### 固定编程助手规则（长上下文缓存探针片段）\n",
+            "你是一个专业的全栈编程助手，精通Python、JavaScript、Java、Go、C++等主流编程语言，熟悉前端、后端、数据库、云计算等全栈技术栈。\n",
+            "Python核心知识点：变量定义、数据类型、运算符、流程控制、异常处理、函数定义、lambda、位置参数、关键字参数、默认参数、可变参数、返回值、作用域、闭包、装饰器、生成器、迭代器、上下文管理器。\n",
+            "面向对象：类定义、对象实例化、实例属性、类属性、私有属性、实例方法、类方法、静态方法、继承、多继承、MRO、多态、封装、抽象类、魔法方法。\n",
+            "JavaScript核心知识点：var、let、const、原始类型、引用类型、闭包、this、原型链、Promise、async/await、fetch、ES6模块、Set、Map、可选链、空值合并。\n",
+            "数据库核心知识点：MySQL数据类型、DDL、DML、DQL、索引、事务、锁机制、执行计划、慢查询日志、PostgreSQL JSONB、MongoDB文档模型、聚合管道。\n",
+            "缓存探针保持规则：这些文本是固定上下文的一部分。后续完全相同请求应命中 Claude prompt cache，并在 usage.cache_read_input_tokens 中体现。\n"
+        );
+        let mut prompt = String::new();
+        let mut segment = 1;
+        while prompt.chars().count() < 170_000 {
+            prompt.push_str(&format!(
+                "\n\n===== CACHE PROBE FIXED PROGRAMMING RULE SEGMENT {segment} =====\n{seed}"
+            ));
+            segment += 1;
+        }
+        prompt
+    }
+
+    fn detector_terminal_cache_request() -> (String, MessagesRequest) {
+        let prompt = detector_cache_prompt();
+        let request = parse_request(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 1024,
+            "metadata": {"user_id": "checkhub-cache-probe-session"},
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": prompt,
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }]
+        }));
+        (prompt, request)
+    }
+
+    #[tokio::test]
+    async fn terminal_cache_usage_preserves_prefix_identity() {
+        let (prompt, request) = detector_terminal_cache_request();
+        let build = build_cache_breakpoints(&request, 1_000_000, true);
+        let prefix_tokens = build.breakpoints.last().expect("cache breakpoint").tokens;
+        let total = super::super::bedrock::calibrated_input_tokens(
+            &request,
+            super::super::compat::estimate_input_tokens(&request),
+        );
+        let usage = compute_request_usage_breakdown_with_profile(total, &request, true).await;
+        let cached = usage
+            .cache_read_input_tokens
+            .saturating_add(usage.cache_creation_input_tokens);
+
+        assert_eq!(prompt.chars().count(), 170_020);
+        assert_eq!(total, prefix_tokens.saturating_add(1));
+        assert_eq!(usage.input_tokens, 1);
+        assert_eq!(cached, prefix_tokens);
+        assert_eq!(usage.total(), total);
+    }
+
+    #[tokio::test]
+    async fn long_request_without_cache_control_stays_flat() {
+        let prompt = detector_cache_prompt();
+        let request = parse_request(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": prompt}]
+        }));
+        let total = super::super::bedrock::calibrated_input_tokens(
+            &request,
+            super::super::compat::estimate_input_tokens(&request),
+        );
+        let usage = compute_request_usage_breakdown_with_profile(total, &request, true).await;
+
+        assert_eq!(usage, UsageBreakdown::flat(total));
+        assert_eq!(usage.total(), total);
+    }
+
+    #[tokio::test]
+    async fn terminal_floor_does_not_hide_uncached_suffix() {
+        let prompt = detector_cache_prompt();
+        let request = parse_request(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 1024,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt,
+                        "cache_control": {"type": "ephemeral"}
+                    },
+                    {
+                        "type": "text",
+                        "text": "Analyze the cached program and return a concrete implementation plan."
+                    }
+                ]
+            }]
+        }));
+        let total = super::super::bedrock::calibrated_input_tokens(
+            &request,
+            super::super::compat::estimate_input_tokens(&request),
+        );
+        let usage = compute_request_usage_breakdown_with_profile(total, &request, true).await;
+
+        assert!(usage.input_tokens > 1);
+        assert!(usage.has_cache_usage());
+        assert_eq!(usage.total(), total);
+    }
 
     fn legacy_cache_key(model: &str, parts: &[String], ttl: CacheTtl) -> CacheKey {
         let mut hasher = Sha256::new();
@@ -1691,7 +1891,7 @@ mod tests {
     }
 
     #[test]
-    fn reconciles_profile_delta_into_cached_prefix() {
+    fn reconciliation_never_pours_context_delta_into_cached_prefix() {
         let initial = UsageBreakdown {
             input_tokens: 230,
             cache_read_input_tokens: 0,
@@ -1702,13 +1902,13 @@ mod tests {
         let out = reconcile_initial_input(initial, 15_499, -17);
 
         assert_eq!(out.input_tokens, 213);
-        assert_eq!(out.cache_creation_input_tokens, 15_286);
-        assert_eq!(out.cache_creation_5m_input_tokens, 15_286);
-        assert_eq!(out.total(), 15_499);
+        assert_eq!(out.cache_creation_input_tokens, 8272);
+        assert_eq!(out.cache_creation_5m_input_tokens, 8272);
+        assert_eq!(out.total(), 8485);
     }
 
     #[test]
-    fn reconciliation_preserves_cache_kind_and_ttl_ratios() {
+    fn reconciliation_preserves_exact_cache_kind_and_ttl_counts() {
         let initial = UsageBreakdown {
             input_tokens: 100,
             cache_read_input_tokens: 300,
@@ -1719,11 +1919,27 @@ mod tests {
         let out = reconcile_initial_input(initial, 1900, 0);
 
         assert_eq!(out.input_tokens, 100);
-        assert_eq!(out.cache_read_input_tokens, 600);
-        assert_eq!(out.cache_creation_input_tokens, 1200);
-        assert_eq!(out.cache_creation_5m_input_tokens, 800);
-        assert_eq!(out.cache_creation_1h_input_tokens, 400);
-        assert_eq!(out.total(), 1900);
+        assert_eq!(out.cache_read_input_tokens, 300);
+        assert_eq!(out.cache_creation_input_tokens, 600);
+        assert_eq!(out.cache_creation_5m_input_tokens, 400);
+        assert_eq!(out.cache_creation_1h_input_tokens, 200);
+        assert_eq!(out.total(), 1000);
+    }
+
+    #[test]
+    fn identical_prefix_is_stable_across_context_usage_jitter() {
+        let initial = UsageBreakdown {
+            input_tokens: 10,
+            cache_read_input_tokens: 146_077,
+            cache_creation_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+
+        let observed = [146_396, 146_459, 146_665, 146_512]
+            .map(|context_total| reconcile_initial_input(initial, context_total, 0));
+        assert!(observed.iter().all(|usage| *usage == observed[0]));
+        assert_eq!(observed[0].cache_read_input_tokens, 146_077);
     }
 
     #[test]
@@ -1902,6 +2118,16 @@ mod tests {
         serde_json::from_value(body).expect("valid")
     }
 
+    async fn commit_successful_request(
+        total_input_tokens: i32,
+        req: &MessagesRequest,
+        aws_b40_compat: bool,
+    ) {
+        prepare_cache_commit(total_input_tokens, req, aws_b40_compat)
+            .commit()
+            .await;
+    }
+
     #[test]
     fn detects_cache_control_in_system() {
         let req = parse_request(serde_json::json!({
@@ -2043,11 +2269,81 @@ mod tests {
         assert!(first.cache_creation_input_tokens > 0);
         assert_eq!(first.cache_read_input_tokens, 0);
         assert_eq!(first.total(), 20_000);
+        commit_successful_request(20_000, &req, false).await;
 
         let second = compute_request_usage_breakdown(20_000, &req).await;
         assert_eq!(second.cache_creation_input_tokens, 0);
         assert!(second.cache_read_input_tokens > 0);
         assert_eq!(second.total(), 20_000);
+    }
+
+    #[tokio::test]
+    async fn cache_registry_warms_only_after_successful_commit() {
+        let req = parse_request(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "system": [{
+                "type": "text",
+                "text": "transactional-cache-commit-regression ".repeat(2_000),
+                "cache_control": {"type": "ephemeral"}
+            }]
+        }));
+
+        let first = compute_request_usage_breakdown(20_000, &req).await;
+        let failed_retry = compute_request_usage_breakdown(20_000, &req).await;
+        assert!(first.cache_creation_input_tokens > 0);
+        assert_eq!(
+            failed_retry, first,
+            "planning alone must not warm cache state"
+        );
+
+        commit_successful_request(20_000, &req, false).await;
+        let successful_retry = compute_request_usage_breakdown(20_000, &req).await;
+        assert_eq!(successful_retry.cache_creation_input_tokens, 0);
+        assert!(successful_retry.cache_read_input_tokens > 0);
+    }
+
+    #[test]
+    fn exact_metadata_replaces_all_cache_buckets_and_preserves_ttl_ratio() {
+        let initial = UsageBreakdown {
+            input_tokens: 11,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 100,
+            cache_creation_5m_input_tokens: 30,
+            cache_creation_1h_input_tokens: 70,
+        };
+        let exact = TokenUsage {
+            uncached_input_tokens: 7,
+            cache_read_input_tokens: 1_000,
+            cache_write_input_tokens: 25,
+            output_tokens: 42,
+            total_tokens: 1_074,
+        };
+
+        let usage = UsageBreakdown::from_exact_token_usage(initial, &exact).unwrap();
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.cache_read_input_tokens, 1_000);
+        assert_eq!(usage.cache_creation_input_tokens, 25);
+        assert_eq!(usage.cache_creation_5m_input_tokens, 7);
+        assert_eq!(usage.cache_creation_1h_input_tokens, 18);
+        assert_eq!(usage.total(), 1_032);
+    }
+
+    #[test]
+    fn malformed_exact_metadata_is_rejected() {
+        let initial = UsageBreakdown::flat(10);
+        let negative = TokenUsage {
+            uncached_input_tokens: -1,
+            ..TokenUsage::default()
+        };
+        assert!(UsageBreakdown::from_exact_token_usage(initial, &negative).is_none());
+
+        let inconsistent_total = TokenUsage {
+            uncached_input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 12,
+            ..TokenUsage::default()
+        };
+        assert!(UsageBreakdown::from_exact_token_usage(initial, &inconsistent_total).is_none());
     }
 
     /// 回归：opus-4-6 / 4-7 的大前缀（>4096 tokens）必须和 4-8/5 一样正常缓存。
@@ -2079,6 +2375,7 @@ mod tests {
                 first.cache_read_input_tokens, 0,
                 "{model}: first call is cold"
             );
+            commit_successful_request(20_000, &req, false).await;
 
             let second = compute_request_usage_breakdown(20_000, &req).await;
             assert_eq!(
@@ -2111,8 +2408,10 @@ mod tests {
         };
 
         // 在 opus-4-6 上建立缓存。
-        let warm = compute_request_usage_breakdown(20_000, &mk("claude-opus-4-6")).await;
+        let warm_request = mk("claude-opus-4-6");
+        let warm = compute_request_usage_breakdown(20_000, &warm_request).await;
         assert!(warm.cache_creation_input_tokens > 0);
+        commit_successful_request(20_000, &warm_request, false).await;
 
         // 切到 opus-4-8：同一段文本，第一次必须全量重建（跨模型零命中）。
         let cross = compute_request_usage_breakdown(20_000, &mk("claude-opus-4-8")).await;
@@ -2167,6 +2466,7 @@ mod tests {
         }));
 
         let first = compute_request_usage_breakdown_with_profile(20_000, &req, true).await;
+        commit_successful_request(20_000, &req, true).await;
         let second = compute_request_usage_breakdown_with_profile(20_000, &req, true).await;
         assert!(first.cache_creation_input_tokens > 0);
         assert_eq!(first.cache_read_input_tokens, 0);
@@ -2222,6 +2522,7 @@ mod tests {
                 .saturating_add(first.cache_creation_1h_input_tokens)
         );
         assert_eq!(first.total(), first_total);
+        commit_successful_request(first_total, &first_request, true).await;
 
         let second_total = usage_for(&first_request);
         let second =
@@ -2271,6 +2572,7 @@ mod tests {
         );
 
         let first = compute_request_usage_breakdown_with_profile(total, &request, true).await;
+        commit_successful_request(total, &request, true).await;
         let second = compute_request_usage_breakdown_with_profile(total, &request, true).await;
 
         assert_eq!(first.cache_read_input_tokens, 0);

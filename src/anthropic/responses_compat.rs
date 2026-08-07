@@ -5,7 +5,11 @@
 //! routing all go through the same real upstream path as `/v1/messages`.
 //! Non-GPT requests retain the historical `/v1/responses` behavior.
 
-use std::{collections::HashMap, convert::Infallible};
+use std::{
+    collections::{HashMap, HashSet},
+    convert::Infallible,
+    sync::Arc,
+};
 
 use axum::{
     Json,
@@ -23,11 +27,12 @@ use super::{
     converter::is_gpt_family_name,
     handlers::{RawApiJson, post_messages},
     middleware::{AppState, mark_gpt_openai_response},
-    response_store::{StoreError, StoredConversation},
+    response_store::{ResponseStore, StoreError, StoredConversation},
     types::{Message, MessagesRequest, Metadata, ReasoningConfig, SystemMessage, Tool},
 };
 
 const GPT56_MODELS: &[&str] = &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
+const GPT56_DEFAULT_MODEL: &str = "gpt-5.6-sol";
 const RESPONSES_BODY_LIMIT: usize = 50 * 1024 * 1024;
 const IMAGE_MEDIA_TYPES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
 const DOCUMENT_MEDIA_TYPES: &[&str] = &[
@@ -40,8 +45,13 @@ const DOCUMENT_MEDIA_TYPES: &[&str] = &[
     "text/markdown",
 ];
 
-fn is_exact_gpt56(model: &str) -> bool {
-    GPT56_MODELS.contains(&model)
+fn canonical_gpt56_model(model: &str) -> Option<&'static str> {
+    match model.trim().to_ascii_lowercase().as_str() {
+        "gpt-5.6" | "gpt 5.6" | "gpt-5.6-sol" | "gpt 5.6 sol" => Some(GPT56_DEFAULT_MODEL),
+        "gpt-5.6-terra" | "gpt 5.6 terra" => Some("gpt-5.6-terra"),
+        "gpt-5.6-luna" | "gpt 5.6 luna" => Some("gpt-5.6-luna"),
+        _ => None,
+    }
 }
 
 fn response_error_type(status: StatusCode) -> &'static str {
@@ -170,6 +180,10 @@ fn validate_top_level_fields(request: &Value) -> Result<(), String> {
                 | "include"
                 | "parallel_tool_calls"
                 | "prompt_cache_options"
+                | "prompt_cache_key"
+                | "client_metadata"
+                | "service_tier"
+                | "stream_options"
         ) {
             return Err(format!("`{key}` is not supported by this endpoint"));
         }
@@ -190,18 +204,18 @@ fn validate_top_level_fields(request: &Value) -> Result<(), String> {
     }
     match object.get("include") {
         None | Some(Value::Null) => {}
-        Some(Value::Array(values)) if values.is_empty() => {}
         Some(Value::Array(values)) => {
-            if values
-                .iter()
-                .any(|value| value.as_str() == Some("reasoning.encrypted_content"))
-            {
-                return Err(
-                    "`include: [\"reasoning.encrypted_content\"]` is unavailable because opaque reasoning items cannot be replayed by this endpoint"
-                        .to_string(),
-                );
+            for (index, value) in values.iter().enumerate() {
+                match value.as_str() {
+                    Some("reasoning.encrypted_content") => {}
+                    Some(value) => {
+                        return Err(format!(
+                            "`include[{index}]` value `{value}` is not supported by this endpoint"
+                        ));
+                    }
+                    None => return Err(format!("`include[{index}]` must be a string")),
+                }
             }
-            return Err("non-empty `include` is not supported by this endpoint".to_string());
         }
         Some(_) => return Err("`include` must be an array".to_string()),
     }
@@ -215,37 +229,73 @@ fn validate_top_level_fields(request: &Value) -> Result<(), String> {
         );
     }
     match object.get("parallel_tool_calls") {
-        None | Some(Value::Bool(true)) => {}
-        Some(Value::Bool(false)) => {
-            return Err(
-                "`parallel_tool_calls: false` cannot be guaranteed by this upstream transport"
-                    .to_string(),
-            );
-        }
+        None | Some(Value::Bool(_)) => {}
         Some(_) => return Err("`parallel_tool_calls` must be a boolean".to_string()),
+    }
+    match object.get("prompt_cache_key") {
+        None | Some(Value::Null | Value::String(_)) => {}
+        Some(_) => return Err("`prompt_cache_key` must be a string".to_string()),
+    }
+    match object.get("client_metadata") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(metadata)) => {
+            if let Some((key, _)) = metadata.iter().find(|(_, value)| !value.is_string()) {
+                return Err(format!("`client_metadata.{key}` must be a string"));
+            }
+        }
+        Some(_) => return Err("`client_metadata` must be an object".to_string()),
+    }
+    match object.get("service_tier") {
+        None | Some(Value::Null | Value::String(_)) => {}
+        Some(_) => return Err("`service_tier` must be a string".to_string()),
+    }
+    match object.get("stream_options") {
+        None | Some(Value::Null | Value::Object(_)) => {}
+        Some(_) => return Err("`stream_options` must be an object".to_string()),
     }
     match object.get("text") {
         None | Some(Value::Null) => {}
         Some(Value::Object(text)) => {
             for key in text.keys() {
-                if key != "format" {
+                if !matches!(key.as_str(), "format" | "verbosity") {
                     return Err(format!("`text.{key}` is not supported"));
                 }
             }
-            if let Some(format) = text.get("format") {
-                let format = format
-                    .as_object()
-                    .ok_or_else(|| "`text.format` must be an object".to_string())?;
-                for key in format.keys() {
-                    if key != "type" {
-                        return Err(format!("`text.format.{key}` is not supported"));
-                    }
+            match text.get("verbosity") {
+                None | Some(Value::Null) => {}
+                Some(Value::String(value))
+                    if matches!(value.as_str(), "low" | "medium" | "high") => {}
+                Some(Value::String(_)) => {
+                    return Err("`text.verbosity` must be one of: low, medium, high".to_string());
                 }
-                if format.get("type").and_then(Value::as_str) != Some("text") {
-                    return Err(
-                        "only `text.format.type: \"text\"` is supported by this endpoint"
-                            .to_string(),
-                    );
+                Some(_) => return Err("`text.verbosity` must be a string".to_string()),
+            }
+            if let Some(format) = text.get("format") {
+                if !format.is_null() {
+                    let format = format
+                        .as_object()
+                        .ok_or_else(|| "`text.format` must be an object".to_string())?;
+                    for key in format.keys() {
+                        if !matches!(key.as_str(), "type" | "strict") {
+                            return Err(format!("`text.format.{key}` is not supported"));
+                        }
+                    }
+                    match format.get("strict") {
+                        None | Some(Value::Null | Value::Bool(_)) => {}
+                        Some(_) => {
+                            return Err("`text.format.strict` must be a boolean".to_string());
+                        }
+                    }
+                    if format.get("type").and_then(Value::as_str) != Some("text") {
+                        return Err(
+                            "only `text.format.type: \"text\"` is supported by this endpoint"
+                                .to_string(),
+                        );
+                    }
+                    // Codex currently sends `strict` on the plain-text format. There is no
+                    // schema to enforce for `type: text`, so accepting either boolean is
+                    // semantically equivalent to the format without this hint. JSON-schema
+                    // formats remain rejected above instead of silently weakening them.
                 }
             }
         }
@@ -317,27 +367,43 @@ fn reasoning_config(request: &Value) -> Result<Option<ReasoningConfig>, String> 
     let Some(reasoning) = request.get("reasoning") else {
         return Ok(None);
     };
+    if reasoning.is_null() {
+        return Ok(None);
+    }
     let reasoning = reasoning
         .as_object()
         .ok_or_else(|| "`reasoning` must be an object".to_string())?;
     for key in reasoning.keys() {
-        if !matches!(key.as_str(), "effort" | "mode" | "context") {
+        if !matches!(key.as_str(), "effort" | "mode" | "context" | "summary") {
             return Err(format!("`reasoning.{key}` is not supported"));
         }
     }
-    if reasoning
-        .get("context")
-        .is_some_and(|context| !context.is_null())
-    {
-        return Err(
-            "`reasoning.context` is unavailable because prior native reasoning items cannot be replayed by this endpoint"
-                .to_string(),
-        );
+    match reasoning.get("context") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(value))
+            if matches!(value.as_str(), "auto" | "current_turn" | "all_turns") => {}
+        Some(Value::String(_)) => {
+            return Err(
+                "`reasoning.context` must be one of: auto, current_turn, all_turns".to_string(),
+            );
+        }
+        Some(_) => return Err("`reasoning.context` must be a string".to_string()),
+    }
+    match reasoning.get("summary") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(value))
+            if matches!(value.as_str(), "auto" | "concise" | "detailed" | "none") => {}
+        Some(Value::String(_)) => {
+            return Err(
+                "`reasoning.summary` must be one of: auto, concise, detailed, none".to_string(),
+            );
+        }
+        Some(_) => return Err("`reasoning.summary` must be a string".to_string()),
     }
     let effort = optional_string(reasoning.get("effort"), "reasoning.effort")?;
     let mode = optional_string(reasoning.get("mode"), "reasoning.mode")?;
     if effort.is_none() && mode.is_none() {
-        return Err("`reasoning` must contain `effort` or `mode`".to_string());
+        return Ok(None);
     }
     let effort = effort.unwrap_or_else(|| "medium".to_string());
     if !["none", "low", "medium", "high", "xhigh", "max"].contains(&effort.as_str()) {
@@ -525,10 +591,509 @@ fn response_content_to_anthropic(content: &Value, role: &str) -> Result<Value, S
     Ok(Value::Array(mapped))
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ResponseToolKind {
+    Function,
+    Custom,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PublicToolKey {
+    kind: ResponseToolKind,
+    namespace: Option<String>,
+    name: String,
+}
+
+impl PublicToolKey {
+    fn function(namespace: Option<&str>, name: &str) -> Self {
+        Self {
+            kind: ResponseToolKind::Function,
+            namespace: namespace.map(str::to_string),
+            name: name.to_string(),
+        }
+    }
+
+    fn custom(namespace: Option<&str>, name: &str) -> Self {
+        Self {
+            kind: ResponseToolKind::Custom,
+            namespace: namespace.map(str::to_string),
+            name: name.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ParsedResponseTool {
+    key: PublicToolKey,
+    description: String,
+    input_schema: HashMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ToolCatalog {
+    anthropic_tools: Vec<Tool>,
+    by_kiro_name: HashMap<String, PublicToolKey>,
+    by_public_key: HashMap<PublicToolKey, String>,
+}
+
+impl ToolCatalog {
+    fn kiro_name(&self, key: &PublicToolKey) -> Option<&str> {
+        self.by_public_key.get(key).map(String::as_str)
+    }
+
+    fn public_key(&self, kiro_name: &str) -> PublicToolKey {
+        self.by_kiro_name
+            .get(kiro_name)
+            .cloned()
+            .unwrap_or_else(|| PublicToolKey::function(None, kiro_name))
+    }
+
+    fn tools(&self) -> Option<Vec<Tool>> {
+        (!self.anthropic_tools.is_empty()).then(|| self.anthropic_tools.clone())
+    }
+}
+
+fn non_empty_tool_string<'a>(
+    object: &'a Map<String, Value>,
+    key: &str,
+    path: &str,
+) -> Result<&'a str, String> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("`{path}.{key}` must be a non-empty string"))
+}
+
+fn tool_description(object: &Map<String, Value>, name: &str, path: &str) -> Result<String, String> {
+    match object.get("description") {
+        None | Some(Value::Null) => Ok(name.to_string()),
+        Some(Value::String(description)) if description.trim().is_empty() => Ok(name.to_string()),
+        Some(Value::String(description)) => Ok(description.clone()),
+        Some(_) => Err(format!("`{path}.description` must be a string")),
+    }
+}
+
+fn validate_strict_and_deferred_fields(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<(), String> {
+    match object.get("strict") {
+        None | Some(Value::Null | Value::Bool(false)) => {}
+        Some(Value::Bool(true)) => {
+            return Err(format!(
+                "`{path}.strict`: strict schema enforcement is not supported"
+            ));
+        }
+        Some(_) => return Err(format!("`{path}.strict` must be a boolean")),
+    }
+    match object.get("defer_loading") {
+        None | Some(Value::Null | Value::Bool(_)) => Ok(()),
+        Some(_) => Err(format!("`{path}.defer_loading` must be a boolean")),
+    }
+}
+
+fn parse_function_tool(
+    object: &Map<String, Value>,
+    path: &str,
+    namespace: Option<&str>,
+    namespace_description: Option<&str>,
+) -> Result<ParsedResponseTool, String> {
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "type" | "name" | "description" | "parameters" | "strict" | "defer_loading"
+        ) {
+            return Err(format!("`{path}.{key}` is not supported"));
+        }
+    }
+    validate_strict_and_deferred_fields(object, path)?;
+    let name = non_empty_tool_string(object, "name", path)?;
+    let mut description = tool_description(object, name, path)?;
+    if let Some(namespace_description) = namespace_description.filter(|value| !value.is_empty()) {
+        description = format!("{namespace_description}\n\n{description}");
+    }
+    let parameters = object
+        .get("parameters")
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("`{path}.parameters` must be an object"))?;
+    Ok(ParsedResponseTool {
+        key: PublicToolKey::function(namespace, name),
+        description,
+        input_schema: parameters
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    })
+}
+
+fn parse_custom_tool(
+    object: &Map<String, Value>,
+    path: &str,
+    namespace: Option<&str>,
+    namespace_description: Option<&str>,
+) -> Result<ParsedResponseTool, String> {
+    for key in object.keys() {
+        if !matches!(key.as_str(), "type" | "name" | "description" | "format") {
+            return Err(format!("`{path}.{key}` is not supported"));
+        }
+    }
+    let name = non_empty_tool_string(object, "name", path)?;
+    let mut description = tool_description(object, name, path)?;
+    if let Some(namespace_description) = namespace_description.filter(|value| !value.is_empty()) {
+        description = format!("{namespace_description}\n\n{description}");
+    }
+    let format = object
+        .get("format")
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("`{path}.format` must be an object"))?;
+    for key in format.keys() {
+        if !matches!(key.as_str(), "type" | "syntax" | "definition") {
+            return Err(format!("`{path}.format.{key}` is not supported"));
+        }
+    }
+    let format_type = non_empty_tool_string(format, "type", &format!("{path}.format"))?;
+    let syntax = non_empty_tool_string(format, "syntax", &format!("{path}.format"))?;
+    let definition = non_empty_tool_string(format, "definition", &format!("{path}.format"))?;
+    description.push_str(&format!(
+        "\n\nThis is a freeform tool. Put the complete tool input in the `input` string field. Format: {format_type}/{syntax}.\n{definition}"
+    ));
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "input": {
+                "type": "string",
+                "description": "The complete freeform input for this custom tool."
+            }
+        },
+        "required": ["input"],
+        "additionalProperties": false
+    });
+    Ok(ParsedResponseTool {
+        key: PublicToolKey::custom(namespace, name),
+        description,
+        input_schema: schema
+            .as_object()
+            .expect("custom tool schema is an object")
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    })
+}
+
+fn parse_tool_value(
+    tool: &Value,
+    path: &str,
+    namespace: Option<&str>,
+    namespace_description: Option<&str>,
+) -> Result<Vec<ParsedResponseTool>, String> {
+    let object = tool
+        .as_object()
+        .ok_or_else(|| format!("`{path}` must be an object"))?;
+    match object.get("type").and_then(Value::as_str) {
+        Some("function") => Ok(vec![parse_function_tool(
+            object,
+            path,
+            namespace,
+            namespace_description,
+        )?]),
+        Some("custom") => Ok(vec![parse_custom_tool(
+            object,
+            path,
+            namespace,
+            namespace_description,
+        )?]),
+        Some("namespace") if namespace.is_none() => {
+            for key in object.keys() {
+                if !matches!(key.as_str(), "type" | "name" | "description" | "tools") {
+                    return Err(format!("`{path}.{key}` is not supported"));
+                }
+            }
+            let namespace = non_empty_tool_string(object, "name", path)?;
+            let namespace_description = tool_description(object, namespace, path)?;
+            let tools = object
+                .get("tools")
+                .and_then(Value::as_array)
+                .filter(|tools| !tools.is_empty())
+                .ok_or_else(|| format!("`{path}.tools` must be a non-empty array"))?;
+            let mut parsed = Vec::new();
+            for (index, tool) in tools.iter().enumerate() {
+                parsed.extend(parse_tool_value(
+                    tool,
+                    &format!("{path}.tools[{index}]"),
+                    Some(namespace),
+                    Some(&namespace_description),
+                )?);
+            }
+            Ok(parsed)
+        }
+        Some("namespace") => Err(format!("nested namespace `{path}` is not supported")),
+        Some(tool_type) => Err(format!(
+            "`{path}.type` value `{tool_type}` is not supported"
+        )),
+        None => Err(format!("`{path}.type` must be a string")),
+    }
+}
+
+fn stable_tool_hash(key: &PublicToolKey) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    let kind = match key.kind {
+        ResponseToolKind::Function => "function",
+        ResponseToolKind::Custom => "custom",
+    };
+    for byte in kind
+        .bytes()
+        .chain(std::iter::once(0))
+        .chain(key.namespace.as_deref().unwrap_or("").bytes())
+        .chain(std::iter::once(0))
+        .chain(key.name.bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn sanitized_tool_fragment(value: &str) -> String {
+    let mut output = String::new();
+    let mut last_was_separator = false;
+    for character in value.chars() {
+        let character = if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+            character
+        } else {
+            '_'
+        };
+        if character == '_' && last_was_separator {
+            continue;
+        }
+        last_was_separator = character == '_';
+        output.push(character);
+    }
+    let output = output.trim_matches('_');
+    if output.is_empty() {
+        "tool".to_string()
+    } else {
+        output.to_string()
+    }
+}
+
+fn generated_kiro_tool_name(key: &PublicToolKey, used: &HashSet<String>) -> String {
+    const MAX_LEN: usize = 63;
+    let prefix = match (key.kind, key.namespace.is_some()) {
+        (ResponseToolKind::Custom, false) => "r_custom_",
+        (ResponseToolKind::Function, true) => "r_namespace_",
+        (ResponseToolKind::Custom, true) => "r_ns_custom_",
+        (ResponseToolKind::Function, false) => "r_function_",
+    };
+    let label = sanitized_tool_fragment(&format!(
+        "{}__{}",
+        key.namespace.as_deref().unwrap_or(""),
+        key.name
+    ));
+    let hash = stable_tool_hash(key);
+    for collision in 0_u32.. {
+        let suffix = if collision == 0 {
+            format!("_{hash:016x}")
+        } else {
+            format!("_{hash:016x}_{collision}")
+        };
+        let label_len = MAX_LEN.saturating_sub(prefix.len() + suffix.len());
+        let candidate = format!("{prefix}{}{suffix}", &label[..label.len().min(label_len)]);
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("tool collision counter is unbounded")
+}
+
+fn tool_catalog(request: &Value) -> Result<ToolCatalog, String> {
+    let mut parsed = Vec::new();
+    if let Some(tools) = request.get("tools") {
+        let tools = tools
+            .as_array()
+            .ok_or_else(|| "`tools` must be an array".to_string())?;
+        for (index, tool) in tools.iter().enumerate() {
+            parsed.extend(parse_tool_value(
+                tool,
+                &format!("tools[{index}]"),
+                None,
+                None,
+            )?);
+        }
+    }
+    if let Some(items) = request.get("input").and_then(Value::as_array) {
+        for (item_index, item) in items.iter().enumerate() {
+            if item.get("type").and_then(Value::as_str) != Some("additional_tools") {
+                continue;
+            }
+            let object = item
+                .as_object()
+                .ok_or_else(|| format!("`input[{item_index}]` must be an object"))?;
+            for key in object.keys() {
+                if !matches!(key.as_str(), "type" | "id" | "role" | "tools") {
+                    return Err(format!(
+                        "additional tools input field `{key}` is not supported"
+                    ));
+                }
+            }
+            if object.get("role").and_then(Value::as_str) != Some("developer") {
+                return Err("additional tools input requires `role: \"developer\"`".to_string());
+            }
+            let tools = object
+                .get("tools")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "additional tools input requires array `tools`".to_string())?;
+            for (tool_index, tool) in tools.iter().enumerate() {
+                parsed.extend(parse_tool_value(
+                    tool,
+                    &format!("input[{item_index}].tools[{tool_index}]"),
+                    None,
+                    None,
+                )?);
+            }
+        }
+    }
+
+    let mut used_names = parsed
+        .iter()
+        .filter(|tool| tool.key.kind == ResponseToolKind::Function && tool.key.namespace.is_none())
+        .map(|tool| tool.key.name.clone())
+        .collect::<HashSet<_>>();
+    let mut catalog = ToolCatalog::default();
+    for tool in parsed {
+        if catalog.by_public_key.contains_key(&tool.key) {
+            return Err(format!(
+                "duplicate tool definition for `{}`{}",
+                tool.key.name,
+                tool.key
+                    .namespace
+                    .as_deref()
+                    .map(|namespace| format!(" in namespace `{namespace}`"))
+                    .unwrap_or_default()
+            ));
+        }
+        let kiro_name =
+            if tool.key.kind == ResponseToolKind::Function && tool.key.namespace.is_none() {
+                tool.key.name.clone()
+            } else {
+                generated_kiro_tool_name(&tool.key, &used_names)
+            };
+        if catalog.by_kiro_name.contains_key(&kiro_name) {
+            return Err(format!(
+                "tool name `{kiro_name}` conflicts with another tool"
+            ));
+        }
+        used_names.insert(kiro_name.clone());
+        catalog.anthropic_tools.push(Tool {
+            tool_type: None,
+            name: kiro_name.clone(),
+            description: tool.description,
+            input_schema: tool.input_schema,
+            max_uses: None,
+            cache_control: None,
+        });
+        catalog
+            .by_kiro_name
+            .insert(kiro_name.clone(), tool.key.clone());
+        catalog.by_public_key.insert(tool.key, kiro_name);
+    }
+    Ok(catalog)
+}
+
+fn optional_tool_namespace<'a>(
+    object: &'a Map<String, Value>,
+    path: &str,
+) -> Result<Option<&'a str>, String> {
+    match object.get("namespace") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(namespace)) if !namespace.trim().is_empty() => {
+            Ok(Some(namespace.as_str()))
+        }
+        Some(Value::String(_)) => Err(format!("`{path}.namespace` must not be empty")),
+        Some(_) => Err(format!("`{path}.namespace` must be a string")),
+    }
+}
+
+fn validate_encrypted_function_args(object: &Map<String, Value>, path: &str) -> Result<(), String> {
+    match object.get("encrypted_function_args") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::Array(values)) if values.iter().all(Value::is_string) => Ok(()),
+        Some(Value::Array(_)) => Err(format!(
+            "`{path}.encrypted_function_args` must contain only strings"
+        )),
+        Some(_) => Err(format!("`{path}.encrypted_function_args` must be an array")),
+    }
+}
+
+fn tool_output_to_anthropic(output: &Value, path: &str) -> Result<Value, String> {
+    match output {
+        Value::String(output) => Ok(Value::String(output.clone())),
+        Value::Array(_) => response_content_to_anthropic(output, "user")
+            .map_err(|message| format!("`{path}` is invalid: {message}")),
+        _ => Err(format!("`{path}` must be a string or content array")),
+    }
+}
+
+fn append_tool_result(
+    object: &Map<String, Value>,
+    item_type: &str,
+    messages: &mut Vec<Message>,
+) -> Result<(), String> {
+    let call_id = object
+        .get("call_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{item_type} input requires non-empty string `call_id`"))?;
+    let output = object
+        .get("output")
+        .ok_or_else(|| format!("{item_type} input requires `output`"))?;
+    messages.push(Message {
+        role: "user".to_string(),
+        content: json!([{
+            "type": "tool_result",
+            "tool_use_id": call_id,
+            "content": tool_output_to_anthropic(output, &format!("{item_type}.output"))?
+        }]),
+    });
+    Ok(())
+}
+
+fn validate_replayed_reasoning_item(object: &Map<String, Value>) -> Result<(), String> {
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "type"
+                | "id"
+                | "summary"
+                | "content"
+                | "encrypted_content"
+                | "status"
+                | "internal_chat_message_metadata_passthrough"
+        ) {
+            return Err(format!("reasoning input field `{key}` is not supported"));
+        }
+    }
+    for key in ["id", "encrypted_content", "status"] {
+        match object.get(key) {
+            None | Some(Value::Null | Value::String(_)) => {}
+            Some(_) => return Err(format!("reasoning input `{key}` must be a string")),
+        }
+    }
+    for key in ["summary", "content"] {
+        match object.get(key) {
+            None | Some(Value::Null | Value::Array(_)) => {}
+            Some(_) => return Err(format!("reasoning input `{key}` must be an array")),
+        }
+    }
+    Ok(())
+}
+
 fn append_input_item(
     item: &Value,
     messages: &mut Vec<Message>,
     system: &mut Vec<SystemMessage>,
+    catalog: &ToolCatalog,
 ) -> Result<(), String> {
     let object = item
         .as_object()
@@ -540,7 +1105,16 @@ fn append_input_item(
     match item_type {
         "message" => {
             for key in object.keys() {
-                if !matches!(key.as_str(), "type" | "role" | "content" | "id" | "status") {
+                if !matches!(
+                    key.as_str(),
+                    "type"
+                        | "role"
+                        | "content"
+                        | "id"
+                        | "status"
+                        | "phase"
+                        | "internal_chat_message_metadata_passthrough"
+                ) {
                     return Err(format!("input message field `{key}` is not supported"));
                 }
             }
@@ -583,7 +1157,15 @@ fn append_input_item(
             for key in object.keys() {
                 if !matches!(
                     key.as_str(),
-                    "type" | "id" | "call_id" | "name" | "arguments" | "status"
+                    "type"
+                        | "id"
+                        | "call_id"
+                        | "name"
+                        | "namespace"
+                        | "arguments"
+                        | "encrypted_function_args"
+                        | "status"
+                        | "internal_chat_message_metadata_passthrough"
                 ) {
                     return Err(format!(
                         "function call input field `{key}` is not supported"
@@ -593,11 +1175,29 @@ fn append_input_item(
             let call_id = object
                 .get("call_id")
                 .and_then(Value::as_str)
-                .ok_or_else(|| "function call input requires string `call_id`".to_string())?;
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    "function call input requires non-empty string `call_id`".to_string()
+                })?;
             let name = object
                 .get("name")
                 .and_then(Value::as_str)
-                .ok_or_else(|| "function call input requires string `name`".to_string())?;
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    "function call input requires non-empty string `name`".to_string()
+                })?;
+            let namespace = optional_tool_namespace(object, "function_call")?;
+            validate_encrypted_function_args(object, "function_call")?;
+            let public_key = PublicToolKey::function(namespace, name);
+            let kiro_name = match (namespace, catalog.kiro_name(&public_key)) {
+                (_, Some(name)) => name,
+                (None, None) => name,
+                (Some(namespace), None) => {
+                    return Err(format!(
+                        "function call references undeclared namespace tool `{namespace}.{name}`"
+                    ));
+                }
+            };
             let arguments = object
                 .get("arguments")
                 .and_then(Value::as_str)
@@ -610,7 +1210,7 @@ fn append_input_item(
                 content: json!([{
                     "type": "tool_use",
                     "id": call_id,
-                    "name": name,
+                    "name": kiro_name,
                     "input": arguments
                 }]),
             });
@@ -619,30 +1219,111 @@ fn append_input_item(
             for key in object.keys() {
                 if !matches!(
                     key.as_str(),
-                    "type" | "id" | "call_id" | "output" | "status"
+                    "type"
+                        | "id"
+                        | "call_id"
+                        | "output"
+                        | "status"
+                        | "internal_chat_message_metadata_passthrough"
                 ) {
                     return Err(format!(
                         "function call output input field `{key}` is not supported"
                     ));
                 }
             }
+            append_tool_result(object, "function_call_output", messages)?;
+        }
+        "custom_tool_call" => {
+            for key in object.keys() {
+                if !matches!(
+                    key.as_str(),
+                    "type"
+                        | "id"
+                        | "call_id"
+                        | "name"
+                        | "namespace"
+                        | "input"
+                        | "status"
+                        | "internal_chat_message_metadata_passthrough"
+                ) {
+                    return Err(format!(
+                        "custom tool call input field `{key}` is not supported"
+                    ));
+                }
+            }
             let call_id = object
                 .get("call_id")
                 .and_then(Value::as_str)
-                .ok_or_else(|| "function call output requires string `call_id`".to_string())?;
-            let output = object
-                .get("output")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    "custom tool call input requires non-empty string `call_id`".to_string()
+                })?;
+            let name = object
+                .get("name")
                 .and_then(Value::as_str)
-                .ok_or_else(|| "function call output requires string `output`".to_string())?;
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    "custom tool call input requires non-empty string `name`".to_string()
+                })?;
+            let namespace = optional_tool_namespace(object, "custom_tool_call")?;
+            let input = object
+                .get("input")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "custom tool call input requires string `input`".to_string())?;
+            let public_key = PublicToolKey::custom(namespace, name);
+            let kiro_name = catalog.kiro_name(&public_key).ok_or_else(|| {
+                if let Some(namespace) = namespace {
+                    format!(
+                        "custom tool call references undeclared namespace tool `{namespace}.{name}`"
+                    )
+                } else {
+                    format!("custom tool call references undeclared tool `{name}`")
+                }
+            })?;
             messages.push(Message {
-                role: "user".to_string(),
+                role: "assistant".to_string(),
                 content: json!([{
-                    "type": "tool_result",
-                    "tool_use_id": call_id,
-                    "content": output
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": kiro_name,
+                    "input": {"input": input}
                 }]),
             });
         }
+        "custom_tool_call_output" => {
+            for key in object.keys() {
+                if !matches!(
+                    key.as_str(),
+                    "type"
+                        | "id"
+                        | "call_id"
+                        | "name"
+                        | "output"
+                        | "status"
+                        | "internal_chat_message_metadata_passthrough"
+                ) {
+                    return Err(format!(
+                        "custom tool call output input field `{key}` is not supported"
+                    ));
+                }
+            }
+            if object
+                .get("name")
+                .is_some_and(|name| !name.is_null() && !name.is_string())
+            {
+                return Err("custom tool call output `name` must be a string".to_string());
+            }
+            append_tool_result(object, "custom_tool_call_output", messages)?;
+        }
+        "reasoning" => {
+            validate_replayed_reasoning_item(object)?;
+            // Responses clients replay opaque reasoning items when `store: false`.
+            // Kiro's upstream transport cannot consume OpenAI encrypted reasoning, and
+            // treating summaries as assistant text would leak or distort hidden state.
+            // Validate and intentionally omit the opaque item while retaining the visible
+            // messages and tool results that follow it.
+        }
+        "additional_tools" => {}
         other => return Err(format!("input item type `{other}` is not supported")),
     }
     Ok(())
@@ -651,6 +1332,7 @@ fn append_input_item(
 fn input_to_messages(
     request: &Value,
     instructions: Option<String>,
+    catalog: &ToolCatalog,
 ) -> Result<(Vec<Message>, Option<Vec<SystemMessage>>), String> {
     let input = request
         .get("input")
@@ -670,7 +1352,7 @@ fn input_to_messages(
         }),
         Value::Array(items) if !items.is_empty() => {
             for item in items {
-                append_input_item(item, &mut messages, &mut system)?;
+                append_input_item(item, &mut messages, &mut system, catalog)?;
             }
         }
         Value::Array(_) => return Err("`input` must not be empty".to_string()),
@@ -682,81 +1364,9 @@ fn input_to_messages(
     Ok((messages, (!system.is_empty()).then_some(system)))
 }
 
-fn tools_to_anthropic(request: &Value) -> Result<Option<Vec<Tool>>, String> {
-    let Some(tools) = request.get("tools") else {
-        return Ok(None);
-    };
-    let tools = tools
-        .as_array()
-        .ok_or_else(|| "`tools` must be an array".to_string())?;
-    if tools.is_empty() {
-        return Ok(None);
-    }
-    let mut mapped = Vec::with_capacity(tools.len());
-    for (index, tool) in tools.iter().enumerate() {
-        let object = tool
-            .as_object()
-            .ok_or_else(|| format!("tool {index} must be an object"))?;
-        for key in object.keys() {
-            if !matches!(
-                key.as_str(),
-                "type" | "name" | "description" | "parameters" | "strict"
-            ) {
-                return Err(format!("tool {index} field `{key}` is not supported"));
-            }
-        }
-        if object.get("type").and_then(Value::as_str) != Some("function") {
-            return Err(format!("tool {index} must have `type`: `function`"));
-        }
-        if object.get("strict").and_then(Value::as_bool) == Some(true) {
-            return Err(format!(
-                "tool {index} strict schema enforcement is not supported"
-            ));
-        }
-        if object
-            .get("strict")
-            .is_some_and(|strict| !strict.is_null() && !strict.is_boolean())
-        {
-            return Err(format!("tool {index} `strict` must be a boolean"));
-        }
-        let name = object
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| format!("tool {index} requires non-empty string `name`"))?;
-        let description = match object.get("description") {
-            None => String::new(),
-            Some(Value::String(value)) => value.clone(),
-            Some(_) => return Err(format!("tool {index} `description` must be a string")),
-        };
-        // 同 `openai_compat`:上游拒绝空 description 的工具,回退到工具名。
-        let description = if description.trim().is_empty() {
-            name.to_string()
-        } else {
-            description
-        };
-        let parameters = object
-            .get("parameters")
-            .and_then(Value::as_object)
-            .ok_or_else(|| format!("tool {index} requires object `parameters`"))?;
-        mapped.push(Tool {
-            tool_type: None,
-            name: name.to_string(),
-            description,
-            input_schema: parameters
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
-            max_uses: None,
-            cache_control: None,
-        });
-    }
-    Ok(Some(mapped))
-}
-
 fn tool_choice_to_anthropic(
     request: &Value,
-    tools: Option<&[Tool]>,
+    catalog: &ToolCatalog,
 ) -> Result<Option<Value>, String> {
     let Some(choice) = request.get("tool_choice") else {
         return Ok(None);
@@ -764,9 +1374,7 @@ fn tool_choice_to_anthropic(
     if let Some(choice) = choice.as_str() {
         return match choice {
             "auto" => Ok(Some(json!({"type": "auto"}))),
-            "required" if tools.is_some_and(|tools| !tools.is_empty()) => {
-                Ok(Some(json!({"type": "any"})))
-            }
+            "required" if !catalog.anthropic_tools.is_empty() => Ok(Some(json!({"type": "any"}))),
             "required" => Err("`tool_choice`: `required` requires at least one tool".to_string()),
             "none" => Ok(None),
             _ => Err(
@@ -779,23 +1387,33 @@ fn tool_choice_to_anthropic(
         "`tool_choice` must be `auto`, `required`, `none`, or a function object".to_string()
     })?;
     for key in object.keys() {
-        if !matches!(key.as_str(), "type" | "name") {
+        if !matches!(key.as_str(), "type" | "name" | "namespace") {
             return Err(format!("`tool_choice.{key}` is not supported"));
         }
     }
-    if object.get("type").and_then(Value::as_str) != Some("function") {
-        return Err("function `tool_choice` must have `type`: `function`".to_string());
-    }
+    let kind = match object.get("type").and_then(Value::as_str) {
+        Some("function") => ResponseToolKind::Function,
+        Some("custom") => ResponseToolKind::Custom,
+        _ => return Err("object `tool_choice.type` must be `function` or `custom`".to_string()),
+    };
     let name = object
         .get("name")
         .and_then(Value::as_str)
-        .ok_or_else(|| "function `tool_choice` requires string `name`".to_string())?;
-    if !tools.is_some_and(|tools| tools.iter().any(|tool| tool.name == name)) {
-        return Err(format!(
-            "`tool_choice` references unknown function `{name}`"
-        ));
-    }
-    Ok(Some(json!({"type": "tool", "name": name})))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "object `tool_choice` requires non-empty string `name`".to_string())?;
+    let namespace = optional_tool_namespace(object, "tool_choice")?;
+    let key = PublicToolKey {
+        kind,
+        namespace: namespace.map(str::to_string),
+        name: name.to_string(),
+    };
+    let kiro_name = catalog.kiro_name(&key).ok_or_else(|| {
+        let qualified = namespace
+            .map(|namespace| format!("{namespace}.{name}"))
+            .unwrap_or_else(|| name.to_string());
+        format!("`tool_choice` references unknown tool `{qualified}`")
+    })?;
+    Ok(Some(json!({"type": "tool", "name": kiro_name})))
 }
 
 #[derive(Clone)]
@@ -809,6 +1427,9 @@ struct ResponseMeta {
     metadata: Value,
     tools: Value,
     tool_choice: Value,
+    parallel_tool_calls: bool,
+    text: Value,
+    tool_catalog: ToolCatalog,
     store: bool,
     previous_response_id: Option<String>,
 }
@@ -819,6 +1440,7 @@ impl ResponseMeta {
         model: &str,
         max_output_tokens: i32,
         reasoning: Option<ReasoningConfig>,
+        tool_catalog: ToolCatalog,
         store: bool,
         previous_response_id: Option<String>,
     ) -> Self {
@@ -845,6 +1467,16 @@ impl ResponseMeta {
                 .get("tool_choice")
                 .cloned()
                 .unwrap_or_else(|| json!("auto")),
+            parallel_tool_calls: request
+                .get("parallel_tool_calls")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            text: request
+                .get("text")
+                .cloned()
+                .filter(|value| !value.is_null())
+                .unwrap_or_else(|| json!({"format": {"type": "text"}})),
+            tool_catalog,
             store,
             previous_response_id,
         }
@@ -868,7 +1500,7 @@ impl ResponseMeta {
             "metadata": self.metadata,
             "model": self.model,
             "output": output,
-            "parallel_tool_calls": true,
+            "parallel_tool_calls": self.parallel_tool_calls,
             "previous_response_id": self.previous_response_id,
             "reasoning": self.reasoning.as_ref().map(|reasoning| json!({
                 "effort": reasoning.effort,
@@ -879,7 +1511,7 @@ impl ResponseMeta {
                 "mode": Value::Null,
                 "summary": Value::Null
             })),
-            "text": {"format": {"type": "text"}},
+            "text": self.text,
             "tool_choice": self.tool_choice,
             "tools": self.tools,
             "truncation": "disabled",
@@ -923,17 +1555,50 @@ fn new_message_output(texts: Vec<String>) -> Value {
     })
 }
 
-fn new_function_output(block: &Value, call_id: &str) -> Value {
-    json!({
-        "type": "function_call",
-        "id": format!("fc_{}", Uuid::new_v4().simple()),
-        "call_id": call_id,
-        "name": block.get("name").and_then(Value::as_str).unwrap_or_default(),
-        "arguments": serde_json::to_string(
-            block.get("input").unwrap_or(&Value::Object(Map::new()))
-        ).unwrap_or_else(|_| "{}".to_string()),
-        "status": "completed"
-    })
+fn custom_input_from_arguments(arguments: &Value) -> String {
+    match arguments {
+        Value::Object(arguments) => arguments
+            .get("input")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| Value::Object(arguments.clone()).to_string()),
+        Value::String(input) => input.clone(),
+        arguments => arguments.to_string(),
+    }
+}
+
+fn new_tool_output(block: &Value, call_id: &str, catalog: &ToolCatalog) -> Value {
+    let kiro_name = block
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let key = catalog.public_key(kiro_name);
+    let input = block
+        .get("input")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    let mut output = match key.kind {
+        ResponseToolKind::Function => json!({
+            "type": "function_call",
+            "id": format!("fc_{}", Uuid::new_v4().simple()),
+            "call_id": call_id,
+            "name": key.name.clone(),
+            "arguments": serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string()),
+            "status": "completed"
+        }),
+        ResponseToolKind::Custom => json!({
+            "type": "custom_tool_call",
+            "id": format!("ctc_{}", Uuid::new_v4().simple()),
+            "call_id": call_id,
+            "name": key.name.clone(),
+            "input": custom_input_from_arguments(&input),
+            "status": "completed"
+        }),
+    };
+    if let Some(namespace) = key.namespace {
+        output["namespace"] = Value::String(namespace);
+    }
+    output
 }
 
 struct MappedResponse {
@@ -952,6 +1617,7 @@ fn anthropic_to_response(
     let mut text = Vec::new();
     let mut output = Vec::new();
     let mut assistant_blocks = Vec::new();
+    let mut exposed_tool_calls = 0_usize;
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
             Some("text") => {
@@ -964,8 +1630,12 @@ fn anthropic_to_response(
                 assistant_blocks.push(json!({"type": "text", "text": value}));
             }
             Some("tool_use") => {
+                if !meta.parallel_tool_calls && exposed_tool_calls > 0 {
+                    continue;
+                }
+                exposed_tool_calls += 1;
                 let call_id = format!("call_{}", Uuid::new_v4().simple());
-                output.push(new_function_output(block, &call_id));
+                output.push(new_tool_output(block, &call_id, &meta.tool_catalog));
                 assistant_blocks.push(json!({
                     "type": "tool_use",
                     "id": call_id,
@@ -1010,7 +1680,16 @@ enum StreamingItem {
         output_index: usize,
         item: Value,
         arguments: String,
+        public_key: PublicToolKey,
+        kiro_name: String,
     },
+}
+
+struct StreamStoreContext {
+    store: Arc<ResponseStore>,
+    model: String,
+    session_id: String,
+    messages: Vec<Message>,
 }
 
 struct ResponsesStreamState {
@@ -1020,13 +1699,20 @@ struct ResponsesStreamState {
     done: bool,
     usage: Value,
     items: Vec<Value>,
+    assistant_blocks: Vec<Value>,
     active: HashMap<i64, StreamingItem>,
     next_output_index: usize,
+    tool_calls_started: usize,
     stop_reason: Option<String>,
+    store: Option<StreamStoreContext>,
 }
 
 impl ResponsesStreamState {
     fn new(meta: ResponseMeta) -> Self {
+        Self::with_store(meta, None)
+    }
+
+    fn with_store(meta: ResponseMeta, store: Option<StreamStoreContext>) -> Self {
         Self {
             meta,
             sequence: 0,
@@ -1034,9 +1720,12 @@ impl ResponsesStreamState {
             done: false,
             usage: json!({}),
             items: Vec::new(),
+            assistant_blocks: Vec::new(),
             active: HashMap::new(),
             next_output_index: 0,
+            tool_calls_started: 0,
             stop_reason: None,
+            store,
         }
     }
 
@@ -1126,20 +1815,46 @@ impl ResponsesStreamState {
                 )
             }
             Some("tool_use" | "server_tool_use") => {
-                let item = json!({
-                    "type": "function_call",
-                    "id": format!("fc_{}", Uuid::new_v4().simple()),
-                    "call_id": format!("call_{}", Uuid::new_v4().simple()),
-                    "name": block.get("name").and_then(Value::as_str).unwrap_or_default(),
-                    "arguments": "",
-                    "status": "in_progress"
-                });
+                if !self.meta.parallel_tool_calls && self.tool_calls_started > 0 {
+                    self.next_output_index = self.next_output_index.saturating_sub(1);
+                    return String::new();
+                }
+                self.tool_calls_started += 1;
+                let kiro_name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let public_key = self.meta.tool_catalog.public_key(&kiro_name);
+                let mut item = match public_key.kind {
+                    ResponseToolKind::Function => json!({
+                        "type": "function_call",
+                        "id": format!("fc_{}", Uuid::new_v4().simple()),
+                        "call_id": format!("call_{}", Uuid::new_v4().simple()),
+                        "name": public_key.name.clone(),
+                        "arguments": "",
+                        "status": "in_progress"
+                    }),
+                    ResponseToolKind::Custom => json!({
+                        "type": "custom_tool_call",
+                        "id": format!("ctc_{}", Uuid::new_v4().simple()),
+                        "call_id": format!("call_{}", Uuid::new_v4().simple()),
+                        "name": public_key.name.clone(),
+                        "input": "",
+                        "status": "in_progress"
+                    }),
+                };
+                if let Some(namespace) = public_key.namespace.as_ref() {
+                    item["namespace"] = Value::String(namespace.clone());
+                }
                 self.active.insert(
                     block_index,
                     StreamingItem::Function {
                         output_index,
                         item: item.clone(),
                         arguments: String::new(),
+                        public_key,
+                        kiro_name,
                     },
                 );
                 self.event(
@@ -1197,6 +1912,8 @@ impl ResponsesStreamState {
                 output_index,
                 item,
                 arguments,
+                public_key,
+                ..
             } if delta.get("type").and_then(Value::as_str) == Some("input_json_delta") => {
                 let value = delta
                     .get("partial_json")
@@ -1204,6 +1921,9 @@ impl ResponsesStreamState {
                     .unwrap_or_default()
                     .to_string();
                 arguments.push_str(&value);
+                if public_key.kind == ResponseToolKind::Custom {
+                    return String::new();
+                }
                 let item_id = item["id"].as_str().unwrap_or_default().to_string();
                 let output_index = *output_index;
                 self.event(
@@ -1241,6 +1961,8 @@ impl ResponsesStreamState {
                 item["status"] = json!("completed");
                 item["content"] = json!([part.clone()]);
                 self.items.push(item.clone());
+                self.assistant_blocks
+                    .push(json!({"type": "text", "text": text.clone()}));
                 format!(
                     "{}{}{}",
                     self.event(
@@ -1272,29 +1994,79 @@ impl ResponsesStreamState {
                 output_index,
                 mut item,
                 mut arguments,
+                public_key,
+                kiro_name,
             } => {
+                let item_id = item["id"].as_str().unwrap_or_default().to_string();
+                let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
+                let parsed_arguments = if arguments.is_empty() {
+                    Value::Object(Map::new())
+                } else {
+                    serde_json::from_str(&arguments).unwrap_or_else(|_| Value::Object(Map::new()))
+                };
                 if arguments.is_empty() {
                     arguments = "{}".to_string();
                 }
-                let item_id = item["id"].as_str().unwrap_or_default().to_string();
-                item["arguments"] = Value::String(arguments.clone());
+                self.assistant_blocks.push(json!({
+                    "type": "tool_use",
+                    "id": call_id.clone(),
+                    "name": kiro_name,
+                    "input": parsed_arguments.clone()
+                }));
                 item["status"] = json!("completed");
-                self.items.push(item.clone());
-                format!(
-                    "{}{}",
-                    self.event(
-                        "response.function_call_arguments.done",
-                        json!({
-                            "item_id": item_id,
-                            "output_index": output_index,
-                            "arguments": arguments
-                        })
-                    ),
-                    self.event(
-                        "response.output_item.done",
-                        json!({"output_index": output_index, "item": item})
-                    )
-                )
+                match public_key.kind {
+                    ResponseToolKind::Function => {
+                        item["arguments"] = Value::String(arguments.clone());
+                        self.items.push(item.clone());
+                        format!(
+                            "{}{}",
+                            self.event(
+                                "response.function_call_arguments.done",
+                                json!({
+                                    "item_id": item_id,
+                                    "output_index": output_index,
+                                    "arguments": arguments
+                                })
+                            ),
+                            self.event(
+                                "response.output_item.done",
+                                json!({"output_index": output_index, "item": item})
+                            )
+                        )
+                    }
+                    ResponseToolKind::Custom => {
+                        let input = custom_input_from_arguments(&parsed_arguments);
+                        item["input"] = Value::String(input.clone());
+                        self.items.push(item.clone());
+                        let delta = (!input.is_empty()).then(|| {
+                            self.event(
+                                "response.custom_tool_call_input.delta",
+                                json!({
+                                    "item_id": item_id,
+                                    "call_id": call_id,
+                                    "output_index": output_index,
+                                    "delta": input.clone()
+                                }),
+                            )
+                        });
+                        format!(
+                            "{}{}{}",
+                            delta.unwrap_or_default(),
+                            self.event(
+                                "response.custom_tool_call_input.done",
+                                json!({
+                                    "item_id": item_id,
+                                    "output_index": output_index,
+                                    "input": input
+                                })
+                            ),
+                            self.event(
+                                "response.output_item.done",
+                                json!({"output_index": output_index, "item": item})
+                            )
+                        )
+                    }
+                }
             }
         }
     }
@@ -1302,6 +2074,30 @@ impl ResponsesStreamState {
     fn completed(&mut self, stop_reason: Option<&str>) -> String {
         if self.done {
             return String::new();
+        }
+        if let Some(mut store) = self.store.take() {
+            if !self.assistant_blocks.is_empty() {
+                store.messages.push(Message {
+                    role: "assistant".to_string(),
+                    content: Value::Array(self.assistant_blocks.clone()),
+                });
+            }
+            let stored = StoredConversation {
+                model: store.model,
+                session_id: store.session_id,
+                messages: store.messages,
+            };
+            if store.store.insert(self.meta.id.clone(), stored).is_err() {
+                self.done = true;
+                return self.event(
+                    "error",
+                    json!({
+                        "code": "response_store_error",
+                        "message": "The completed response exceeded the retention limit required by `store: true`.",
+                        "param": Value::Null
+                    }),
+                );
+            }
         }
         self.done = true;
         let status = if stop_reason == Some("max_tokens") {
@@ -1416,13 +2212,17 @@ fn drain_sse(buffer: &mut BytesMut, state: &mut ResponsesStreamState) -> String 
     output
 }
 
-fn responses_stream_response(body: Body, meta: ResponseMeta) -> Response {
+fn responses_stream_response(
+    body: Body,
+    meta: ResponseMeta,
+    store: Option<StreamStoreContext>,
+) -> Response {
     let input = body.into_data_stream();
     let output = stream::unfold(
         (
             input,
             BytesMut::new(),
-            ResponsesStreamState::new(meta),
+            ResponsesStreamState::with_store(meta, store),
             false,
         ),
         |(mut input, mut buffer, mut state, finished)| async move {
@@ -1479,9 +2279,10 @@ fn translated_request(
     let reasoning = reasoning_config(request)?;
     let store = store_requested(request)?;
     let previous_response_id = previous_response_id(request)?;
-    let (messages, system) = input_to_messages(request, instructions)?;
-    let mut tools = tools_to_anthropic(request)?;
-    let tool_choice = tool_choice_to_anthropic(request, tools.as_deref())?;
+    let catalog = tool_catalog(request)?;
+    let (messages, system) = input_to_messages(request, instructions, &catalog)?;
+    let mut tools = catalog.tools();
+    let tool_choice = tool_choice_to_anthropic(request, &catalog)?;
     if request.get("tool_choice").and_then(Value::as_str) == Some("none") {
         tools = None;
     }
@@ -1490,6 +2291,7 @@ fn translated_request(
         model,
         max_tokens,
         reasoning.clone(),
+        catalog,
         store,
         previous_response_id,
     );
@@ -1497,6 +2299,9 @@ fn translated_request(
         MessagesRequest {
             model: model.to_string(),
             max_tokens,
+            temperature: None,
+            top_p: None,
+            top_k: None,
             messages,
             stream,
             system,
@@ -1540,22 +2345,23 @@ pub async fn post_responses(
     State(state): State<AppState>,
     ResponsesJson(request): ResponsesJson,
 ) -> Response {
-    let model = match required_model(&request) {
+    let requested_model = match required_model(&request) {
         Ok(model) => model.to_string(),
         Err(message) => return invalid_request(message, true),
     };
-    if !is_exact_gpt56(&model) {
-        if is_gpt_family_name(&model) {
+    let model = match canonical_gpt56_model(&requested_model) {
+        Some(model) => model.to_string(),
+        None if is_gpt_family_name(&requested_model) => {
             return invalid_request(
                 format!(
-                    "The model `{model}` is not supported. Supported models: {}",
+                    "The model `{requested_model}` is not supported. Supported models: gpt-5.6, {}",
                     GPT56_MODELS.join(", ")
                 ),
                 true,
             );
         }
-        return legacy_non_gpt_response(&state);
-    }
+        None => return legacy_non_gpt_response(&state),
+    };
 
     let (mut translated, meta) = match translated_request(&request, &model) {
         Ok(translated) => translated,
@@ -1563,12 +2369,6 @@ pub async fn post_responses(
     };
     debug_assert_eq!(translated.model, model);
     let stream_requested = translated.stream;
-    if stream_requested && (meta.store || meta.previous_response_id.is_some()) {
-        return invalid_request(
-            "`stream: true` cannot be combined with `store: true` or `previous_response_id` on this endpoint",
-            true,
-        );
-    }
 
     let prior = if let Some(previous_response_id) = meta.previous_response_id.as_deref() {
         let Some(prior) = state.response_store.get(previous_response_id) else {
@@ -1623,7 +2423,17 @@ pub async fn post_responses(
     let status = response.status();
 
     if stream_requested && status.is_success() {
-        return mark_gpt_openai_response(responses_stream_response(response.into_body(), meta));
+        let stream_store = stored_messages.take().map(|messages| StreamStoreContext {
+            store: state.response_store.clone(),
+            model: model.clone(),
+            session_id,
+            messages,
+        });
+        return mark_gpt_openai_response(responses_stream_response(
+            response.into_body(),
+            meta,
+            stream_store,
+        ));
     }
 
     let body = match axum::body::to_bytes(response.into_body(), usize::MAX).await {
@@ -1703,7 +2513,130 @@ mod tests {
     }
 
     fn base_meta(model: &str) -> ResponseMeta {
-        ResponseMeta::new(&base_request(model), model, 64, None, false, None)
+        ResponseMeta::new(
+            &base_request(model),
+            model,
+            64,
+            None,
+            ToolCatalog::default(),
+            false,
+            None,
+        )
+    }
+
+    fn realistic_codex_request() -> Value {
+        json!({
+            "model": "gpt-5.6",
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "shell_command",
+                            "description": "Run a shell command",
+                            "strict": false,
+                            "defer_loading": false,
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"cmd": {"type": "string"}},
+                                "required": ["cmd"]
+                            }
+                        },
+                        {
+                            "type": "custom",
+                            "name": "apply_patch",
+                            "description": "Apply a patch",
+                            "format": {
+                                "type": "grammar",
+                                "syntax": "lark",
+                                "definition": "start: patch\npatch: /.+/s"
+                            }
+                        },
+                        {
+                            "type": "namespace",
+                            "name": "collaboration",
+                            "description": "Coordinate agents",
+                            "tools": [{
+                                "type": "function",
+                                "name": "list_agents",
+                                "description": "List agents",
+                                "strict": false,
+                                "parameters": {"type": "object", "properties": {}}
+                            }]
+                        },
+                        {
+                            "type": "namespace",
+                            "name": "codex_apps",
+                            "description": "Use Codex apps",
+                            "tools": [{
+                                "type": "function",
+                                "name": "list_agents",
+                                "description": "List app agents",
+                                "parameters": {"type": "object", "properties": {}}
+                            }]
+                        }
+                    ]
+                },
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "phase": "commentary",
+                    "content": [{"type": "input_text", "text": "Work carefully."}]
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_previous",
+                    "summary": [{"type": "summary_text", "text": "Opaque prior reasoning"}],
+                    "content": [],
+                    "encrypted_content": "opaque-reasoning-payload",
+                    "status": "completed"
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Fix the file."}]
+                },
+                {
+                    "type": "custom_tool_call",
+                    "id": "ctc_previous",
+                    "call_id": "call_previous",
+                    "name": "apply_patch",
+                    "input": "*** Begin Patch\n*** End Patch",
+                    "status": "completed"
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "id": "ctco_previous",
+                    "call_id": "call_previous",
+                    "name": "apply_patch",
+                    "output": [{"type": "input_text", "text": "Done"}]
+                }
+            ],
+            "include": ["reasoning.encrypted_content"],
+            "prompt_cache_key": "codex-session-key",
+            "client_metadata": {
+                "originator": "codex_cli_rs",
+                "session_id": "session-123"
+            },
+            "reasoning": {
+                "effort": "high",
+                "context": "all_turns",
+                "summary": "auto"
+            },
+            "text": {
+                "format": {"type": "text", "strict": true},
+                "verbosity": "medium"
+            },
+            "parallel_tool_calls": false,
+            "stream": true,
+            "store": false,
+            "stream_options": {
+                "include_usage": true,
+                "future_option": {"accepted": true}
+            }
+        })
     }
 
     fn parsed_events(output: &str) -> Vec<(String, Value)> {
@@ -1728,6 +2661,81 @@ mod tests {
             assert_eq!(meta.model, *model);
             assert_eq!(translated.messages[0].content, "Say hello");
         }
+    }
+
+    #[tokio::test]
+    async fn canonicalizes_the_gpt56_alias_before_entering_the_provider_path() {
+        assert_eq!(canonical_gpt56_model("gpt-5.6"), Some("gpt-5.6-sol"));
+        assert_eq!(canonical_gpt56_model("GPT 5.6"), Some("gpt-5.6-sol"));
+        assert_eq!(
+            canonical_gpt56_model("gpt-5.6-terra"),
+            Some("gpt-5.6-terra")
+        );
+
+        let response = post_responses(
+            State(AppState::new("test-api-key", true, true)),
+            ResponsesJson(base_request("gpt-5.6")),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the alias must pass local model validation and reach the real provider path"
+        );
+    }
+
+    #[test]
+    fn translates_current_codex_additional_tools_and_replays_custom_calls() {
+        let request = realistic_codex_request();
+        let (translated, meta) =
+            translated_request(&request, "gpt-5.6-sol").expect("current Codex request");
+
+        assert_eq!(translated.model, "gpt-5.6-sol");
+        assert!(translated.stream);
+        assert_eq!(translated.tools.as_ref().unwrap().len(), 4);
+        assert_eq!(
+            translated.system.as_ref().unwrap()[0].text,
+            "Work carefully."
+        );
+        assert_eq!(translated.messages.len(), 3);
+        assert_eq!(translated.messages[0].content[0]["text"], "Fix the file.");
+
+        let custom_name = meta
+            .tool_catalog
+            .kiro_name(&PublicToolKey::custom(None, "apply_patch"))
+            .expect("custom tool mapping");
+        let collaboration_name = meta
+            .tool_catalog
+            .kiro_name(&PublicToolKey::function(
+                Some("collaboration"),
+                "list_agents",
+            ))
+            .expect("collaboration namespace mapping");
+        let codex_apps_name = meta
+            .tool_catalog
+            .kiro_name(&PublicToolKey::function(Some("codex_apps"), "list_agents"))
+            .expect("codex_apps namespace mapping");
+        assert_ne!(collaboration_name, codex_apps_name);
+        assert!(custom_name.len() <= 63);
+        assert!(collaboration_name.len() <= 63);
+        assert!(codex_apps_name.len() <= 63);
+        assert_eq!(translated.messages[1].content[0]["name"], custom_name);
+        assert_eq!(
+            translated.messages[1].content[0]["input"],
+            json!({"input": "*** Begin Patch\n*** End Patch"})
+        );
+        assert_eq!(
+            translated.messages[2].content[0]["content"],
+            json!([{"type": "text", "text": "Done"}])
+        );
+        assert_eq!(meta.parallel_tool_calls, false);
+        assert_eq!(meta.text["verbosity"], "medium");
+        assert_eq!(
+            meta.response("completed", json!([]), json!({}))["text"],
+            request["text"]
+        );
+        super::super::converter::convert_request(&translated)
+            .expect("the translated current Codex request must reach the Kiro wire converter");
     }
 
     #[test]
@@ -1777,6 +2785,42 @@ mod tests {
             Some(json!({"type": "tool", "name": "weather"}))
         );
         assert_eq!(translated.messages.len(), 3);
+    }
+
+    #[test]
+    fn replayed_reasoning_is_validated_and_omitted_from_kiro_messages() {
+        let request = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_123",
+                    "summary": [{"type": "summary_text", "text": "Prior summary"}],
+                    "content": [],
+                    "encrypted_content": "opaque-payload",
+                    "status": "completed"
+                },
+                {"type": "message", "role": "user", "content": "Continue"}
+            ],
+            "store": false,
+            "text": {"format": {"type": "text", "strict": true}}
+        });
+        let (translated, meta) =
+            translated_request(&request, "gpt-5.6-sol").expect("Codex replay request");
+        assert_eq!(translated.messages.len(), 1);
+        assert_eq!(translated.messages[0].role, "user");
+        assert_eq!(translated.messages[0].content, "Continue");
+        assert_eq!(meta.text, request["text"]);
+
+        for invalid in [
+            json!({"type": "reasoning", "encrypted_content": 1}),
+            json!({"type": "reasoning", "summary": "not-an-array"}),
+            json!({"type": "reasoning", "future_field": true}),
+        ] {
+            let mut invalid_request = request.clone();
+            invalid_request["input"][0] = invalid;
+            assert!(translated_request(&invalid_request, "gpt-5.6-sol").is_err());
+        }
     }
 
     #[test]
@@ -1885,19 +2929,33 @@ other product, model, or company.";
         request["store"] = json!(true);
         request["metadata"] = json!({"test_run": "gpt56"});
         request["previous_response_id"] = json!("resp_previous");
-        request["text"] = json!({"format": {"type": "text"}});
-        request["include"] = json!([]);
-        request["parallel_tool_calls"] = json!(true);
+        request["text"] = json!({"format": {"type": "text"}, "verbosity": "high"});
+        request["include"] = json!(["reasoning.encrypted_content"]);
+        request["parallel_tool_calls"] = json!(false);
+        request["prompt_cache_key"] = json!("codex-cache-key");
+        request["client_metadata"] = json!({"originator": "codex_cli_rs"});
+        request["service_tier"] = json!("auto");
+        request["stream_options"] = json!({
+            "include_usage": true,
+            "unknown_future_option": [1, 2, 3]
+        });
+        request["reasoning"] = json!({
+            "effort": "high",
+            "context": "all_turns",
+            "summary": "auto"
+        });
 
-        let (_, meta) = translated_request(&request, "gpt-5.6-sol").expect("safe optional fields");
+        let (_, meta) = translated_request(&request, "gpt-5.6-sol").expect("current Codex fields");
         let response = meta.response("completed", json!([]), json!({}));
         assert_eq!(response["metadata"]["test_run"], "gpt56");
         assert_eq!(response["store"], true);
         assert_eq!(response["previous_response_id"], "resp_previous");
+        assert_eq!(response["parallel_tool_calls"], false);
+        assert_eq!(response["text"], request["text"]);
+        assert_eq!(response["output"], json!([]));
 
         for (field, value) in [
             ("include", json!(["message.output_text.logprobs"])),
-            ("parallel_tool_calls", json!(false)),
             (
                 "prompt_cache_options",
                 json!({"mode": "explicit", "retention": "30m"}),
@@ -1906,6 +2964,9 @@ other product, model, or company.";
                 "text",
                 json!({"format": {"type": "json_schema", "name": "result"}}),
             ),
+            ("parallel_tool_calls", json!("false")),
+            ("prompt_cache_key", json!({"not": "a string"})),
+            ("client_metadata", json!({"invalid": 1})),
         ] {
             let mut unsupported = base_request("gpt-5.6-sol");
             unsupported[field] = value;
@@ -1915,14 +2976,28 @@ other product, model, or company.";
             );
         }
 
-        for reasoning in [
+        for accepted_reasoning in [
             json!({"effort": "high", "context": "all_turns"}),
             json!({"effort": "high", "context": "current_turn"}),
             json!({"effort": "high", "context": "auto"}),
+            json!({"context": "all_turns", "summary": "auto"}),
         ] {
-            let mut unsupported = base_request("gpt-5.6-sol");
-            unsupported["reasoning"] = reasoning;
-            assert!(translated_request(&unsupported, "gpt-5.6-sol").is_err());
+            let mut supported = base_request("gpt-5.6-sol");
+            supported["reasoning"] = accepted_reasoning;
+            translated_request(&supported, "gpt-5.6-sol").expect("Codex reasoning controls");
+        }
+
+        for (field, value) in [
+            (
+                "reasoning",
+                json!({"effort": "high", "context": "everywhere"}),
+            ),
+            ("reasoning", json!({"effort": "high", "summary": "verbose"})),
+            ("text", json!({"verbosity": "extreme"})),
+        ] {
+            let mut invalid = base_request("gpt-5.6-sol");
+            invalid[field] = value;
+            assert!(translated_request(&invalid, "gpt-5.6-sol").is_err());
         }
 
         for invalid_id in ["foo", "resp_", "resp_contains.dot"] {
@@ -2004,7 +3079,11 @@ other product, model, or company.";
         streamed["stream"] = json!(true);
         streamed["store"] = json!(true);
         let response = post_responses(State(first_state.clone()), ResponsesJson(streamed)).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "stream + store must reach the real provider path"
+        );
 
         let mut wrong_model = base_request("gpt-5.6-terra");
         wrong_model["previous_response_id"] = json!("resp_stored");
@@ -2217,6 +3296,101 @@ other product, model, or company.";
     }
 
     #[test]
+    fn maps_custom_and_namespaced_tool_outputs_back_to_responses_shapes() {
+        let mut request = realistic_codex_request();
+        request["stream"] = json!(false);
+        request["parallel_tool_calls"] = json!(true);
+        let (_, meta) = translated_request(&request, "gpt-5.6-sol").expect("current Codex request");
+        let custom_name = meta
+            .tool_catalog
+            .kiro_name(&PublicToolKey::custom(None, "apply_patch"))
+            .unwrap()
+            .to_string();
+        let namespace_name = meta
+            .tool_catalog
+            .kiro_name(&PublicToolKey::function(
+                Some("collaboration"),
+                "list_agents",
+            ))
+            .unwrap()
+            .to_string();
+
+        let mapped = anthropic_to_response(
+            &json!({
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_private_custom",
+                        "name": custom_name,
+                        "input": {"input": "*** Begin Patch\n*** End Patch"}
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_private_namespace",
+                        "name": namespace_name,
+                        "input": {"path_prefix": "/root"}
+                    }
+                ],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 2, "output_tokens": 3}
+            }),
+            &meta,
+        )
+        .expect("mapped tool response");
+        let assistant = mapped
+            .assistant_message
+            .expect("stored assistant tool calls");
+        let output = mapped.response["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["type"], "custom_tool_call");
+        assert_eq!(output[0]["name"], "apply_patch");
+        assert_eq!(output[0]["input"], "*** Begin Patch\n*** End Patch");
+        assert!(output[0]["id"].as_str().unwrap().starts_with("ctc_"));
+        assert_eq!(output[1]["type"], "function_call");
+        assert_eq!(output[1]["namespace"], "collaboration");
+        assert_eq!(output[1]["name"], "list_agents");
+        assert_eq!(
+            serde_json::from_str::<Value>(output[1]["arguments"].as_str().unwrap()).unwrap(),
+            json!({"path_prefix": "/root"})
+        );
+        assert_eq!(assistant.content[0]["id"], output[0]["call_id"]);
+        assert_eq!(assistant.content[1]["id"], output[1]["call_id"]);
+        assert_ne!(assistant.content[0]["name"], "apply_patch");
+        assert_ne!(assistant.content[1]["name"], "list_agents");
+    }
+
+    #[test]
+    fn parallel_tool_calls_false_exposes_only_one_nonstream_tool_call() {
+        let mut request = base_request("gpt-5.6-sol");
+        request["parallel_tool_calls"] = json!(false);
+        let (_, meta) = translated_request(&request, "gpt-5.6-sol").unwrap();
+        let mapped = anthropic_to_response(
+            &json!({
+                "content": [
+                    {"type": "tool_use", "name": "first", "input": {"n": 1}},
+                    {"type": "tool_use", "name": "second", "input": {"n": 2}}
+                ],
+                "stop_reason": "tool_use",
+                "usage": {}
+            }),
+            &meta,
+        )
+        .unwrap();
+        assert_eq!(mapped.response["output"].as_array().unwrap().len(), 1);
+        assert_eq!(mapped.response["output"][0]["name"], "first");
+        assert_eq!(
+            mapped
+                .assistant_message
+                .unwrap()
+                .content
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn transforms_text_stream_to_responses_events_without_chat_done_marker() {
         let meta = base_meta("gpt-5.6-sol");
         let mut state = ResponsesStreamState::new(meta);
@@ -2363,6 +3537,160 @@ other product, model, or company.";
         assert_eq!(done["arguments"], item_done["item"]["arguments"]);
         serde_json::from_str::<Value>(done["arguments"].as_str().unwrap())
             .expect("final function arguments must be JSON");
+    }
+
+    #[test]
+    fn transforms_custom_stream_into_codex_custom_tool_events() {
+        let request = json!({
+            "model": "gpt-5.6-sol",
+            "input": "Apply the patch",
+            "tools": [{
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a patch",
+                "format": {
+                    "type": "grammar",
+                    "syntax": "lark",
+                    "definition": "start: patch\npatch: /.+/s"
+                }
+            }]
+        });
+        let (_, meta) = translated_request(&request, "gpt-5.6-sol").unwrap();
+        let custom_name = meta
+            .tool_catalog
+            .kiro_name(&PublicToolKey::custom(None, "apply_patch"))
+            .unwrap()
+            .to_string();
+        let raw_input = "*** Begin Patch\n*** End Patch";
+        let arguments = serde_json::to_string(&json!({"input": raw_input})).unwrap();
+        let mut state = ResponsesStreamState::new(meta);
+        let output = [
+            (
+                "message_start",
+                json!({"message": {"usage": {"input_tokens": 5}}}),
+            ),
+            (
+                "content_block_start",
+                json!({
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_private",
+                        "name": custom_name,
+                        "input": {}
+                    }
+                }),
+            ),
+            (
+                "content_block_delta",
+                json!({
+                    "index": 0,
+                    "delta": {"type": "input_json_delta", "partial_json": arguments}
+                }),
+            ),
+            ("content_block_stop", json!({"index": 0})),
+            ("message_stop", json!({})),
+        ]
+        .iter()
+        .map(|(name, event)| state.transform(name, event))
+        .collect::<String>();
+        assert!(output.contains("response.custom_tool_call_input.delta"));
+        assert!(output.contains("response.custom_tool_call_input.done"));
+        assert!(!output.contains("response.function_call_arguments"));
+        let events = parsed_events(&output);
+        let delta = events
+            .iter()
+            .find(|(name, _)| name == "response.custom_tool_call_input.delta")
+            .map(|(_, event)| event)
+            .unwrap();
+        let done = events
+            .iter()
+            .find(|(name, _)| name == "response.custom_tool_call_input.done")
+            .map(|(_, event)| event)
+            .unwrap();
+        let item_done = events
+            .iter()
+            .find(|(name, _)| name == "response.output_item.done")
+            .map(|(_, event)| event)
+            .unwrap();
+        assert_eq!(delta["delta"], raw_input);
+        assert_eq!(done["input"], raw_input);
+        assert_eq!(item_done["item"]["type"], "custom_tool_call");
+        assert_eq!(item_done["item"]["name"], "apply_patch");
+        assert_eq!(item_done["item"]["input"], raw_input);
+        assert!(
+            item_done["item"]["id"]
+                .as_str()
+                .unwrap()
+                .starts_with("ctc_")
+        );
+    }
+
+    #[test]
+    fn parallel_tool_calls_false_exposes_only_one_streamed_tool_call() {
+        let mut request = base_request("gpt-5.6-sol");
+        request["parallel_tool_calls"] = json!(false);
+        let (_, meta) = translated_request(&request, "gpt-5.6-sol").unwrap();
+        let mut state = ResponsesStreamState::new(meta);
+        let output = [
+            ("message_start", json!({"message": {"usage": {}}})),
+            (
+                "content_block_start",
+                json!({
+                    "index": 0,
+                    "content_block": {"type": "tool_use", "name": "first", "input": {}}
+                }),
+            ),
+            (
+                "content_block_delta",
+                json!({
+                    "index": 0,
+                    "delta": {"type": "input_json_delta", "partial_json": "{\"n\":1}"}
+                }),
+            ),
+            ("content_block_stop", json!({"index": 0})),
+            (
+                "content_block_start",
+                json!({
+                    "index": 1,
+                    "content_block": {"type": "tool_use", "name": "second", "input": {}}
+                }),
+            ),
+            (
+                "content_block_delta",
+                json!({
+                    "index": 1,
+                    "delta": {"type": "input_json_delta", "partial_json": "{\"n\":2}"}
+                }),
+            ),
+            ("content_block_stop", json!({"index": 1})),
+            ("message_stop", json!({})),
+        ]
+        .iter()
+        .map(|(name, event)| state.transform(name, event))
+        .collect::<String>();
+        let events = parsed_events(&output);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(name, _)| name == "response.output_item.added")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(name, _)| name == "response.output_item.done")
+                .count(),
+            1
+        );
+        let completed = events
+            .iter()
+            .find(|(name, _)| name == "response.completed")
+            .map(|(_, event)| event)
+            .unwrap();
+        assert_eq!(completed["response"]["output"].as_array().unwrap().len(), 1);
+        assert_eq!(completed["response"]["parallel_tool_calls"], false);
     }
 
     #[test]

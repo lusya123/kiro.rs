@@ -170,6 +170,29 @@ pub struct MessagesRequest {
     pub model: String,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: i32,
+    /// Optional sampling controls from the Anthropic Messages API.
+    ///
+    /// These stay as request metadata: the Kiro transport does not emulate
+    /// sampling by changing prompts or generated text. Model-specific support
+    /// is validated at the HTTP boundary before either upstream is selected.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_sampling_number"
+    )]
+    pub temperature: Option<f64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_sampling_number"
+    )]
+    pub top_p: Option<f64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_sampling_number"
+    )]
+    pub top_k: Option<f64>,
     pub messages: Vec<Message>,
     #[serde(default)]
     pub stream: bool,
@@ -189,6 +212,21 @@ pub struct MessagesRequest {
 
 fn default_max_tokens() -> i32 {
     1024
+}
+
+/// Deserialize a sampling number while distinguishing an omitted field from
+/// an explicitly supplied `null`. Anthropic sampling parameters are numbers;
+/// `null`, strings, booleans, arrays, and objects are malformed requests.
+fn deserialize_optional_sampling_number<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let number = value
+        .as_f64()
+        .filter(|number| number.is_finite())
+        .ok_or_else(|| serde::de::Error::custom("sampling parameter must be a finite number"))?;
+    Ok(Some(number))
 }
 
 /// 反序列化 system 字段，支持字符串或数组格式
@@ -361,4 +399,61 @@ pub struct CountTokensRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CountTokensResponse {
     pub input_tokens: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn base_request() -> serde_json::Value {
+        json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}]
+        })
+    }
+
+    #[test]
+    fn messages_request_parses_and_serializes_sampling_parameters() {
+        let mut body = base_request();
+        body["temperature"] = json!(1.0);
+        body["top_p"] = json!(0.99);
+        body["top_k"] = json!(1);
+
+        let request: MessagesRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(request.temperature, Some(1.0));
+        assert_eq!(request.top_p, Some(0.99));
+        assert_eq!(request.top_k, Some(1.0));
+
+        let serialized = serde_json::to_value(request).unwrap();
+        assert_eq!(serialized["temperature"], 1.0);
+        assert_eq!(serialized["top_p"], 0.99);
+        assert_eq!(serialized["top_k"], 1.0);
+    }
+
+    #[test]
+    fn messages_request_distinguishes_omitted_sampling_from_invalid_values() {
+        let request: MessagesRequest = serde_json::from_value(base_request()).unwrap();
+        assert_eq!(request.temperature, None);
+        assert_eq!(request.top_p, None);
+        assert_eq!(request.top_k, None);
+        let serialized = serde_json::to_value(request).unwrap();
+        assert!(serialized.get("temperature").is_none());
+        assert!(serialized.get("top_p").is_none());
+        assert!(serialized.get("top_k").is_none());
+
+        for (field, invalid) in [
+            ("temperature", serde_json::Value::Null),
+            ("top_p", json!("0.99")),
+            ("top_k", json!(true)),
+        ] {
+            let mut body = base_request();
+            body[field] = invalid;
+            assert!(
+                serde_json::from_value::<MessagesRequest>(body).is_err(),
+                "{field} must reject a non-number"
+            );
+        }
+    }
 }

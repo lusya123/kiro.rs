@@ -585,14 +585,21 @@ pub enum IdentityTarget {
     Gpt56Sol,
     Gpt56Terra,
     Gpt56Luna,
+    MiniMaxM25,
+    Glm5,
+    DeepSeekV32,
 }
 
 impl IdentityTarget {
     pub fn for_model(model: &str) -> Self {
-        match model.trim().to_ascii_lowercase().as_str() {
+        let model = model.trim().to_ascii_lowercase();
+        match model.as_str() {
             "gpt-5.6-sol" | "gpt 5.6 sol" => Self::Gpt56Sol,
             "gpt-5.6-terra" | "gpt 5.6 terra" => Self::Gpt56Terra,
             "gpt-5.6-luna" | "gpt 5.6 luna" => Self::Gpt56Luna,
+            _ if model.contains("minimax") => Self::MiniMaxM25,
+            _ if model.contains("glm") => Self::Glm5,
+            "deepseek-3.2" | "deepseek-v3.2" | "deepseek v3.2" => Self::DeepSeekV32,
             _ => Self::Claude,
         }
     }
@@ -601,6 +608,9 @@ impl IdentityTarget {
         match self {
             Self::Claude => "Claude",
             Self::Gpt56Sol | Self::Gpt56Terra | Self::Gpt56Luna => "ChatGPT",
+            Self::MiniMaxM25 => "MiniMax",
+            Self::Glm5 => "GLM",
+            Self::DeepSeekV32 => "DeepSeek",
         }
     }
 
@@ -610,6 +620,19 @@ impl IdentityTarget {
             Self::Gpt56Sol => "GPT-5.6 Sol",
             Self::Gpt56Terra => "GPT-5.6 Terra",
             Self::Gpt56Luna => "GPT-5.6 Luna",
+            Self::MiniMaxM25 => "MiniMax M2.5",
+            Self::Glm5 => "GLM-5",
+            Self::DeepSeekV32 => "DeepSeek V3.2",
+        }
+    }
+
+    pub fn model_family(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::Gpt56Sol | Self::Gpt56Terra | Self::Gpt56Luna => "GPT",
+            Self::MiniMaxM25 => "MiniMax",
+            Self::Glm5 => "GLM",
+            Self::DeepSeekV32 => "DeepSeek",
         }
     }
 
@@ -617,11 +640,18 @@ impl IdentityTarget {
         match self {
             Self::Claude => "Anthropic",
             Self::Gpt56Sol | Self::Gpt56Terra | Self::Gpt56Luna => "OpenAI",
+            Self::MiniMaxM25 => "MiniMax",
+            Self::Glm5 => "Z.ai",
+            Self::DeepSeekV32 => "DeepSeek",
         }
     }
 
+    pub fn is_claude(self) -> bool {
+        matches!(self, Self::Claude)
+    }
+
     pub fn is_gpt(self) -> bool {
-        !matches!(self, Self::Claude)
+        matches!(self, Self::Gpt56Sol | Self::Gpt56Terra | Self::Gpt56Luna)
     }
 }
 
@@ -806,7 +836,7 @@ pub fn sanitize_identity_json_value(
                 if private_identity_boolean && options.protects_private_runtime() {
                     *value = serde_json::Value::Bool(false);
                 } else if claude_identity_boolean && options.protects_private_runtime() {
-                    *value = serde_json::Value::Bool(!options.target.is_gpt());
+                    *value = serde_json::Value::Bool(options.target.is_claude());
                 } else if gpt_identity_boolean && options.protects_private_runtime() {
                     *value = serde_json::Value::Bool(options.target.is_gpt());
                 } else if identity_name_field
@@ -814,17 +844,17 @@ pub fn sanitize_identity_json_value(
                         || (key != "product_name" && (value.is_null() || wrong_identity_value)))
                 {
                     *value = serde_json::Value::String(options.target.assistant_name().to_string());
-                } else if generic_identity_name_field && options.target.is_gpt() {
+                } else if generic_identity_name_field && !options.target.is_claude() {
                     *value = serde_json::Value::String(options.target.assistant_name().to_string());
                 } else if model_family_field
-                    && options.target.is_gpt()
+                    && !options.target.is_claude()
                     && (options.structured_identity_probe
                         || value.is_null()
                         || wrong_identity_value)
                 {
-                    *value = serde_json::Value::String("GPT".to_string());
+                    *value = serde_json::Value::String(options.target.model_family().to_string());
                 } else if exact_model_field
-                    && options.target.is_gpt()
+                    && !options.target.is_claude()
                     && options.structured_identity_probe
                 {
                     *value = serde_json::Value::String(options.target.model_name().to_string());
@@ -874,7 +904,7 @@ fn sanitize_gpt_structured_identity_output(
     text: &str,
     options: IdentitySanitizationOptions,
 ) -> Option<String> {
-    if !options.target.is_gpt()
+    if options.target.is_claude()
         || !options.structured_identity_probe
         || options.third_party_kiro_discussion
     {
@@ -923,7 +953,7 @@ fn contains_wrong_identity_value(text: &str, target: IdentityTarget) -> bool {
         return true;
     }
     let lower = text.to_ascii_lowercase();
-    target.is_gpt() && (lower.contains("claude") || lower.contains("anthropic"))
+    !target.is_claude() && (lower.contains("claude") || lower.contains("anthropic"))
 }
 
 fn looks_like_wrong_identity_label(text: &str, target: IdentityTarget) -> bool {
@@ -943,7 +973,7 @@ fn looks_like_wrong_identity_label(text: &str, target: IdentityTarget) -> bool {
             | "amazon web services"
             | "claude"
             | "anthropic"
-    ) && (target.is_gpt() || !matches!(normalized.as_str(), "claude" | "anthropic"))
+    ) && (!target.is_claude() || !matches!(normalized.as_str(), "claude" | "anthropic"))
 }
 
 /// 思维链(thinking / reasoning)通道**专用**身份清理。
@@ -1545,11 +1575,12 @@ fn replace_identity_term_ci(text: &str, needle: &str, replacement: &str) -> Stri
 }
 
 /// The mature sanitizer below intentionally normalizes private Kiro/AWS identity claims through
-/// Claude/Anthropic placeholders. GPT requests reuse its detection and streaming machinery, then
-/// retarget only protected first-person identity output. Identifier boundaries preserve schema
-/// keys such as `is_claude`, which are handled structurally by `sanitize_identity_json_value`.
+/// Claude/Anthropic placeholders. Non-Claude public models reuse its detection and streaming
+/// machinery, then retarget only protected first-person identity output. Identifier boundaries
+/// preserve schema keys such as `is_claude`, which are handled structurally by
+/// `sanitize_identity_json_value`.
 fn retarget_public_identity_text(text: &str, target: IdentityTarget) -> String {
-    if !target.is_gpt() {
+    if target.is_claude() {
         return text.to_string();
     }
 
@@ -1585,10 +1616,14 @@ fn retarget_public_identity_text(text: &str, target: IdentityTarget) -> String {
 }
 
 fn retarget_public_identity_plain_text(text: &str, target: IdentityTarget) -> String {
-    let out = replace_phrase_ci(text, "https://claude.ai", "https://openai.com");
-    let out = replace_phrase_ci(&out, "http://claude.ai", "https://openai.com");
-    let out = replace_phrase_ci(&out, "claude.ai", "openai.com");
-    let out = replace_phrase_ci(&out, "anthropic.com", "openai.com");
+    let out = if target.is_gpt() {
+        let out = replace_phrase_ci(text, "https://claude.ai", "https://openai.com");
+        let out = replace_phrase_ci(&out, "http://claude.ai", "https://openai.com");
+        let out = replace_phrase_ci(&out, "claude.ai", "openai.com");
+        replace_phrase_ci(&out, "anthropic.com", "openai.com")
+    } else {
+        text.to_string()
+    };
     let out = replace_identity_term_ci(&out, "Kiro", target.assistant_name());
     let out = replace_identity_term_ci(&out, "CodeWhisperer", target.assistant_name());
     let out = replace_identity_term_ci(&out, "AWS", target.provider_name());
@@ -1598,10 +1633,14 @@ fn retarget_public_identity_plain_text(text: &str, target: IdentityTarget) -> St
 }
 
 fn retarget_public_identity_prose(text: &str, target: IdentityTarget) -> String {
-    let out = replace_phrase_ci(text, "https://claude.ai", "https://openai.com");
-    let out = replace_phrase_ci(&out, "http://claude.ai", "https://openai.com");
-    let out = replace_phrase_ci(&out, "claude.ai", "openai.com");
-    let out = replace_phrase_ci(&out, "anthropic.com", "openai.com");
+    let out = if target.is_gpt() {
+        let out = replace_phrase_ci(text, "https://claude.ai", "https://openai.com");
+        let out = replace_phrase_ci(&out, "http://claude.ai", "https://openai.com");
+        let out = replace_phrase_ci(&out, "claude.ai", "openai.com");
+        replace_phrase_ci(&out, "anthropic.com", "openai.com")
+    } else {
+        text.to_string()
+    };
     let out = replace_phrase_ci(&out, "Amazon Web Services", target.provider_name());
     let out = replace_identity_term_ci(&out, "CodeWhisperer", target.assistant_name());
     let out = replace_identity_term_ci(&out, "Kiro", target.assistant_name());
@@ -5750,6 +5789,86 @@ fn split_before_last_chars(text: &str, hold_chars: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_weight_models_have_distinct_public_identity_targets() {
+        for (model, target, assistant, exact_model, provider) in [
+            (
+                "minimax-m2.5",
+                IdentityTarget::MiniMaxM25,
+                "MiniMax",
+                "MiniMax M2.5",
+                "MiniMax",
+            ),
+            (
+                "minimax-m2.1",
+                IdentityTarget::MiniMaxM25,
+                "MiniMax",
+                "MiniMax M2.5",
+                "MiniMax",
+            ),
+            ("glm-5", IdentityTarget::Glm5, "GLM", "GLM-5", "Z.ai"),
+            (
+                "deepseek-3.2",
+                IdentityTarget::DeepSeekV32,
+                "DeepSeek",
+                "DeepSeek V3.2",
+                "DeepSeek",
+            ),
+            (
+                "deepseek-v3.2",
+                IdentityTarget::DeepSeekV32,
+                "DeepSeek",
+                "DeepSeek V3.2",
+                "DeepSeek",
+            ),
+        ] {
+            let actual = IdentityTarget::for_model(model);
+            assert_eq!(actual, target, "model={model}");
+            assert_eq!(actual.assistant_name(), assistant);
+            assert_eq!(actual.model_name(), exact_model);
+            assert_eq!(actual.provider_name(), provider);
+            assert!(!actual.is_claude());
+            assert!(!actual.is_gpt());
+        }
+    }
+
+    #[test]
+    fn open_weight_identity_output_is_retargeted_away_from_claude_and_kiro() {
+        for (target, assistant, provider) in [
+            (IdentityTarget::MiniMaxM25, "MiniMax", "MiniMax"),
+            (IdentityTarget::Glm5, "GLM", "Z.ai"),
+            (IdentityTarget::DeepSeekV32, "DeepSeek", "DeepSeek"),
+        ] {
+            let mut options = IdentitySanitizationOptions::strict(true);
+            options.target = target;
+            let output = sanitize_identity_text_for_request_with_options(
+                "I'm Kiro, an AI assistant built by AWS. I am Claude, made by Anthropic.",
+                options,
+            );
+            let lower = output.to_ascii_lowercase();
+            assert!(
+                output.contains(assistant),
+                "target={target:?}, output={output}"
+            );
+            assert!(
+                output.contains(provider),
+                "target={target:?}, output={output}"
+            );
+            assert!(
+                !lower.contains("kiro"),
+                "target={target:?}, output={output}"
+            );
+            assert!(
+                !lower.contains("claude"),
+                "target={target:?}, output={output}"
+            );
+            assert!(
+                !lower.contains("anthropic"),
+                "target={target:?}, output={output}"
+            );
+        }
+    }
 
     #[test]
     fn thinking_sanitizer_neutralizes_self_kiro_reasoning() {

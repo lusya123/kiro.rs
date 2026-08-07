@@ -809,6 +809,12 @@ pub struct StreamContext {
     output_token_limit_reached: bool,
     /// 已收到的上游助手原始文本，用于 max_tokens 截断后的续写上下文
     pub assistant_raw_content: String,
+    /// Native reasoning generated during the current upstream invocation.
+    /// Kept independently from the client-visible thinking buffer so hidden
+    /// reasoning can still be removed from end-of-turn context occupancy.
+    upstream_reasoning_current_round: String,
+    /// Raw tool argument bytes generated during the current invocation.
+    upstream_tool_input_current_round: String,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 后端 tool_use_id(`toolu_bdrk_…`)→ 对客户端暴露的 Anthropic 形态 id(`toolu_01…`)。
@@ -852,6 +858,16 @@ pub struct StreamContext {
     /// 首轮确实收到 contextUsageEvent 时保留其校准后总量。`None` 不能用本地
     /// 虚拟缓存估算冒充权威值。
     first_round_authoritative_input_tokens: Option<i32>,
+    /// Exact cache/input split from `metadataEvent.tokenUsage`, when the
+    /// selected Kiro runtime exposes it.
+    exact_first_round_usage: Option<super::cache::UsageBreakdown>,
+    /// Exact aggregate input/output for the invocation currently streaming.
+    exact_current_input_tokens: Option<i32>,
+    exact_current_output_tokens: Option<i32>,
+    /// Exact output accumulated across completed continuation rounds.  The
+    /// boolean stays false once any round lacks native output accounting.
+    exact_completed_output_tokens: i32,
+    exact_output_complete_for_prior_rounds: bool,
     /// 疑似截断探测续写时吞掉完成哨兵，避免把内部控制文本发给客户端
     swallow_complete_sentinel_probe: bool,
     /// 探测完成哨兵可能被上游拆成多个 chunk，需要短暂缓冲确认
@@ -939,6 +955,8 @@ impl StreamContext {
             output_token_limit: None,
             output_token_limit_reached: false,
             assistant_raw_content: String::new(),
+            upstream_reasoning_current_round: String::new(),
+            upstream_tool_input_current_round: String::new(),
             tool_block_indices: HashMap::new(),
             tool_output_ids: HashMap::new(),
             tool_json_pending: HashMap::new(),
@@ -958,6 +976,11 @@ impl StreamContext {
             initial_usage_breakdown,
             input_context_calibration: super::bedrock::InputContextCalibration::default(),
             first_round_authoritative_input_tokens: None,
+            exact_first_round_usage: None,
+            exact_current_input_tokens: None,
+            exact_current_output_tokens: None,
+            exact_completed_output_tokens: 0,
+            exact_output_complete_for_prior_rounds: true,
             swallow_complete_sentinel_probe: false,
             complete_sentinel_probe_buffer: String::new(),
             continuation_merge_tail: None,
@@ -1212,7 +1235,12 @@ impl StreamContext {
         // A context event can arrive after the visible output has already hit
         // max_tokens. It is still authoritative billing data and must not be
         // discarded with later content events.
-        if self.output_token_limit_reached && !matches!(event, Event::ContextUsage(_)) {
+        if self.output_token_limit_reached
+            && !matches!(
+                event,
+                Event::ContextUsage(_) | Event::Metadata(_) | Event::Metering(_)
+            )
+        {
             return Vec::new();
         }
 
@@ -1283,7 +1311,43 @@ impl StreamContext {
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
                 Vec::new()
             }
-            Event::Metering(_) => Vec::new(),
+            Event::Metering(metering) => {
+                if self.exact_current_input_tokens.is_none() && metering.input_tokens > 0 {
+                    self.exact_current_input_tokens = Some(metering.input_tokens);
+                }
+                if self.exact_current_output_tokens.is_none() && metering.output_tokens > 0 {
+                    self.exact_current_output_tokens = Some(metering.output_tokens);
+                }
+                tracing::debug!(
+                    input_tokens = metering.input_tokens,
+                    output_tokens = metering.output_tokens,
+                    usage = metering.usage,
+                    "收到 meteringEvent"
+                );
+                Vec::new()
+            }
+            Event::Metadata(metadata) => {
+                let usage = &metadata.token_usage;
+                if let Some(exact) = super::cache::UsageBreakdown::from_exact_token_usage(
+                    self.initial_usage_breakdown,
+                    usage,
+                ) {
+                    self.exact_current_input_tokens = Some(exact.total());
+                    self.exact_current_output_tokens = Some(usage.output_tokens);
+                    if !self.continuation_started {
+                        self.exact_first_round_usage = Some(exact);
+                    }
+                }
+                tracing::debug!(
+                    uncached_input_tokens = usage.uncached_input_tokens,
+                    cache_read_input_tokens = usage.cache_read_input_tokens,
+                    cache_write_input_tokens = usage.cache_write_input_tokens,
+                    output_tokens = usage.output_tokens,
+                    total_tokens = usage.total_tokens,
+                    "收到 metadataEvent"
+                );
+                Vec::new()
+            }
         }
     }
 
@@ -1538,6 +1602,7 @@ impl StreamContext {
                     cumulative_event_delta(&reasoning.text, &self.native_reasoning_last_chunk);
                 self.native_reasoning_last_chunk = reasoning.text.clone();
                 if !delta.is_empty() {
+                    self.upstream_reasoning_current_round.push_str(&delta);
                     self.thinking_tokens += estimate_tokens(&delta);
                     self.thinking_text_acc.push_str(&delta);
                 }
@@ -1558,6 +1623,7 @@ impl StreamContext {
             let delta = cumulative_event_delta(&reasoning.text, &self.native_reasoning_last_chunk);
             self.native_reasoning_last_chunk = reasoning.text.clone();
             if !delta.is_empty() {
+                self.upstream_reasoning_current_round.push_str(&delta);
                 if !self.native_reasoning_active {
                     events.extend(self.start_native_reasoning_block());
                 }
@@ -2007,6 +2073,10 @@ impl StreamContext {
         &mut self,
         tool_use: &crate::kiro::model::events::ToolUseEvent,
     ) -> Vec<SseEvent> {
+        if !tool_use.input.is_empty() {
+            self.upstream_tool_input_current_round
+                .push_str(&tool_use.input);
+        }
         if self.output_token_limit_reached {
             return Vec::new();
         }
@@ -2406,14 +2476,23 @@ impl StreamContext {
     }
 
     fn current_billable_input_tokens(&self) -> i32 {
+        if let Some(exact) = self.exact_current_input_tokens {
+            return exact.max(1);
+        }
+        let context_input_tokens = super::bedrock::context_input_without_current_generation(
+            self.context_input_tokens,
+            &self.assistant_raw_content,
+            &self.upstream_reasoning_current_round,
+            &self.upstream_tool_input_current_round,
+        );
         if self.aws_b40_compat {
             self.input_context_calibration.calibrate(
                 &self.model,
                 self.input_tokens,
-                self.context_input_tokens,
+                context_input_tokens,
             )
         } else {
-            super::billing::billable_input_tokens(self.input_tokens, self.context_input_tokens)
+            super::billing::billable_input_tokens(self.input_tokens, context_input_tokens)
         }
     }
 
@@ -2421,12 +2500,26 @@ impl StreamContext {
         self.final_usage_breakdown_uncapped()
     }
 
+    fn exact_total_output_tokens(&self) -> Option<i32> {
+        if !self.continuation_started {
+            return self.exact_current_output_tokens;
+        }
+        if !self.exact_output_complete_for_prior_rounds {
+            return None;
+        }
+        self.exact_current_output_tokens.map(|current| {
+            self.exact_completed_output_tokens
+                .saturating_add(current.max(0))
+        })
+    }
+
     fn final_usage_breakdown_uncapped(&self) -> super::cache::UsageBreakdown {
         let current_input_tokens = self.current_billable_input_tokens();
         let authoritative_first_round_input_tokens = if self.continuation_started {
             self.first_round_authoritative_input_tokens
         } else {
-            self.context_input_tokens.map(|_| current_input_tokens)
+            (self.exact_current_input_tokens.is_some() || self.context_input_tokens.is_some())
+                .then_some(current_input_tokens)
         };
         let mut additional_round_input_tokens = self.additional_round_input_tokens.clone();
         if self.continuation_started {
@@ -2438,16 +2531,29 @@ impl StreamContext {
                     .cache_input_adjustment(self.initial_input_tokens, first_round_input_tokens)
             })
             .unwrap_or(0);
-        let usage = super::cache::finalize_request_usage(
-            self.initial_usage_breakdown,
-            authoritative_first_round_input_tokens,
-            self.initial_input_tokens,
-            &additional_round_input_tokens,
-            ordinary_input_adjustment,
-            &self.model,
-            self.aws_b40_compat,
-        );
-        if self.aws_b40_compat && !self.continuation_started && !self.upstream_fatal_event {
+        let usage = if let Some(mut exact) = self.exact_first_round_usage {
+            exact.input_tokens = additional_round_input_tokens
+                .iter()
+                .fold(exact.input_tokens, |total, round| {
+                    total.saturating_add((*round).max(1))
+                });
+            exact
+        } else {
+            super::cache::finalize_request_usage(
+                self.initial_usage_breakdown,
+                authoritative_first_round_input_tokens,
+                self.initial_input_tokens,
+                &additional_round_input_tokens,
+                ordinary_input_adjustment,
+                &self.model,
+                self.aws_b40_compat,
+            )
+        };
+        if self.exact_first_round_usage.is_none()
+            && self.aws_b40_compat
+            && !self.continuation_started
+            && !self.upstream_fatal_event
+        {
             self.input_context_calibration
                 .calibrate_authoritative_direct_catalog_usage(
                     &self.model,
@@ -2663,10 +2769,22 @@ impl StreamContext {
         let uncapped_output_tokens = visible_output_tokens
             + thinking_usage_tokens
             + if thinking_usage_tokens > 0 { 2 } else { 0 };
-        let final_output_tokens = self
+        let locally_counted_output_tokens = self
             .output_token_limit
             .map(|limit| uncapped_output_tokens.min(limit.max(1)))
             .unwrap_or(uncapped_output_tokens);
+        let final_output_tokens =
+            if !self.output_token_limit_reached && !forced_application_identity {
+                self.exact_total_output_tokens()
+                    .map(|exact| {
+                        self.output_token_limit
+                            .map(|limit| exact.min(limit.max(1)))
+                            .unwrap_or(exact)
+                    })
+                    .unwrap_or(locally_counted_output_tokens)
+            } else {
+                locally_counted_output_tokens
+            };
         if self
             .output_token_limit
             .is_some_and(|limit| final_output_tokens >= limit.max(1))
@@ -2763,11 +2881,23 @@ impl StreamContext {
                 .push(current_input_tokens);
         } else {
             self.first_round_authoritative_input_tokens =
-                self.context_input_tokens.map(|_| current_input_tokens);
+                (self.exact_current_input_tokens.is_some() || self.context_input_tokens.is_some())
+                    .then_some(current_input_tokens);
             self.continuation_started = true;
+        }
+        if let Some(output_tokens) = self.exact_current_output_tokens {
+            self.exact_completed_output_tokens = self
+                .exact_completed_output_tokens
+                .saturating_add(output_tokens.max(0));
+        } else {
+            self.exact_output_complete_for_prior_rounds = false;
         }
         self.input_tokens = next_estimated_input_tokens.max(1);
         self.context_input_tokens = None;
+        self.exact_current_input_tokens = None;
+        self.exact_current_output_tokens = None;
+        self.upstream_reasoning_current_round.clear();
+        self.upstream_tool_input_current_round.clear();
     }
 
     #[allow(dead_code)]
@@ -2783,6 +2913,13 @@ impl StreamContext {
     pub fn mark_upstream_fatal_event(&mut self) {
         self.upstream_fatal_event = true;
         self.state_manager.set_stop_reason("max_tokens");
+    }
+
+    /// A cache prefix becomes warm only after a complete, non-fatal upstream
+    /// invocation.  HTTP 200 alone is insufficient because Kiro may carry an
+    /// error or exception inside the EventStream body.
+    pub fn upstream_succeeded_for_cache(&self) -> bool {
+        !self.upstream_fatal_event
     }
 
     fn apply_output_token_limit(&mut self, text: &str) -> Option<String> {
@@ -3053,6 +3190,10 @@ impl BufferedStreamContext {
     pub fn begin_continuation_for_billing(&mut self, next_estimated_input_tokens: i32) {
         self.inner
             .begin_continuation_for_billing(next_estimated_input_tokens);
+    }
+
+    pub fn upstream_succeeded_for_cache(&self) -> bool {
+        self.inner.upstream_succeeded_for_cache()
     }
 
     #[allow(dead_code)]
@@ -3775,7 +3916,7 @@ mod tests {
     }
 
     #[test]
-    fn aws_b_final_usage_reconciles_inflated_cache_to_context_event() {
+    fn aws_b_context_event_never_resizes_an_impossible_cache_prefix() {
         let payload =
             serde_json::from_value::<super::super::types::MessagesRequest>(serde_json::json!({
                 "model": "claude-opus-4-8",
@@ -3805,13 +3946,10 @@ mod tests {
 
         let usage = ctx.final_usage_breakdown();
 
-        assert_eq!(usage.total(), 522_479);
-        assert_eq!(usage.input_tokens, 7);
-        assert_eq!(usage.cache_creation_input_tokens, 522_472);
-        assert_ne!(usage.cache_creation_input_tokens, 999_999);
         assert_eq!(
-            usage.cache_creation_5m_input_tokens + usage.cache_creation_1h_input_tokens,
-            usage.cache_creation_input_tokens
+            usage,
+            super::super::cache::UsageBreakdown::flat(1),
+            "an impossible local prefix must be held, not resized from end-of-turn context occupancy"
         );
     }
 
@@ -3917,9 +4055,9 @@ mod tests {
 
         assert_eq!(ctx.context_input_tokens, Some(600_000));
         let usage = ctx.final_usage_breakdown();
-        assert_eq!(usage.total(), 593_150);
+        assert_eq!(usage.total(), 500_000);
         assert_eq!(usage.input_tokens, 2);
-        assert_eq!(usage.cache_creation_input_tokens, 593_148);
+        assert_eq!(usage.cache_creation_input_tokens, 499_998);
     }
 
     #[test]
