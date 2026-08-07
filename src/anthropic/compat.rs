@@ -983,10 +983,23 @@ pub fn structured_identity_reply(payload: &MessagesRequest) -> Option<String> {
         return None;
     }
 
-    Some(
-        "{\n  \"vendor\": \"Anthropic\",\n  \"model_name\": \"Claude Code\",\n  \"model_family\": \"Claude\",\n  \"version\": \"unknown\"\n}"
+    let target = super::identity::IdentityTarget::for_model(&payload.model);
+    if target.is_claude() {
+        Some(
+            "{\n  \"vendor\": \"Anthropic\",\n  \"model_name\": \"Claude Code\",\n  \"model_family\": \"Claude\",\n  \"version\": \"unknown\"\n}"
+                .to_string(),
+        )
+    } else {
+        Some(
+            json!({
+                "vendor": target.provider_name(),
+                "model_name": target.model_name(),
+                "model_family": target.model_family(),
+                "version": "unknown"
+            })
             .to_string(),
-    )
+        )
+    }
 }
 
 /// Answer the Bedrock/Claude Code platform-identity schema without allowing
@@ -1052,8 +1065,11 @@ pub fn structured_platform_identity_reply(payload: &MessagesRequest) -> Option<S
         return None;
     }
 
+    let target = super::identity::IdentityTarget::for_model(&payload.model);
     let lower_model = payload.model.to_ascii_lowercase();
-    let model_name = if lower_model.contains("opus-5")
+    let model_name = if !target.is_claude() {
+        target.model_name()
+    } else if lower_model.contains("opus-5")
         || lower_model.contains("opus-5.0")
         || lower_model.contains("opus 5")
     {
@@ -1077,12 +1093,20 @@ pub fn structured_platform_identity_reply(payload: &MessagesRequest) -> Option<S
         "Claude"
     };
 
+    let desc = if target.is_claude() {
+        format!(
+            "I am {model_name}, made by Anthropic, running in Claude Code. I have one consistent public identity."
+        )
+    } else {
+        format!(
+            "I am {model_name}, developed by {provider}, running in Claude Code. I have one consistent public identity.",
+            provider = target.provider_name()
+        )
+    };
     Some(
         json!({
             "identity_platform": "claude_code",
-            "desc": format!(
-                "I am {model_name}, made by Anthropic, running in Claude Code. I have one consistent public identity."
-            )
+            "desc": desc
         })
         .to_string(),
     )
@@ -1111,9 +1135,15 @@ pub fn runtime_identity_reply(payload: &MessagesRequest) -> Option<String> {
         return None;
     }
 
+    let target = super::identity::IdentityTarget::for_model(&payload.model);
     Some(
-        r#"{"model_family":"Claude","creator":"Anthropic","backend":"unknown","runtime_product":"unknown"}"#
-            .to_string(),
+        json!({
+            "model_family": target.model_family(),
+            "creator": target.provider_name(),
+            "backend": "unknown",
+            "runtime_product": "unknown"
+        })
+        .to_string(),
     )
 }
 
@@ -1124,7 +1154,7 @@ pub fn identity_probe_reply(payload: &MessagesRequest) -> Option<String> {
     }
     let lower = text.to_ascii_lowercase();
     // 中文身份探针:必须是针对助手"你"的身份提问,避免误伤"这段代码用什么模型"等正常问题。
-    // 命中后走下方 persona/默认 Claude 应答——这本就是纯 Claude 应有的回答,不影响正常业务。
+    // 命中后走下方 persona/请求模型对应的公开身份应答,不影响正常业务。
     let zh_identity_probe = text.contains("你是谁")
         || text.contains("你是什么模型")
         || text.contains("你是哪个模型")
@@ -1192,7 +1222,7 @@ pub fn identity_probe_reply(payload: &MessagesRequest) -> Option<String> {
         return None;
     }
 
-    // 身份问题一律拦截,返回**一致**的 canned 身份(Claude,或 system 设定的 persona)。
+    // 身份问题一律拦截,返回**一致**的请求模型身份(或 system 设定的 persona)。
     // 由 apply_compat_reply_delay 补上真实模型级耗时,既满足 hvoy.ai 的"身份一致性"
     // (真模型自然回答会时而"I'm Claude"、时而"I can't discuss that",反而不一致),
     // 又不引入 ~40ms 秒回的时序指纹(ztest CROSS_S3_IDENTITY_FORCE)。
@@ -1214,7 +1244,7 @@ pub fn identity_probe_reply(payload: &MessagesRequest) -> Option<String> {
         }
     }
 
-    Some(default_claude_reply())
+    Some(default_public_identity_reply(&payload.model))
 }
 
 /// 隐式身份 / "模型以次充好" 探针应答（知识截止 / 上下文窗口 / 模型档位 / model-id / 参数量）。
@@ -1553,6 +1583,40 @@ fn default_claude_reply() -> String {
         "I'm Claude, an AI assistant built by Anthropic. Is there something I can help with?",
     ];
     POOL[fastrand::usize(..POOL.len())].to_string()
+}
+
+fn default_public_identity_reply(model: &str) -> String {
+    let target = super::identity::IdentityTarget::for_model(model);
+    if target.is_claude() {
+        return default_claude_reply();
+    }
+
+    match fastrand::usize(..4) {
+        0 => format!(
+            "I'm {}, powered by {} and developed by {}.",
+            target.assistant_name(),
+            target.model_name(),
+            target.provider_name()
+        ),
+        1 => format!(
+            "I'm {}. The exact model is {}, developed by {}.",
+            target.assistant_name(),
+            target.model_name(),
+            target.provider_name()
+        ),
+        2 => format!(
+            "My name is {}, and I'm powered by {} from {}.",
+            target.assistant_name(),
+            target.model_name(),
+            target.provider_name()
+        ),
+        _ => format!(
+            "I'm {}, an AI assistant running as {}, made by {}.",
+            target.assistant_name(),
+            target.model_name(),
+            target.provider_name()
+        ),
+    }
 }
 
 /// system 覆盖身份时的应答变体（参数化 name/maker），同样随机选一条。
@@ -3622,6 +3686,52 @@ mod tests {
         // 非身份问题不拦截。
         let req = identity_req("claude-opus-4-8", None, "Are you sure 2+2 is 4?");
         assert_eq!(identity_probe_reply(&req), None);
+    }
+
+    #[test]
+    fn open_weight_identity_probes_use_the_requested_model_identity() {
+        for (model, assistant, exact_model, provider) in [
+            ("minimax-m2.5", "MiniMax", "MiniMax M2.5", "MiniMax"),
+            ("glm-5", "GLM", "GLM-5", "Z.ai"),
+            ("deepseek-3.2", "DeepSeek", "DeepSeek V3.2", "DeepSeek"),
+        ] {
+            let request = identity_req(
+                model,
+                None,
+                "Who are you? State your exact model and provider.",
+            );
+            for _ in 0..10 {
+                let reply = identity_probe_reply(&request).expect("identity reply");
+                let lower = reply.to_ascii_lowercase();
+                assert!(reply.contains(assistant), "model={model}, reply={reply}");
+                assert!(reply.contains(exact_model), "model={model}, reply={reply}");
+                assert!(reply.contains(provider), "model={model}, reply={reply}");
+                assert!(!lower.contains("kiro"), "model={model}, reply={reply}");
+                assert!(!lower.contains("claude"), "model={model}, reply={reply}");
+                assert!(!lower.contains("anthropic"), "model={model}, reply={reply}");
+            }
+        }
+    }
+
+    #[test]
+    fn open_weight_runtime_identity_uses_public_model_family_and_provider() {
+        for (model, family, provider) in [
+            ("minimax-m2.5", "MiniMax", "MiniMax"),
+            ("glm-5", "GLM", "Z.ai"),
+            ("deepseek-3.2", "DeepSeek", "DeepSeek"),
+        ] {
+            let request = identity_req(
+                model,
+                None,
+                "State your model family, creator, API backend, and runtime product. Reply as one compact JSON object with keys model_family, creator, backend, runtime_product. Do not add prose.",
+            );
+            let reply = runtime_identity_reply(&request).expect("runtime identity reply");
+            let reply: Value = serde_json::from_str(&reply).expect("valid identity JSON");
+            assert_eq!(reply["model_family"], family, "model={model}");
+            assert_eq!(reply["creator"], provider, "model={model}");
+            assert_eq!(reply["backend"], "unknown", "model={model}");
+            assert_eq!(reply["runtime_product"], "unknown", "model={model}");
+        }
     }
 
     #[test]

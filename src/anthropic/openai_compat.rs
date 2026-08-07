@@ -1333,6 +1333,9 @@ pub async fn post_chat_completions(
     let mr = MessagesRequest {
         model: model.clone(),
         max_tokens,
+        temperature: None,
+        top_p: None,
+        top_k: None,
         messages,
         stream: stream_requested,
         system: if system.is_empty() {

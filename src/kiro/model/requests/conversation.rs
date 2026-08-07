@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::tool::{Tool, ToolResult, ToolUseEntry};
+use super::tool::{CachePoint, Tool, ToolResult, ToolUseEntry};
 
 /// 对话状态
 ///
@@ -108,6 +108,9 @@ pub struct UserInputMessage {
     /// 消息来源（通常为 "AI_EDITOR"）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// Cache the prompt prefix through this message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_point: Option<CachePoint>,
 }
 
 impl UserInputMessage {
@@ -120,6 +123,7 @@ impl UserInputMessage {
             images: Vec::new(),
             documents: Vec::new(),
             origin: Some("AI_EDITOR".to_string()),
+            cache_point: None,
         }
     }
 
@@ -144,6 +148,11 @@ impl UserInputMessage {
     /// 设置来源
     pub fn with_origin(mut self, origin: impl Into<String>) -> Self {
         self.origin = Some(origin.into());
+        self
+    }
+
+    pub fn with_cache_point(mut self, cache_point: CachePoint) -> Self {
+        self.cache_point = Some(cache_point);
         self
     }
 }
@@ -286,6 +295,9 @@ pub struct UserMessage {
     /// 用户输入消息上下文
     #[serde(default, skip_serializing_if = "is_default_context")]
     pub user_input_message_context: UserInputMessageContext,
+    /// Cache the prompt prefix through this history message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_point: Option<CachePoint>,
 }
 
 fn is_default_context(ctx: &UserInputMessageContext) -> bool {
@@ -302,6 +314,7 @@ impl UserMessage {
             images: Vec::new(),
             documents: Vec::new(),
             user_input_message_context: UserInputMessageContext::default(),
+            cache_point: None,
         }
     }
 
@@ -320,6 +333,11 @@ impl UserMessage {
     /// 设置上下文
     pub fn with_context(mut self, context: UserInputMessageContext) -> Self {
         self.user_input_message_context = context;
+        self
+    }
+
+    pub fn with_cache_point(mut self, cache_point: CachePoint) -> Self {
+        self.cache_point = Some(cache_point);
         self
     }
 }
@@ -350,6 +368,9 @@ pub struct AssistantMessage {
     /// 工具使用列表
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_uses: Option<Vec<ToolUseEntry>>,
+    /// Cache the prompt prefix through this assistant history message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_point: Option<CachePoint>,
 }
 
 impl AssistantMessage {
@@ -358,12 +379,18 @@ impl AssistantMessage {
         Self {
             content: content.into(),
             tool_uses: None,
+            cache_point: None,
         }
     }
 
     /// 设置工具使用
     pub fn with_tool_uses(mut self, tool_uses: Vec<ToolUseEntry>) -> Self {
         self.tool_uses = Some(tool_uses);
+        self
+    }
+
+    pub fn with_cache_point(mut self, cache_point: CachePoint) -> Self {
+        self.cache_point = Some(cache_point);
         self
     }
 }

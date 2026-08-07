@@ -5,11 +5,18 @@
 mod assistant;
 mod base;
 mod context_usage;
+mod metadata;
+mod metering;
 mod reasoning;
 mod tool_use;
 
 pub use assistant::AssistantResponseEvent;
 pub use base::Event;
 pub use context_usage::ContextUsageEvent;
+// Keep raw payload models public so downstream code can distinguish ordinary
+// uncached input from total logical input without re-parsing EventStream JSON.
+#[allow(unused_imports)]
+pub use metadata::{MetadataEvent, TokenUsage};
+pub use metering::MeteringEvent;
 pub use reasoning::ReasoningContentEvent;
 pub use tool_use::ToolUseEvent;

@@ -453,6 +453,7 @@ fn build_continuation_request_body(
             images: current.images,
             documents: current.documents,
             user_input_message_context: current.user_input_message_context,
+            cache_point: current.cache_point,
         },
     };
     request
@@ -2316,7 +2317,7 @@ pub async fn get_models(State(state): State<AppState>, RawQuery(raw_query): RawQ
     }
 
     // Anthropic 原生 `/v1/models`：每条仅 `type/id/display_name/created_at`。
-    // 列出公开支持的 Claude 与 GPT 模型；glm-5/minimax 等兼容模型仍可按名直接调用。
+    // 列出公开支持的 Claude、GPT 与 DeepSeek 模型；glm-5/minimax 等兼容模型仍可按名直接调用。
     // 源数据用 (id, display_name, created_unix) 表示，序列化时把 unix 转成 RFC3339 字符串。
     const CATALOG: &[(&str, &str, i64)] = &[
         ("claude-opus-5", "Claude Opus 5", 1784937600),
@@ -2346,6 +2347,11 @@ pub async fn get_models(State(state): State<AppState>, RawQuery(raw_query): RawQ
             super::converter::GPT_56_LUNA_MODEL_ID,
             "GPT 5.6 Luna",
             1785024000,
+        ),
+        (
+            super::converter::DEEPSEEK_V32_MODEL_ID,
+            "DeepSeek V3.2",
+            1785542400,
         ),
         ("claude-opus-4-8", "Claude Opus 4.8", 1779897600),
         (
@@ -2454,6 +2460,9 @@ pub async fn post_messages(
         return response;
     }
     if let Some(response) = reject_invalid_model_reasoning(&payload) {
+        return response;
+    }
+    if let Some(response) = reject_invalid_opus_48_sampling(&payload, aws_b40_compat) {
         return response;
     }
 
@@ -2682,6 +2691,10 @@ pub async fn post_messages(
         return response;
     }
 
+    // Usage planning is read-only.  Carry the exact prefix keys into the real
+    // upstream path and mark them warm only after that invocation completes.
+    let cache_commit = super::cache::prepare_cache_commit(input_tokens, &payload, aws_b40_compat);
+
     // 检查是否启用了 thinking，以及是否向客户端暴露 thinking 块。
     let thinking_enabled = payload
         .thinking
@@ -2720,6 +2733,7 @@ pub async fn post_messages(
             aws_b40_compat,
             aws_b40_adaptive_signature,
             aws_b40_thinking_requested,
+            cache_commit,
         )
         .await
     } else {
@@ -2744,6 +2758,7 @@ pub async fn post_messages(
             tool_choice_forces_tool(&payload),
             aws_b40_compat,
             aws_b40_adaptive_signature,
+            cache_commit,
         )
         .await
     }
@@ -2769,6 +2784,7 @@ async fn handle_stream_request(
     aws_b40_compat: bool,
     aws_b40_adaptive_signature: bool,
     aws_b40_thinking_requested: bool,
+    cache_commit: super::cache::CacheCommit,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let upstream_started = Instant::now();
@@ -2827,6 +2843,7 @@ async fn handle_stream_request(
         request_body.to_string(),
         requested_max_tokens,
         aws_b40_compat,
+        cache_commit,
     );
 
     // 返回 SSE 响应
@@ -2859,6 +2876,7 @@ fn create_sse_stream(
     request_body: String,
     requested_max_tokens: i32,
     aws_b40_compat: bool,
+    cache_commit: super::cache::CacheCommit,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -2886,6 +2904,7 @@ fn create_sse_stream(
             request_body,
             0usize,
             max_continuation_rounds,
+            Some(cache_commit),
         ),
         move |(
             mut body_stream,
@@ -2897,6 +2916,7 @@ fn create_sse_stream(
             request_body,
             continuation_round,
             max_continuation_rounds,
+            mut cache_commit,
         )| async move {
             if finished {
                 return None;
@@ -2942,7 +2962,7 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds, cache_commit)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
@@ -2953,7 +2973,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds, cache_commit)))
                         }
                         None => {
                             let mut continuation_reason = "unknown";
@@ -2964,6 +2984,11 @@ fn create_sse_stream(
                                 );
                                 ctx.mark_upstream_truncated();
                                 continuation_reason = "pending_frame";
+                            }
+                            if continuation_round == 0 && ctx.upstream_succeeded_for_cache() {
+                                if let Some(commit) = cache_commit.take() {
+                                    commit.commit().await;
+                                }
                             }
                             if continuation_round < max_continuation_rounds
                                 && ctx.should_auto_continue(requested_max_tokens)
@@ -3020,6 +3045,7 @@ fn create_sse_stream(
                                                     next_request_body,
                                                     continuation_round + 1,
                                                     max_continuation_rounds,
+                                                    cache_commit,
                                                 ),
                                             ));
                                         }
@@ -3035,7 +3061,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds, cache_commit)))
                         }
                     }
                 }
@@ -3044,7 +3070,7 @@ fn create_sse_stream(
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> =
                         vec![Ok(create_ping_sse(aws_b40_compat))];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds, cache_commit)))
                 }
             }
         },
@@ -3076,6 +3102,7 @@ async fn handle_non_stream_request(
     force_tool_only: bool,
     aws_b40_compat: bool,
     aws_b40_adaptive_signature: bool,
+    cache_commit: super::cache::CacheCommit,
 ) -> Response {
     let mut text_content = String::new();
     let mut native_thinking_content = String::new();
@@ -3088,6 +3115,10 @@ async fn handle_non_stream_request(
     let mut first_round_authoritative_input_tokens: Option<i32> = None;
     let mut additional_round_input_tokens = Vec::new();
     let mut upstream_fatal_error: Option<&'static str> = None;
+    let mut cache_commit = Some(cache_commit);
+    let mut exact_first_round_usage: Option<super::cache::UsageBreakdown> = None;
+    let mut exact_output_tokens = 0i32;
+    let mut all_rounds_have_exact_output = true;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -3108,6 +3139,9 @@ async fn handle_non_stream_request(
             estimate_kiro_request_input_tokens(&current_request_body, input_tokens)
         };
         let mut round_context_input_tokens: Option<i32> = None;
+        let mut round_exact_input_tokens: Option<i32> = None;
+        let mut round_exact_output_tokens: Option<i32> = None;
+        let mut round_exact_usage: Option<super::cache::UsageBreakdown> = None;
 
         let response = match provider.call_api(&current_request_body).await {
             Ok(resp) => resp,
@@ -3136,6 +3170,9 @@ async fn handle_non_stream_request(
         }
 
         let mut chunk_text_content = String::new();
+        let mut round_assistant_generated = String::new();
+        let mut round_reasoning_generated = String::new();
+        let mut round_tool_input_generated = String::new();
         let mut round_has_assistant_content = false;
         let mut round_reasoning_previous = String::new();
         stop_reason = "end_turn".to_string();
@@ -3160,6 +3197,7 @@ async fn handle_non_stream_request(
                                 );
                                 round_reasoning_previous = reasoning.text;
                                 native_thinking_content.push_str(&delta);
+                                round_reasoning_generated.push_str(&delta);
                             }
                             if !reasoning.signature.is_empty() {
                                 upstream_thinking_signature = Some(reasoning.signature);
@@ -3169,6 +3207,7 @@ async fn handle_non_stream_request(
                             }
                         }
                         Event::AssistantResponse(resp) => {
+                            round_assistant_generated.push_str(&resp.content);
                             let content = if continuation_round > 0 && !round_has_assistant_content
                             {
                                 super::stream::merge_continuation_text(&text_content, &resp.content)
@@ -3183,6 +3222,7 @@ async fn handle_non_stream_request(
                         }
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
+                            round_tool_input_generated.push_str(&tool_use.input);
 
                             // 累积工具的 JSON 输入
                             let buffer = tool_json_buffers
@@ -3259,6 +3299,27 @@ async fn handle_non_stream_request(
                                 actual_input_tokens
                             );
                         }
+                        Event::Metadata(metadata) => {
+                            if let Some(exact) =
+                                super::cache::UsageBreakdown::from_exact_token_usage(
+                                    initial_usage_breakdown,
+                                    &metadata.token_usage,
+                                )
+                            {
+                                round_exact_input_tokens = Some(exact.total());
+                                round_exact_output_tokens =
+                                    Some(metadata.token_usage.output_tokens);
+                                round_exact_usage = Some(exact);
+                            }
+                        }
+                        Event::Metering(metering) => {
+                            if round_exact_input_tokens.is_none() && metering.input_tokens > 0 {
+                                round_exact_input_tokens = Some(metering.input_tokens);
+                            }
+                            if round_exact_output_tokens.is_none() && metering.output_tokens > 0 {
+                                round_exact_output_tokens = Some(metering.output_tokens);
+                            }
+                        }
                         Event::Error { .. } => {
                             upstream_fatal_error = Some("upstream model error");
                         }
@@ -3294,11 +3355,25 @@ async fn handle_non_stream_request(
             upstream_fatal_error = Some("truncated upstream event stream");
         }
 
+        if continuation_round == 0 && upstream_fatal_error.is_none() {
+            if let Some(commit) = cache_commit.take() {
+                commit.commit().await;
+            }
+        }
+
         if has_tool_use && stop_reason == "end_turn" {
             stop_reason = "tool_use".to_string();
         }
 
-        let round_input_tokens = if continuation_round == 0 && aws_b40_compat {
+        let round_context_input_tokens = super::bedrock::context_input_without_current_generation(
+            round_context_input_tokens,
+            &round_assistant_generated,
+            &round_reasoning_generated,
+            &round_tool_input_generated,
+        );
+        let round_input_tokens = if let Some(exact) = round_exact_input_tokens {
+            exact.max(1)
+        } else if continuation_round == 0 && aws_b40_compat {
             input_context_calibration.calibrate(
                 model,
                 round_estimated_input_tokens,
@@ -3312,10 +3387,17 @@ async fn handle_non_stream_request(
         };
         if continuation_round == 0 {
             first_round_input_tokens = round_input_tokens;
-            first_round_authoritative_input_tokens =
-                round_context_input_tokens.map(|_| round_input_tokens);
+            first_round_authoritative_input_tokens = (round_exact_input_tokens.is_some()
+                || round_context_input_tokens.is_some())
+            .then_some(round_input_tokens);
+            exact_first_round_usage = round_exact_usage;
         } else {
             additional_round_input_tokens.push(round_input_tokens);
+        }
+        if let Some(output_tokens) = round_exact_output_tokens {
+            exact_output_tokens = exact_output_tokens.saturating_add(output_tokens.max(0));
+        } else {
+            all_rounds_have_exact_output = false;
         }
 
         if is_continuation_complete_sentinel(&chunk_text_content) {
@@ -3403,16 +3485,26 @@ async fn handle_non_stream_request(
             input_context_calibration.cache_input_adjustment(input_tokens, authoritative)
         })
         .unwrap_or(0);
-    let usage_breakdown = super::cache::finalize_request_usage(
-        initial_usage_breakdown,
-        first_round_authoritative_input_tokens,
-        first_round_input_tokens,
-        &additional_round_input_tokens,
-        ordinary_input_adjustment,
-        model,
-        aws_b40_compat,
-    );
-    let usage_breakdown = if aws_b40_compat
+    let usage_breakdown = if let Some(mut exact) = exact_first_round_usage {
+        exact.input_tokens = additional_round_input_tokens
+            .iter()
+            .fold(exact.input_tokens, |total, round| {
+                total.saturating_add((*round).max(1))
+            });
+        exact
+    } else {
+        super::cache::finalize_request_usage(
+            initial_usage_breakdown,
+            first_round_authoritative_input_tokens,
+            first_round_input_tokens,
+            &additional_round_input_tokens,
+            ordinary_input_adjustment,
+            model,
+            aws_b40_compat,
+        )
+    };
+    let usage_breakdown = if exact_first_round_usage.is_none()
+        && aws_b40_compat
         && additional_round_input_tokens.is_empty()
         && upstream_fatal_error.is_none()
     {
@@ -3628,8 +3720,14 @@ async fn handle_non_stream_request(
     let uncapped_output_tokens = visible_output_tokens
         + compat_thinking_tokens
         + if compat_thinking_tokens > 0 { 2 } else { 0 };
-    let output_tokens = uncapped_output_tokens.min(requested_max_tokens.max(1));
-    if uncapped_output_tokens > output_tokens && !forced_application_identity {
+    let locally_counted_output_tokens = uncapped_output_tokens.min(requested_max_tokens.max(1));
+    let output_tokens =
+        if all_rounds_have_exact_output && !output_truncated && !forced_application_identity {
+            exact_output_tokens.min(requested_max_tokens.max(1))
+        } else {
+            locally_counted_output_tokens
+        };
+    if uncapped_output_tokens > locally_counted_output_tokens && !forced_application_identity {
         stop_reason = "max_tokens".to_string();
     }
     // 只要请求开启了 thinking，就在 usage 里带 output_tokens_details（哪怕本轮没产出思考，
@@ -5168,6 +5266,46 @@ fn reject_invalid_model_reasoning(payload: &MessagesRequest) -> Option<Response>
     None
 }
 
+/// Enforce the Claude Opus 4.8 sampling contract at the AWS-B HTTP boundary.
+///
+/// Opus 4.8 does not expose non-default sampling controls. Anthropic retains
+/// narrow backwards compatibility for the default values (`temperature=1`
+/// and `top_p` in the documented 0.99..=1 range), while `top_k` is rejected
+/// whenever supplied. This function only validates request metadata; it never
+/// changes prompts, generation settings, or response text.
+fn reject_invalid_opus_48_sampling(
+    payload: &MessagesRequest,
+    aws_b40_compat: bool,
+) -> Option<Response> {
+    if !aws_b40_compat || !super::compat::is_opus_4_8(&payload.model) {
+        return None;
+    }
+
+    let message = if payload
+        .temperature
+        .is_some_and(|temperature| temperature != 1.0)
+    {
+        Some("`temperature` must be omitted or set to 1 for Claude Opus 4.8")
+    } else if payload
+        .top_p
+        .is_some_and(|top_p| !(0.99..=1.0).contains(&top_p))
+    {
+        Some("`top_p` must be omitted or between 0.99 and 1 for Claude Opus 4.8")
+    } else if payload.top_k.is_some() {
+        Some("`top_k` is not supported for Claude Opus 4.8")
+    } else {
+        None
+    }?;
+
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invalid_request_error", message)),
+        )
+            .into_response(),
+    )
+}
+
 /// 规整 thinking / output_config，使请求与 Kiro 上游标准一致
 ///
 /// 触发条件（满足任一即等价于客户请求了 `*-thinking` 模型）：
@@ -5356,6 +5494,9 @@ pub async fn post_messages_cc(
         return response;
     }
     if let Some(response) = reject_invalid_model_reasoning(&payload) {
+        return response;
+    }
+    if let Some(response) = reject_invalid_opus_48_sampling(&payload, aws_b40_compat) {
         return response;
     }
 
@@ -5595,6 +5736,8 @@ pub async fn post_messages_cc(
 
     if payload.stream {
         // 流式响应（缓冲模式）
+        let cache_commit =
+            super::cache::prepare_cache_commit(input_tokens, &payload, aws_b40_compat);
         handle_stream_request_buffered(
             provider,
             &request_body,
@@ -5614,10 +5757,13 @@ pub async fn post_messages_cc(
             aws_b40_compat,
             aws_b40_adaptive_signature,
             aws_b40_thinking_requested,
+            cache_commit,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
+        let cache_commit =
+            super::cache::prepare_cache_commit(input_tokens, &payload, aws_b40_compat);
         let extract_thinking = state.extract_thinking && thinking_enabled;
         handle_non_stream_request(
             provider,
@@ -5638,6 +5784,7 @@ pub async fn post_messages_cc(
             tool_choice_forces_tool(&payload),
             aws_b40_compat,
             aws_b40_adaptive_signature,
+            cache_commit,
         )
         .await
     }
@@ -5666,6 +5813,7 @@ async fn handle_stream_request_buffered(
     aws_b40_compat: bool,
     aws_b40_adaptive_signature: bool,
     aws_b40_thinking_requested: bool,
+    cache_commit: super::cache::CacheCommit,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let upstream_started = Instant::now();
@@ -5719,6 +5867,7 @@ async fn handle_stream_request_buffered(
         request_body.to_string(),
         requested_max_tokens,
         aws_b40_compat,
+        cache_commit,
     );
 
     // 返回 SSE 响应
@@ -5745,6 +5894,7 @@ fn create_buffered_sse_stream(
     request_body: String,
     requested_max_tokens: i32,
     aws_b40_compat: bool,
+    cache_commit: super::cache::CacheCommit,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
     let requested_max_tokens = effective_auto_continue_max_tokens(requested_max_tokens);
@@ -5764,6 +5914,7 @@ fn create_buffered_sse_stream(
             request_body,
             0usize,
             max_continuation_rounds,
+            Some(cache_commit),
         ),
         move |(
             mut body_stream,
@@ -5775,6 +5926,7 @@ fn create_buffered_sse_stream(
             request_body,
             continuation_round,
             max_continuation_rounds,
+            mut cache_commit,
         )| async move {
             if finished {
                 return None;
@@ -5791,7 +5943,7 @@ fn create_buffered_sse_stream(
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> =
                             vec![Ok(create_ping_sse(aws_b40_compat))];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds, cache_commit)));
                     }
 
                     // 然后处理数据流
@@ -5835,7 +5987,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds, cache_commit)));
                             }
                             None => {
                                 let mut continuation_reason = "unknown";
@@ -5846,6 +5998,11 @@ fn create_buffered_sse_stream(
                                     );
                                     ctx.mark_upstream_truncated();
                                     continuation_reason = "pending_frame";
+                                }
+                                if continuation_round == 0 && ctx.upstream_succeeded_for_cache() {
+                                    if let Some(commit) = cache_commit.take() {
+                                        commit.commit().await;
+                                    }
                                 }
                                 if continuation_round < max_continuation_rounds
                                     && ctx.should_auto_continue(requested_max_tokens)
@@ -5907,6 +6064,7 @@ fn create_buffered_sse_stream(
                                                         next_request_body,
                                                         continuation_round + 1,
                                                         max_continuation_rounds,
+                                                        cache_commit,
                                                     ),
                                                 ));
                                             }
@@ -5922,7 +6080,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds, cache_commit)));
                             }
                         }
                     }
@@ -6419,6 +6577,58 @@ mod tests {
         normalize_aws_b40_thinking(&mut request);
         assert_eq!(request.model, "gpt-5.6-sol-thinking");
         assert!(request.thinking.is_none());
+    }
+
+    #[test]
+    fn aws_b_opus_48_accepts_only_backwards_compatible_sampling_values() {
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({"temperature": 1}),
+            serde_json::json!({"top_p": 0.99}),
+            serde_json::json!({"top_p": 1}),
+            serde_json::json!({"temperature": 1, "top_p": 0.995}),
+        ] {
+            let request = parse("claude-opus-4-8", extra.clone());
+            assert!(
+                reject_invalid_opus_48_sampling(&request, true).is_none(),
+                "compatible sampling parameters must pass: {extra}"
+            );
+        }
+
+        for extra in [
+            serde_json::json!({"temperature": 0}),
+            serde_json::json!({"temperature": 0.7}),
+            serde_json::json!({"temperature": 1.01}),
+            serde_json::json!({"top_p": 0.98}),
+            serde_json::json!({"top_p": 1.01}),
+            serde_json::json!({"top_k": 0}),
+            serde_json::json!({"top_k": 1}),
+        ] {
+            let request = parse("claude-opus-4-8", extra.clone());
+            assert_eq!(
+                reject_invalid_opus_48_sampling(&request, true)
+                    .expect("unsupported sampling parameter must be rejected")
+                    .status(),
+                StatusCode::BAD_REQUEST,
+                "unsupported sampling parameters must fail: {extra}"
+            );
+        }
+    }
+
+    #[test]
+    fn opus_48_sampling_guard_is_scoped_to_aws_b_and_that_model() {
+        let opus = parse(
+            "anthropic.claude-opus-4-8",
+            serde_json::json!({"temperature": 0.7}),
+        );
+        assert!(reject_invalid_opus_48_sampling(&opus, true).is_some());
+        assert!(reject_invalid_opus_48_sampling(&opus, false).is_none());
+
+        let sonnet = parse(
+            "claude-sonnet-4-6",
+            serde_json::json!({"temperature": 0.7, "top_k": 10}),
+        );
+        assert!(reject_invalid_opus_48_sampling(&sonnet, true).is_none());
     }
 
     #[test]

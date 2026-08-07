@@ -458,6 +458,7 @@ AWS-B 会根据模型自动生成公开消息 ID，不需要额外的容器启�
 | `gpt-5.6-sol` / `GPT 5.6 Sol` | `gpt-5.6-sol` |
 | `gpt-5.6-terra` / `GPT 5.6 Terra` | `gpt-5.6-terra` |
 | `gpt-5.6-luna` / `GPT 5.6 Luna` | `gpt-5.6-luna` |
+| `deepseek-3.2` / `deepseek-v3.2` / `DeepSeek V3.2` | `deepseek-3.2` |
 | `*sonnet*`（含 5/5.0） | `claude-sonnet-5` |
 | `*sonnet*`（含 4.6/4-6） | `claude-sonnet-4.6` |
 | `*sonnet*`（其他） | `claude-sonnet-4.5` |

@@ -1,0 +1,17 @@
+[Unit]
+Description=Report-only GPT-5.6 Codex compatibility check for Kiro accounts
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/kiro-rs/gpt56-health-check.env
+ExecStart=/usr/bin/flock -n /run/lock/kiro-gpt56-health-check.lock /usr/bin/python3 /opt/kiro-rs/scripts/gpt56_codex_health_check.py --out-dir /var/lib/kiro-rs/gpt56-health-check-runs --parallel 12 --retries 1
+User=root
+Group=root
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/kiro-rs/gpt56-health-check-runs /run/lock

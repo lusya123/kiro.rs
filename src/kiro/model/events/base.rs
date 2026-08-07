@@ -16,6 +16,8 @@ pub enum EventType {
     ToolUse,
     /// 计费事件
     Metering,
+    /// 精确 token 计量事件
+    Metadata,
     /// 上下文使用率事件
     ContextUsage,
     /// 未知事件类型
@@ -30,6 +32,7 @@ impl EventType {
             "reasoningContentEvent" => Self::ReasoningContent,
             "toolUseEvent" => Self::ToolUse,
             "meteringEvent" => Self::Metering,
+            "metadataEvent" => Self::Metadata,
             "contextUsageEvent" => Self::ContextUsage,
             _ => Self::Unknown,
         }
@@ -42,6 +45,7 @@ impl EventType {
             Self::ReasoningContent => "reasoningContentEvent",
             Self::ToolUse => "toolUseEvent",
             Self::Metering => "meteringEvent",
+            Self::Metadata => "metadataEvent",
             Self::ContextUsage => "contextUsageEvent",
             Self::Unknown => "unknown",
         }
@@ -74,7 +78,9 @@ pub enum Event {
     /// 工具使用
     ToolUse(super::ToolUseEvent),
     /// 计费
-    Metering(()),
+    Metering(super::MeteringEvent),
+    /// Exact token accounting from newer Kiro runtimes.
+    Metadata(super::MetadataEvent),
     /// 上下文使用率
     ContextUsage(super::ContextUsageEvent),
     /// 未知事件（保留事件类型与原始 payload，便于新模型协议前向兼容）
@@ -129,7 +135,14 @@ impl Event {
                 let payload = super::ToolUseEvent::from_frame(&frame)?;
                 Ok(Self::ToolUse(payload))
             }
-            EventType::Metering => Ok(Self::Metering(())),
+            EventType::Metering => {
+                let payload = super::MeteringEvent::from_frame(&frame)?;
+                Ok(Self::Metering(payload))
+            }
+            EventType::Metadata => {
+                let payload = super::MetadataEvent::from_frame(&frame)?;
+                Ok(Self::Metadata(payload))
+            }
             EventType::ContextUsage => {
                 let payload = super::ContextUsageEvent::from_frame(&frame)?;
                 Ok(Self::ContextUsage(payload))
@@ -189,6 +202,7 @@ mod tests {
         );
         assert_eq!(EventType::from_str("toolUseEvent"), EventType::ToolUse);
         assert_eq!(EventType::from_str("meteringEvent"), EventType::Metering);
+        assert_eq!(EventType::from_str("metadataEvent"), EventType::Metadata);
         assert_eq!(
             EventType::from_str("contextUsageEvent"),
             EventType::ContextUsage
@@ -207,6 +221,36 @@ mod tests {
             "reasoningContentEvent"
         );
         assert_eq!(EventType::ToolUse.as_str(), "toolUseEvent");
+        assert_eq!(EventType::Metering.as_str(), "meteringEvent");
+        assert_eq!(EventType::Metadata.as_str(), "metadataEvent");
+        assert_eq!(EventType::ContextUsage.as_str(), "contextUsageEvent");
+    }
+
+    #[test]
+    fn metadata_event_preserves_stop_reason_without_token_usage() {
+        let mut headers = Headers::new();
+        headers.insert(
+            ":message-type".to_string(),
+            HeaderValue::String("event".to_string()),
+        );
+        headers.insert(
+            ":event-type".to_string(),
+            HeaderValue::String("metadataEvent".to_string()),
+        );
+
+        let event = Event::from_frame(Frame {
+            headers,
+            payload: br#"{"stopReason":"END_TURN","futureField":true}"#.to_vec(),
+        })
+        .expect("live metadata payload should parse");
+
+        match event {
+            Event::Metadata(metadata) => {
+                assert_eq!(metadata.stop_reason.as_deref(), Some("END_TURN"));
+                assert!(!metadata.token_usage.is_present());
+            }
+            other => panic!("expected metadata event, got {other:?}"),
+        }
     }
 
     #[test]

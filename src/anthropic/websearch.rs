@@ -987,6 +987,9 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
             messages: vec![Message {
                 role: "user".to_string(),
                 content: serde_json::json!("test"),
@@ -1020,6 +1023,9 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
             messages: vec![Message {
                 role: "user".to_string(),
                 content: serde_json::json!("test"),
@@ -1065,6 +1071,9 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
             messages: vec![Message {
                 role: "user".to_string(),
                 content: serde_json::json!("search my private index"),
@@ -1104,6 +1113,9 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
             messages: vec![Message {
                 role: "user".to_string(),
                 content: serde_json::json!([{
@@ -1134,6 +1146,9 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
             messages: vec![Message {
                 role: "user".to_string(),
                 content: serde_json::json!("What is the weather today?"),

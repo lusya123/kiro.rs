@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn native_bedrock_ids_are_limited_to_claude_models() {
-        for model in ["glm-5", "minimax-m2.5", "qwen3-coder-next"] {
+        for model in ["glm-5", "minimax-m2.5", "deepseek-3.2", "qwen3-coder-next"] {
             let id = bedrock_message_id_for_model(model);
             assert_anthropic_id(&id, "msg");
             assert!(id.starts_with("msg_01bdrk"), "{model}: {id}");

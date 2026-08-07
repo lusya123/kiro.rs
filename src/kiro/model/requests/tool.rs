@@ -6,12 +6,55 @@ use serde::{Deserialize, Serialize};
 
 /// 工具定义
 ///
-/// 用于在请求中定义可用的工具
+/// Kiro 的 `tools` 数组是一个 union：普通项携带 `toolSpecification`，
+/// 缓存断点项携带 `cachePoint`。两个字段保持互斥。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Tool {
     /// 工具规范
-    pub tool_specification: ToolSpecification,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_specification: Option<ToolSpecification>,
+    /// 原生提示词缓存断点
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_point: Option<CachePoint>,
+}
+
+impl Tool {
+    pub fn specification(tool_specification: ToolSpecification) -> Self {
+        Self {
+            tool_specification: Some(tool_specification),
+            cache_point: None,
+        }
+    }
+
+    pub fn cache_point(cache_point: CachePoint) -> Self {
+        Self {
+            tool_specification: None,
+            cache_point: Some(cache_point),
+        }
+    }
+
+    pub fn specification_ref(&self) -> Option<&ToolSpecification> {
+        self.tool_specification.as_ref()
+    }
+}
+
+/// Kiro/Bedrock 原生缓存断点。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CachePoint {
+    #[serde(rename = "type")]
+    pub point_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
+}
+
+impl CachePoint {
+    pub fn default_ttl(ttl: Option<String>) -> Self {
+        Self {
+            point_type: "default".to_string(),
+            ttl,
+        }
+    }
 }
 
 /// 工具规范

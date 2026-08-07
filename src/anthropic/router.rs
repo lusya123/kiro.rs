@@ -310,6 +310,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aws_b_message_entrypoints_share_opus_48_sampling_validation() {
+        let (base, server) = spawn_router(true).await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test HTTP client");
+
+        for path in ["/v1/messages", "/cc/v1/messages"] {
+            for invalid in [json!({"temperature": 0.7}), json!({"top_k": 1})] {
+                let mut body = json!({
+                    "model": "claude-opus-4-8",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "hello"}]
+                });
+                body.as_object_mut()
+                    .unwrap()
+                    .extend(invalid.as_object().unwrap().clone());
+
+                let response = client
+                    .post(format!("{base}{path}"))
+                    .header("x-api-key", "test-key")
+                    .json(&body)
+                    .send()
+                    .await
+                    .expect("invalid sampling request");
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}: {body}");
+                let error: Value = response.json().await.expect("sampling error JSON");
+                assert_eq!(error["error"]["type"], "invalid_request_error");
+            }
+
+            for compatible in [json!({}), json!({"temperature": 1, "top_p": 0.99})] {
+                let mut body = json!({
+                    "model": "claude-opus-4-8",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "hello"}]
+                });
+                body.as_object_mut()
+                    .unwrap()
+                    .extend(compatible.as_object().unwrap().clone());
+
+                let response = client
+                    .post(format!("{base}{path}"))
+                    .header("x-api-key", "test-key")
+                    .json(&body)
+                    .send()
+                    .await
+                    .expect("compatible sampling request");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "{path}: compatible sampling must pass validation and reach the absent provider"
+                );
+            }
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn profiles_share_token_engine_but_keep_distinct_model_catalogs() {
         let (aws_b_base, aws_b_server) = spawn_router(true).await;
         let (aws_p_base, aws_p_server) = spawn_router(false).await;
@@ -461,6 +520,24 @@ mod tests {
         let response = client
             .post(format!("http://{app_addr}/v1/messages"))
             .bearer_auth("client-secret")
+            .json(&json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 1024,
+                "temperature": 0.7,
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .expect("invalid native sampling request");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            captured.lock().expect("capture lock").is_none(),
+            "sampling validation must run before the native upstream"
+        );
+
+        let response = client
+            .post(format!("http://{app_addr}/v1/messages"))
+            .bearer_auth("client-secret")
             .header("anthropic-version", "2023-06-01")
             .header(
                 "anthropic-beta",
@@ -470,7 +547,7 @@ mod tests {
                 "model": "claude-opus-4-8",
                 "max_tokens": 1024,
                 "stream": true,
-                "temperature": 0.7,
+                "temperature": 1,
                 "custom_extension": {"keep": true},
                 "messages": [{"role": "user", "content": "hello"}]
             }))
@@ -495,7 +572,7 @@ mod tests {
             "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"
         );
         assert_eq!(body["model"], "anthropic.claude-opus-4-8");
-        assert_eq!(body["temperature"], 0.7);
+        assert_eq!(body["temperature"], 1);
         assert_eq!(body["custom_extension"]["keep"], true);
 
         let count_tokens: Value = client

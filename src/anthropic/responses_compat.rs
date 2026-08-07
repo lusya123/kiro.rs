@@ -276,8 +276,14 @@ fn validate_top_level_fields(request: &Value) -> Result<(), String> {
                         .as_object()
                         .ok_or_else(|| "`text.format` must be an object".to_string())?;
                     for key in format.keys() {
-                        if key != "type" {
+                        if !matches!(key.as_str(), "type" | "strict") {
                             return Err(format!("`text.format.{key}` is not supported"));
+                        }
+                    }
+                    match format.get("strict") {
+                        None | Some(Value::Null | Value::Bool(_)) => {}
+                        Some(_) => {
+                            return Err("`text.format.strict` must be a boolean".to_string());
                         }
                     }
                     if format.get("type").and_then(Value::as_str) != Some("text") {
@@ -1145,6 +1151,36 @@ fn append_tool_result(
     Ok(())
 }
 
+fn validate_replayed_reasoning_item(object: &Map<String, Value>) -> Result<(), String> {
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "type"
+                | "id"
+                | "summary"
+                | "content"
+                | "encrypted_content"
+                | "status"
+                | "internal_chat_message_metadata_passthrough"
+        ) {
+            return Err(format!("reasoning input field `{key}` is not supported"));
+        }
+    }
+    for key in ["id", "encrypted_content", "status"] {
+        match object.get(key) {
+            None | Some(Value::Null | Value::String(_)) => {}
+            Some(_) => return Err(format!("reasoning input `{key}` must be a string")),
+        }
+    }
+    for key in ["summary", "content"] {
+        match object.get(key) {
+            None | Some(Value::Null | Value::Array(_)) => {}
+            Some(_) => return Err(format!("reasoning input `{key}` must be an array")),
+        }
+    }
+    Ok(())
+}
+
 fn append_input_item(
     item: &Value,
     messages: &mut Vec<Message>,
@@ -1370,6 +1406,12 @@ fn append_input_item(
                 return Err("custom tool call output `name` must be a string".to_string());
             }
             append_tool_result(object, "custom_tool_call_output", messages)?;
+        }
+        "reasoning" => {
+            validate_replayed_reasoning_item(object)?;
+            // Codex replays opaque reasoning items when `store: false`. Kiro cannot
+            // consume OpenAI encrypted reasoning, so retain visible messages and tool
+            // results while intentionally omitting this validated opaque item.
         }
         "additional_tools" => {}
         other => return Err(format!("input item type `{other}` is not supported")),
@@ -2362,6 +2404,9 @@ fn translated_request_for_profile(
         MessagesRequest {
             model: model.to_string(),
             max_tokens,
+            temperature: None,
+            top_p: None,
+            top_k: None,
             messages,
             stream,
             system,
@@ -3007,6 +3052,47 @@ mod tests {
             Some(json!({"type": "tool", "name": "weather"}))
         );
         assert_eq!(translated.messages.len(), 3);
+    }
+
+    #[test]
+    fn accepts_codex_text_strict_and_omits_validated_replayed_reasoning() {
+        let request = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_previous",
+                    "summary": [{"type": "summary_text", "text": "Opaque prior reasoning"}],
+                    "content": [],
+                    "encrypted_content": "opaque-reasoning-payload",
+                    "status": "completed"
+                },
+                {"type": "message", "role": "user", "content": "Continue"}
+            ],
+            "store": false,
+            "text": {"format": {"type": "text", "strict": true}}
+        });
+
+        let (translated, meta) =
+            translated_request(&request, "gpt-5.6-sol").expect("Codex replay request");
+        assert_eq!(translated.messages.len(), 1);
+        assert_eq!(translated.messages[0].role, "user");
+        assert_eq!(translated.messages[0].content, "Continue");
+        assert_eq!(meta.text, request["text"]);
+
+        for invalid in [
+            json!({"type": "reasoning", "encrypted_content": 1}),
+            json!({"type": "reasoning", "summary": "not-an-array"}),
+            json!({"type": "reasoning", "future_field": true}),
+        ] {
+            let mut invalid_request = request.clone();
+            invalid_request["input"][0] = invalid;
+            assert!(translated_request(&invalid_request, "gpt-5.6-sol").is_err());
+        }
+
+        let mut invalid_strict = request;
+        invalid_strict["text"]["format"]["strict"] = json!("yes");
+        assert!(translated_request(&invalid_strict, "gpt-5.6-sol").is_err());
     }
 
     #[test]
