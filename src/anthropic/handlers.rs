@@ -3300,16 +3300,14 @@ async fn handle_non_stream_request(
                             );
                         }
                         Event::Metadata(metadata) => {
-                            if let Some(exact) =
-                                super::cache::UsageBreakdown::from_exact_token_usage(
-                                    initial_usage_breakdown,
-                                    &metadata.token_usage,
-                                )
-                            {
-                                round_exact_input_tokens = Some(exact.total());
-                                round_exact_output_tokens =
-                                    Some(metadata.token_usage.output_tokens);
-                                round_exact_usage = Some(exact);
+                            if let Some(native) = super::cache::reconcile_native_usage(
+                                model,
+                                initial_usage_breakdown,
+                                &metadata.token_usage,
+                            ) {
+                                round_exact_input_tokens = Some(native.aggregate_input_tokens);
+                                round_exact_output_tokens = Some(native.output_tokens);
+                                round_exact_usage = native.public_cache_usage;
                             }
                         }
                         Event::Metering(metering) => {

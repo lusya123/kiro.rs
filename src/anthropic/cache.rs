@@ -77,6 +77,20 @@ pub struct UsageBreakdown {
     pub cache_creation_1h_input_tokens: i32,
 }
 
+/// Validated native token totals plus the optional public cache-bucket split.
+///
+/// Kiro exposes `metadataEvent.tokenUsage` for several model families, but the
+/// cache read/write fields are not equally reliable across those families.
+/// The aggregate input/output counts remain useful for every model. Keeping
+/// the public cache split optional lets affected models retain the shared,
+/// deterministic prefix registry without throwing away the native totals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReconciledNativeUsage {
+    pub(super) aggregate_input_tokens: i32,
+    pub(super) output_tokens: i32,
+    pub(super) public_cache_usage: Option<UsageBreakdown>,
+}
+
 impl UsageBreakdown {
     /// 平凡情况：所有 token 算作普通 input，cache 字段为 0
     pub fn flat(input_tokens: i32) -> Self {
@@ -210,6 +224,36 @@ impl UsageBreakdown {
     pub fn clamp_for_model(self, model: &str) -> Self {
         self.clamp_to_context_window(super::converter::get_context_window_size(model))
     }
+}
+
+/// Reconcile a native Kiro usage frame without allowing an unstable model's
+/// cache buckets to overwrite the shared compatibility cache.
+///
+/// Production billing evidence on 2026-08-09 showed identical Sonnet requests
+/// repeatedly reporting a full cache write and zero reads, while Opus
+/// 4.7/4.8/5 correctly transitioned from write to read. Therefore only those
+/// verified Opus families may replace the public cache split. All other models
+/// still use validated native aggregate totals, but keep the deterministic
+/// cache plan computed before the request.
+pub(super) fn reconcile_native_usage(
+    model: &str,
+    initial: UsageBreakdown,
+    exact: &TokenUsage,
+) -> Option<ReconciledNativeUsage> {
+    let exact_usage =
+        UsageBreakdown::from_exact_token_usage(initial, exact)?.clamp_for_model(model);
+    Some(ReconciledNativeUsage {
+        aggregate_input_tokens: exact_usage.total(),
+        output_tokens: exact.output_tokens,
+        public_cache_usage: native_cache_buckets_are_trusted(model).then_some(exact_usage),
+    })
+}
+
+fn native_cache_buckets_are_trusted(model: &str) -> bool {
+    matches!(
+        super::converter::map_model(model).as_deref(),
+        Some("claude-opus-4.7" | "claude-opus-4.8" | "claude-opus-5")
+    )
 }
 
 fn split_exact_cache_creation(total: i32, initial_5m: i32, initial_1h: i32) -> (i32, i32) {
@@ -2326,6 +2370,86 @@ mod tests {
         assert_eq!(usage.cache_creation_5m_input_tokens, 7);
         assert_eq!(usage.cache_creation_1h_input_tokens, 18);
         assert_eq!(usage.total(), 1_032);
+    }
+
+    #[test]
+    fn only_verified_opus_families_trust_native_cache_buckets() {
+        for model in [
+            "claude-opus-4-7",
+            "claude-opus-4.8",
+            "claude-opus-5-thinking",
+        ] {
+            assert!(
+                native_cache_buckets_are_trusted(model),
+                "{model} should keep its verified native cache split"
+            );
+        }
+
+        for model in [
+            "claude-sonnet-4-6",
+            "claude-sonnet-5",
+            "claude-opus-4-6",
+            "claude-opus-4-5-20251101",
+            "claude-haiku-4-5-20251001",
+        ] {
+            assert!(
+                !native_cache_buckets_are_trusted(model),
+                "{model} should retain deterministic shared-cache accounting"
+            );
+        }
+    }
+
+    #[test]
+    fn sonnet_native_repeated_write_cannot_overwrite_a_local_cache_read() {
+        let local_hot = UsageBreakdown {
+            input_tokens: 182,
+            cache_read_input_tokens: 89_520,
+            cache_creation_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let native_repeated_write = TokenUsage {
+            uncached_input_tokens: 182,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 89_520,
+            output_tokens: 72,
+            total_tokens: 89_774,
+        };
+
+        for model in ["claude-sonnet-4-6", "claude-sonnet-5"] {
+            let native = reconcile_native_usage(model, local_hot, &native_repeated_write)
+                .expect("native totals are valid");
+            assert_eq!(native.aggregate_input_tokens, 89_702);
+            assert_eq!(native.output_tokens, 72);
+            assert_eq!(
+                native.public_cache_usage, None,
+                "{model}: the repeated-write signal must not erase the local read"
+            );
+        }
+    }
+
+    #[test]
+    fn verified_opus_keeps_authoritative_native_cache_buckets() {
+        let initial = UsageBreakdown {
+            input_tokens: 182,
+            cache_read_input_tokens: 89_520,
+            cache_creation_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let exact = TokenUsage {
+            uncached_input_tokens: 182,
+            cache_read_input_tokens: 89_520,
+            cache_write_input_tokens: 0,
+            output_tokens: 72,
+            total_tokens: 89_774,
+        };
+
+        for model in ["claude-opus-4-7", "claude-opus-4-8", "claude-opus-5"] {
+            let native =
+                reconcile_native_usage(model, initial, &exact).expect("native totals are valid");
+            assert_eq!(native.public_cache_usage, Some(initial));
+        }
     }
 
     #[test]

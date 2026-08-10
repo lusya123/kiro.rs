@@ -1328,14 +1328,15 @@ impl StreamContext {
             }
             Event::Metadata(metadata) => {
                 let usage = &metadata.token_usage;
-                if let Some(exact) = super::cache::UsageBreakdown::from_exact_token_usage(
+                if let Some(native) = super::cache::reconcile_native_usage(
+                    &self.model,
                     self.initial_usage_breakdown,
                     usage,
                 ) {
-                    self.exact_current_input_tokens = Some(exact.total());
-                    self.exact_current_output_tokens = Some(usage.output_tokens);
+                    self.exact_current_input_tokens = Some(native.aggregate_input_tokens);
+                    self.exact_current_output_tokens = Some(native.output_tokens);
                     if !self.continuation_started {
-                        self.exact_first_round_usage = Some(exact);
+                        self.exact_first_round_usage = native.public_cache_usage;
                     }
                 }
                 tracing::debug!(
