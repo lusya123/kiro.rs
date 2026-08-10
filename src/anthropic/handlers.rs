@@ -4623,7 +4623,7 @@ async fn reject_invalid_thinking_signatures(
     reject_invalid_thinking_signatures_with_import_policy(
         payload,
         aws_b40_compat,
-        super::signature::native_signature_import_window_open(),
+        super::signature::native_signature_import_allowed(),
     )
     .await
 }
@@ -4672,7 +4672,7 @@ async fn reject_invalid_thinking_signatures_with_import_policy(
                                         block_index,
                                         signature_encoded_len = signature.len(),
                                         import_result = ?import,
-                                        "accepted a pre-registry Bedrock thinking signature during bounded migration"
+                                        "accepted a previously unseen provider-envelope Bedrock thinking signature"
                                     );
                                     true
                                 }

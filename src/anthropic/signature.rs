@@ -13,9 +13,10 @@
 //! 摘要不参与绑定，这与 Bedrock 对空 thinking 文本的实际回放语义一致。
 //!
 //! 从旧版本升级到严格登记版时，升级前签发的原生 AWS 签名没有登记记录。生产可通过一个带绝对
-//! 截止时间的迁移窗口导入结构完整、内部模型匹配的 Bedrock 签名。迁移期仍拒绝空值、畸形值，
-//! 并用分块指纹识别本服务已签发值的常见单点篡改；导入后立即转入精确登记。窗口默认关闭，且
-//! 必须用 `KIRO_NATIVE_SIGNATURE_IMPORT_UNTIL_EPOCH` 显式设置，避免重启时反复开启宽松路径。
+//! 截止时间的迁移窗口导入结构完整、内部模型匹配的 Bedrock 签名；需要长期兼容跨网关、跨升级
+//! 会话时，也可显式设置 `KIRO_NATIVE_SIGNATURE_ACCEPT_PROVIDER_ENVELOPE=true`。两种模式仍拒绝空值、
+//! 畸形值和内部模型不匹配，并用分块指纹识别本服务已签发值的常见单点篡改；导入后立即转入精确
+//! 登记。两种导入方式默认都关闭，避免普通部署无意开启未知签名兼容路径。
 //!
 //! 现在改为**无状态自校验 HMAC**：签名内部布局为 `[protobuf 头][随机体] || HMAC(密钥, 前面全部)`，
 //! 验签时用同一把密钥对"被签名区"重算 HMAC，与尾部 32 字节做常量时间比对。特性：
@@ -354,13 +355,28 @@ pub async fn validate_native_signature(model: &str, thinking: &str, signature: &
     false
 }
 
-pub fn native_signature_import_window_open() -> bool {
-    static IMPORT_UNTIL: OnceLock<Option<u64>> = OnceLock::new();
-    let Some(until) = *IMPORT_UNTIL.get_or_init(|| {
-        std::env::var("KIRO_NATIVE_SIGNATURE_IMPORT_UNTIL_EPOCH")
+pub fn native_signature_import_allowed() -> bool {
+    static IMPORT_POLICY: OnceLock<(bool, Option<u64>)> = OnceLock::new();
+    let (accept_provider_envelope, import_until) = *IMPORT_POLICY.get_or_init(|| {
+        let accept_provider_envelope = std::env::var(
+            "KIRO_NATIVE_SIGNATURE_ACCEPT_PROVIDER_ENVELOPE",
+        )
+        .ok()
+        .is_some_and(|value| explicit_truthy(&value));
+        let import_until = std::env::var("KIRO_NATIVE_SIGNATURE_IMPORT_UNTIL_EPOCH")
             .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-    }) else {
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        if accept_provider_envelope {
+            tracing::warn!(
+                "provider-envelope native-signature compatibility is enabled for previously unseen Bedrock signatures"
+            );
+        }
+        (accept_provider_envelope, import_until)
+    });
+    if accept_provider_envelope {
+        return true;
+    }
+    let Some(until) = import_until else {
         return false;
     };
     let now = SystemTime::now()
@@ -368,6 +384,13 @@ pub fn native_signature_import_window_open() -> bool {
         .map(|duration| duration.as_secs())
         .unwrap_or(u64::MAX);
     now < until
+}
+
+fn explicit_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -747,6 +770,16 @@ pub fn native_bedrock_signature_for_test(internal_model: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_envelope_import_requires_an_explicit_truthy_value() {
+        for value in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(explicit_truthy(value), "{value:?} should enable the policy");
+        }
+        for value in ["", "0", "false", "no", "off", "enabled"] {
+            assert!(!explicit_truthy(value), "{value:?} must remain disabled");
+        }
+    }
 
     /// 与真 Anthropic thinking 签名同构:顶层 `field2 { … }` + `field3=1`(以 `18 01` 收尾),
     /// 总长在真签名实测区间(364–503)附近浮动。
