@@ -4620,6 +4620,19 @@ async fn reject_invalid_thinking_signatures(
     payload: &MessagesRequest,
     aws_b40_compat: bool,
 ) -> Option<Response> {
+    reject_invalid_thinking_signatures_with_import_policy(
+        payload,
+        aws_b40_compat,
+        super::signature::native_signature_import_window_open(),
+    )
+    .await
+}
+
+async fn reject_invalid_thinking_signatures_with_import_policy(
+    payload: &MessagesRequest,
+    aws_b40_compat: bool,
+    allow_native_import: bool,
+) -> Option<Response> {
     for (message_index, message) in payload.messages.iter().enumerate() {
         let Some(blocks) = message.content.as_array() else {
             continue;
@@ -4634,12 +4647,41 @@ async fn reject_invalid_thinking_signatures(
             if aws_b40_compat {
                 let valid = match (thinking, signature) {
                     (Some(thinking), Some(signature)) if !signature.is_empty() => {
-                        super::signature::validate_native_signature(
+                        let exact = super::signature::validate_native_signature(
                             &payload.model,
                             thinking,
                             signature,
                         )
-                        .await
+                        .await;
+                        if exact {
+                            true
+                        } else if allow_native_import {
+                            let import =
+                                super::signature::import_native_signature_during_migration(
+                                    &payload.model,
+                                    thinking,
+                                    signature,
+                                )
+                                .await;
+                            match import {
+                                super::signature::NativeSignatureImportResult::Imported
+                                | super::signature::NativeSignatureImportResult::RecoveredExactFingerprint => {
+                                    tracing::info!(
+                                        model = %payload.model,
+                                        message_index,
+                                        block_index,
+                                        signature_encoded_len = signature.len(),
+                                        import_result = ?import,
+                                        "accepted a pre-registry Bedrock thinking signature during bounded migration"
+                                    );
+                                    true
+                                }
+                                super::signature::NativeSignatureImportResult::RegisteredNearMatch
+                                | super::signature::NativeSignatureImportResult::InvalidStructure => false,
+                            }
+                        } else {
+                            false
+                        }
                     }
                     _ => false,
                 };
@@ -6924,7 +6966,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aws_b_accepts_only_registered_native_signature_and_rejects_tampering() {
+    async fn aws_b_accepts_registered_native_signature_and_rejects_signature_tampering() {
         let signature = "opaque-native-upstream-signature".repeat(16);
         super::super::signature::register_native_signature(
             "claude-opus-4-8",
@@ -6979,12 +7021,11 @@ mod tests {
         let mut changed_thinking = valid.clone();
         changed_thinking.messages[0].content[0]["thinking"] =
             serde_json::Value::String("changed".to_string());
-        assert_eq!(
+        assert!(
             reject_invalid_thinking_signatures(&changed_thinking, true)
                 .await
-                .expect("the native signature must be bound to the exact outbound thinking text")
-                .status(),
-            StatusCode::BAD_REQUEST
+                .is_none(),
+            "the opaque provider signature is not bound to the public thinking summary"
         );
 
         let local_hmac = super::super::signature::generate_signature();
@@ -7063,6 +7104,71 @@ mod tests {
                 StatusCode::BAD_REQUEST
             );
         }
+    }
+
+    #[tokio::test]
+    async fn aws_b_bounded_migration_imports_old_bedrock_signature_but_rejects_tampering() {
+        let signature = super::super::signature::native_bedrock_signature_for_test("claude-honey");
+        let legacy = parse(
+            "claude-opus-5",
+            serde_json::json!({
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "thinking",
+                            "thinking": "",
+                            "signature": signature
+                        }]
+                    },
+                    {"role": "user", "content": "continue"}
+                ]
+            }),
+        );
+
+        assert_eq!(
+            reject_invalid_thinking_signatures_with_import_policy(&legacy, true, false)
+                .await
+                .expect("an unregistered signature stays closed outside the migration window")
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(
+            reject_invalid_thinking_signatures_with_import_policy(&legacy, true, true)
+                .await
+                .is_none(),
+            "a structurally valid matching pre-registry Bedrock signature is imported once"
+        );
+
+        let mut tampered = legacy.clone();
+        let mut bytes = tampered.messages[0].content[0]["signature"]
+            .as_str()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let index = bytes.len() / 2;
+        bytes[index] = if bytes[index] == b'A' { b'B' } else { b'A' };
+        tampered.messages[0].content[0]["signature"] =
+            serde_json::Value::String(String::from_utf8(bytes).unwrap());
+        assert_eq!(
+            reject_invalid_thinking_signatures_with_import_policy(&tampered, true, true)
+                .await
+                .expect("a near-match of an imported signature remains rejected")
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let mismatched_model = parse(
+            "claude-sonnet-5",
+            serde_json::json!({"messages": legacy.messages}),
+        );
+        assert_eq!(
+            reject_invalid_thinking_signatures_with_import_policy(&mismatched_model, true, true,)
+                .await
+                .expect("the internal Bedrock model must match the requested model")
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[tokio::test]

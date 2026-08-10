@@ -8,8 +8,14 @@
 //! - 真 Anthropic 永远看不到这些签名，客户端 SDK 自己也不验签。
 //!
 //! 本模块同时维护 AWS-B 原生签名的精确回传登记。服务端无法离线验证上游的私有签名算法，
-//! 因此只接受本服务实际向客户端透传过、且 `模型 + 对外 thinking 文本 + signature` 完全一致的
-//! 组合。登记键只保存 SHA-256 摘要，并通过集群缓存跨容器共享；不会保存或记录原始思考与签名。
+//! 因此正常路径只接受本服务实际向客户端透传过的 `模型 + signature` 组合。登记键只保存
+//! SHA-256 摘要，并通过集群缓存跨容器共享；不会保存或记录原始思考与签名。公开 thinking
+//! 摘要不参与绑定，这与 Bedrock 对空 thinking 文本的实际回放语义一致。
+//!
+//! 从旧版本升级到严格登记版时，升级前签发的原生 AWS 签名没有登记记录。生产可通过一个带绝对
+//! 截止时间的迁移窗口导入结构完整、内部模型匹配的 Bedrock 签名。迁移期仍拒绝空值、畸形值，
+//! 并用分块指纹识别本服务已签发值的常见单点篡改；导入后立即转入精确登记。窗口默认关闭，且
+//! 必须用 `KIRO_NATIVE_SIGNATURE_IMPORT_UNTIL_EPOCH` 显式设置，避免重启时反复开启宽松路径。
 //!
 //! 现在改为**无状态自校验 HMAC**：签名内部布局为 `[protobuf 头][随机体] || HMAC(密钥, 前面全部)`，
 //! 验签时用同一把密钥对"被签名区"重算 HMAC，与尾部 32 字节做常量时间比对。特性：
@@ -25,10 +31,13 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use futures::future::join_all;
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
+use tokio::sync::Mutex as AsyncMutex;
 
 /// HMAC-SHA256 输出长度。
 const MAC_LEN: usize = 32;
@@ -37,6 +46,15 @@ const MAC_LEN: usize = 32;
 /// 限制本地/Redis 登记表增长，不参与 prompt-cache TTL，也不会改变任何 token 计算。
 const DEFAULT_NATIVE_SIGNATURE_REGISTRY_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 const NATIVE_SIGNATURE_KEY_PREFIX: &str = "awsb:native-thinking-signature:v1:";
+const NATIVE_SIGNATURE_V2_KEY_PREFIX: &str = "awsb:native-thinking-signature:v2:";
+const NATIVE_SIGNATURE_FINGERPRINT_KEY_PREFIX: &str =
+    "awsb:native-thinking-signature:fingerprint:v2:";
+const NATIVE_SIGNATURE_FINGERPRINT_PARTS: usize = 4;
+const NATIVE_SIGNATURE_NEAR_MATCH_THRESHOLD: usize = 3;
+const MAX_NATIVE_SIGNATURE_RAW_BYTES: usize = 2 * 1024 * 1024;
+const DURABLE_REDIS_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+const DURABLE_REDIS_OPERATION_TIMEOUT: Duration = Duration::from_millis(80);
+const DURABLE_REDIS_RETRY_DELAY_MS: u64 = 3_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignatureValidationFailure {
@@ -81,28 +99,218 @@ fn native_signature_registry_ttl() -> Duration {
     })
 }
 
+struct DurableNativeSignatureStore {
+    client: redis::Client,
+    connection: AsyncMutex<Option<redis::aio::MultiplexedConnection>>,
+    retry_after_ms: AtomicU64,
+    failure_logged: AtomicBool,
+}
+
+impl DurableNativeSignatureStore {
+    async fn connection(&self) -> Option<redis::aio::MultiplexedConnection> {
+        if unix_time_ms() < self.retry_after_ms.load(Ordering::Relaxed) {
+            return None;
+        }
+        let mut connection = self.connection.lock().await;
+        if let Some(existing) = connection.as_ref() {
+            return Some(existing.clone());
+        }
+        let result = tokio::time::timeout(
+            DURABLE_REDIS_CONNECT_TIMEOUT,
+            self.client.get_multiplexed_async_connection(),
+        )
+        .await;
+        match result {
+            Ok(Ok(connected)) => {
+                self.failure_logged.store(false, Ordering::Relaxed);
+                *connection = Some(connected.clone());
+                Some(connected)
+            }
+            _ => {
+                self.note_failure("connect");
+                None
+            }
+        }
+    }
+
+    fn note_failure(&self, operation: &'static str) {
+        self.retry_after_ms.store(
+            unix_time_ms().saturating_add(DURABLE_REDIS_RETRY_DELAY_MS),
+            Ordering::Relaxed,
+        );
+        if !self.failure_logged.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                operation,
+                "durable native-signature registry is unavailable; retaining cluster-cache fallback"
+            );
+        }
+    }
+
+    async fn invalidate_connection(&self, operation: &'static str) {
+        *self.connection.lock().await = None;
+        self.note_failure(operation);
+    }
+
+    async fn exists(&self, key: &str) -> Option<bool> {
+        let mut connection = self.connection().await?;
+        let mut command = redis::cmd("EXISTS");
+        command.arg(key);
+        match tokio::time::timeout(
+            DURABLE_REDIS_OPERATION_TIMEOUT,
+            command.query_async::<i64>(&mut connection),
+        )
+        .await
+        {
+            Ok(Ok(count)) => Some(count > 0),
+            _ => {
+                self.invalidate_connection("exists").await;
+                None
+            }
+        }
+    }
+
+    async fn register(&self, key: &str, ttl: Duration) -> Option<()> {
+        let mut connection = self.connection().await?;
+        let mut command = redis::cmd("SET");
+        command.arg(key).arg(1).arg("EX").arg(ttl.as_secs().max(1));
+        match tokio::time::timeout(
+            DURABLE_REDIS_OPERATION_TIMEOUT,
+            command.query_async::<String>(&mut connection),
+        )
+        .await
+        {
+            Ok(Ok(_)) => Some(()),
+            _ => {
+                self.invalidate_connection("register").await;
+                None
+            }
+        }
+    }
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn durable_native_signature_store() -> Option<&'static DurableNativeSignatureStore> {
+    static STORE: OnceLock<Option<DurableNativeSignatureStore>> = OnceLock::new();
+    STORE
+        .get_or_init(|| {
+            let url = std::env::var("KIRO_NATIVE_SIGNATURE_REDIS_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())?;
+            match redis::Client::open(url) {
+                Ok(client) => {
+                    tracing::info!("durable native-signature registry is enabled");
+                    Some(DurableNativeSignatureStore {
+                        client,
+                        connection: AsyncMutex::new(None),
+                        retry_after_ms: AtomicU64::new(0),
+                        failure_logged: AtomicBool::new(false),
+                    })
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "invalid durable native-signature Redis configuration; retaining cluster-cache fallback"
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+async fn native_registry_exists(key: &str) -> bool {
+    if let Some(store) = durable_native_signature_store()
+        && store.exists(key).await == Some(true)
+    {
+        return true;
+    }
+    crate::cluster_cache::global().exists(key).await
+}
+
+async fn register_native_registry_keys(keys: &[String]) {
+    let ttl = native_signature_registry_ttl();
+    let cluster = crate::cluster_cache::global();
+    let durable = durable_native_signature_store();
+    join_all(keys.iter().map(|key| async move {
+        cluster.register(key, ttl).await;
+        if let Some(store) = durable {
+            let _ = store.register(key, ttl).await;
+        }
+    }))
+    .await;
+}
+
 fn update_len_prefixed(hasher: &mut Sha256, value: &[u8]) {
     hasher.update((value.len() as u64).to_be_bytes());
     hasher.update(value);
 }
 
-/// Build a privacy-preserving registry key bound to exactly what the client saw.
-/// Length-prefixing prevents ambiguous concatenations such as `(ab, c)` vs `(a, bc)`.
-fn native_signature_registry_key(model: &str, thinking: &str, signature: &str) -> String {
-    let canonical_model =
-        super::converter::map_model(model).unwrap_or_else(|| model.trim().to_ascii_lowercase());
-    let mut hasher = Sha256::new();
-    hasher.update(b"kiro-rs/aws-b/native-thinking-signature/v1\0");
-    update_len_prefixed(&mut hasher, canonical_model.as_bytes());
-    update_len_prefixed(&mut hasher, thinking.as_bytes());
-    update_len_prefixed(&mut hasher, signature.as_bytes());
+fn digest_hex(hasher: Sha256) -> String {
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest {
         use std::fmt::Write as _;
         let _ = write!(hex, "{byte:02x}");
     }
-    format!("{NATIVE_SIGNATURE_KEY_PREFIX}{hex}")
+    hex
+}
+
+fn canonical_native_model(model: &str) -> String {
+    super::converter::map_model(model).unwrap_or_else(|| model.trim().to_ascii_lowercase())
+}
+
+/// Build a privacy-preserving registry key bound to exactly what the client saw.
+/// Length-prefixing prevents ambiguous concatenations such as `(ab, c)` vs `(a, bc)`.
+fn native_signature_registry_key(model: &str, thinking: &str, signature: &str) -> String {
+    let canonical_model = canonical_native_model(model);
+    let mut hasher = Sha256::new();
+    hasher.update(b"kiro-rs/aws-b/native-thinking-signature/v1\0");
+    update_len_prefixed(&mut hasher, canonical_model.as_bytes());
+    update_len_prefixed(&mut hasher, thinking.as_bytes());
+    update_len_prefixed(&mut hasher, signature.as_bytes());
+    format!("{NATIVE_SIGNATURE_KEY_PREFIX}{}", digest_hex(hasher))
+}
+
+/// V2 follows the provider behavior: the opaque signature is model-bound, while the public
+/// thinking summary is not part of the cryptographic identity.
+fn native_signature_v2_registry_key(model: &str, signature: &str) -> String {
+    let canonical_model = canonical_native_model(model);
+    let mut hasher = Sha256::new();
+    hasher.update(b"kiro-rs/aws-b/native-thinking-signature/v2\0");
+    update_len_prefixed(&mut hasher, canonical_model.as_bytes());
+    update_len_prefixed(&mut hasher, signature.as_bytes());
+    format!("{NATIVE_SIGNATURE_V2_KEY_PREFIX}{}", digest_hex(hasher))
+}
+
+fn native_signature_fingerprint_keys(model: &str, signature: &str) -> Vec<String> {
+    let Ok(raw) = BASE64.decode(signature) else {
+        return Vec::new();
+    };
+    if raw.len() < 32 || raw.len() > MAX_NATIVE_SIGNATURE_RAW_BYTES {
+        return Vec::new();
+    }
+    let canonical_model = canonical_native_model(model);
+    (0..NATIVE_SIGNATURE_FINGERPRINT_PARTS)
+        .map(|part| {
+            let start = part * raw.len() / NATIVE_SIGNATURE_FINGERPRINT_PARTS;
+            let end = (part + 1) * raw.len() / NATIVE_SIGNATURE_FINGERPRINT_PARTS;
+            let mut hasher = Sha256::new();
+            hasher.update(b"kiro-rs/aws-b/native-thinking-signature/fingerprint/v2\0");
+            update_len_prefixed(&mut hasher, canonical_model.as_bytes());
+            hasher.update((raw.len() as u64).to_be_bytes());
+            hasher.update((part as u64).to_be_bytes());
+            update_len_prefixed(&mut hasher, &raw[start..end]);
+            format!(
+                "{NATIVE_SIGNATURE_FINGERPRINT_KEY_PREFIX}{}",
+                digest_hex(hasher)
+            )
+        })
+        .collect()
 }
 
 /// Register an opaque native signature before it is exposed to the client.
@@ -111,13 +319,17 @@ pub async fn register_native_signature(model: &str, thinking: &str, signature: &
     if signature.is_empty() {
         return;
     }
-    let key = native_signature_registry_key(model, thinking, signature);
-    crate::cluster_cache::global()
-        .register(&key, native_signature_registry_ttl())
-        .await;
+    let mut keys = vec![
+        // Keep writing V1 throughout a rolling upgrade so old containers can validate responses
+        // issued by new containers before the whole fleet has switched to V2.
+        native_signature_registry_key(model, thinking, signature),
+        native_signature_v2_registry_key(model, signature),
+    ];
+    keys.extend(native_signature_fingerprint_keys(model, signature));
+    register_native_registry_keys(&keys).await;
 }
 
-/// Validate a native signature by exact, model-and-content-bound round trip.
+/// Validate a native signature by exact, model-bound round trip.
 ///
 /// This deliberately does not attempt to reverse engineer or imitate the AWS/Anthropic private
 /// cryptographic format. Unknown imported signatures fail closed on the Kiro conversion path;
@@ -126,17 +338,218 @@ pub async fn validate_native_signature(model: &str, thinking: &str, signature: &
     if signature.is_empty() {
         return false;
     }
-    let key = native_signature_registry_key(model, thinking, signature);
-    let registry = crate::cluster_cache::global();
-    if !registry.exists(&key).await {
+    let v2_key = native_signature_v2_registry_key(model, signature);
+    let v1_key = native_signature_registry_key(model, thinking, signature);
+    if native_registry_exists(&v2_key).await || native_registry_exists(&v1_key).await {
+        // Refresh every associated key and promote an exact V1 hit into the durable V2 namespace.
+        register_native_signature(model, thinking, signature).await;
+        return true;
+    }
+    // Old AWS-B releases could emit a local self-verifying HMAC fallback. It remains safe to
+    // accept those across upgrades because tampering is checked cryptographically and statelessly.
+    if validate_signature(signature).is_ok() {
+        register_native_signature(model, thinking, signature).await;
+        return true;
+    }
+    false
+}
+
+pub fn native_signature_import_window_open() -> bool {
+    static IMPORT_UNTIL: OnceLock<Option<u64>> = OnceLock::new();
+    let Some(until) = *IMPORT_UNTIL.get_or_init(|| {
+        std::env::var("KIRO_NATIVE_SIGNATURE_IMPORT_UNTIL_EPOCH")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    }) else {
+        return false;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(u64::MAX);
+    now < until
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeSignatureImportResult {
+    Imported,
+    RecoveredExactFingerprint,
+    RegisteredNearMatch,
+    InvalidStructure,
+}
+
+/// Import one pre-registry Bedrock signature during a bounded production migration.
+///
+/// This is intentionally separate from normal exact validation. A signature that shares at least
+/// three of four model-and-length-bound chunks with one already issued by this fleet is a typical
+/// single-point modification and remains rejected. Four matches recover an exact value if an
+/// interrupted Redis write left only its fingerprints. A completely unknown value must pass the
+/// observed Bedrock protobuf envelope and internal-model checks before being registered.
+pub async fn import_native_signature_during_migration(
+    model: &str,
+    thinking: &str,
+    signature: &str,
+) -> NativeSignatureImportResult {
+    if !is_plausible_bedrock_native_signature(model, signature) {
+        return NativeSignatureImportResult::InvalidStructure;
+    }
+    let fingerprint_keys = native_signature_fingerprint_keys(model, signature);
+    let matches = join_all(
+        fingerprint_keys
+            .iter()
+            .map(|key| native_registry_exists(key)),
+    )
+    .await
+    .into_iter()
+    .filter(|matched| *matched)
+    .count();
+    if matches == NATIVE_SIGNATURE_FINGERPRINT_PARTS {
+        register_native_signature(model, thinking, signature).await;
+        return NativeSignatureImportResult::RecoveredExactFingerprint;
+    }
+    if matches >= NATIVE_SIGNATURE_NEAR_MATCH_THRESHOLD {
+        return NativeSignatureImportResult::RegisteredNearMatch;
+    }
+    register_native_signature(model, thinking, signature).await;
+    NativeSignatureImportResult::Imported
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProtobufValue<'a> {
+    Varint(u64),
+    Bytes(&'a [u8]),
+    Fixed,
+}
+
+fn read_protobuf_varint(input: &[u8], cursor: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    for shift in (0..=63).step_by(7) {
+        let byte = *input.get(*cursor)?;
+        *cursor += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn parse_protobuf_fields(input: &[u8]) -> Option<Vec<(u64, ProtobufValue<'_>)>> {
+    let mut cursor = 0usize;
+    let mut fields = Vec::new();
+    while cursor < input.len() {
+        let tag = read_protobuf_varint(input, &mut cursor)?;
+        let field = tag >> 3;
+        if field == 0 {
+            return None;
+        }
+        let value = match tag & 0x07 {
+            0 => ProtobufValue::Varint(read_protobuf_varint(input, &mut cursor)?),
+            1 => {
+                cursor = cursor.checked_add(8)?;
+                if cursor > input.len() {
+                    return None;
+                }
+                ProtobufValue::Fixed
+            }
+            2 => {
+                let len = usize::try_from(read_protobuf_varint(input, &mut cursor)?).ok()?;
+                let end = cursor.checked_add(len)?;
+                let bytes = input.get(cursor..end)?;
+                cursor = end;
+                ProtobufValue::Bytes(bytes)
+            }
+            5 => {
+                cursor = cursor.checked_add(4)?;
+                if cursor > input.len() {
+                    return None;
+                }
+                ProtobufValue::Fixed
+            }
+            _ => return None,
+        };
+        fields.push((field, value));
+        if fields.len() > 64 {
+            return None;
+        }
+    }
+    Some(fields)
+}
+
+fn internal_model_matches(model: &str, internal: &str) -> bool {
+    let canonical = canonical_native_model(model);
+    match canonical.as_str() {
+        "claude-opus-4.8" => internal == "claude-quince",
+        "claude-opus-5" => internal == "claude-honey",
+        "claude-sonnet-5" => internal == "claude-saffron",
+        "claude-opus-4.7" => internal == "claude-opus-4-7",
+        "claude-opus-4.6" => internal == "claude-opus-4-6",
+        "claude-sonnet-4.6" => internal == "claude-sonnet-4-6",
+        "claude-sonnet-4.5" => internal == "claude-sonnet-4-5",
+        "claude-haiku-4.5" => internal == "claude-haiku-4-5",
+        _ => false,
+    }
+}
+
+fn is_plausible_bedrock_native_signature(model: &str, signature: &str) -> bool {
+    let Ok(raw) = BASE64.decode(signature) else {
+        return false;
+    };
+    if raw.len() < 128
+        || raw.len() > MAX_NATIVE_SIGNATURE_RAW_BYTES
+        || raw.first() != Some(&0x12)
+        || !raw.ends_with(&[0x18, 0x01])
+    {
         return false;
     }
-    // Successful conversation continuations refresh the retention window so active long-running
-    // sessions do not age out merely because the first thinking turn was created weeks earlier.
-    registry
-        .register(&key, native_signature_registry_ttl())
-        .await;
-    true
+    let Some(top) = parse_protobuf_fields(&raw) else {
+        return false;
+    };
+    let mut inner = None;
+    let mut terminal = false;
+    for (field, value) in top {
+        match (field, value) {
+            (2, ProtobufValue::Bytes(bytes)) if inner.is_none() => inner = Some(bytes),
+            (3, ProtobufValue::Varint(1)) => terminal = true,
+            _ => {}
+        }
+    }
+    let (Some(inner), true) = (inner, terminal) else {
+        return false;
+    };
+    let Some(inner_fields) = parse_protobuf_fields(inner) else {
+        return false;
+    };
+    let mut header = None;
+    let mut required_payload_fields = [false; 4];
+    for (field, value) in inner_fields {
+        if let ProtobufValue::Bytes(bytes) = value {
+            match field {
+                1 if header.is_none() => header = Some(bytes),
+                2..=5 => required_payload_fields[(field - 2) as usize] = !bytes.is_empty(),
+                _ => {}
+            }
+        }
+    }
+    if required_payload_fields.iter().any(|present| !present) {
+        return false;
+    }
+    let Some(header_fields) = header.and_then(parse_protobuf_fields) else {
+        return false;
+    };
+    let mut internal_model = None;
+    let mut thinking_marker = false;
+    for (field, value) in header_fields {
+        if let ProtobufValue::Bytes(bytes) = value {
+            match field {
+                6 => internal_model = std::str::from_utf8(bytes).ok(),
+                8 => thinking_marker = bytes == b"thinking",
+                _ => {}
+            }
+        }
+    }
+    thinking_marker
+        && internal_model.is_some_and(|internal| internal_model_matches(model, internal))
 }
 
 /// 手写 HMAC-SHA256（复用已有的 `sha2` 依赖，避免引入 `hmac` crate）。
@@ -308,6 +721,27 @@ pub fn validate_signature(signature: &str) -> Result<(), SignatureValidationDiag
 #[cfg(test)]
 pub fn verify_signature(signature: &str) -> bool {
     validate_signature(signature).is_ok()
+}
+
+#[cfg(test)]
+pub fn native_bedrock_signature_for_test(internal_model: &str) -> String {
+    let mut header = vec![0x08, 0x0f, 0x10, 0x01, 0x18, 0x02];
+    push_len_field(&mut header, 5, &rand_bytes(64));
+    push_len_field(&mut header, 6, internal_model.as_bytes());
+    header.extend_from_slice(&[0x38, 0x00]);
+    push_len_field(&mut header, 8, b"thinking");
+
+    let mut inner = Vec::new();
+    push_len_field(&mut inner, 1, &header);
+    push_len_field(&mut inner, 2, &rand_bytes(12));
+    push_len_field(&mut inner, 3, &rand_bytes(12));
+    push_len_field(&mut inner, 4, &rand_bytes(48));
+    push_len_field(&mut inner, 5, &rand_bytes(256));
+
+    let mut raw = Vec::new();
+    push_len_field(&mut raw, 2, &inner);
+    raw.extend_from_slice(&[0x18, 0x01]);
+    BASE64.encode(raw)
 }
 
 #[cfg(test)]
@@ -511,10 +945,23 @@ mod tests {
                 "modified-signature-material",
             )
         );
+
+        let v2 = native_signature_v2_registry_key("claude-opus-4-8", "opaque-signature-material");
+        assert_eq!(
+            v2,
+            native_signature_v2_registry_key(
+                "anthropic.claude-opus-4-8",
+                "opaque-signature-material",
+            )
+        );
+        assert_ne!(
+            v2,
+            native_signature_v2_registry_key("claude-opus-5", "opaque-signature-material")
+        );
     }
 
     #[tokio::test]
-    async fn native_registry_accepts_only_exact_registered_round_trip() {
+    async fn native_registry_binds_model_and_signature_but_not_public_thinking_summary() {
         let signature = format!("native-opaque-{}", fastrand::u64(..));
         assert!(
             !validate_native_signature("claude-opus-4-8", "visible thinking", &signature).await
@@ -524,8 +971,15 @@ mod tests {
             validate_native_signature("anthropic.claude-opus-4-8", "visible thinking", &signature,)
                 .await
         );
+        assert!(validate_native_signature("claude-opus-4-8", "changed thinking", &signature).await);
+        assert!(!validate_native_signature("claude-opus-5", "visible thinking", &signature).await);
         assert!(
-            !validate_native_signature("claude-opus-4-8", "changed thinking", &signature).await
+            !validate_native_signature(
+                "claude-opus-4-8",
+                "visible thinking",
+                &format!("{signature}changed"),
+            )
+            .await
         );
         assert!(!validate_native_signature("claude-opus-4-8", "visible thinking", "").await);
     }
