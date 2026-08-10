@@ -681,6 +681,18 @@ impl MultiTokenManager {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
     }
 
+    /// 检查凭据是否支持请求的模型。
+    ///
+    /// 所有凭据选择路径（包括 priority 模式的 current_id 快路径）都必须复用
+    /// 这个条件，避免对 Opus 的订阅等级约束出现分支漂移。
+    fn credential_supports_model(credentials: &KiroCredentials, model: Option<&str>) -> bool {
+        let is_opus = model
+            .map(|model| model.to_ascii_lowercase().contains("opus"))
+            .unwrap_or(false);
+
+        !is_opus || credentials.supports_opus()
+    }
+
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
@@ -691,11 +703,6 @@ impl MultiTokenManager {
     fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
 
-        // 检查是否是 opus 模型
-        let is_opus = model
-            .map(|m| m.to_lowercase().contains("opus"))
-            .unwrap_or(false);
-
         // 过滤可用凭据
         let available: Vec<_> = entries
             .iter()
@@ -703,11 +710,7 @@ impl MultiTokenManager {
                 if e.disabled {
                     return false;
                 }
-                // 如果是 opus 模型，需要检查订阅等级
-                if is_opus && !e.credentials.supports_opus() {
-                    return false;
-                }
-                true
+                Self::credential_supports_model(&e.credentials, model)
             })
             .collect();
 
@@ -772,7 +775,11 @@ impl MultiTokenManager {
                     let current_id = *self.current_id.lock();
                     entries
                         .iter()
-                        .find(|e| e.id == current_id && !e.disabled)
+                        .find(|e| {
+                            e.id == current_id
+                                && !e.disabled
+                                && Self::credential_supports_model(&e.credentials, model)
+                        })
                         .map(|e| (e.id, e.credentials.clone()))
                 };
 
@@ -2336,6 +2343,51 @@ mod tests {
         let ctx = manager.acquire_context(None).await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_switches_from_current_free_credential_for_opus() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority".to_string();
+
+        let expires_at = (Utc::now() + Duration::hours(1)).to_rfc3339();
+
+        let mut free_credential = KiroCredentials::default();
+        free_credential.priority = 0;
+        free_credential.access_token = Some("free-token".to_string());
+        free_credential.expires_at = Some(expires_at.clone());
+        free_credential.subscription_title = Some("KIRO FREE".to_string());
+
+        let mut opus_credential = KiroCredentials::default();
+        opus_credential.priority = 1;
+        opus_credential.access_token = Some("opus-token".to_string());
+        opus_credential.expires_at = Some(expires_at);
+        opus_credential.subscription_title = Some("KIRO PRO+".to_string());
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![free_credential, opus_credential],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let ordinary_context = manager
+            .acquire_context(Some("claude-sonnet-5"))
+            .await
+            .unwrap();
+        assert_eq!(ordinary_context.id, 1);
+        assert_eq!(ordinary_context.token, "free-token");
+        assert_eq!(manager.snapshot().current_id, 1);
+
+        let opus_context = manager
+            .acquire_context(Some("claude-opus-5"))
+            .await
+            .unwrap();
+        assert_eq!(opus_context.id, 2);
+        assert_eq!(opus_context.token, "opus-token");
+        assert_eq!(manager.snapshot().current_id, 2);
     }
 
     #[tokio::test]

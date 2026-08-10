@@ -151,6 +151,8 @@ pub fn context_input_without_current_generation(
 
 impl InputContextCalibration {
     pub fn for_request(payload: &MessagesRequest) -> Self {
+        let effective_payload = super::types::effective_kiro_request(payload);
+        let payload = effective_payload.as_ref();
         let Some(tools) = payload.tools.as_ref().filter(|tools| !tools.is_empty()) else {
             return Self {
                 enabled: true,
@@ -678,6 +680,8 @@ pub fn invocation_metrics(
 /// Adjust the shared tokenizer to Bedrock's reported input-usage envelope.
 /// Tool requests already carry their own calibrated schema framing.
 pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i32 {
+    let effective_payload = super::types::effective_kiro_request(payload);
+    let payload = effective_payload.as_ref();
     // `compat` already charges every image exactly once as visual patches plus
     // its placement framing (+4 top-level, +21 inside a tool result). Keep the
     // Bedrock calibration text-only so the former blanket `image_count * 5`
@@ -787,7 +791,8 @@ pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i
             let reference_total = prefix_tokens.saturating_add(reference_envelope);
             let boundary_compatible_total =
                 calibrated_short_input_tokens(payload, base_tokens, &segments);
-            return blend_long_cache_total(boundary_compatible_total, reference_total, char_count)
+            return blend_long_text_total(boundary_compatible_total, reference_total, char_count)
+                .max(reference_total)
                 .max(1);
         }
 
@@ -860,10 +865,8 @@ fn terminal_cached_single_user_text(payload: &MessagesRequest) -> Option<&str> {
             .tools
             .as_ref()
             .is_some_and(|tools| !tools.is_empty())
-        || payload
-            .thinking
-            .as_ref()
-            .is_some_and(|thinking| thinking.thinking_type == "enabled")
+        || payload.thinking.is_some()
+        || payload.reasoning.is_some()
         || payload.output_config.is_some()
         || payload.messages.len() != 1
         || payload.messages[0].role != "user"
@@ -884,14 +887,21 @@ fn terminal_cached_single_user_text(payload: &MessagesRequest) -> Option<&str> {
     block.get("text").and_then(Value::as_str)
 }
 
-fn blend_long_cache_total(legacy_total: i32, reference_total: i32, char_count: usize) -> i32 {
+fn long_text_blend_weight(char_count: usize) -> f64 {
     const BLEND_START: usize = 1_024;
     const BLEND_END: usize = 4_096;
 
-    let weight = ((char_count.saturating_sub(BLEND_START)) as f64
-        / (BLEND_END - BLEND_START) as f64)
-        .clamp(0.0, 1.0);
-    (f64::from(legacy_total) * (1.0 - weight) + f64::from(reference_total) * weight)
+    ((char_count.saturating_sub(BLEND_START)) as f64 / (BLEND_END - BLEND_START) as f64)
+        .clamp(0.0, 1.0)
+}
+
+fn blend_long_text_total(
+    boundary_compatible_total: i32,
+    reference_total: i32,
+    char_count: usize,
+) -> i32 {
+    let weight = long_text_blend_weight(char_count);
+    (f64::from(boundary_compatible_total) * (1.0 - weight) + f64::from(reference_total) * weight)
         .round()
         .clamp(1.0, f64::from(i32::MAX)) as i32
 }
@@ -1452,10 +1462,33 @@ pub fn calibrated_cache_prefix_tokens(
         .iter()
         .map(|text| text.chars().filter(|character| *character == ':').count())
         .sum::<usize>();
+    let correction = long_text_correction(char_count, colon_count);
+    let correction = if terminal_single_text_cache_prefix(system_segments, content_segments, tools)
+    {
+        (f64::from(correction) * long_text_blend_weight(char_count)).round() as i32
+    } else {
+        correction
+    };
     base_tokens
-        .saturating_add((long_text_correction(char_count, colon_count) - 3).max(0))
+        .saturating_add((correction - 3).max(0))
         .saturating_add(image_prefix_framing)
         .max(1)
+}
+
+fn terminal_single_text_cache_prefix(
+    system_segments: &[String],
+    content_segments: &[Value],
+    tools: &[Tool],
+) -> bool {
+    if !system_segments.is_empty() || !tools.is_empty() || content_segments.len() != 1 {
+        return false;
+    }
+    let Some(blocks) = content_segments[0].as_array() else {
+        return false;
+    };
+    blocks.len() == 1
+        && blocks[0].get("type").and_then(Value::as_str) == Some("text")
+        && blocks[0].get("text").and_then(Value::as_str).is_some()
 }
 
 fn contains_image_block(value: &Value) -> bool {
@@ -1718,7 +1751,8 @@ pub fn head_models_response() -> Response {
 }
 
 pub fn request_preflight_error(payload: &MessagesRequest) -> Option<Response> {
-    thinking_model_preflight_error(&payload.model).or_else(|| cache_control_limit_error(payload))
+    thinking_model_preflight_error(&payload.model)
+        .or_else(|| cache_control_preflight_error(payload))
 }
 
 fn thinking_model_preflight_error(model: &str) -> Option<Response> {
@@ -1753,24 +1787,237 @@ fn edge_preflight_failed() -> Response {
     response
 }
 
-fn cache_control_limit_error(payload: &MessagesRequest) -> Option<Response> {
-    let count = super::cache::request_cache_control_count(payload);
-    if count <= 4 {
-        return None;
-    }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PublicCacheTtl {
+    FiveMinutes,
+    OneHour,
+}
+
+fn cache_control_preflight_error(payload: &MessagesRequest) -> Option<Response> {
+    let controls = direct_cache_controls(payload);
+    let validation = if controls.len() > 4 {
+        Err(format!(
+            "A maximum of 4 cache_control breakpoints may be provided. Found {}.",
+            controls.len()
+        ))
+    } else {
+        validate_cache_controls(&controls)
+            .and_then(|()| validate_automatic_cache_target_ttl(payload))
+    };
+    let message = validation.err()?;
+
     let request_id = super::middleware::aws_b40_oneapi_request_id();
     let body = json!({
+        "type": "error",
         "error": {
-            "type": "<nil>",
-            "message": format!(
-                "upstream call, upstream invocation error, upstream returned error, RequestID: <redacted>, ValidationError: A maximum of 4 blocks with cache_control may be provided. Found {count}. (request id: {request_id})"
-            )
-        },
-        "type": "error"
+            "type": "invalid_request_error",
+            "message": format!("{message} (request id: {request_id})")
+        }
     });
     let mut response = (StatusCode::BAD_REQUEST, Json(body)).into_response();
     super::middleware::apply_aws_b40_headers(response.headers_mut(), &request_id);
     Some(response)
+}
+
+/// Automatic caching targets the final eligible block. If that block already
+/// has an explicit marker, Anthropic treats equal TTLs as a no-op and rejects
+/// different TTLs instead of silently choosing one.
+fn validate_automatic_cache_target_ttl(payload: &MessagesRequest) -> Result<(), String> {
+    let Some(automatic) = payload.cache_control.as_ref() else {
+        return Ok(());
+    };
+    let Some((path, explicit)) = final_cacheable_block_control(payload) else {
+        return Ok(());
+    };
+    let automatic_ttl = validate_cache_control("cache_control", automatic)?;
+    let explicit_ttl = validate_cache_control(&path, explicit)?;
+    if automatic_ttl != explicit_ttl {
+        return Err(format!(
+            "cache_control.ttl must match {path}.ttl because automatic caching targets the same final block"
+        ));
+    }
+    Ok(())
+}
+
+fn final_cacheable_block_control(payload: &MessagesRequest) -> Option<(String, &Value)> {
+    for (message_index, message) in payload.messages.iter().enumerate().rev() {
+        match &message.content {
+            Value::String(text) if !text.is_empty() => return None,
+            Value::Array(blocks) => {
+                for (block_index, block) in blocks.iter().enumerate().rev() {
+                    if !automatic_cache_block_is_eligible(block) {
+                        continue;
+                    }
+                    return block
+                        .get("cache_control")
+                        .filter(|control| !control.is_null())
+                        .map(|control| {
+                            (
+                                format!(
+                                    "messages.{message_index}.content.{block_index}.cache_control"
+                                ),
+                                control,
+                            )
+                        });
+                }
+            }
+            Value::Object(block) if automatic_cache_block_is_eligible(&message.content) => {
+                return block
+                    .get("cache_control")
+                    .filter(|control| !control.is_null())
+                    .map(|control| {
+                        (
+                            format!("messages.{message_index}.content.cache_control"),
+                            control,
+                        )
+                    });
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(system) = payload.system.as_ref() {
+        for (index, block) in system.iter().enumerate().rev() {
+            if block.text.is_empty() {
+                continue;
+            }
+            return block
+                .cache_control
+                .as_ref()
+                .map(|control| (format!("system.{index}.cache_control"), control));
+        }
+    }
+
+    payload.tools.as_ref().and_then(|tools| {
+        tools
+            .iter()
+            .enumerate()
+            .next_back()
+            .and_then(|(index, tool)| {
+                tool.cache_control
+                    .as_ref()
+                    .map(|control| (format!("tools.{index}.cache_control"), control))
+            })
+    })
+}
+
+fn automatic_cache_block_is_eligible(block: &Value) -> bool {
+    let Some(object) = block.as_object() else {
+        return false;
+    };
+    match object.get("type").and_then(Value::as_str) {
+        Some("thinking" | "redacted_thinking") => false,
+        Some("text") => object
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty()),
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// Return public cache breakpoints in their rendered prompt order. Explicit
+/// blocks follow the documented tools -> system -> messages hierarchy. The
+/// request-level automatic cache point lands on the final cacheable block, so
+/// it is ordered last and consumes one of the four public breakpoint slots.
+fn direct_cache_controls(payload: &MessagesRequest) -> Vec<(String, &Value)> {
+    let mut controls = Vec::new();
+
+    if let Some(tools) = payload.tools.as_ref() {
+        for (index, tool) in tools.iter().enumerate() {
+            if let Some(control) = tool.cache_control.as_ref() {
+                controls.push((format!("tools.{index}.cache_control"), control));
+            }
+        }
+    }
+
+    if let Some(system) = payload.system.as_ref() {
+        for (index, block) in system.iter().enumerate() {
+            if let Some(control) = block.cache_control.as_ref() {
+                controls.push((format!("system.{index}.cache_control"), control));
+            }
+        }
+    }
+
+    for (message_index, message) in payload.messages.iter().enumerate() {
+        match &message.content {
+            Value::Array(blocks) => {
+                for (block_index, block) in blocks.iter().enumerate() {
+                    let Some(control) = block.get("cache_control") else {
+                        continue;
+                    };
+                    if !control.is_null() {
+                        controls.push((
+                            format!("messages.{message_index}.content.{block_index}.cache_control"),
+                            control,
+                        ));
+                    }
+                }
+            }
+            Value::Object(block) => {
+                if let Some(control) = block.get("cache_control")
+                    && !control.is_null()
+                {
+                    controls.push((
+                        format!("messages.{message_index}.content.cache_control"),
+                        control,
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(control) = payload.cache_control.as_ref()
+        && !control.is_null()
+    {
+        controls.push(("cache_control".to_string(), control));
+    }
+
+    controls
+}
+
+fn validate_cache_controls(controls: &[(String, &Value)]) -> Result<(), String> {
+    let mut saw_five_minute = false;
+    for (path, control) in controls {
+        let ttl = validate_cache_control(path, control)?;
+        match ttl {
+            PublicCacheTtl::FiveMinutes => saw_five_minute = true,
+            PublicCacheTtl::OneHour if saw_five_minute => {
+                return Err(format!(
+                    "{path}.ttl: 1h cache_control entries must appear before all 5m entries"
+                ));
+            }
+            PublicCacheTtl::OneHour => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_cache_control(path: &str, control: &Value) -> Result<PublicCacheTtl, String> {
+    let object = control
+        .as_object()
+        .ok_or_else(|| format!("{path}: Input should be a valid object"))?;
+
+    if let Some(extra) = object
+        .keys()
+        .find(|field| !matches!(field.as_str(), "type" | "ttl"))
+    {
+        return Err(format!("{path}.{extra}: Extra inputs are not permitted"));
+    }
+
+    match object.get("type") {
+        Some(Value::String(cache_type)) if cache_type == "ephemeral" => {}
+        Some(_) => return Err(format!("{path}.type: Input should be 'ephemeral'")),
+        None => return Err(format!("{path}.type: Field required")),
+    }
+
+    match object.get("ttl") {
+        None => Ok(PublicCacheTtl::FiveMinutes),
+        Some(Value::String(ttl)) if ttl == "5m" => Ok(PublicCacheTtl::FiveMinutes),
+        Some(Value::String(ttl)) if ttl == "1h" => Ok(PublicCacheTtl::OneHour),
+        Some(_) => Err(format!("{path}.ttl: Input should be '5m' or '1h'")),
+    }
 }
 
 fn no_bedrock_distributor(model: &str) -> Response {
@@ -1860,28 +2107,6 @@ pub fn response_model(model: &str) -> String {
 
 pub fn response_id(model: &str) -> String {
     id::bedrock_message_id_for_model(model)
-}
-
-pub fn signature(
-    model: &str,
-    adaptive: bool,
-    thinking_text: &str,
-    usage: UsageBreakdown,
-) -> String {
-    if adaptive {
-        let context_tokens = usage
-            .input_tokens
-            .saturating_add(usage.cache_read_input_tokens)
-            .saturating_add(usage.cache_creation_input_tokens);
-        super::signature::generate_aws_b40_adaptive_signature_for_model(
-            model,
-            thinking_text.len(),
-            context_tokens,
-            usage.cache_read_input_tokens,
-        )
-    } else {
-        super::signature::generate_aws_b40_signature_for_model(model)
-    }
 }
 
 pub fn non_stream_response(
@@ -3737,8 +3962,23 @@ mod tests {
     }
 
     #[test]
-    fn automatic_cache_mode_does_not_reduce_four_block_limit() {
+    fn automatic_cache_mode_uses_one_of_four_breakpoint_slots() {
         let four_blocks = request(json!({
+            "cache_control": {"type": "ephemeral"},
+            "system": [
+                {"type": "text", "text": "one", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "two", "cache_control": {"type": "ephemeral"}}
+            ],
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "three", "cache_control": {"type": "ephemeral"}}
+                ]
+            }]
+        }));
+        assert!(request_preflight_error(&four_blocks).is_none());
+
+        let five_blocks = request(json!({
             "cache_control": {"type": "ephemeral"},
             "system": [
                 {"type": "text", "text": "one", "cache_control": {"type": "ephemeral"}},
@@ -3752,26 +3992,208 @@ mod tests {
                 ]
             }]
         }));
-        assert!(request_preflight_error(&four_blocks).is_none());
-
-        let five_blocks = request(json!({
-            "system": [
-                {"type": "text", "text": "one", "cache_control": {"type": "ephemeral"}},
-                {"type": "text", "text": "two", "cache_control": {"type": "ephemeral"}}
-            ],
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "three", "cache_control": {"type": "ephemeral"}},
-                    {"type": "text", "text": "four", "cache_control": {"type": "ephemeral"}},
-                    {"type": "text", "text": "five", "cache_control": {"type": "ephemeral"}}
-                ]
-            }]
-        }));
         assert_eq!(
             request_preflight_error(&five_blocks).unwrap().status(),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    #[test]
+    fn automatic_cache_ttl_must_match_an_explicit_final_block() {
+        let matching = request(json!({
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "final",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                }]
+            }]
+        }));
+        assert!(request_preflight_error(&matching).is_none());
+
+        let conflicting = request(json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "final",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                }]
+            }]
+        }));
+        assert_eq!(
+            request_preflight_error(&conflicting).unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let earlier_different_ttl = request(json!({
+            "cache_control": {"type": "ephemeral"},
+            "system": [{
+                "type": "text",
+                "text": "stable",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }],
+            "messages": [{"role": "user", "content": "final unmarked block"}]
+        }));
+        assert!(request_preflight_error(&earlier_different_ttl).is_none());
+    }
+
+    #[test]
+    fn null_cache_controls_are_omitted_at_every_public_location() {
+        let payload = request(json!({
+            "cache_control": null,
+            "tools": [{
+                "name": "lookup",
+                "description": "Lookup a value",
+                "input_schema": {"type": "object", "properties": {}},
+                "cache_control": null
+            }],
+            "system": [{
+                "type": "text",
+                "text": "stable system",
+                "cache_control": null
+            }],
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "hello",
+                    "cache_control": null
+                }]
+            }]
+        }));
+
+        assert!(request_preflight_error(&payload).is_none());
+        assert!(direct_cache_controls(&payload).is_empty());
+    }
+
+    #[test]
+    fn cache_control_shape_is_validated_at_every_public_location() {
+        let invalid_requests = [
+            json!({"cache_control": true}),
+            json!({"cache_control": []}),
+            json!({"cache_control": {}}),
+            json!({"cache_control": {"type": "persistent"}}),
+            json!({"cache_control": {"type": "ephemeral", "ttl": "2h"}}),
+            json!({"cache_control": {"type": "ephemeral", "ttl": null}}),
+            json!({"cache_control": {"type": "ephemeral", "future": true}}),
+            json!({
+                "tools": [{
+                    "name": "lookup",
+                    "cache_control": "ephemeral"
+                }]
+            }),
+            json!({
+                "system": [{
+                    "type": "text",
+                    "text": "stable",
+                    "cache_control": {"ttl": "1h"}
+                }]
+            }),
+            json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "hello",
+                        "cache_control": {"type": "ephemeral", "ttl": false}
+                    }]
+                }]
+            }),
+        ];
+
+        for extra in invalid_requests {
+            let response = request_preflight_error(&request(extra)).expect("invalid cache_control");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn mixed_cache_ttls_follow_rendered_prompt_order() {
+        let valid = request(json!({
+            "tools": [{
+                "name": "lookup",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }],
+            "system": [{
+                "type": "text",
+                "text": "stable",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }],
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "hello",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }],
+            "cache_control": {"type": "ephemeral", "ttl": "5m"}
+        }));
+        assert!(request_preflight_error(&valid).is_none());
+
+        for invalid in [
+            json!({
+                "tools": [{
+                    "name": "lookup",
+                    "cache_control": {"type": "ephemeral"}
+                }],
+                "system": [{
+                    "type": "text",
+                    "text": "stable",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                }]
+            }),
+            json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "short", "cache_control": {"type": "ephemeral"}},
+                        {"type": "text", "text": "long", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+                    ]
+                }]
+            }),
+            json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "short",
+                        "cache_control": {"type": "ephemeral"}
+                    }]
+                }],
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }),
+        ] {
+            let response = request_preflight_error(&request(invalid)).expect("invalid TTL order");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_control_errors_use_anthropic_shape_for_stream_and_non_stream() {
+        for stream in [false, true] {
+            let payload = request(json!({
+                "stream": stream,
+                "cache_control": {"type": "ephemeral", "ttl": "forever"}
+            }));
+            let response = request_preflight_error(&payload).expect("invalid ttl");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("cache_control error body");
+            let body: Value = serde_json::from_slice(&bytes).expect("Anthropic error JSON");
+            assert_eq!(body["type"], "error");
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("cache_control.ttl"))
+            );
+        }
     }
 
     #[test]
@@ -4151,7 +4573,7 @@ mod tests {
     #[test]
     fn terminal_cache_total_is_monotone_across_long_text_boundary() {
         let calibrated = |text: String| {
-            calibrated_payload(&request(json!({
+            let payload = request(json!({
                 "model": "claude-opus-4-8",
                 "messages": [{
                     "role": "user",
@@ -4161,18 +4583,24 @@ mod tests {
                         "cache_control": {"type": "ephemeral"}
                     }]
                 }]
-            })))
+            }));
+            let total = calibrated_payload(&payload);
+            let contents = vec![payload.messages[0].content.clone()];
+            let base =
+                super::super::compat::estimate_prefix_tokens(&payload.model, &[], &contents, &[]);
+            let prefix = calibrated_cache_prefix_tokens(&payload.model, base, &[], &contents, &[]);
+            (total, prefix)
         };
 
         for prefix in ["a", "def value():\n    return 1\n#"] {
-            let at_boundary = calibrated(
+            let (at_boundary, _) = calibrated(
                 prefix
                     .repeat(1_024 / prefix.chars().count() + 1)
                     .chars()
                     .take(1_024)
                     .collect(),
             );
-            let after_boundary = calibrated(
+            let (after_boundary, after_prefix) = calibrated(
                 prefix
                     .repeat(1_025 / prefix.chars().count() + 1)
                     .chars()
@@ -4183,6 +4611,46 @@ mod tests {
                 after_boundary >= at_boundary,
                 "one appended character reduced terminal cache usage: {at_boundary} -> {after_boundary}",
             );
+            assert!(
+                after_boundary.saturating_sub(at_boundary) < 32,
+                "one appended character caused a discontinuous terminal cache jump: {at_boundary} -> {after_boundary}",
+            );
+            assert!(
+                after_boundary >= after_prefix.saturating_add(2),
+                "full usage fell below cache prefix plus terminal envelope: {after_boundary} < {after_prefix} + 2",
+            );
+
+            for length in [2_048, 4_095] {
+                let (total, cached_prefix) = calibrated(
+                    prefix
+                        .repeat(length / prefix.chars().count() + 1)
+                        .chars()
+                        .take(length)
+                        .collect(),
+                );
+                assert!(total >= cached_prefix.saturating_add(2));
+            }
         }
+    }
+
+    #[test]
+    fn long_system_cache_prefix_keeps_existing_accounting_curve() {
+        let system = vec!["stable system context ".repeat(160)];
+        let base =
+            super::super::compat::estimate_prefix_tokens("claude-opus-4-8", &system, &[], &[]);
+        let char_count = system[0].chars().count();
+        let colon_count = system[0]
+            .chars()
+            .filter(|character| *character == ':')
+            .count();
+        let expected = base
+            .saturating_add((long_text_correction(char_count, colon_count) - 3).max(0))
+            .max(1);
+
+        assert_eq!(
+            calibrated_cache_prefix_tokens("claude-opus-4-8", base, &system, &[], &[]),
+            expected,
+            "terminal text smoothing must not alter ordinary system-cache billing"
+        );
     }
 }

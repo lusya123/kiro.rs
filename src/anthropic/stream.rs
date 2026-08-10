@@ -861,8 +861,29 @@ pub struct StreamContext {
     /// Exact cache/input split from `metadataEvent.tokenUsage`, when the
     /// selected Kiro runtime exposes it.
     exact_first_round_usage: Option<super::cache::UsageBreakdown>,
-    /// Exact aggregate input/output for the invocation currently streaming.
+    /// Request-derived TTL layout for an authoritative aggregate cache write.
+    exact_cache_ttl_plan: super::cache::ExactCacheTtlPlan,
+    /// Evidence that the first invocation reached a native terminal event.
+    /// HTTP 200, partial text/reasoning and a clean transport EOF are not
+    /// sufficient on their own.
+    first_round_terminal_evidence: bool,
+    /// A refusal is a valid client response, but is not by itself proof that a
+    /// locally planned compatibility-cache prefix became warm.
+    first_round_refused: bool,
+    /// Whether the current invocation supplied a known native stop reason.
+    /// End-of-stream shape heuristics must not replace authoritative metadata.
+    native_stop_reason_received: bool,
+    /// A fully closed tool call is meaningful terminal model output even when
+    /// no assistant text is visible to the client.
+    first_round_completed_tool_use: bool,
+    /// Exact aggregate input for the invocation currently streaming, derived
+    /// only from `metadataEvent.tokenUsage` (which also carries cache buckets).
     exact_current_input_tokens: Option<i32>,
+    /// Aggregate input observed in `meteringEvent`. This may refine ordinary
+    /// input billing, but it has no cache-bucket semantics and must never by
+    /// itself authorize a locally estimated cache split.
+    metered_current_input_tokens: Option<i32>,
+    /// Aggregate output observed from either native usage event.
     exact_current_output_tokens: Option<i32>,
     /// Exact output accumulated across completed continuation rounds.  The
     /// boolean stays false once any round lacks native output accounting.
@@ -907,6 +928,11 @@ pub struct StreamContext {
     native_reasoning_active: bool,
     /// Opaque signature received from the upstream reasoning stream.
     upstream_thinking_signature: Option<String>,
+    /// Exact thinking text emitted for the currently open native block. This is deliberately
+    /// separate from accounting text so omitted/sanitized output binds to what the client saw.
+    outbound_native_thinking_block: String,
+    /// A native signature must be registered before its SSE delta is exposed to the client.
+    pending_native_signature_registration: Option<(String, String)>,
     /// 待注入的合成 thinking 内容。仅作为旧模型或旧协议没有原生 reasoning 事件时的回退；
     /// 一旦收到真实 reasoningContentEvent 会立即取消。真实答案不受影响。
     pending_synthetic_thinking: Option<String>,
@@ -919,7 +945,6 @@ pub struct StreamContext {
     forced_tool_text_pending: String,
     /// Preserve the externally observed AWS-B/Bedrock protocol shape.
     aws_b40_compat: bool,
-    aws_b40_adaptive_signature: bool,
     aws_b40_thinking_requested: bool,
     /// `call_api_stream` 返回响应头前已经消耗的时间。
     upstream_request_latency_ms: u64,
@@ -927,6 +952,32 @@ pub struct StreamContext {
     stream_started_at: Instant,
     /// 首个上游 EventStream 事件到达的端到端耗时。
     first_byte_latency_ms: Option<u64>,
+}
+
+/// Choose the first-round aggregate that may reconcile public usage.
+///
+/// `meteringEvent.inputTokens` is useful for flat, ordinary input accounting,
+/// but it carries no cache read/write semantics. A request with an explicit
+/// cache split therefore requires either native `metadataEvent.tokenUsage` or
+/// an independently observed `contextUsageEvent`; metering alone is not cache
+/// authority.
+pub(super) fn select_first_round_reconciled_input(
+    initial_usage: super::cache::UsageBreakdown,
+    exact_token_usage_input: Option<i32>,
+    metered_aggregate_input: Option<i32>,
+    context_usage_input: Option<i32>,
+    resolved_aggregate_input: i32,
+) -> Option<i32> {
+    if initial_usage.has_cache_usage() {
+        return exact_token_usage_input
+            .or(context_usage_input)
+            .map(|tokens| tokens.max(1));
+    }
+
+    (exact_token_usage_input.is_some()
+        || metered_aggregate_input.is_some()
+        || context_usage_input.is_some())
+    .then_some(resolved_aggregate_input.max(1))
 }
 
 impl StreamContext {
@@ -977,7 +1028,13 @@ impl StreamContext {
             input_context_calibration: super::bedrock::InputContextCalibration::default(),
             first_round_authoritative_input_tokens: None,
             exact_first_round_usage: None,
+            exact_cache_ttl_plan: super::cache::ExactCacheTtlPlan::default(),
+            first_round_terminal_evidence: false,
+            first_round_refused: false,
+            native_stop_reason_received: false,
+            first_round_completed_tool_use: false,
             exact_current_input_tokens: None,
+            metered_current_input_tokens: None,
             exact_current_output_tokens: None,
             exact_completed_output_tokens: 0,
             exact_output_complete_for_prior_rounds: true,
@@ -995,11 +1052,12 @@ impl StreamContext {
             native_reasoning_chunk_lengths: Vec::new(),
             native_reasoning_active: false,
             upstream_thinking_signature: None,
+            outbound_native_thinking_block: String::new(),
+            pending_native_signature_registration: None,
             pending_synthetic_thinking: None,
             suppress_text_blocks: false,
             forced_tool_text_pending: String::new(),
             aws_b40_compat: false,
-            aws_b40_adaptive_signature: false,
             aws_b40_thinking_requested: false,
             upstream_request_latency_ms: 0,
             stream_started_at: Instant::now(),
@@ -1007,9 +1065,8 @@ impl StreamContext {
         }
     }
 
-    pub fn enable_aws_b40_compat(&mut self, adaptive_signature: bool) {
+    pub fn enable_aws_b40_compat(&mut self) {
         self.aws_b40_compat = true;
-        self.aws_b40_adaptive_signature = adaptive_signature;
         self.model = super::bedrock::response_model(&self.model);
         self.message_id = super::bedrock::response_id(&self.model);
         self.state_manager.set_emit_initial_ping(false);
@@ -1024,6 +1081,18 @@ impl StreamContext {
         calibration: super::bedrock::InputContextCalibration,
     ) {
         self.input_context_calibration = calibration;
+    }
+
+    pub fn set_exact_cache_ttl_plan(&mut self, plan: super::cache::ExactCacheTtlPlan) {
+        self.exact_cache_ttl_plan = plan;
+    }
+
+    pub(super) fn take_native_signature_registration(
+        &mut self,
+    ) -> Option<(String, String, String)> {
+        self.pending_native_signature_registration
+            .take()
+            .map(|(thinking, signature)| (self.model.clone(), thinking, signature))
     }
 
     pub fn set_upstream_request_latency(&mut self, elapsed: Duration) {
@@ -1290,6 +1359,15 @@ impl StreamContext {
                 );
                 Vec::new()
             }
+            Event::InvalidState(invalid) => {
+                self.mark_upstream_fatal_event();
+                tracing::error!(
+                    reason = %invalid.reason,
+                    message = %invalid.message,
+                    "收到 invalidStateEvent，终止当前上游调用"
+                );
+                Vec::new()
+            }
             Event::Error {
                 error_code,
                 error_message,
@@ -1305,6 +1383,9 @@ impl StreamContext {
                 // 处理 ContentLengthExceededException
                 if exception_type == "ContentLengthExceededException" {
                     self.state_manager.set_stop_reason("max_tokens");
+                    if !self.continuation_started {
+                        self.first_round_terminal_evidence = true;
+                    }
                 } else {
                     self.mark_upstream_fatal_event();
                 }
@@ -1312,8 +1393,14 @@ impl StreamContext {
                 Vec::new()
             }
             Event::Metering(metering) => {
-                if self.exact_current_input_tokens.is_none() && metering.input_tokens > 0 {
-                    self.exact_current_input_tokens = Some(metering.input_tokens);
+                // Kiro emits metering as a terminal accounting event. It is
+                // completion evidence, but its aggregate input count still
+                // carries no cache read/write semantics.
+                if !self.continuation_started {
+                    self.first_round_terminal_evidence = true;
+                }
+                if self.metered_current_input_tokens.is_none() && metering.input_tokens > 0 {
+                    self.metered_current_input_tokens = Some(metering.input_tokens);
                 }
                 if self.exact_current_output_tokens.is_none() && metering.output_tokens > 0 {
                     self.exact_current_output_tokens = Some(metering.output_tokens);
@@ -1328,14 +1415,48 @@ impl StreamContext {
             }
             Event::Metadata(metadata) => {
                 let usage = &metadata.token_usage;
-                if let Some(exact) = super::cache::UsageBreakdown::from_exact_token_usage(
+                let native = super::cache::reconcile_native_usage(
+                    &self.model,
                     self.initial_usage_breakdown,
                     usage,
-                ) {
-                    self.exact_current_input_tokens = Some(exact.total());
-                    self.exact_current_output_tokens = Some(usage.output_tokens);
+                    self.exact_cache_ttl_plan,
+                );
+                let mapped_stop_reason = metadata
+                    .stop_reason
+                    .as_deref()
+                    .and_then(crate::kiro::model::events::anthropic_stop_reason);
+                if let Some(reason) = mapped_stop_reason {
+                    self.native_stop_reason_received = true;
+                    // A client-side cap remains authoritative for the bytes
+                    // actually exposed even when terminal metadata arrives
+                    // after the locally truncated content.
+                    if !self.output_token_limit_reached {
+                        self.state_manager.set_stop_reason(reason);
+                    }
+                    if !self.continuation_started && reason == "refusal" {
+                        self.first_round_refused = true;
+                    }
+                } else if metadata
+                    .stop_reason
+                    .as_deref()
+                    .is_some_and(|reason| !reason.trim().is_empty())
+                {
+                    tracing::warn!(
+                        native_stop_reason = %metadata.stop_reason.as_deref().unwrap_or_default(),
+                        "忽略未知 Kiro stopReason，保留安全的本地终止推断"
+                    );
+                }
+                if !self.continuation_started
+                    && (native.is_some()
+                        || mapped_stop_reason.is_some_and(|reason| reason != "refusal"))
+                {
+                    self.first_round_terminal_evidence = true;
+                }
+                if let Some(native) = native {
+                    self.exact_current_input_tokens = Some(native.aggregate_input_tokens);
+                    self.exact_current_output_tokens = Some(native.output_tokens);
                     if !self.continuation_started {
-                        self.exact_first_round_usage = Some(exact);
+                        self.exact_first_round_usage = native.public_cache_usage;
                     }
                 }
                 tracing::debug!(
@@ -1463,7 +1584,7 @@ impl StreamContext {
                     self.thinking_buffer =
                         self.thinking_buffer[start_pos + "<thinking>".len()..].to_string();
 
-                    if self.expose_thinking {
+                    if self.expose_thinking && !self.aws_b40_compat {
                         // 创建 thinking 块的 content_block_start 事件
                         let thinking_index = self.state_manager.next_block_index();
                         self.thinking_block_index = Some(thinking_index);
@@ -1528,7 +1649,7 @@ impl StreamContext {
                     self.thinking_extracted = true;
 
                     // 先 flush(清理后)累积的 thinking,再发空的 thinking_delta、signature_delta、content_block_stop
-                    if self.expose_thinking {
+                    if self.expose_thinking && !self.aws_b40_compat {
                         if let Some(thinking_index) = self.thinking_block_index {
                             if let Some(ev) = self.flush_thinking_delta(thinking_index) {
                                 events.push(ev);
@@ -1536,7 +1657,11 @@ impl StreamContext {
                             if self.expose_thinking_text {
                                 events.push(self.create_thinking_delta_event(thinking_index, ""));
                             }
-                            events.push(self.create_signature_delta_event(thinking_index));
+                            if let Some(signature) =
+                                self.create_signature_delta_event(thinking_index)
+                            {
+                                events.push(signature);
+                            }
                             if let Some(stop_event) =
                                 self.state_manager.handle_content_block_stop(thinking_index)
                             {
@@ -1625,7 +1750,14 @@ impl StreamContext {
             if !delta.is_empty() {
                 self.upstream_reasoning_current_round.push_str(&delta);
                 if !self.native_reasoning_active {
-                    events.extend(self.start_native_reasoning_block());
+                    if self.aws_b40_compat {
+                        // Buffer until the upstream signature arrives. This
+                        // prevents an unsigned Kiro reasoning fragment from
+                        // being exposed as an Anthropic thinking block.
+                        self.native_reasoning_active = true;
+                    } else {
+                        events.extend(self.start_native_reasoning_block());
+                    }
                 }
                 self.native_reasoning_chunk_lengths
                     .push(delta.chars().count());
@@ -1635,7 +1767,7 @@ impl StreamContext {
 
         if !reasoning.signature.is_empty() {
             self.upstream_thinking_signature = Some(reasoning.signature.clone());
-            if !self.native_reasoning_active && reasoning.redacted_content.is_empty() {
+            if self.thinking_block_index.is_none() && reasoning.redacted_content.is_empty() {
                 events.extend(self.start_native_reasoning_block());
             }
             if self.native_reasoning_active {
@@ -1648,6 +1780,7 @@ impl StreamContext {
 
     fn start_native_reasoning_block(&mut self) -> Vec<SseEvent> {
         self.native_reasoning_active = true;
+        self.outbound_native_thinking_block.clear();
         if !self.expose_thinking {
             return Vec::new();
         }
@@ -1677,10 +1810,30 @@ impl StreamContext {
         self.thinking_extracted = true;
 
         let mut events = Vec::new();
+        if self.aws_b40_compat && self.upstream_thinking_signature.is_none() {
+            let raw = std::mem::take(&mut self.thinking_pending_raw);
+            if !raw.is_empty() {
+                self.thinking_tokens += estimate_tokens(&raw);
+                self.thinking_text_acc.push_str(&raw);
+            }
+            self.native_reasoning_last_chunk.clear();
+            self.native_reasoning_chunk_lengths.clear();
+            return events;
+        }
         if self.expose_thinking {
             if let Some(index) = self.thinking_block_index {
                 events.extend(self.flush_native_reasoning_deltas(index));
-                events.push(self.create_signature_delta_event(index));
+                if self.aws_b40_compat
+                    && let Some(signature) = self.upstream_thinking_signature.as_ref()
+                {
+                    self.pending_native_signature_registration = Some((
+                        std::mem::take(&mut self.outbound_native_thinking_block),
+                        signature.clone(),
+                    ));
+                }
+                if let Some(signature) = self.create_signature_delta_event(index) {
+                    events.push(signature);
+                }
                 if let Some(stop) = self.state_manager.handle_content_block_stop(index) {
                     events.push(stop);
                 }
@@ -1951,6 +2104,12 @@ impl StreamContext {
     /// 发出后置 `thinking_extracted=true`,后续真实内容走文本路径。
     fn emit_synthetic_thinking_block(&mut self, synth: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
+        if self.aws_b40_compat {
+            // A local string cannot stand in for model-layer reasoning or its
+            // signature. AWS-B therefore exposes no synthetic thinking block.
+            self.thinking_extracted = true;
+            return events;
+        }
         if self.expose_thinking {
             let idx = self.state_manager.next_block_index();
             self.thinking_block_index = Some(idx);
@@ -1967,16 +2126,10 @@ impl StreamContext {
                     }
                 }),
             ));
-            if self.aws_b40_compat {
-                self.thinking_tokens += estimate_tokens(synth);
-                self.thinking_text_acc.push_str(synth);
-                for chunk in text_delta_chunks(synth) {
-                    events.push(Self::thinking_delta_event(idx, chunk));
-                }
-            } else {
-                events.push(self.create_thinking_delta_event(idx, synth));
+            events.push(self.create_thinking_delta_event(idx, synth));
+            if let Some(signature) = self.create_signature_delta_event(idx) {
+                events.push(signature);
             }
-            events.push(self.create_signature_delta_event(idx));
             if let Some(stop) = self.state_manager.handle_content_block_stop(idx) {
                 events.push(stop);
             }
@@ -2017,6 +2170,7 @@ impl StreamContext {
     /// 创建 thinking_delta 事件
     fn create_thinking_delta_event(&mut self, index: i32, thinking: &str) -> SseEvent {
         if !thinking.is_empty() {
+            self.outbound_native_thinking_block.push_str(thinking);
             self.thinking_tokens += estimate_tokens(thinking);
             self.thinking_text_acc.push_str(thinking); // ctoc 流结束时计数
         }
@@ -2037,25 +2191,17 @@ impl StreamContext {
         )
     }
 
-    /// Create a signature delta. Native signatures are opaque and pass through
-    /// unchanged; locally generated signatures remain a legacy fallback.
-    fn create_signature_delta_event(&self, index: i32) -> SseEvent {
+    /// Create a signature delta. AWS-B only passes through a native upstream
+    /// signature; legacy profiles retain their local compatibility fallback.
+    fn create_signature_delta_event(&self, index: i32) -> Option<SseEvent> {
         let signature = if let Some(signature) = self.upstream_thinking_signature.as_ref() {
             signature.clone()
         } else if self.aws_b40_compat {
-            // 与 message_start / message_delta 上报的 usage 保持同一口径，
-            // 否则超限请求的签名会由钳制前的数值算出，与对外 usage 不自洽。
-            let usage = self.stream_start_usage_breakdown();
-            super::bedrock::signature(
-                &self.model,
-                self.aws_b40_adaptive_signature,
-                &self.thinking_text_acc,
-                usage,
-            )
+            return None;
         } else {
             super::signature::generate_signature()
         };
-        SseEvent::new(
+        Some(SseEvent::new(
             "content_block_delta",
             json!({
                 "type": "content_block_delta",
@@ -2065,7 +2211,7 @@ impl StreamContext {
                     "signature": signature
                 }
             }),
-        )
+        ))
     }
 
     /// 处理工具使用事件
@@ -2122,7 +2268,7 @@ impl StreamContext {
                 self.in_thinking_block = false;
                 self.thinking_extracted = true;
 
-                if self.expose_thinking {
+                if self.expose_thinking && !self.aws_b40_compat {
                     if let Some(thinking_index) = self.thinking_block_index {
                         if let Some(ev) = self.flush_thinking_delta(thinking_index) {
                             events.push(ev);
@@ -2130,7 +2276,9 @@ impl StreamContext {
                         if self.expose_thinking_text {
                             events.push(self.create_thinking_delta_event(thinking_index, ""));
                         }
-                        events.push(self.create_signature_delta_event(thinking_index));
+                        if let Some(signature) = self.create_signature_delta_event(thinking_index) {
+                            events.push(signature);
+                        }
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
                         {
@@ -2322,6 +2470,9 @@ impl StreamContext {
         {
             events.push(stop_event);
         }
+        if tool_use.stop && !self.continuation_started {
+            self.first_round_completed_tool_use = true;
+        }
 
         events
     }
@@ -2475,25 +2626,53 @@ impl StreamContext {
         events
     }
 
-    fn current_billable_input_tokens(&self) -> i32 {
-        if let Some(exact) = self.exact_current_input_tokens {
-            return exact.max(1);
-        }
+    fn context_authoritative_input_tokens(&self) -> Option<i32> {
         let context_input_tokens = super::bedrock::context_input_without_current_generation(
             self.context_input_tokens,
             &self.assistant_raw_content,
             &self.upstream_reasoning_current_round,
             &self.upstream_tool_input_current_round,
-        );
-        if self.aws_b40_compat {
+        )?;
+        Some(if self.aws_b40_compat {
             self.input_context_calibration.calibrate(
                 &self.model,
                 self.input_tokens,
-                context_input_tokens,
+                Some(context_input_tokens),
             )
         } else {
-            super::billing::billable_input_tokens(self.input_tokens, context_input_tokens)
+            super::billing::billable_input_tokens(self.input_tokens, Some(context_input_tokens))
+        })
+    }
+
+    fn current_billable_input_tokens(&self) -> i32 {
+        if let Some(exact) = self.exact_current_input_tokens {
+            return exact.max(1);
         }
+        if let Some(metered) = self.metered_current_input_tokens {
+            return metered.max(1);
+        }
+        if let Some(context) = self.context_authoritative_input_tokens() {
+            return context.max(1);
+        }
+        if self.aws_b40_compat {
+            self.input_context_calibration
+                .calibrate(&self.model, self.input_tokens, None)
+        } else {
+            super::billing::billable_input_tokens(self.input_tokens, None)
+        }
+    }
+
+    fn current_first_round_reconciled_input_tokens(
+        &self,
+        resolved_input_tokens: i32,
+    ) -> Option<i32> {
+        select_first_round_reconciled_input(
+            self.initial_usage_breakdown,
+            self.exact_current_input_tokens,
+            self.metered_current_input_tokens,
+            self.context_authoritative_input_tokens(),
+            resolved_input_tokens,
+        )
     }
 
     fn final_usage_breakdown(&self) -> super::cache::UsageBreakdown {
@@ -2518,8 +2697,7 @@ impl StreamContext {
         let authoritative_first_round_input_tokens = if self.continuation_started {
             self.first_round_authoritative_input_tokens
         } else {
-            (self.exact_current_input_tokens.is_some() || self.context_input_tokens.is_some())
-                .then_some(current_input_tokens)
+            self.current_first_round_reconciled_input_tokens(current_input_tokens)
         };
         let mut additional_round_input_tokens = self.additional_round_input_tokens.clone();
         if self.continuation_started {
@@ -2631,7 +2809,7 @@ impl StreamContext {
                     self.accumulate_thinking(&thinking_content);
 
                     // 关闭 thinking 块：先 flush(清理后)累积内容,再 thinking_delta 空 + signature + stop
-                    if self.expose_thinking {
+                    if self.expose_thinking && !self.aws_b40_compat {
                         if let Some(thinking_index) = self.thinking_block_index {
                             if let Some(ev) = self.flush_thinking_delta(thinking_index) {
                                 events.push(ev);
@@ -2639,7 +2817,11 @@ impl StreamContext {
                             if self.expose_thinking_text {
                                 events.push(self.create_thinking_delta_event(thinking_index, ""));
                             }
-                            events.push(self.create_signature_delta_event(thinking_index));
+                            if let Some(signature) =
+                                self.create_signature_delta_event(thinking_index)
+                            {
+                                events.push(signature);
+                            }
                             if let Some(stop_event) =
                                 self.state_manager.handle_content_block_stop(thinking_index)
                             {
@@ -2661,7 +2843,7 @@ impl StreamContext {
                     // 仍在 thinking 块内:把剩余缓冲区累积后统一清理,再关闭 thinking 块
                     let thinking_buffer = self.thinking_buffer.clone();
                     self.accumulate_thinking(&thinking_buffer);
-                    if self.expose_thinking {
+                    if self.expose_thinking && !self.aws_b40_compat {
                         if let Some(thinking_index) = self.thinking_block_index {
                             if let Some(ev) = self.flush_thinking_delta(thinking_index) {
                                 events.push(ev);
@@ -2669,7 +2851,11 @@ impl StreamContext {
                             if self.expose_thinking_text {
                                 events.push(self.create_thinking_delta_event(thinking_index, ""));
                             }
-                            events.push(self.create_signature_delta_event(thinking_index));
+                            if let Some(signature) =
+                                self.create_signature_delta_event(thinking_index)
+                            {
+                                events.push(signature);
+                            }
                             if let Some(stop_event) =
                                 self.state_manager.handle_content_block_stop(thinking_index)
                             {
@@ -2715,6 +2901,7 @@ impl StreamContext {
             && self.expose_thinking
             && self.thinking_block_index.is_some()
             && !self.state_manager.has_non_thinking_blocks()
+            && !self.native_stop_reason_received
         {
             self.state_manager.set_stop_reason("max_tokens");
             events.extend(self.emit_text_delta_events(" "));
@@ -2790,6 +2977,7 @@ impl StreamContext {
             .is_some_and(|limit| final_output_tokens >= limit.max(1))
             && !self.state_manager.has_tool_use()
             && !forced_application_identity
+            && !self.native_stop_reason_received
         {
             self.state_manager.set_stop_reason("max_tokens");
         }
@@ -2881,8 +3069,7 @@ impl StreamContext {
                 .push(current_input_tokens);
         } else {
             self.first_round_authoritative_input_tokens =
-                (self.exact_current_input_tokens.is_some() || self.context_input_tokens.is_some())
-                    .then_some(current_input_tokens);
+                self.current_first_round_reconciled_input_tokens(current_input_tokens);
             self.continuation_started = true;
         }
         if let Some(output_tokens) = self.exact_current_output_tokens {
@@ -2895,9 +3082,11 @@ impl StreamContext {
         self.input_tokens = next_estimated_input_tokens.max(1);
         self.context_input_tokens = None;
         self.exact_current_input_tokens = None;
+        self.metered_current_input_tokens = None;
         self.exact_current_output_tokens = None;
         self.upstream_reasoning_current_round.clear();
         self.upstream_tool_input_current_round.clear();
+        self.native_stop_reason_received = false;
     }
 
     #[allow(dead_code)]
@@ -2919,7 +3108,32 @@ impl StreamContext {
     /// invocation.  HTTP 200 alone is insufficient because Kiro may carry an
     /// error or exception inside the EventStream body.
     pub fn upstream_succeeded_for_cache(&self) -> bool {
-        !self.upstream_fatal_event
+        if self.upstream_fatal_event {
+            return false;
+        }
+
+        let has_completion_evidence =
+            self.first_round_completed_tool_use || self.first_round_terminal_evidence;
+        if !has_completion_evidence {
+            return false;
+        }
+
+        // Refusal metadata is completion evidence for the response, not for a
+        // speculative local cache write. An exact native read proves that the
+        // prefix was already reusable before the refusal; an exact write does
+        // not prove that a refused invocation committed a reusable prefix.
+        if self.first_round_refused {
+            return self
+                .exact_first_round_usage
+                .is_some_and(|usage| usage.cache_read_input_tokens > 0);
+        }
+
+        // A verified native cache split can veto registry warming when the
+        // provider explicitly reports zero cache activity. Models whose
+        // native cache buckets are known to be unstable leave this field
+        // empty and intentionally retain deterministic registry behavior.
+        self.exact_first_round_usage
+            .is_none_or(|usage| usage.has_cache_usage())
     }
 
     fn apply_output_token_limit(&mut self, text: &str) -> Option<String> {
@@ -3084,8 +3298,8 @@ impl BufferedStreamContext {
         self.inner.set_thinking_text_visible(visible);
     }
 
-    pub fn enable_aws_b40_compat(&mut self, adaptive_signature: bool) {
-        self.inner.enable_aws_b40_compat(adaptive_signature);
+    pub fn enable_aws_b40_compat(&mut self) {
+        self.inner.enable_aws_b40_compat();
     }
 
     pub fn set_aws_b40_thinking_requested(&mut self, requested: bool) {
@@ -3099,17 +3313,22 @@ impl BufferedStreamContext {
         self.inner.set_input_context_calibration(calibration);
     }
 
+    pub fn set_exact_cache_ttl_plan(&mut self, plan: super::cache::ExactCacheTtlPlan) {
+        self.inner.set_exact_cache_ttl_plan(plan);
+    }
+
+    pub(super) fn take_native_signature_registration(
+        &mut self,
+    ) -> Option<(String, String, String)> {
+        self.inner.take_native_signature_registration()
+    }
+
     pub fn set_suppress_text_blocks(&mut self, suppress: bool) {
         self.inner.set_suppress_text_blocks(suppress);
     }
 
     pub fn set_upstream_request_latency(&mut self, elapsed: Duration) {
         self.inner.set_upstream_request_latency(elapsed);
-    }
-
-    /// 透传:设置待注入的合成 thinking(见 StreamContext::set_synthetic_thinking)。
-    pub fn set_synthetic_thinking(&mut self, thinking: Option<String>) {
-        self.inner.set_synthetic_thinking(thinking);
     }
 
     /// 处理 Kiro 事件并缓冲结果
@@ -3315,6 +3534,402 @@ mod tests {
     }
 
     #[test]
+    fn cache_commit_requires_model_completion_evidence() {
+        let mut empty =
+            StreamContext::new_with_thinking("test-model", 100, false, false, HashMap::new());
+        assert!(!empty.upstream_succeeded_for_cache());
+
+        let _ = empty.process_assistant_response("real upstream output");
+        assert!(
+            !empty.upstream_succeeded_for_cache(),
+            "partial text followed by a clean EOF is not proof of completion"
+        );
+
+        let _ = empty.process_kiro_event(&Event::Metering(
+            crate::kiro::model::events::MeteringEvent::default(),
+        ));
+        assert!(empty.upstream_succeeded_for_cache());
+
+        empty.mark_upstream_fatal_event();
+        assert!(!empty.upstream_succeeded_for_cache());
+    }
+
+    #[test]
+    fn native_metadata_stop_reasons_are_preserved_in_stream_delta() {
+        for (native, expected) in [
+            ("END_TURN", "end_turn"),
+            ("MAX_TOKENS", "max_tokens"),
+            ("TOOL_USE", "tool_use"),
+            ("STOP_SEQUENCE", "stop_sequence"),
+            ("REFUSAL", "refusal"),
+            (
+                "MODEL_CONTEXT_WINDOW_EXCEEDED",
+                "model_context_window_exceeded",
+            ),
+        ] {
+            let mut ctx =
+                StreamContext::new_with_thinking("test-model", 100, false, false, HashMap::new());
+            let _ = ctx.process_kiro_event(&Event::Metadata(
+                crate::kiro::model::events::MetadataEvent {
+                    stop_reason: Some(native.to_string()),
+                    token_usage: Default::default(),
+                },
+            ));
+
+            let events = ctx.generate_final_events();
+            let delta = events
+                .iter()
+                .find(|event| event.event == "message_delta")
+                .expect("message_delta");
+            assert_eq!(delta.data["delta"]["stop_reason"], expected, "{native}");
+            assert!(delta.data["delta"]["stop_details"].is_null());
+        }
+    }
+
+    #[test]
+    fn unknown_native_stop_reason_fails_closed_without_cache_evidence() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 100, false, false, HashMap::new());
+        let _ = ctx.process_kiro_event(&Event::Metadata(
+            crate::kiro::model::events::MetadataEvent {
+                stop_reason: Some("FUTURE_PROVIDER_REASON".to_string()),
+                token_usage: Default::default(),
+            },
+        ));
+
+        assert_eq!(ctx.state_manager.get_stop_reason(), "end_turn");
+        assert!(!ctx.first_round_terminal_evidence);
+        assert!(!ctx.upstream_succeeded_for_cache());
+    }
+
+    #[test]
+    fn refusal_does_not_warm_fallback_cache_even_with_generic_metering() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 100, false, false, HashMap::new());
+        let _ = ctx.process_kiro_event(&Event::Metering(
+            crate::kiro::model::events::MeteringEvent::default(),
+        ));
+        let _ = ctx.process_kiro_event(&Event::Metadata(
+            crate::kiro::model::events::MetadataEvent {
+                stop_reason: Some("REFUSAL".to_string()),
+                token_usage: Default::default(),
+            },
+        ));
+
+        assert!(ctx.first_round_terminal_evidence);
+        assert!(ctx.first_round_refused);
+        assert_eq!(ctx.state_manager.get_stop_reason(), "refusal");
+        assert!(!ctx.upstream_succeeded_for_cache());
+    }
+
+    #[test]
+    fn invalid_state_after_terminal_accounting_prevents_cache_commit() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 100, false, false, HashMap::new());
+        let _ = ctx.process_kiro_event(&Event::Metering(
+            crate::kiro::model::events::MeteringEvent::default(),
+        ));
+        assert!(ctx.upstream_succeeded_for_cache());
+
+        let _ = ctx.process_kiro_event(&Event::InvalidState(
+            crate::kiro::model::events::InvalidStateEvent {
+                reason: "CONTENT_LENGTH_EXCEEDS_THRESHOLD".to_string(),
+                message: "request state rejected".to_string(),
+            },
+        ));
+        assert!(!ctx.upstream_succeeded_for_cache());
+    }
+
+    #[test]
+    fn exact_cache_usage_is_window_validated_before_commit() {
+        let request = serde_json::from_value::<super::super::types::MessagesRequest>(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 32,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "cache this terminal prefix",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }]
+        }))
+        .unwrap();
+        let plan =
+            super::super::cache::prepare_cache_commit(5_000, &request, true).exact_ttl_plan();
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-8",
+            5_000,
+            false,
+            super::super::cache::UsageBreakdown::flat(5_000),
+            HashMap::new(),
+        );
+        ctx.set_exact_cache_ttl_plan(plan);
+        let _ = ctx.process_kiro_event(&Event::Metadata(
+            crate::kiro::model::events::MetadataEvent {
+                stop_reason: Some("END_TURN".to_string()),
+                token_usage: crate::kiro::model::events::TokenUsage {
+                    uncached_input_tokens: 0,
+                    cache_read_input_tokens: 999_999,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 1,
+                    total_tokens: 1_000_000,
+                },
+            },
+        ));
+
+        assert_eq!(
+            ctx.exact_first_round_usage,
+            Some(super::super::cache::UsageBreakdown::flat(1))
+        );
+        assert!(!ctx.upstream_succeeded_for_cache());
+    }
+
+    #[test]
+    fn content_length_terminal_event_can_complete_cache_write() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 100, false, false, HashMap::new());
+        let _ = ctx.process_assistant_response("complete prefix before native output limit");
+        let _ = ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ContentLengthExceededException".to_string(),
+            message: "output limit reached".to_string(),
+        });
+
+        assert!(ctx.upstream_succeeded_for_cache());
+    }
+
+    #[test]
+    fn exact_zero_cache_metadata_prevents_local_registry_warming() {
+        let initial = super::super::cache::UsageBreakdown {
+            input_tokens: 1,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 99,
+            cache_creation_5m_input_tokens: 99,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-8",
+            100,
+            false,
+            initial,
+            HashMap::new(),
+        );
+        let _ = ctx.process_assistant_response("completed output");
+        let _ = ctx.process_kiro_event(&Event::Metadata(
+            crate::kiro::model::events::MetadataEvent {
+                stop_reason: Some("END_TURN".to_string()),
+                token_usage: crate::kiro::model::events::TokenUsage {
+                    uncached_input_tokens: 100,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 2,
+                    total_tokens: 102,
+                },
+            },
+        ));
+
+        assert!(!ctx.upstream_succeeded_for_cache());
+    }
+
+    #[test]
+    fn sonnet_repeated_native_write_preserves_shared_cache_read_in_stream() {
+        let request = serde_json::from_value::<super::super::types::MessagesRequest>(json!({
+            "model": "claude-sonnet-5",
+            "max_tokens": 32,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "stable Sonnet cache prefix",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }]
+        }))
+        .expect("cache request parses");
+        let initial = super::super::cache::UsageBreakdown {
+            input_tokens: 182,
+            cache_read_input_tokens: 89_520,
+            cache_creation_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let plan =
+            super::super::cache::prepare_cache_commit(89_702, &request, true).exact_ttl_plan();
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-5",
+            89_702,
+            false,
+            initial,
+            HashMap::new(),
+        );
+        ctx.enable_aws_b40_compat();
+        ctx.set_exact_cache_ttl_plan(plan);
+        let _ = ctx.process_assistant_response("completed output");
+        let _ = ctx.process_kiro_event(&Event::Metadata(
+            crate::kiro::model::events::MetadataEvent {
+                stop_reason: Some("END_TURN".to_string()),
+                token_usage: crate::kiro::model::events::TokenUsage {
+                    uncached_input_tokens: 182,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 89_520,
+                    output_tokens: 72,
+                    total_tokens: 89_774,
+                },
+            },
+        ));
+
+        assert_eq!(ctx.exact_current_input_tokens, Some(89_702));
+        assert_eq!(ctx.exact_first_round_usage, None);
+        assert_eq!(ctx.final_usage_breakdown(), initial);
+        assert!(ctx.upstream_succeeded_for_cache());
+    }
+
+    #[test]
+    fn exact_cache_activity_allows_successful_registry_refresh() {
+        let request = serde_json::from_value::<super::super::types::MessagesRequest>(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 32,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "cache this terminal native prefix",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }]
+        }))
+        .expect("cache request parses");
+        let exact_plan =
+            super::super::cache::prepare_cache_commit(100, &request, true).exact_ttl_plan();
+        let initial = super::super::cache::UsageBreakdown {
+            input_tokens: 1,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 99,
+            cache_creation_5m_input_tokens: 99,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 100, false, initial, HashMap::new());
+        ctx.set_exact_cache_ttl_plan(exact_plan);
+        let _ = ctx.process_kiro_event(&Event::Metadata(
+            crate::kiro::model::events::MetadataEvent {
+                stop_reason: Some("END_TURN".to_string()),
+                token_usage: crate::kiro::model::events::TokenUsage {
+                    uncached_input_tokens: 1,
+                    cache_read_input_tokens: 99,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 2,
+                    total_tokens: 102,
+                },
+            },
+        ));
+
+        assert!(ctx.upstream_succeeded_for_cache());
+    }
+
+    #[test]
+    fn refusal_preserves_exact_native_cache_activity() {
+        let request = serde_json::from_value::<super::super::types::MessagesRequest>(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 32,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "cache this prefix even when policy refuses the answer",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }]
+        }))
+        .expect("cache request parses");
+        let exact_plan =
+            super::super::cache::prepare_cache_commit(100, &request, true).exact_ttl_plan();
+        let initial = super::super::cache::UsageBreakdown {
+            input_tokens: 1,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 99,
+            cache_creation_5m_input_tokens: 99,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-8",
+            100,
+            false,
+            initial,
+            HashMap::new(),
+        );
+        ctx.set_exact_cache_ttl_plan(exact_plan);
+        let _ = ctx.process_kiro_event(&Event::Metadata(
+            crate::kiro::model::events::MetadataEvent {
+                stop_reason: Some("REFUSAL".to_string()),
+                token_usage: crate::kiro::model::events::TokenUsage {
+                    uncached_input_tokens: 1,
+                    cache_read_input_tokens: 99,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 2,
+                    total_tokens: 102,
+                },
+            },
+        ));
+
+        let exact = ctx
+            .exact_first_round_usage
+            .expect("native cache accounting must be retained");
+        assert_eq!(exact.input_tokens, 1);
+        assert_eq!(exact.cache_read_input_tokens, 99);
+        assert_eq!(ctx.state_manager.get_stop_reason(), "refusal");
+        assert!(ctx.upstream_succeeded_for_cache());
+    }
+
+    #[test]
+    fn refusal_exact_cache_write_does_not_warm_fallback_registry() {
+        let request = serde_json::from_value::<super::super::types::MessagesRequest>(json!({
+            "model": "claude-opus-5",
+            "max_tokens": 32,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "cacheable prefix rejected before a reusable entry is committed",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }]
+        }))
+        .expect("cache request parses");
+        let exact_plan =
+            super::super::cache::prepare_cache_commit(100, &request, true).exact_ttl_plan();
+        let initial = super::super::cache::UsageBreakdown {
+            input_tokens: 1,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 99,
+            cache_creation_5m_input_tokens: 99,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-5", 100, false, initial, HashMap::new());
+        ctx.set_exact_cache_ttl_plan(exact_plan);
+        let _ = ctx.process_kiro_event(&Event::Metadata(
+            crate::kiro::model::events::MetadataEvent {
+                stop_reason: Some("REFUSAL".to_string()),
+                token_usage: crate::kiro::model::events::TokenUsage {
+                    uncached_input_tokens: 1,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 99,
+                    output_tokens: 2,
+                    total_tokens: 102,
+                },
+            },
+        ));
+
+        let exact = ctx
+            .exact_first_round_usage
+            .expect("native cache accounting must remain visible");
+        assert_eq!(exact.cache_creation_input_tokens, 99);
+        assert_eq!(ctx.state_manager.get_stop_reason(), "refusal");
+        assert!(!ctx.upstream_succeeded_for_cache());
+    }
+
+    #[test]
     fn aws_b_transport_chunks_preserve_text_and_stay_bounded() {
         let text = "Claude can explain code safely. ".repeat(200);
         let chunks = text_delta_chunks(&text);
@@ -3325,26 +3940,16 @@ mod tests {
     }
 
     #[test]
-    fn aws_b_synthetic_thinking_chunks_preserve_content_and_usage() {
+    fn aws_b_synthetic_thinking_is_suppressed() {
         let thinking = "Inspect the request, calculate the result, and answer clearly.";
         let mut ctx =
             StreamContext::new_with_thinking("claude-opus-4-8", 1, true, true, HashMap::new());
-        ctx.enable_aws_b40_compat(true);
+        ctx.enable_aws_b40_compat();
 
         let events = ctx.emit_synthetic_thinking_block(thinking);
-        let deltas = events
-            .iter()
-            .filter(|event| event.data["delta"]["type"] == "thinking_delta")
-            .collect::<Vec<_>>();
-        let reconstructed = deltas
-            .iter()
-            .filter_map(|event| event.data["delta"]["thinking"].as_str())
-            .collect::<String>();
-
-        assert!(deltas.len() > 1);
-        assert_eq!(reconstructed, thinking);
-        assert_eq!(ctx.thinking_text_acc, thinking);
-        assert_eq!(ctx.thinking_tokens, estimate_tokens(thinking));
+        assert!(events.is_empty());
+        assert!(ctx.thinking_text_acc.is_empty());
+        assert_eq!(ctx.thinking_tokens, 0);
     }
 
     #[test]
@@ -3474,6 +4079,37 @@ mod tests {
                 .collect::<String>(),
             "Final answer."
         );
+    }
+
+    #[test]
+    fn aws_b_native_signature_registration_binds_exact_emitted_thinking() {
+        use crate::kiro::model::events::ReasoningContentEvent;
+
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 1, true, true, HashMap::new());
+        ctx.enable_aws_b40_compat();
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            text: "Plan carefully".to_string(),
+            ..Default::default()
+        }));
+        let events = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            signature: "upstream-opaque-signature".to_string(),
+            ..Default::default()
+        }));
+
+        assert!(events.iter().any(|event| {
+            event.event == "content_block_delta" && event.data["delta"]["type"] == "signature_delta"
+        }));
+        assert_eq!(
+            ctx.take_native_signature_registration(),
+            Some((
+                "claude-opus-4-8".to_string(),
+                "Plan carefully".to_string(),
+                "upstream-opaque-signature".to_string(),
+            ))
+        );
+        assert!(ctx.take_native_signature_registration().is_none());
     }
 
     #[test]
@@ -3887,7 +4523,7 @@ mod tests {
             usage,
             HashMap::new(),
         );
-        ctx.enable_aws_b40_compat(false);
+        ctx.enable_aws_b40_compat();
 
         let event = ctx.create_message_start_event();
         let message = &event["message"];
@@ -3937,7 +4573,7 @@ mod tests {
             initial,
             HashMap::new(),
         );
-        ctx.enable_aws_b40_compat(false);
+        ctx.enable_aws_b40_compat();
         ctx.set_input_context_calibration(
             super::super::bedrock::InputContextCalibration::for_request(&payload),
         );
@@ -3969,7 +4605,7 @@ mod tests {
             initial,
             HashMap::new(),
         );
-        ctx.enable_aws_b40_compat(false);
+        ctx.enable_aws_b40_compat();
 
         let start = ctx.create_message_start_event();
         assert_eq!(start["message"]["usage"]["input_tokens"], 1);
@@ -3978,6 +4614,60 @@ mod tests {
         assert_eq!(
             ctx.final_usage_breakdown(),
             super::super::cache::UsageBreakdown::flat(1)
+        );
+    }
+
+    #[test]
+    fn aws_b_metering_aggregate_does_not_authorize_cached_usage() {
+        let initial = super::super::cache::UsageBreakdown {
+            input_tokens: 20,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 150,
+            cache_creation_5m_input_tokens: 150,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let mut cached = StreamContext::new_with_thinking(
+            "claude-opus-4-8",
+            170,
+            false,
+            initial,
+            HashMap::new(),
+        );
+        cached.enable_aws_b40_compat();
+        let _ = cached.process_kiro_event(&Event::Metering(
+            crate::kiro::model::events::MeteringEvent {
+                input_tokens: 171,
+                ..Default::default()
+            },
+        ));
+
+        assert_eq!(cached.exact_current_input_tokens, None);
+        assert_eq!(cached.metered_current_input_tokens, Some(171));
+        assert_eq!(cached.current_billable_input_tokens(), 171);
+        assert_eq!(
+            cached.final_usage_breakdown(),
+            super::super::cache::UsageBreakdown::flat(1),
+            "metering has no cache buckets and cannot unlock a local cache split"
+        );
+
+        let mut ordinary = StreamContext::new_with_thinking(
+            "claude-opus-4-8",
+            170,
+            false,
+            super::super::cache::UsageBreakdown::flat(170),
+            HashMap::new(),
+        );
+        ordinary.enable_aws_b40_compat();
+        let _ = ordinary.process_kiro_event(&Event::Metering(
+            crate::kiro::model::events::MeteringEvent {
+                input_tokens: 171,
+                ..Default::default()
+            },
+        ));
+        assert_eq!(
+            ordinary.final_usage_breakdown(),
+            super::super::cache::UsageBreakdown::flat(171),
+            "aggregate metering remains usable for ordinary flat input"
         );
     }
 
@@ -4003,7 +4693,7 @@ mod tests {
             initial,
             HashMap::new(),
         );
-        ctx.enable_aws_b40_compat(false);
+        ctx.enable_aws_b40_compat();
         ctx.set_input_context_calibration(
             super::super::bedrock::InputContextCalibration::for_request(&payload),
         );
@@ -4039,7 +4729,7 @@ mod tests {
             initial,
             HashMap::new(),
         );
-        ctx.enable_aws_b40_compat(false);
+        ctx.enable_aws_b40_compat();
         ctx.set_input_context_calibration(
             super::super::bedrock::InputContextCalibration::for_request(&payload),
         );
@@ -4069,7 +4759,7 @@ mod tests {
             super::super::cache::UsageBreakdown::flat(33),
             HashMap::new(),
         );
-        ctx.enable_aws_b40_compat(true);
+        ctx.enable_aws_b40_compat();
         ctx.set_aws_b40_thinking_requested(true);
 
         let event = ctx.create_message_start_event();
@@ -4086,7 +4776,7 @@ mod tests {
             super::super::cache::UsageBreakdown::flat(33),
             HashMap::new(),
         );
-        ctx.enable_aws_b40_compat(true);
+        ctx.enable_aws_b40_compat();
         ctx.set_aws_b40_thinking_requested(true);
         ctx.set_synthetic_thinking(Some("synthetic fallback".to_string()));
 
@@ -4167,7 +4857,7 @@ mod tests {
             raw,
             HashMap::new(),
         );
-        ctx.enable_aws_b40_compat(false);
+        ctx.enable_aws_b40_compat();
         ctx.set_input_context_calibration(calibration);
 
         let event = ctx.create_message_start_event();
@@ -4204,7 +4894,7 @@ mod tests {
     fn aws_b_stream_preserves_backend_tool_id_and_omits_caller() {
         let mut ctx =
             StreamContext::new_with_thinking("claude-sonnet-4-6", 1, false, false, HashMap::new());
-        ctx.enable_aws_b40_compat(false);
+        ctx.enable_aws_b40_compat();
 
         let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
             name: "Read".to_string(),
@@ -4234,7 +4924,7 @@ mod tests {
     fn aws_b_stream_sanitizes_private_identity_tool_arguments() {
         let mut ctx =
             StreamContext::new_with_thinking("claude-opus-4-8", 1, false, false, HashMap::new());
-        ctx.enable_aws_b40_compat(false);
+        ctx.enable_aws_b40_compat();
         ctx.enable_identity_sanitization_with_strict_mode(true);
 
         let first = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
@@ -4267,7 +4957,7 @@ mod tests {
     fn aws_b_stream_closes_truncated_private_identity_tool_with_safe_json() {
         let mut ctx =
             StreamContext::new_with_thinking("claude-opus-4-8", 1, false, false, HashMap::new());
-        ctx.enable_aws_b40_compat(false);
+        ctx.enable_aws_b40_compat();
         ctx.enable_identity_sanitization_with_strict_mode(true);
 
         let mut events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
@@ -4294,10 +4984,10 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_thinking_precedes_tool_only_response() {
+    fn aws_b_tool_only_response_does_not_gain_synthetic_thinking() {
         let mut ctx =
             StreamContext::new_with_thinking("claude-opus-4-8", 1, true, true, HashMap::new());
-        ctx.enable_aws_b40_compat(false);
+        ctx.enable_aws_b40_compat();
         ctx.set_synthetic_thinking(Some("synthetic fallback".to_string()));
 
         let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
@@ -4312,14 +5002,14 @@ mod tests {
             .filter_map(|event| event.data["content_block"]["type"].as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(block_types, vec!["thinking", "tool_use"]);
+        assert_eq!(block_types, vec!["tool_use"]);
     }
 
     #[test]
     fn forced_tool_response_discards_text_before_and_after_tool() {
         let mut ctx =
             StreamContext::new_with_thinking("claude-opus-4-8", 1, false, false, HashMap::new());
-        ctx.enable_aws_b40_compat(false);
+        ctx.enable_aws_b40_compat();
         ctx.set_suppress_text_blocks(true);
 
         let mut events = ctx.generate_initial_events();
@@ -4355,7 +5045,7 @@ mod tests {
     fn forced_tool_response_replays_text_when_upstream_omits_tool() {
         let mut ctx =
             StreamContext::new_with_thinking("claude-opus-4-8", 1, false, false, HashMap::new());
-        ctx.enable_aws_b40_compat(false);
+        ctx.enable_aws_b40_compat();
         ctx.set_suppress_text_blocks(true);
 
         let mut events = ctx.generate_initial_events();
@@ -4375,7 +5065,7 @@ mod tests {
     fn aws_b_stream_normalizes_tool_json_structural_boundaries() {
         let mut ctx =
             StreamContext::new_with_thinking("claude-opus-4-8", 1, false, false, HashMap::new());
-        ctx.enable_aws_b40_compat(false);
+        ctx.enable_aws_b40_compat();
 
         let first = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
             name: "get_weather".to_string(),
@@ -4410,7 +5100,7 @@ mod tests {
     fn aws_b_stream_complex_tool_usage_matches_non_stream_bedrock_usage() {
         let mut ctx =
             StreamContext::new_with_thinking("claude-opus-4-8", 564, false, false, HashMap::new());
-        ctx.enable_aws_b40_compat(false);
+        ctx.enable_aws_b40_compat();
 
         ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
             name: "get_weather".to_string(),
@@ -4437,7 +5127,7 @@ mod tests {
     fn aws_b_stream_flushes_tool_json_when_upstream_ends_mid_argument() {
         let mut ctx =
             StreamContext::new_with_thinking("claude-opus-4-8", 509, false, false, HashMap::new());
-        ctx.enable_aws_b40_compat(false);
+        ctx.enable_aws_b40_compat();
 
         let mut events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
             name: "get_weather".to_string(),
@@ -4470,7 +5160,7 @@ mod tests {
             super::super::cache::UsageBreakdown::flat(14),
             HashMap::new(),
         );
-        ctx.enable_aws_b40_compat(false);
+        ctx.enable_aws_b40_compat();
         ctx.set_output_token_limit(1);
         let _ = ctx.generate_initial_events();
         let _ = ctx.process_assistant_response("CALIBRATION_OK");
@@ -4497,7 +5187,7 @@ mod tests {
             super::super::cache::UsageBreakdown::flat(42),
             HashMap::new(),
         );
-        aws_b.enable_aws_b40_compat(false);
+        aws_b.enable_aws_b40_compat();
         let _ = aws_b.generate_initial_events();
         let _ = aws_b.process_assistant_response("hello");
         let events = aws_b.generate_final_events();
@@ -4576,7 +5266,7 @@ mod tests {
                 super::super::cache::UsageBreakdown::flat(42),
                 HashMap::new(),
             );
-            gpt.enable_aws_b40_compat(false);
+            gpt.enable_aws_b40_compat();
             let _ = gpt.generate_initial_events();
             let _ = gpt.process_assistant_response("hello");
             let gpt_events = gpt.generate_final_events();
@@ -4601,7 +5291,7 @@ mod tests {
             super::super::cache::UsageBreakdown::flat(42),
             HashMap::new(),
         );
-        claude.enable_aws_b40_compat(false);
+        claude.enable_aws_b40_compat();
         let _ = claude.generate_initial_events();
         let _ = claude.process_assistant_response("hello");
         let claude_events = claude.generate_final_events();
@@ -4627,7 +5317,7 @@ mod tests {
             super::super::cache::UsageBreakdown::flat(10),
             HashMap::new(),
         );
-        ctx.enable_aws_b40_compat(false);
+        ctx.enable_aws_b40_compat();
         let text = "Unicode 安全：你好，世界。 Code stays exact: `let answer = 42;` and Markdown stays intact.";
 
         let events = ctx.process_assistant_response(text);
@@ -4685,7 +5375,7 @@ mod tests {
             breakdown,
             HashMap::new(),
         );
-        context.enable_aws_b40_compat(false);
+        context.enable_aws_b40_compat();
         context.context_input_tokens = Some(34_329);
         let _ = context.generate_initial_events();
         let _ = context.process_assistant_response("2");
@@ -6079,7 +6769,7 @@ mod tests {
             super::super::cache::UsageBreakdown::flat(600_000),
             HashMap::new(),
         );
-        ctx.enable_aws_b40_compat(false);
+        ctx.enable_aws_b40_compat();
         ctx.context_input_tokens = Some(600_000);
         ctx.begin_continuation_for_billing(600_000);
 

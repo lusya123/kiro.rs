@@ -1,16 +1,19 @@
-//! Prompt cache usage 兼容策略。
+//! Anthropic prompt-cache usage compatibility.
 //!
-//! Kiro 上游不支持 Anthropic/AWS prompt caching，但客户端会依赖 usage 里的
-//! cache 字段计费。本模块按 aws-p 实测行为维护一个本进程内的前缀缓存：
+//! The Kiro transport can carry native cache points, but the upstream event
+//! stream does not expose the complete Anthropic cache contract consistently.
+//! This module therefore has two deliberately separated accounting paths:
 //!
-//! - 无 `cache_control`：所有 token 都计入普通 `input_tokens`。
-//! - 显式 system/tool breakpoint 或顶层 automatic cache：首轮写入 creation，
-//!   5 分钟或 1 小时 TTL 内重复前缀进入 read。
-//! - 显式 message content breakpoint：aws-p 实测会写 creation，但后续不读命中；
-//!   本地保持同样行为。
-//! - `input_tokens` 只展示最后一个 cache breakpoint 后面的非缓存部分。
-//! - `cache_creation.ephemeral_5m_input_tokens` 和 `ephemeral_1h_input_tokens`
-//!   按每个 breakpoint 的 TTL 分拆。
+//! - authoritative `metadataEvent.tokenUsage`, when present, supplies the
+//!   ordinary/read/write totals; request breakpoints only split an exact write
+//!   between the 5-minute and 1-hour buckets;
+//! - otherwise a deterministic prefix registry provides the compatibility
+//!   fallback, and becomes warm only after a successful upstream completion.
+//!
+//! Requests without public `cache_control` remain flat even if Kiro used an
+//! internal cache. Cache-point wire objects are transport controls and never
+//! count as language input. In every path, ordinary input plus cache read plus
+//! cache creation preserves the aggregate input-token identity.
 
 use crate::anthropic::types::{Message, MessagesRequest, Tool};
 use crate::kiro::model::events::TokenUsage;
@@ -19,10 +22,108 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
-const CACHE_MIN_TOKENS: i32 = 1_024;
+const CACHE_MIN_TOKENS_OPUS_5: i32 = 512;
+const CACHE_MIN_TOKENS_OPUS_48_SONNET_5_46_45: i32 = 1_024;
+const CACHE_MIN_TOKENS_OPUS_47: i32 = 2_048;
+const CACHE_MIN_TOKENS_OPUS_46_45_HAIKU_45: i32 = 4_096;
 const MAX_CACHE_BREAKPOINTS: usize = 4;
 const MAX_READ_CANDIDATES: usize = 20;
 // 缓存登记表已迁移到 `crate::cluster_cache`(跨容器共享 + 本地回退)。
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ExactCacheTtlSegment {
+    end_tokens: i32,
+    one_hour: bool,
+}
+
+/// Request-derived cache-prefix layout used to split an authoritative native
+/// cache write into Anthropic's 5m and 1h creation buckets.
+///
+/// This plan is deliberately independent of the local hot/cold registry. A
+/// hot local estimate has zero creation buckets and therefore cannot tell us
+/// whether a native cache miss wrote a 5m or a 1h prefix. The request's ordered
+/// breakpoints retain that information for both cold and hot invocations.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ExactCacheTtlPlan {
+    segments: [ExactCacheTtlSegment; MAX_CACHE_BREAKPOINTS],
+    len: usize,
+}
+
+/// Validated native token totals plus the optional public cache-bucket split.
+///
+/// Kiro exposes `metadataEvent.tokenUsage` for several model families, but the
+/// cache read/write fields are not equally reliable across those families.
+/// The aggregate input/output counts remain useful for every model.  Keeping
+/// the public cache split optional lets affected models retain the shared,
+/// deterministic prefix registry without throwing away the native totals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReconciledNativeUsage {
+    pub(super) aggregate_input_tokens: i32,
+    pub(super) output_tokens: i32,
+    pub(super) public_cache_usage: Option<UsageBreakdown>,
+}
+
+impl ExactCacheTtlPlan {
+    fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    fn split_cache_write(self, cache_read: i32, cache_write: i32) -> Option<(i32, i32)> {
+        let cache_read = cache_read.max(0);
+        let cache_write = cache_write.max(0);
+        if cache_write == 0 {
+            return Some((0, 0));
+        }
+        let segments = self.segments.get(..self.len)?;
+        let plan_total = segments.last()?.end_tokens.max(0);
+        let exact_cache_total = cache_read.saturating_add(cache_write);
+        if plan_total <= 0 || exact_cache_total <= 0 {
+            return None;
+        }
+
+        // Native metadata reports aggregate read/write counts, while the
+        // request plan is measured by the local tokenizer. Scale breakpoint
+        // endpoints onto the native cached-token total, then treat the write
+        // as the suffix after the authoritative read prefix. This preserves
+        // mixed-TTL requests when (for example) a 1h prefix is read and an
+        // expired 5m suffix is recreated.
+        let write_start = cache_read.min(exact_cache_total);
+        let write_end = exact_cache_total;
+        let mut previous_end = 0i32;
+        let mut creation_5m = 0i32;
+        let mut creation_1h = 0i32;
+
+        for segment in segments {
+            let scaled_end =
+                scale_cache_endpoint(segment.end_tokens, plan_total, exact_cache_total)
+                    .clamp(previous_end, exact_cache_total);
+            let overlap_start = previous_end.max(write_start);
+            let overlap_end = scaled_end.min(write_end);
+            let overlap = overlap_end.saturating_sub(overlap_start);
+            if segment.one_hour {
+                creation_1h = creation_1h.saturating_add(overlap);
+            } else {
+                creation_5m = creation_5m.saturating_add(overlap);
+            }
+            previous_end = scaled_end;
+        }
+
+        let allocated = creation_5m.saturating_add(creation_1h);
+        if allocated != cache_write {
+            return None;
+        }
+        Some((creation_5m, creation_1h))
+    }
+}
+
+fn scale_cache_endpoint(endpoint: i32, plan_total: i32, exact_total: i32) -> i32 {
+    if endpoint <= 0 || plan_total <= 0 || exact_total <= 0 {
+        return 0;
+    }
+    ((i64::from(endpoint) * i64::from(exact_total) + i64::from(plan_total) / 2)
+        / i64::from(plan_total))
+    .clamp(0, i64::from(exact_total)) as i32
+}
 
 #[cfg(test)]
 std::thread_local! {
@@ -104,7 +205,16 @@ impl UsageBreakdown {
     /// buckets.  This is the only path allowed to replace deterministic cache
     /// estimates: unlike `contextUsageEvent`, these fields explicitly identify
     /// uncached, cache-read and cache-write input.
+    #[cfg(test)]
     pub fn from_exact_token_usage(initial: Self, exact: &TokenUsage) -> Option<Self> {
+        Self::from_exact_token_usage_with_ttl_plan(initial, exact, ExactCacheTtlPlan::default())
+    }
+
+    pub(super) fn from_exact_token_usage_with_ttl_plan(
+        initial: Self,
+        exact: &TokenUsage,
+        ttl_plan: ExactCacheTtlPlan,
+    ) -> Option<Self> {
         if !exact.is_present() {
             return None;
         }
@@ -128,11 +238,33 @@ impl UsageBreakdown {
             return None;
         }
 
-        let (creation_5m, creation_1h) = split_exact_cache_creation(
-            exact.cache_write_input_tokens,
-            initial.cache_creation_5m_input_tokens,
-            initial.cache_creation_1h_input_tokens,
-        );
+        // Kiro may use an internal runtime cache even when the Anthropic
+        // caller did not opt into prompt caching. Preserve the authoritative
+        // aggregate input count, but never expose or bill those internal
+        // buckets unless this invocation actually carried a native cachePoint.
+        // The initial split alone is insufficient here because a valid native
+        // prefix can sit below the local fallback minimum.
+        // Exact Kiro cache buckets are public only when the converter actually
+        // emitted at least one native cachePoint for this invocation. A local
+        // compatibility breakpoint can exist at an Anthropic block boundary
+        // which Kiro cannot represent (for example, a non-terminal block in a
+        // message); it must not authorize unrelated internal runtime caching.
+        if ttl_plan.is_empty() {
+            return Some(Self::flat(total_input));
+        }
+
+        let (creation_5m, creation_1h) = ttl_plan
+            .split_cache_write(
+                exact.cache_read_input_tokens,
+                exact.cache_write_input_tokens,
+            )
+            .unwrap_or_else(|| {
+                split_exact_cache_creation(
+                    exact.cache_write_input_tokens,
+                    initial.cache_creation_5m_input_tokens,
+                    initial.cache_creation_1h_input_tokens,
+                )
+            });
         Some(Self {
             input_tokens: exact.ordinary_input_tokens(),
             cache_read_input_tokens: exact.cache_read_input_tokens,
@@ -210,6 +342,38 @@ impl UsageBreakdown {
     pub fn clamp_for_model(self, model: &str) -> Self {
         self.clamp_to_context_window(super::converter::get_context_window_size(model))
     }
+}
+
+/// Reconcile a native Kiro usage frame without allowing an unstable model's
+/// cache buckets to overwrite the shared compatibility cache.
+///
+/// Production billing evidence on 2026-08-09 showed identical Sonnet 5
+/// requests repeatedly reporting the same 88k-89k cache write and zero reads,
+/// while Opus 4.7/4.8/5 correctly transitioned from write to read.  Therefore
+/// only those verified Opus families may replace the public cache split.  All
+/// other models still use the validated native aggregate totals, but keep the
+/// deterministic cache plan computed before the request.
+pub(super) fn reconcile_native_usage(
+    model: &str,
+    initial: UsageBreakdown,
+    exact: &TokenUsage,
+    ttl_plan: ExactCacheTtlPlan,
+) -> Option<ReconciledNativeUsage> {
+    let exact_usage =
+        UsageBreakdown::from_exact_token_usage_with_ttl_plan(initial, exact, ttl_plan)?
+            .clamp_for_model(model);
+    Some(ReconciledNativeUsage {
+        aggregate_input_tokens: exact_usage.total(),
+        output_tokens: exact.output_tokens,
+        public_cache_usage: native_cache_buckets_are_trusted(model).then_some(exact_usage),
+    })
+}
+
+fn native_cache_buckets_are_trusted(model: &str) -> bool {
+    matches!(
+        super::converter::map_model(model).as_deref(),
+        Some("claude-opus-4.7" | "claude-opus-4.8" | "claude-opus-5")
+    )
 }
 
 fn split_exact_cache_creation(total: i32, initial_5m: i32, initial_1h: i32) -> (i32, i32) {
@@ -342,6 +506,12 @@ pub fn request_cache_control_count(req: &MessagesRequest) -> usize {
     system + messages + tools
 }
 
+/// Count all public cache slots. Top-level automatic caching consumes one of
+/// the same four slots as explicit block-level breakpoints.
+fn request_cache_breakpoint_slot_count(req: &MessagesRequest) -> usize {
+    request_cache_control_count(req) + usize::from(req.cache_control.is_some())
+}
+
 fn message_cache_control_count(msg: &Message) -> usize {
     match &msg.content {
         Value::String(_) => 0,
@@ -354,7 +524,8 @@ fn direct_cache_control_count(value: &Value) -> usize {
     usize::from(
         value
             .as_object()
-            .is_some_and(|map| map.contains_key("cache_control")),
+            .and_then(|map| map.get("cache_control"))
+            .is_some_and(|control| !control.is_null()),
     )
 }
 
@@ -548,6 +719,26 @@ struct CachePlan {
     cache_creation_1h_tokens: i32,
 }
 
+/// Minimum cacheable prefix for the currently supported Claude Platform on
+/// AWS model families. Unknown/future models deliberately have no local
+/// compatibility cache: authoritative native metadata may still report cache
+/// activity, but the registry must not invent it from an assumed threshold.
+fn local_cache_min_tokens(model: &str) -> Option<i32> {
+    let mapped = super::converter::map_model(model)?;
+    let family = mapped.strip_suffix("-1m").unwrap_or(&mapped);
+    match family {
+        "claude-opus-5" => Some(CACHE_MIN_TOKENS_OPUS_5),
+        "claude-opus-4.8" | "claude-sonnet-5" | "claude-sonnet-4.6" | "claude-sonnet-4.5" => {
+            Some(CACHE_MIN_TOKENS_OPUS_48_SONNET_5_46_45)
+        }
+        "claude-opus-4.7" => Some(CACHE_MIN_TOKENS_OPUS_47),
+        "claude-opus-4.6" | "claude-opus-4.5" | "claude-haiku-4.5" => {
+            Some(CACHE_MIN_TOKENS_OPUS_46_45_HAIKU_45)
+        }
+        _ => None,
+    }
+}
+
 /// Cache-registry mutation prepared from the exact request prefix.
 ///
 /// Planning usage is deliberately read-only.  The caller owns this value and
@@ -558,10 +749,19 @@ struct CachePlan {
 #[derive(Debug, Default)]
 pub(super) struct CacheCommit {
     entries: Vec<(CacheKey, CacheTtl)>,
+    exact_ttl_plan: ExactCacheTtlPlan,
 }
 
 impl CacheCommit {
+    pub(super) fn exact_ttl_plan(&self) -> ExactCacheTtlPlan {
+        self.exact_ttl_plan
+    }
+
     pub(super) async fn commit(self) {
+        tracing::debug!(
+            entries = self.entries.len(),
+            "committing prompt-cache registry entries"
+        );
         for (key, ttl) in self.entries {
             register_cache_key(key, ttl).await;
         }
@@ -577,19 +777,21 @@ pub(super) fn prepare_cache_commit(
     req: &MessagesRequest,
     aws_b40_compat: bool,
 ) -> CacheCommit {
-    let explicit_breakpoints = request_cache_control_count(req);
-    if (req.cache_control.is_none() && explicit_breakpoints == 0)
-        || explicit_breakpoints > MAX_CACHE_BREAKPOINTS
-    {
+    let breakpoint_slots = request_cache_breakpoint_slot_count(req);
+    if breakpoint_slots == 0 || breakpoint_slots > MAX_CACHE_BREAKPOINTS {
         return CacheCommit::default();
     }
 
     let CacheBuild {
-        mut breakpoints, ..
+        mut breakpoints,
+        exact_ttl_plan,
+        ..
     } = build_cache_breakpoints(req, total_input_tokens.max(0), aws_b40_compat);
-    breakpoints.retain(|breakpoint| breakpoint.tokens >= CACHE_MIN_TOKENS);
     breakpoints.sort_by_key(|breakpoint| breakpoint.tokens);
     breakpoints.truncate(MAX_CACHE_BREAKPOINTS);
+    let local_minimum = local_cache_min_tokens(&req.model);
+    breakpoints
+        .retain(|breakpoint| local_minimum.is_some_and(|minimum| breakpoint.tokens >= minimum));
 
     let mut entries = Vec::new();
     for breakpoint in breakpoints {
@@ -601,7 +803,20 @@ pub(super) fn prepare_cache_commit(
             entries.push((breakpoint.key, breakpoint.ttl));
         }
     }
-    CacheCommit { entries }
+    tracing::debug!(
+        model = %req.model,
+        breakpoint_slots,
+        entries = entries.len(),
+        keys = ?entries
+            .iter()
+            .map(|(key, ttl)| (key.redis_key(), *ttl))
+            .collect::<Vec<_>>(),
+        "prepared prompt-cache registry commit"
+    );
+    CacheCommit {
+        entries,
+        exact_ttl_plan,
+    }
 }
 
 async fn cache_plan_for_request(
@@ -609,22 +824,24 @@ async fn cache_plan_for_request(
     req: &MessagesRequest,
     aws_b40_compat: bool,
 ) -> Option<CachePlan> {
-    let explicit_breakpoints = request_cache_control_count(req);
-    if req.cache_control.is_none() && explicit_breakpoints == 0 {
+    let local_minimum = local_cache_min_tokens(&req.model)?;
+    let breakpoint_slots = request_cache_breakpoint_slot_count(req);
+    if breakpoint_slots == 0 {
         return None;
     }
     // The Anthropic/Bedrock contract allows at most four explicit blocks.
     // HTTP preflight owns the client-facing error; this accounting layer fails
     // closed so an unvalidated route cannot turn malformed input into B×N work.
-    if explicit_breakpoints > MAX_CACHE_BREAKPOINTS {
+    if breakpoint_slots > MAX_CACHE_BREAKPOINTS {
         return None;
     }
 
     let CacheBuild {
         mut breakpoints,
         token_context,
+        ..
     } = build_cache_breakpoints(req, total_input_tokens, aws_b40_compat);
-    breakpoints.retain(|b| b.tokens >= CACHE_MIN_TOKENS);
+    breakpoints.retain(|b| b.tokens >= local_minimum);
     if breakpoints.is_empty() {
         return None;
     }
@@ -737,6 +954,9 @@ struct PrefixPosition {
 struct CacheReadCandidate {
     keys: CacheKeyPair,
     position: PrefixPosition,
+    /// Precomputed token endpoint for converter-derived wire layouts. Legacy
+    /// public layouts leave this at zero and hydrate it lazily on a real hit.
+    tokens: i32,
 }
 
 struct CacheReadMatch {
@@ -768,6 +988,212 @@ struct PrefixTokenContext {
 struct CacheBuild {
     breakpoints: Vec<CacheBreakpoint>,
     token_context: PrefixTokenContext,
+    exact_ttl_plan: ExactCacheTtlPlan,
+}
+
+impl ExactCacheTtlPlan {
+    /// Build the ordered TTL layout directly from the request, without
+    /// consulting or mutating the local hot/cold registry.
+    #[allow(dead_code)]
+    pub(super) fn for_request(
+        total_input_tokens: i32,
+        req: &MessagesRequest,
+        aws_b40_compat: bool,
+    ) -> Self {
+        let breakpoint_slots = request_cache_breakpoint_slot_count(req);
+        if breakpoint_slots == 0 || breakpoint_slots > MAX_CACHE_BREAKPOINTS {
+            return Self::default();
+        }
+
+        build_cache_breakpoints(req, total_input_tokens.max(0), aws_b40_compat).exact_ttl_plan
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NativeCachePointSpec {
+    position: PrefixPosition,
+    ttl: CacheTtl,
+}
+
+/// Return only cache points which `converter.rs` can put on the Kiro wire.
+///
+/// The public Anthropic fallback deliberately supports finer block boundaries,
+/// but Kiro has message-level cache points: every marked tool is representable,
+/// the synthetic system message uses only the final system item, and a merged
+/// history/current message uses only its terminal content block. Trailing
+/// assistant prefill is dropped by the converter and therefore contributes no
+/// native point.
+fn native_cache_point_specs(req: &MessagesRequest) -> Vec<NativeCachePointSpec> {
+    let tool_count = req.tools.as_ref().map_or(0, Vec::len);
+    let system_count = req.system.as_ref().map_or(0, Vec::len);
+    let mut specs = Vec::new();
+
+    if let Some(tools) = &req.tools {
+        for (index, tool) in tools.iter().enumerate() {
+            if tool.cache_control.is_some() {
+                specs.push(NativeCachePointSpec {
+                    position: PrefixPosition {
+                        tool_count: index + 1,
+                        system_count: 0,
+                        content_count: 0,
+                    },
+                    ttl: cache_ttl(tool.cache_control.as_ref()),
+                });
+            }
+        }
+    }
+
+    if let Some(system) = &req.system
+        && let Some(last) = system.last()
+        && last.cache_control.is_some()
+    {
+        specs.push(NativeCachePointSpec {
+            position: PrefixPosition {
+                tool_count,
+                system_count,
+                content_count: 0,
+            },
+            ttl: cache_ttl(last.cache_control.as_ref()),
+        });
+    }
+
+    let Some(current_index) = converter_current_message_index(&req.messages) else {
+        return specs;
+    };
+    let history_terminals = converter_history_group_terminals(&req.messages, current_index);
+    let mut content_count = 0usize;
+    for (index, message) in req.messages.iter().enumerate() {
+        content_count = content_count.saturating_add(message_content_segment_count(message));
+        if index > current_index {
+            break;
+        }
+
+        let converter_emits_this_message = index == current_index || history_terminals[index];
+        let terminal_control = converter_emits_this_message
+            .then(|| terminal_message_cache_control(&message.content))
+            .flatten();
+        if let Some(cache_control) = terminal_control {
+            specs.push(NativeCachePointSpec {
+                position: PrefixPosition {
+                    tool_count,
+                    system_count,
+                    content_count,
+                },
+                ttl: cache_ttl(Some(cache_control)),
+            });
+        } else if index == current_index
+            && let Some(cache_control) = req.cache_control.as_ref()
+        {
+            // Current-message explicit cache control wins over automatic
+            // caching, exactly matching converter's Option::or ordering.
+            specs.push(NativeCachePointSpec {
+                position: PrefixPosition {
+                    tool_count,
+                    system_count,
+                    content_count,
+                },
+                ttl: cache_ttl(Some(cache_control)),
+            });
+        }
+    }
+
+    specs
+}
+
+fn converter_current_message_index(messages: &[Message]) -> Option<usize> {
+    let last = messages.last()?;
+    if last.role == "user" {
+        Some(messages.len() - 1)
+    } else {
+        messages.iter().rposition(|message| message.role == "user")
+    }
+}
+
+/// Mirror `build_history`: consecutive messages with the same recognized role
+/// are merged and only the final member's terminal cache marker survives.
+fn converter_history_group_terminals(messages: &[Message], history_end: usize) -> Vec<bool> {
+    let mut terminals = vec![false; messages.len()];
+    let mut pending_role: Option<&str> = None;
+    let mut pending_last: Option<usize> = None;
+
+    for (index, message) in messages.iter().take(history_end).enumerate() {
+        let role = message.role.as_str();
+        if !matches!(role, "user" | "assistant") {
+            continue;
+        }
+        if pending_role.is_some_and(|pending| pending != role) {
+            if let Some(last) = pending_last {
+                terminals[last] = true;
+            }
+        }
+        pending_role = Some(role);
+        pending_last = Some(index);
+    }
+    if let Some(last) = pending_last {
+        terminals[last] = true;
+    }
+    terminals
+}
+
+fn message_content_segment_count(message: &Message) -> usize {
+    match &message.content {
+        Value::Array(items) => items.len(),
+        _ => 1,
+    }
+}
+
+fn terminal_message_cache_control(content: &Value) -> Option<&Value> {
+    let cache_control = match content {
+        Value::Array(items) => items.last().and_then(|item| item.get("cache_control")),
+        Value::Object(object) => object.get("cache_control"),
+        _ => None,
+    };
+    cache_control.filter(|control| !control.is_null())
+}
+
+fn build_exact_cache_ttl_plan(
+    req: &MessagesRequest,
+    total_input_tokens: i32,
+    aws_b40_compat: bool,
+    state: &PrefixState,
+    local_breakpoints: &[CacheBreakpoint],
+) -> ExactCacheTtlPlan {
+    if request_cache_breakpoint_slot_count(req) > MAX_CACHE_BREAKPOINTS {
+        return ExactCacheTtlPlan::default();
+    }
+
+    let mut plan = ExactCacheTtlPlan::default();
+    for spec in native_cache_point_specs(req)
+        .into_iter()
+        .take(MAX_CACHE_BREAKPOINTS)
+    {
+        let tokens = local_breakpoints
+            .iter()
+            .find(|breakpoint| breakpoint.position == spec.position && breakpoint.ttl == spec.ttl)
+            .map(|breakpoint| breakpoint.tokens)
+            .or_else(|| {
+                calibrated_prefix_tokens_at(
+                    req,
+                    &state.tools,
+                    &state.system_segments,
+                    &state.content_segments,
+                    spec.position,
+                    aws_b40_compat,
+                )
+            })
+            .unwrap_or(0)
+            .min(total_input_tokens)
+            .max(0);
+        if tokens <= 0 {
+            continue;
+        }
+        plan.segments[plan.len] = ExactCacheTtlSegment {
+            end_tokens: tokens,
+            one_hour: spec.ttl == CacheTtl::Ephemeral1h,
+        };
+        plan.len += 1;
+    }
+    plan
 }
 
 fn build_cache_breakpoints(
@@ -775,8 +1201,24 @@ fn build_cache_breakpoints(
     total_input_tokens: i32,
     aws_b40_compat: bool,
 ) -> CacheBuild {
+    if request_cache_breakpoint_slot_count(req) > MAX_CACHE_BREAKPOINTS {
+        return empty_cache_build();
+    }
+    if aws_b40_compat {
+        return build_forwarded_cache_breakpoints(req, total_input_tokens)
+            .unwrap_or_else(empty_cache_build);
+    }
+
     let mut state = PrefixState::new(&req.model);
     let mut breakpoints = Vec::new();
+
+    // Thinking mode and resolved effort are rendered ahead of the user prompt
+    // by this transport. Hash the effective values, not raw API JSON, so an
+    // omitted effort and explicit `high` share identity while a real behavior
+    // change cannot reuse an incompatible prefix.
+    if let Some(config) = rendered_thinking_and_effort_key(req) {
+        state.push_key_part(&format!("model-config:{config}"));
+    }
 
     if let Some(tools) = &req.tools {
         for tool in tools {
@@ -800,6 +1242,13 @@ fn build_cache_breakpoints(
         }
     }
 
+    // The Kiro transport currently renders forced tool choice into its system
+    // instruction. Keep tool-definition keys reusable, but invalidate system
+    // and message prefixes when that effective instruction changes.
+    if let Some(tool_choice) = effective_forced_tool_choice_key(req) {
+        state.push_key_part(&format!("forced-tool-choice:{tool_choice}"));
+    }
+
     if let Some(system) = &req.system {
         for item in system {
             state.system_segments.push(item.text.clone());
@@ -820,23 +1269,43 @@ fn build_cache_breakpoints(
         }
     }
 
+    // Claude invalidates every message-level cache when image presence toggles,
+    // even if the image occurs after an earlier message breakpoint. This salt
+    // deliberately starts after tools/system so those layers remain reusable.
+    if !req.messages.is_empty() {
+        state.push_key_part(if request_has_user_image(req) {
+            "message-image-presence:true"
+        } else {
+            "message-image-presence:false"
+        });
+    }
+
     for message in &req.messages {
         collect_message_prefix(message, &mut state, &mut breakpoints, aws_b40_compat);
     }
 
-    if req.cache_control.is_some() && breakpoints.is_empty() && state.has_cacheable_content() {
+    if req.cache_control.is_some() && state.has_cacheable_content() {
         let ttl = cache_ttl(req.cache_control.as_ref());
-        let warm_on_first_use =
-            aws_b40_compat && cache_control_is_global(req.cache_control.as_ref());
-        push_breakpoint(
-            &state,
-            &mut breakpoints,
-            ttl,
-            CacheBreakpointOptions {
-                readable: true,
-                warm_on_first_use,
-            },
-        );
+        let position = state.position();
+        // Automatic caching is an independent final breakpoint. It is a no-op
+        // only when the final cacheable block already has an explicit marker
+        // with the same TTL; preflight rejects the different-TTL form.
+        if !breakpoints
+            .iter()
+            .any(|breakpoint| breakpoint.position == position && breakpoint.ttl == ttl)
+        {
+            let warm_on_first_use =
+                aws_b40_compat && cache_control_is_global(req.cache_control.as_ref());
+            push_breakpoint(
+                &state,
+                &mut breakpoints,
+                ttl,
+                CacheBreakpointOptions {
+                    readable: true,
+                    warm_on_first_use,
+                },
+            );
+        }
     }
 
     breakpoints.retain_mut(|breakpoint| {
@@ -863,9 +1332,340 @@ fn build_cache_breakpoints(
         true
     });
 
+    let exact_ttl_plan = build_exact_cache_ttl_plan(
+        req,
+        total_input_tokens,
+        aws_b40_compat,
+        &state,
+        &breakpoints,
+    );
+
     CacheBuild {
         breakpoints,
         token_context: state.into_token_context(),
+        exact_ttl_plan,
+    }
+}
+
+fn empty_cache_build() -> CacheBuild {
+    CacheBuild {
+        breakpoints: Vec::new(),
+        token_context: PrefixTokenContext {
+            tools: Vec::new(),
+            system_segments: Vec::new(),
+            content_segments: Vec::new(),
+        },
+        exact_ttl_plan: ExactCacheTtlPlan::default(),
+    }
+}
+
+#[derive(Clone)]
+struct ForwardedPrefixSnapshot {
+    keys: CacheKeyPair,
+    segment_count: usize,
+    cumulative_weight: i32,
+}
+
+struct RawForwardedCachePoint {
+    ttl: CacheTtl,
+    key: CacheKey,
+    segment_count: usize,
+    cumulative_weight: i32,
+    candidates: Vec<ForwardedPrefixSnapshot>,
+}
+
+/// Build the AWS-B cache layout from the final Kiro conversation wire.
+///
+/// This is the single source of truth for fallback keys, warm commits and the
+/// native exact-TTL plan. Calling the real converter here intentionally folds
+/// in all model-visible transformations: prefill truncation, same-role merge,
+/// dynamic system policy, forced-tool instructions, placeholder tools, media
+/// promotion and the exact cachePoint positions actually sent upstream.
+fn build_forwarded_cache_breakpoints(
+    req: &MessagesRequest,
+    total_input_tokens: i32,
+) -> Option<CacheBuild> {
+    let converted = super::converter::convert_request(req).ok()?;
+    let system_history_len = converted.system_history_len;
+    let conversation = converted.conversation_state;
+    let mut key_state = PrefixKeyState::new(&req.model);
+    let mut segments = Vec::<Value>::new();
+    let mut snapshots = VecDeque::<ForwardedPrefixSnapshot>::new();
+    let mut raw_points = Vec::<RawForwardedCachePoint>::new();
+    let mut cumulative_weight = 0i32;
+
+    let push_segment = |label: &str,
+                        value: Value,
+                        key_state: &mut PrefixKeyState,
+                        segments: &mut Vec<Value>,
+                        snapshots: &mut VecDeque<ForwardedPrefixSnapshot>,
+                        cumulative_weight: &mut i32| {
+        let canonical = canonical_json(&value);
+        key_state.push(&format!("{label}:{canonical}"));
+        *cumulative_weight =
+            cumulative_weight.saturating_add(super::claude_tok::count_claude(&canonical).max(1));
+        segments.push(value);
+        if snapshots.len() == MAX_READ_CANDIDATES + 1 {
+            snapshots.pop_front();
+        }
+        snapshots.push_back(ForwardedPrefixSnapshot {
+            keys: key_state.snapshot(),
+            segment_count: segments.len(),
+            cumulative_weight: *cumulative_weight,
+        });
+    };
+
+    let capture_point = |ttl: CacheTtl,
+                         key_state: &PrefixKeyState,
+                         segments: &[Value],
+                         snapshots: &VecDeque<ForwardedPrefixSnapshot>,
+                         cumulative_weight: i32,
+                         raw_points: &mut Vec<RawForwardedCachePoint>| {
+        if raw_points.len() >= MAX_CACHE_BREAKPOINTS || segments.is_empty() {
+            return;
+        }
+        let key = key_state.snapshot().for_ttl(ttl);
+        let candidates = snapshots
+            .iter()
+            .rev()
+            .skip_while(|candidate| candidate.keys.for_ttl(ttl) == key)
+            .take(MAX_READ_CANDIDATES)
+            .cloned()
+            .collect();
+        raw_points.push(RawForwardedCachePoint {
+            ttl,
+            key,
+            segment_count: segments.len(),
+            cumulative_weight,
+            candidates,
+        });
+    };
+
+    if let Some(config) = rendered_thinking_and_effort_key(req) {
+        push_segment(
+            "model-config",
+            Value::String(config),
+            &mut key_state,
+            &mut segments,
+            &mut snapshots,
+            &mut cumulative_weight,
+        );
+    }
+
+    let current = conversation.current_message.user_input_message;
+    for tool in &current.user_input_message_context.tools {
+        if let Some(specification) = tool.tool_specification.as_ref() {
+            push_segment(
+                "tool",
+                serde_json::to_value(specification).ok()?,
+                &mut key_state,
+                &mut segments,
+                &mut snapshots,
+                &mut cumulative_weight,
+            );
+        } else if let Some(cache_point) = tool.cache_point.as_ref() {
+            capture_point(
+                forwarded_cache_ttl(cache_point.ttl.as_deref()),
+                &key_state,
+                &segments,
+                &snapshots,
+                cumulative_weight,
+                &mut raw_points,
+            );
+        }
+    }
+
+    let mut message_scope_salted = false;
+    if system_history_len == 0 {
+        key_state.push(if request_has_user_image(req) {
+            "message-image-presence:true"
+        } else {
+            "message-image-presence:false"
+        });
+        message_scope_salted = true;
+    }
+    for (history_index, message) in conversation.history.iter().enumerate() {
+        let (label, mut value, ttl) = match message {
+            crate::kiro::model::requests::conversation::Message::User(message) => {
+                let ttl = message
+                    .user_input_message
+                    .cache_point
+                    .as_ref()
+                    .map(|point| forwarded_cache_ttl(point.ttl.as_deref()));
+                let mut value = serde_json::to_value(&message.user_input_message).ok()?;
+                normalize_forwarded_user_value(&mut value);
+                ("user", value, ttl)
+            }
+            crate::kiro::model::requests::conversation::Message::Assistant(message) => {
+                let ttl = message
+                    .assistant_response_message
+                    .cache_point
+                    .as_ref()
+                    .map(|point| forwarded_cache_ttl(point.ttl.as_deref()));
+                (
+                    "assistant",
+                    serde_json::to_value(&message.assistant_response_message).ok()?,
+                    ttl,
+                )
+            }
+        };
+        remove_top_level_cache_point(&mut value);
+        push_segment(
+            label,
+            value,
+            &mut key_state,
+            &mut segments,
+            &mut snapshots,
+            &mut cumulative_weight,
+        );
+        if let Some(ttl) = ttl {
+            capture_point(
+                ttl,
+                &key_state,
+                &segments,
+                &snapshots,
+                cumulative_weight,
+                &mut raw_points,
+            );
+        }
+        if !message_scope_salted && history_index + 1 == system_history_len {
+            key_state.push(if request_has_user_image(req) {
+                "message-image-presence:true"
+            } else {
+                "message-image-presence:false"
+            });
+            message_scope_salted = true;
+        }
+    }
+
+    if !message_scope_salted {
+        key_state.push(if request_has_user_image(req) {
+            "message-image-presence:true"
+        } else {
+            "message-image-presence:false"
+        });
+    }
+
+    let current_ttl = current
+        .cache_point
+        .as_ref()
+        .map(|point| forwarded_cache_ttl(point.ttl.as_deref()));
+    let mut current_value = serde_json::to_value(&current).ok()?;
+    normalize_forwarded_user_value(&mut current_value);
+    push_segment(
+        "user",
+        current_value,
+        &mut key_state,
+        &mut segments,
+        &mut snapshots,
+        &mut cumulative_weight,
+    );
+    if let Some(ttl) = current_ttl {
+        capture_point(
+            ttl,
+            &key_state,
+            &segments,
+            &snapshots,
+            cumulative_weight,
+            &mut raw_points,
+        );
+    }
+
+    let full_weight = cumulative_weight.max(1);
+    let total_input_tokens = total_input_tokens.max(0);
+    let scale = |weight: i32| -> i32 {
+        if weight <= 0 || total_input_tokens <= 0 {
+            return 0;
+        }
+        ((i64::from(weight) * i64::from(total_input_tokens) + i64::from(full_weight) / 2)
+            / i64::from(full_weight))
+        .clamp(0, i64::from(total_input_tokens)) as i32
+    };
+
+    let mut exact_ttl_plan = ExactCacheTtlPlan::default();
+    let mut breakpoints = Vec::with_capacity(raw_points.len());
+    for raw in raw_points {
+        let tokens = scale(raw.cumulative_weight);
+        if tokens <= 0 {
+            continue;
+        }
+        let position = PrefixPosition {
+            tool_count: 0,
+            system_count: 0,
+            content_count: raw.segment_count,
+        };
+        let read_candidates = raw
+            .candidates
+            .into_iter()
+            .map(|candidate| CacheReadCandidate {
+                keys: candidate.keys,
+                position: PrefixPosition {
+                    tool_count: 0,
+                    system_count: 0,
+                    content_count: candidate.segment_count,
+                },
+                tokens: scale(candidate.cumulative_weight),
+            })
+            .collect();
+        breakpoints.push(CacheBreakpoint {
+            tokens,
+            ttl: raw.ttl,
+            key: raw.key,
+            position,
+            readable: true,
+            read_candidates,
+            warm_on_first_use: false,
+        });
+        if exact_ttl_plan.len < MAX_CACHE_BREAKPOINTS {
+            exact_ttl_plan.segments[exact_ttl_plan.len] = ExactCacheTtlSegment {
+                end_tokens: tokens,
+                one_hour: raw.ttl == CacheTtl::Ephemeral1h,
+            };
+            exact_ttl_plan.len += 1;
+        }
+    }
+
+    Some(CacheBuild {
+        breakpoints,
+        token_context: PrefixTokenContext {
+            tools: Vec::new(),
+            system_segments: Vec::new(),
+            content_segments: segments,
+        },
+        exact_ttl_plan,
+    })
+}
+
+fn forwarded_cache_ttl(ttl: Option<&str>) -> CacheTtl {
+    if ttl == Some("1h") {
+        CacheTtl::Ephemeral1h
+    } else {
+        CacheTtl::Ephemeral5m
+    }
+}
+
+fn remove_top_level_cache_point(value: &mut Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.remove("cachePoint");
+    }
+}
+
+fn normalize_forwarded_user_value(value: &mut Value) {
+    remove_top_level_cache_point(value);
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let remove_context = object
+        .get_mut("userInputMessageContext")
+        .and_then(Value::as_object_mut)
+        .is_some_and(|context| {
+            // Tool specifications live before system/messages in the public
+            // cache hierarchy and are already hashed separately above.
+            context.remove("tools");
+            context.is_empty()
+        });
+    if remove_context {
+        object.remove("userInputMessageContext");
     }
 }
 
@@ -878,11 +1678,27 @@ struct PrefixKeyState {
     part_count: usize,
 }
 
+/// Resolve the model namespace used by both the in-process and shared
+/// prompt-cache registries.
+///
+/// Cache identity follows the model ID that `converter` actually puts on the
+/// upstream wire, so public aliases for the same model reuse one prefix.  The
+/// mapped value is retained byte-for-byte (including a distinct `-1m` route if
+/// the converter exposes one) so different upstream models cannot share a
+/// registry entry. Unsupported names deliberately keep their exact requested
+/// bytes instead of being normalized together; normal request validation will
+/// reject them, while direct/internal callers still fail closed into separate
+/// namespaces.
+fn cache_model_identity(model: &str) -> String {
+    super::converter::map_model(model).unwrap_or_else(|| model.to_string())
+}
+
 impl PrefixKeyState {
     fn new(model: &str) -> Self {
+        let model = cache_model_identity(model);
         Self {
-            ephemeral_5m: seeded_cache_hasher(model, CacheTtl::Ephemeral5m),
-            ephemeral_1h: seeded_cache_hasher(model, CacheTtl::Ephemeral1h),
+            ephemeral_5m: seeded_cache_hasher(&model, CacheTtl::Ephemeral5m),
+            ephemeral_1h: seeded_cache_hasher(&model, CacheTtl::Ephemeral1h),
             part_count: 0,
         }
     }
@@ -979,6 +1795,14 @@ fn collect_message_prefix(
                 let ttl = cache_ttl(item_without_cache.get("cache_control"));
                 if let Some(obj) = item_without_cache.as_object_mut() {
                     obj.remove("cache_control");
+                    // Kiro history has no field for an Anthropic thinking
+                    // signature; only the thinking text reaches the model.
+                    // Do not turn opaque response metadata into a false miss.
+                    if message.role == "assistant"
+                        && obj.get("type").and_then(Value::as_str) == Some("thinking")
+                    {
+                        obj.remove("signature");
+                    }
                 }
                 state.push_key_part(&format!(
                     "{}:{}",
@@ -1017,6 +1841,7 @@ fn remember_read_candidate(state: &mut PrefixState) {
     let candidate = CacheReadCandidate {
         keys: state.cache_keys(),
         position: state.position(),
+        tokens: 0,
     };
     if state.read_candidates.len() == MAX_READ_CANDIDATES + 1 {
         state.read_candidates.pop_front();
@@ -1139,8 +1964,46 @@ fn calibrated_prefix_tokens_at(
 
 fn has_direct_cache_control(v: &Value) -> bool {
     v.as_object()
-        .map(|map| map.contains_key("cache_control"))
-        .unwrap_or(false)
+        .and_then(|map| map.get("cache_control"))
+        .is_some_and(|control| !control.is_null())
+}
+
+fn rendered_thinking_and_effort_key(req: &MessagesRequest) -> Option<String> {
+    super::converter::forwarded_claude_effort(req).map(|effort| format!("effort={effort}"))
+}
+
+fn effective_forced_tool_choice_key(req: &MessagesRequest) -> Option<String> {
+    let choice = req.tool_choice.as_ref()?;
+    let tools = req.tools.as_ref()?;
+    match choice.get("type").and_then(Value::as_str) {
+        Some("any") if !tools.is_empty() => Some("any".to_string()),
+        Some("tool") => {
+            let name = choice.get("name").and_then(Value::as_str)?;
+            tools
+                .iter()
+                .any(|tool| tool.name == name)
+                .then(|| format!("tool:{}", canonical_json(&Value::String(name.to_string()))))
+        }
+        _ => None,
+    }
+}
+
+fn request_has_user_image(req: &MessagesRequest) -> bool {
+    req.messages
+        .iter()
+        .filter(|message| message.role == "user")
+        .any(|message| value_contains_image(&message.content))
+}
+
+fn value_contains_image(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(value_contains_image),
+        Value::Object(map) => {
+            map.get("type").and_then(Value::as_str) == Some("image")
+                || map.values().any(value_contains_image)
+        }
+        _ => false,
+    }
 }
 
 fn cache_ttl(value: Option<&Value>) -> CacheTtl {
@@ -1173,7 +2036,15 @@ async fn cache_entry_match(
         return None;
     }
     let redis_key = breakpoint.key.redis_key();
-    if crate::cluster_cache::global().exists(&redis_key).await {
+    let exact_hit = crate::cluster_cache::global().exists(&redis_key).await;
+    tracing::debug!(
+        model = %req.model,
+        key = %redis_key,
+        tokens = breakpoint.tokens,
+        exact_hit,
+        "checked prompt-cache registry entry"
+    );
+    if exact_hit {
         return Some(CacheReadMatch {
             tokens: breakpoint.tokens,
         });
@@ -1188,7 +2059,9 @@ async fn cache_entry_match(
 
         // Tokenization is the expensive part. Candidate keys are cheap to
         // probe, so calculate the exact prefix tokens only for a real hit.
-        let tokens = if let Some(tokens) = candidate_tokens.get(&candidate.position).copied() {
+        let tokens = if candidate.tokens > 0 {
+            candidate.tokens
+        } else if let Some(tokens) = candidate_tokens.get(&candidate.position).copied() {
             tokens
         } else {
             let Some(tokens) = calibrated_prefix_tokens_at(
@@ -1218,6 +2091,7 @@ async fn cache_entry_match(
 
 async fn register_cache_key(key: CacheKey, ttl: CacheTtl) {
     let redis_key = key.redis_key();
+    tracing::debug!(key = %redis_key, ?ttl, "registering prompt-cache registry entry");
     crate::cluster_cache::global()
         .register(&redis_key, ttl.duration())
         .await;
@@ -1283,21 +2157,21 @@ mod tests {
     #[tokio::test]
     async fn terminal_cache_usage_preserves_prefix_identity() {
         let (prompt, request) = detector_terminal_cache_request();
-        let build = build_cache_breakpoints(&request, 1_000_000, true);
-        let prefix_tokens = build.breakpoints.last().expect("cache breakpoint").tokens;
         let total = super::super::bedrock::calibrated_input_tokens(
             &request,
             super::super::compat::estimate_input_tokens(&request),
         );
+        let build = build_cache_breakpoints(&request, total, true);
+        let prefix_tokens = build.breakpoints.last().expect("cache breakpoint").tokens;
         let usage = compute_request_usage_breakdown_with_profile(total, &request, true).await;
         let cached = usage
             .cache_read_input_tokens
             .saturating_add(usage.cache_creation_input_tokens);
 
         assert_eq!(prompt.chars().count(), 170_020);
-        assert_eq!(total, prefix_tokens.saturating_add(1));
+        assert_eq!(prefix_tokens, total);
         assert_eq!(usage.input_tokens, 1);
-        assert_eq!(cached, prefix_tokens);
+        assert_eq!(cached, total.saturating_sub(1));
         assert_eq!(usage.total(), total);
     }
 
@@ -1320,7 +2194,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_floor_does_not_hide_uncached_suffix() {
+    async fn nonterminal_public_breakpoint_does_not_claim_an_unforwarded_cache() {
         let prompt = detector_cache_prompt();
         let request = parse_request(serde_json::json!({
             "model": "claude-opus-4-8",
@@ -1346,14 +2220,12 @@ mod tests {
         );
         let usage = compute_request_usage_breakdown_with_profile(total, &request, true).await;
 
-        assert!(usage.input_tokens > 1);
-        assert!(usage.has_cache_usage());
-        assert_eq!(usage.total(), total);
+        assert_eq!(usage, UsageBreakdown::flat(total));
     }
 
     fn legacy_cache_key(model: &str, parts: &[String], ttl: CacheTtl) -> CacheKey {
         let mut hasher = Sha256::new();
-        hasher.update(model.as_bytes());
+        hasher.update(cache_model_identity(model).as_bytes());
         hasher.update(b"\n");
         hasher.update(format!("{ttl:?}").as_bytes());
         hasher.update(b"\n");
@@ -1398,11 +2270,11 @@ mod tests {
 
         assert_eq!(
             state.cache_keys().ephemeral_5m.redis_key(),
-            "krcc:1bb852275c477e415c7f83b54d6107121e24e012ccec8881ec8db043fe0b16f7"
+            "krcc:f2be10850bce280622ea3be9ea061f1c6493718f31a4e00f1fd7b96ebb19bdc0"
         );
         assert_eq!(
             state.cache_keys().ephemeral_1h.redis_key(),
-            "krcc:a0620da520687b11cd49014ea4da5ced2d77620fc716c56e0d6cda562a013266"
+            "krcc:b7aa71573952fded3d1b39e8861ec990e5cc5bbc2aeb95b2536d0bebcbd99775"
         );
     }
 
@@ -1412,11 +2284,11 @@ mod tests {
         let mut state = PrefixState::new(model);
         assert_eq!(
             state.cache_keys().ephemeral_5m.redis_key(),
-            "krcc:f1e205d81bb1583ea0aa084eadc78bf51ece9d1636f2daa7506e1b43c53af7b7"
+            "krcc:508d538b114afd01a5a07b94201336991415f0bd8fbbf9f05fb64b169e801e7f"
         );
         assert_eq!(
             state.cache_keys().ephemeral_1h.redis_key(),
-            "krcc:eb8d1bfa5fc5997fab98854ac8d1eff21d7a106a7675da8dd8f453d747a72830"
+            "krcc:0ab227d62441c7299e07f180e714c732faf46d39aa6d11d20451632d4adff4a2"
         );
 
         let parts = ["", "x", KEY_PART_SEPARATOR, "中文\0suffix"];
@@ -1448,6 +2320,22 @@ mod tests {
         c.push_key_part("user:hello");
         assert_eq!(a.cache_keys().ephemeral_5m, c.cache_keys().ephemeral_5m);
         assert_ne!(a.cache_keys().ephemeral_5m, a.cache_keys().ephemeral_1h);
+    }
+
+    #[test]
+    fn unsupported_model_names_keep_separate_cache_namespaces() {
+        let mut first = PrefixState::new("future-model-alpha");
+        first.push_key_part("user:same prompt");
+        let mut second = PrefixState::new("future-model-alpha-thinking");
+        second.push_key_part("user:same prompt");
+
+        assert!(super::super::converter::map_model("future-model-alpha").is_none());
+        assert!(super::super::converter::map_model("future-model-alpha-thinking").is_none());
+        assert_ne!(
+            first.cache_keys().ephemeral_5m,
+            second.cache_keys().ephemeral_5m,
+            "unmapped names must not be guessed to be aliases of one model"
+        );
     }
 
     #[test]
@@ -1508,7 +2396,11 @@ mod tests {
         reset_prefix_tokenization_calls();
         let build = build_cache_breakpoints(&automatic, 100_000, true);
         assert_eq!(build.breakpoints.len(), 1);
-        assert_eq!(prefix_tokenization_calls(), 1);
+        assert_eq!(
+            prefix_tokenization_calls(),
+            0,
+            "converter-derived layouts reuse their precomputed canonical wire weights"
+        );
     }
 
     /// 回归：cache_creation 是本请求的真子集，不得超过请求总量。
@@ -1670,14 +2562,10 @@ mod tests {
         assert!(cache_plan_for_request(10_000, &req, true).await.is_none());
         assert_eq!(prefix_tokenization_calls(), 0);
 
-        // Direct callers are bounded as well, even if they bypass preflight.
+        // Direct callers fail closed as well if they bypass HTTP preflight.
         let build = build_cache_breakpoints(&req, 10_000, true);
-        assert_eq!(build.breakpoints.len(), MAX_CACHE_BREAKPOINTS);
-        assert_eq!(
-            prefix_tokenization_calls(),
-            MAX_CACHE_BREAKPOINTS,
-            "only the four representable breakpoints may invoke the tokenizer"
-        );
+        assert!(build.breakpoints.is_empty());
+        assert_eq!(prefix_tokenization_calls(), 0);
     }
 
     #[test]
@@ -2175,8 +3063,282 @@ mod tests {
     }
 
     #[test]
-    fn customer_xueding_request_has_cache_control() {
-        // 客户 sk-cde0... 的真实请求含 system.cache_control={"type":"ephemeral"}
+    fn null_message_cache_control_is_absent_everywhere() {
+        let req = parse_request(serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "plain question",
+                    "cache_control": null
+                }]
+            }]
+        }));
+
+        assert!(!request_has_cache_control(&req));
+        assert_eq!(request_cache_control_count(&req), 0);
+        assert!(
+            build_cache_breakpoints(&req, 10_000, true)
+                .breakpoints
+                .is_empty()
+        );
+    }
+
+    fn automatic_cache_key(req: &MessagesRequest) -> CacheKey {
+        let build = build_cache_breakpoints(req, 1_000_000, true);
+        assert_eq!(build.breakpoints.len(), 1);
+        build.breakpoints[0].key
+    }
+
+    fn system_cache_key_for_layout(model: &str, aws_b40_compat: bool) -> CacheKey {
+        let req = parse_request(serde_json::json!({
+            "model": model,
+            "system": [{
+                "type": "text",
+                "text": "stable cache namespace test",
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": [{"role": "user", "content": "same request"}]
+        }));
+        let build = build_cache_breakpoints(&req, 10_000, aws_b40_compat);
+        assert_eq!(build.breakpoints.len(), 1);
+        build.breakpoints[0].key
+    }
+
+    #[test]
+    fn opus_5_aliases_share_canonical_registry_keys_in_both_layouts() {
+        for aws_b40_compat in [false, true] {
+            let canonical = system_cache_key_for_layout("claude-opus-5", aws_b40_compat);
+            for alias in ["claude-opus-5-20260725", "claude-opus-5-thinking"] {
+                assert_eq!(
+                    canonical,
+                    system_cache_key_for_layout(alias, aws_b40_compat),
+                    "{alias} must share the canonical Opus 5 cache namespace"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn distinct_upstream_models_never_share_registry_keys() {
+        for aws_b40_compat in [false, true] {
+            assert_ne!(
+                system_cache_key_for_layout("claude-opus-4-8", aws_b40_compat),
+                system_cache_key_for_layout("claude-opus-5", aws_b40_compat),
+                "Opus 4.8 and Opus 5 are different upstream models"
+            );
+        }
+    }
+
+    #[test]
+    fn ignored_thinking_signature_does_not_change_forwarded_prefix_key() {
+        let request_with = |signature: &str, thinking: &str| {
+            parse_request(serde_json::json!({
+                "model": "claude-opus-4-8",
+                "cache_control": {"type": "ephemeral"},
+                "messages": [
+                    {"role": "user", "content": "solve this"},
+                    {"role": "assistant", "content": [{
+                        "type": "thinking",
+                        "thinking": thinking,
+                        "signature": signature
+                    }, {"type": "text", "text": "partial"}]},
+                    {"role": "user", "content": "continue"}
+                ]
+            }))
+        };
+
+        let first = request_with("opaque-signature-a", "same reasoning");
+        let second = request_with("opaque-signature-b", "same reasoning");
+        let changed = request_with("opaque-signature-b", "different reasoning");
+
+        assert_eq!(automatic_cache_key(&first), automatic_cache_key(&second));
+        assert_ne!(automatic_cache_key(&first), automatic_cache_key(&changed));
+    }
+
+    #[test]
+    fn effective_effort_key_uses_official_high_default() {
+        let request_with = |effort: Option<&str>| {
+            let mut body = serde_json::json!({
+                "model": "claude-opus-4-8",
+                "cache_control": {"type": "ephemeral"},
+                "thinking": {"type": "adaptive"},
+                "messages": [{"role": "user", "content": "reason carefully"}]
+            });
+            if let Some(effort) = effort {
+                body["output_config"] = serde_json::json!({"effort": effort});
+            }
+            parse_request(body)
+        };
+
+        let omitted = request_with(None);
+        let explicit_high = request_with(Some("high"));
+        let medium = request_with(Some("medium"));
+        assert_eq!(
+            automatic_cache_key(&omitted),
+            automatic_cache_key(&explicit_high)
+        );
+        assert_ne!(automatic_cache_key(&omitted), automatic_cache_key(&medium));
+    }
+
+    #[test]
+    fn trailing_assistant_prefill_does_not_change_forwarded_cache_identity() {
+        let request_with_prefill = |prefill: &str| {
+            parse_request(serde_json::json!({
+                "model": "claude-opus-4-8",
+                "cache_control": {"type": "ephemeral"},
+                "messages": [
+                    {"role": "user", "content": "stable user turn"},
+                    {"role": "assistant", "content": prefill}
+                ]
+            }))
+        };
+
+        let first = request_with_prefill("discarded prefill one");
+        let second = request_with_prefill("a completely different discarded prefill");
+        let without_prefill = parse_request(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "cache_control": {"type": "ephemeral"},
+            "messages": [{"role": "user", "content": "stable user turn"}]
+        }));
+
+        assert_eq!(automatic_cache_key(&first), automatic_cache_key(&second));
+        assert_eq!(
+            automatic_cache_key(&first),
+            automatic_cache_key(&without_prefill)
+        );
+
+        let estimate = |request: &MessagesRequest| {
+            let base = super::super::compat::estimate_input_tokens(request);
+            super::super::bedrock::calibrated_input_tokens(request, base)
+        };
+        let first_total = estimate(&first);
+        let second_total = estimate(&second);
+        let without_prefill_total = estimate(&without_prefill);
+        assert_eq!(first_total, second_total);
+        assert_eq!(first_total, without_prefill_total);
+
+        let first_build = build_cache_breakpoints(&first, first_total, true);
+        let second_build = build_cache_breakpoints(&second, second_total, true);
+        let without_build = build_cache_breakpoints(&without_prefill, without_prefill_total, true);
+        assert_eq!(first_build.exact_ttl_plan, second_build.exact_ttl_plan);
+        assert_eq!(first_build.exact_ttl_plan, without_build.exact_ttl_plan);
+    }
+
+    #[test]
+    fn dynamic_system_policy_is_part_of_the_forwarded_system_key() {
+        let request_with_user = |user: &str| {
+            parse_request(serde_json::json!({
+                "model": "claude-opus-4-8",
+                "system": [{
+                    "type": "text",
+                    "text": "stable public system",
+                    "cache_control": {"type": "ephemeral"}
+                }],
+                "messages": [{"role": "user", "content": user}]
+            }))
+        };
+
+        let ordinary = request_with_user("Explain a hash map briefly.");
+        let literal_code = request_with_user(
+            "Write Rust fn kiro_cache_key(input: &str) and preserve the literal \"Kiro:\" exactly.",
+        );
+        assert!(!super::super::converter::preserves_private_product_code_content(&ordinary));
+        assert!(super::super::converter::preserves_private_product_code_content(&literal_code));
+
+        let ordinary_build = build_cache_breakpoints(&ordinary, 20_000, true);
+        let literal_build = build_cache_breakpoints(&literal_code, 20_000, true);
+        assert_eq!(ordinary_build.breakpoints.len(), 1);
+        assert_eq!(literal_build.breakpoints.len(), 1);
+        assert_ne!(
+            ordinary_build.breakpoints[0].key, literal_build.breakpoints[0].key,
+            "the system breakpoint must fingerprint the actual dynamic Kiro system wire"
+        );
+    }
+
+    #[test]
+    fn synthesized_placeholder_tools_are_part_of_forwarded_system_identity() {
+        let request_with_tool = |name: &str| {
+            parse_request(serde_json::json!({
+                "model": "claude-opus-4-8",
+                "system": [{
+                    "type": "text",
+                    "text": "stable public system",
+                    "cache_control": {"type": "ephemeral"}
+                }],
+                "messages": [
+                    {"role": "user", "content": "Use the historical tool."},
+                    {"role": "assistant", "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_history",
+                        "name": name,
+                        "input": {"value": 1}
+                    }]},
+                    {"role": "user", "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_history",
+                        "content": "done"
+                    }]}
+                ]
+            }))
+        };
+
+        let first = build_cache_breakpoints(&request_with_tool("history_tool_alpha"), 20_000, true);
+        let second = build_cache_breakpoints(&request_with_tool("history_tool_beta"), 20_000, true);
+        assert_eq!(first.breakpoints.len(), 1);
+        assert_eq!(second.breakpoints.len(), 1);
+        assert_ne!(
+            first.breakpoints[0].key, second.breakpoints[0].key,
+            "placeholder tools are sent before system/messages and must scope the cache key"
+        );
+    }
+
+    #[test]
+    fn image_presence_invalidates_message_keys_but_not_system_keys() {
+        let request_with_image = |with_image: bool| {
+            let mut final_content = vec![serde_json::json!({"type": "text", "text": "next"})];
+            if with_image {
+                final_content.push(serde_json::json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "iVBORw0KGgo="
+                    }
+                }));
+            }
+            parse_request(serde_json::json!({
+                "model": "claude-opus-4-8",
+                "system": [{
+                    "type": "text",
+                    "text": "stable system",
+                    "cache_control": {"type": "ephemeral"}
+                }],
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "early message prefix",
+                        "cache_control": {"type": "ephemeral"}
+                    }]
+                }, {"role": "assistant", "content": "ack"}, {
+                    "role": "user",
+                    "content": final_content
+                }]
+            }))
+        };
+
+        let without = build_cache_breakpoints(&request_with_image(false), 100_000, true);
+        let with = build_cache_breakpoints(&request_with_image(true), 100_000, true);
+        assert_eq!(without.breakpoints.len(), 2);
+        assert_eq!(with.breakpoints.len(), 2);
+        assert_eq!(without.breakpoints[0].key, with.breakpoints[0].key);
+        assert_ne!(without.breakpoints[1].key, with.breakpoints[1].key);
+    }
+
+    #[test]
+    fn adaptive_request_with_system_breakpoint_has_cache_control() {
+        // Adaptive thinking does not suppress an explicit system cache breakpoint.
         let req = parse_request(serde_json::json!({
             "thinking": {"type": "adaptive", "display": "summarized"},
             "output_config": {"effort": "max"},
@@ -2194,7 +3356,7 @@ mod tests {
     }
 
     #[test]
-    fn top_level_cache_mode_does_not_consume_a_bedrock_breakpoint() {
+    fn top_level_cache_mode_consumes_one_of_four_slots() {
         let req = parse_request(serde_json::json!({
             "cache_control": {"type": "ephemeral"},
             "system": [{
@@ -2219,6 +3381,8 @@ mod tests {
 
         assert!(request_has_cache_control(&req));
         assert_eq!(request_cache_control_count(&req), 4);
+        assert_eq!(request_cache_breakpoint_slot_count(&req), 5);
+        assert!(ExactCacheTtlPlan::for_request(10_000, &req, true).is_empty());
     }
 
     #[test]
@@ -2303,7 +3467,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_metadata_replaces_all_cache_buckets_and_preserves_ttl_ratio() {
+    fn exact_metadata_replaces_all_cache_buckets_using_native_ttl_plan() {
         let initial = UsageBreakdown {
             input_tokens: 11,
             cache_read_input_tokens: 0,
@@ -2313,19 +3477,588 @@ mod tests {
         };
         let exact = TokenUsage {
             uncached_input_tokens: 7,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 1_025,
+            output_tokens: 42,
+            total_tokens: 1_074,
+        };
+        let mut plan = ExactCacheTtlPlan::default();
+        plan.segments[0] = ExactCacheTtlSegment {
+            end_tokens: 700,
+            one_hour: true,
+        };
+        plan.segments[1] = ExactCacheTtlSegment {
+            end_tokens: 1_025,
+            one_hour: false,
+        };
+        plan.len = 2;
+
+        let usage =
+            UsageBreakdown::from_exact_token_usage_with_ttl_plan(initial, &exact, plan).unwrap();
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, 1_025);
+        assert_eq!(usage.cache_creation_5m_input_tokens, 325);
+        assert_eq!(usage.cache_creation_1h_input_tokens, 700);
+        assert_eq!(usage.total(), 1_032);
+    }
+
+    #[test]
+    fn native_internal_cache_is_flat_without_public_cache_intent() {
+        let exact = TokenUsage {
+            uncached_input_tokens: 7,
             cache_read_input_tokens: 1_000,
             cache_write_input_tokens: 25,
             output_tokens: 42,
             total_tokens: 1_074,
         };
 
-        let usage = UsageBreakdown::from_exact_token_usage(initial, &exact).unwrap();
-        assert_eq!(usage.input_tokens, 7);
-        assert_eq!(usage.cache_read_input_tokens, 1_000);
-        assert_eq!(usage.cache_creation_input_tokens, 25);
-        assert_eq!(usage.cache_creation_5m_input_tokens, 7);
-        assert_eq!(usage.cache_creation_1h_input_tokens, 18);
-        assert_eq!(usage.total(), 1_032);
+        let usage = UsageBreakdown::from_exact_token_usage(
+            UsageBreakdown::flat(exact.total_input_tokens()),
+            &exact,
+        )
+        .expect("valid native token usage");
+
+        assert_eq!(usage, UsageBreakdown::flat(1_032));
+    }
+
+    #[test]
+    fn only_verified_opus_families_trust_native_cache_buckets() {
+        for model in [
+            "claude-opus-4-7",
+            "claude-opus-4.8",
+            "claude-opus-5-thinking",
+        ] {
+            assert!(
+                native_cache_buckets_are_trusted(model),
+                "{model} should keep its verified native cache split"
+            );
+        }
+
+        for model in [
+            "claude-sonnet-4-6",
+            "claude-sonnet-5",
+            "claude-opus-4-6",
+            "claude-opus-4-5-20251101",
+            "claude-haiku-4-5-20251001",
+        ] {
+            assert!(
+                !native_cache_buckets_are_trusted(model),
+                "{model} should retain deterministic shared-cache accounting"
+            );
+        }
+    }
+
+    #[test]
+    fn sonnet_native_repeated_write_cannot_overwrite_a_local_cache_read() {
+        let local_hot = UsageBreakdown {
+            input_tokens: 182,
+            cache_read_input_tokens: 89_520,
+            cache_creation_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let native_repeated_write = TokenUsage {
+            uncached_input_tokens: 182,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 89_520,
+            output_tokens: 72,
+            total_tokens: 89_774,
+        };
+        let mut plan = ExactCacheTtlPlan::default();
+        plan.segments[0] = ExactCacheTtlSegment {
+            end_tokens: 89_520,
+            one_hour: false,
+        };
+        plan.len = 1;
+
+        for model in ["claude-sonnet-4-6", "claude-sonnet-5"] {
+            let native = reconcile_native_usage(model, local_hot, &native_repeated_write, plan)
+                .expect("native totals are valid");
+            assert_eq!(native.aggregate_input_tokens, 89_702);
+            assert_eq!(native.output_tokens, 72);
+            assert_eq!(
+                native.public_cache_usage, None,
+                "{model}: the known repeated-write signal must not erase the local read"
+            );
+        }
+    }
+
+    #[test]
+    fn verified_opus_keeps_authoritative_native_cache_buckets() {
+        let initial = UsageBreakdown {
+            input_tokens: 182,
+            cache_read_input_tokens: 89_520,
+            cache_creation_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let exact = TokenUsage {
+            uncached_input_tokens: 182,
+            cache_read_input_tokens: 89_520,
+            cache_write_input_tokens: 0,
+            output_tokens: 72,
+            total_tokens: 89_774,
+        };
+        let mut plan = ExactCacheTtlPlan::default();
+        plan.segments[0] = ExactCacheTtlSegment {
+            end_tokens: 89_520,
+            one_hour: false,
+        };
+        plan.len = 1;
+
+        for model in ["claude-opus-4-7", "claude-opus-4-8", "claude-opus-5"] {
+            let native = reconcile_native_usage(model, initial, &exact, plan)
+                .expect("native totals are valid");
+            assert_eq!(
+                native.public_cache_usage,
+                Some(UsageBreakdown {
+                    input_tokens: 182,
+                    cache_read_input_tokens: 89_520,
+                    cache_creation_input_tokens: 0,
+                    cache_creation_5m_input_tokens: 0,
+                    cache_creation_1h_input_tokens: 0,
+                }),
+                "{model}: verified native reads remain authoritative"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_plan_ignores_public_breakpoint_not_forwarded_to_kiro() {
+        let req = parse_request(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "public local boundary ".repeat(2_000),
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                }, {
+                    "type": "text",
+                    "text": "terminal uncached suffix"
+                }]
+            }]
+        }));
+        let build = build_cache_breakpoints(&req, 20_000, true);
+        assert!(build.breakpoints.is_empty());
+        assert!(
+            build.exact_ttl_plan.is_empty(),
+            "a non-terminal block has no native Kiro cachePoint"
+        );
+
+        let initial = UsageBreakdown {
+            input_tokens: 10,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 10_000,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 10_000,
+        };
+        let exact = TokenUsage {
+            uncached_input_tokens: 7,
+            cache_read_input_tokens: 9_000,
+            cache_write_input_tokens: 1_000,
+            output_tokens: 2,
+            total_tokens: 10_009,
+        };
+        let usage = UsageBreakdown::from_exact_token_usage_with_ttl_plan(
+            initial,
+            &exact,
+            build.exact_ttl_plan,
+        )
+        .expect("valid exact metadata");
+        assert_eq!(usage, UsageBreakdown::flat(10_007));
+    }
+
+    #[test]
+    fn cache_commit_contains_only_points_present_on_the_kiro_wire() {
+        let req = parse_request(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "system": [{
+                "type": "text",
+                "text": "forwarded system cache ".repeat(2_000),
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }],
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "unforwarded intra-message boundary ".repeat(2_000),
+                    "cache_control": {"type": "ephemeral"}
+                }, {
+                    "type": "text",
+                    "text": "terminal suffix without a marker"
+                }]
+            }]
+        }));
+
+        let commit = prepare_cache_commit(50_000, &req, true);
+        assert_eq!(commit.entries.len(), 1);
+        assert_eq!(commit.exact_ttl_plan.len, 1);
+        assert!(commit.exact_ttl_plan.segments[0].one_hour);
+    }
+
+    #[test]
+    fn exact_plan_mirrors_converter_system_and_history_terminal_rules() {
+        let ignored = parse_request(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "system": [{
+                "type": "text",
+                "text": "early system",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }, {
+                "type": "text",
+                "text": "final system without marker"
+            }],
+            "messages": [
+                {"role": "user", "content": [{
+                    "type": "text", "text": "first merged user",
+                    "cache_control": {"type": "ephemeral"}
+                }]},
+                {"role": "user", "content": "last merged user"},
+                {"role": "assistant", "content": [{
+                    "type": "text", "text": "first merged assistant",
+                    "cache_control": {"type": "ephemeral"}
+                }]},
+                {"role": "assistant", "content": "last merged assistant"},
+                {"role": "user", "content": "current"}
+            ]
+        }));
+        let ignored_plan = ExactCacheTtlPlan::for_request(50_000, &ignored, true);
+        assert!(
+            ignored_plan.is_empty(),
+            "only the final system item and final message in each merged role group survive conversion"
+        );
+
+        let forwarded = parse_request(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "system": [{"type": "text", "text": "early system"}, {
+                "type": "text",
+                "text": "final system",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }],
+            "messages": [
+                {"role": "user", "content": "first merged user"},
+                {"role": "user", "content": [{
+                    "type": "text", "text": "last merged user",
+                    "cache_control": {"type": "ephemeral"}
+                }]},
+                {"role": "assistant", "content": "assistant"},
+                {"role": "user", "content": [{
+                    "type": "text", "text": "current terminal",
+                    "cache_control": {"type": "ephemeral"}
+                }]}
+            ]
+        }));
+        let forwarded_plan = ExactCacheTtlPlan::for_request(50_000, &forwarded, true);
+        assert_eq!(forwarded_plan.len, 3);
+        assert!(forwarded_plan.segments[0].one_hour);
+        assert!(!forwarded_plan.segments[1].one_hour);
+        assert!(!forwarded_plan.segments[2].one_hour);
+    }
+
+    #[test]
+    fn exact_plan_uses_native_automatic_point_when_explicit_block_is_nonterminal() {
+        let req = parse_request(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "local explicit boundary ".repeat(2_000),
+                    "cache_control": {"type": "ephemeral"}
+                }, {"type": "text", "text": "terminal block"}]
+            }]
+        }));
+        let build = build_cache_breakpoints(&req, 20_000, true);
+        assert_eq!(build.breakpoints.len(), 1);
+        assert_eq!(build.exact_ttl_plan.len, 1);
+        assert!(
+            build.exact_ttl_plan.segments[0].one_hour,
+            "converter attaches the top-level automatic cachePoint to currentMessage"
+        );
+        assert_eq!(
+            build.exact_ttl_plan.segments[0].end_tokens, build.breakpoints[0].tokens,
+            "fallback and exact accounting share the same forwarded point"
+        );
+    }
+
+    #[test]
+    fn automatic_and_explicit_points_share_one_forwarded_layout() {
+        let req = parse_request(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "cache_control": {"type": "ephemeral"},
+            "system": [{
+                "type": "text",
+                "text": "long-lived system prefix",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }],
+            "messages": [{"role": "user", "content": "automatic current-message point"}]
+        }));
+
+        let build = build_cache_breakpoints(&req, 20_000, true);
+        assert_eq!(build.breakpoints.len(), 2);
+        assert_eq!(build.exact_ttl_plan.len, 2);
+        assert_eq!(build.breakpoints[0].ttl, CacheTtl::Ephemeral1h);
+        assert_eq!(build.breakpoints[1].ttl, CacheTtl::Ephemeral5m);
+        assert!(build.exact_ttl_plan.segments[0].one_hour);
+        assert!(!build.exact_ttl_plan.segments[1].one_hour);
+        assert_eq!(
+            build.exact_ttl_plan.segments[0].end_tokens,
+            build.breakpoints[0].tokens
+        );
+        assert_eq!(
+            build.exact_ttl_plan.segments[1].end_tokens,
+            build.breakpoints[1].tokens
+        );
+    }
+
+    #[test]
+    fn exact_plan_keeps_each_forwarded_tool_cache_point() {
+        let req = parse_request(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "tools": [{
+                "name": "first_tool",
+                "description": "first",
+                "input_schema": {"type": "object"},
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }, {
+                "name": "second_tool",
+                "description": "second",
+                "input_schema": {"type": "object"},
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": [{"role": "user", "content": "use a tool"}]
+        }));
+        let plan = ExactCacheTtlPlan::for_request(20_000, &req, true);
+        assert_eq!(plan.len, 2);
+        assert!(plan.segments[0].one_hour);
+        assert!(!plan.segments[1].one_hour);
+        assert!(plan.segments[1].end_tokens >= plan.segments[0].end_tokens);
+    }
+
+    #[test]
+    fn local_cache_minimum_is_model_specific_and_unknown_fails_closed() {
+        assert_eq!(local_cache_min_tokens("claude-opus-5"), Some(512));
+        assert_eq!(local_cache_min_tokens("claude-opus-4-8"), Some(1_024));
+        assert_eq!(local_cache_min_tokens("claude-sonnet-5"), Some(1_024));
+        assert_eq!(local_cache_min_tokens("claude-sonnet-4-6"), Some(1_024));
+        assert_eq!(local_cache_min_tokens("claude-sonnet-4-5"), Some(1_024));
+        assert_eq!(local_cache_min_tokens("claude-opus-4-7"), Some(2_048));
+        assert_eq!(local_cache_min_tokens("claude-opus-4-6"), Some(4_096));
+        assert_eq!(local_cache_min_tokens("claude-opus-4-5"), Some(4_096));
+        assert_eq!(local_cache_min_tokens("claude-haiku-4-5"), Some(4_096));
+        assert_eq!(
+            local_cache_min_tokens("claude-opus-4-6-1m"),
+            Some(4_096),
+            "the 1m route inherits the Opus 4.6 family minimum"
+        );
+        assert_eq!(
+            local_cache_min_tokens("claude-sonnet-4-6-1m"),
+            Some(1_024),
+            "the 1m route inherits the Sonnet 4.6 family minimum"
+        );
+        assert_eq!(local_cache_min_tokens("glm-5"), None);
+    }
+
+    #[tokio::test]
+    async fn local_minimum_does_not_discard_native_exact_plan() {
+        let request_for = |model: &str| {
+            parse_request(serde_json::json!({
+                "model": model,
+                "system": [{
+                    "type": "text",
+                    "text": "cacheable platform prefix ".repeat(2_000),
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                }]
+            }))
+        };
+
+        let opus_48 = request_for("claude-opus-4-8");
+        assert!(
+            cache_plan_for_request(1_500, &opus_48, true)
+                .await
+                .is_some()
+        );
+
+        let opus_47 = request_for("claude-opus-4-7");
+        assert!(
+            cache_plan_for_request(1_500, &opus_47, true)
+                .await
+                .is_none()
+        );
+
+        let opus_46 = request_for("claude-opus-4-6");
+        assert!(
+            cache_plan_for_request(3_000, &opus_46, true)
+                .await
+                .is_none()
+        );
+        let commit = prepare_cache_commit(3_000, &opus_46, true);
+        assert!(
+            commit.entries.is_empty(),
+            "sub-minimum local registry stays cold"
+        );
+        assert_eq!(
+            commit.exact_ttl_plan.len, 1,
+            "native metadata remains authoritative below the local gate"
+        );
+
+        let unknown = request_for("glm-5");
+        assert!(
+            cache_plan_for_request(50_000, &unknown, true)
+                .await
+                .is_none()
+        );
+        let commit = prepare_cache_commit(50_000, &unknown, true);
+        assert!(
+            commit.entries.is_empty(),
+            "unknown models fail closed locally"
+        );
+        assert_eq!(
+            commit.exact_ttl_plan.len, 1,
+            "a real native cachePoint is not erased by the local model table"
+        );
+    }
+
+    #[test]
+    fn exact_cache_write_uses_request_ttl_when_local_plan_was_hot() {
+        let req = parse_request(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "system": [{
+                "type": "text",
+                "text": "authoritative-one-hour-cache-prefix ".repeat(2_000),
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }]
+        }));
+        let total = 20_000;
+        let plan = ExactCacheTtlPlan::for_request(total, &req, true);
+        assert_eq!(plan.len, 1);
+        assert!(plan.segments[0].one_hour);
+
+        // The local registry believed the whole prefix was hot, so the
+        // initial creation split contains no TTL information at all.
+        let initial = UsageBreakdown {
+            input_tokens: 7,
+            cache_read_input_tokens: 12_000,
+            cache_creation_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let exact = TokenUsage {
+            uncached_input_tokens: 7,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 12_000,
+            output_tokens: 4,
+            total_tokens: 12_011,
+        };
+
+        let usage = UsageBreakdown::from_exact_token_usage_with_ttl_plan(initial, &exact, plan)
+            .expect("valid native usage");
+        assert_eq!(usage.cache_creation_input_tokens, 12_000);
+        assert_eq!(usage.cache_creation_5m_input_tokens, 0);
+        assert_eq!(usage.cache_creation_1h_input_tokens, 12_000);
+        assert_eq!(usage.total(), 12_007);
+
+        // The commit carries the same request-derived plan so handlers do not
+        // have to rebuild or retokenize the request before moving the commit.
+        let commit = prepare_cache_commit(total, &req, true);
+        assert_eq!(commit.exact_ttl_plan(), plan);
+    }
+
+    #[test]
+    fn exact_ttl_plan_survives_the_local_cache_minimum_gate() {
+        let req = parse_request(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "system": [{
+                "type": "text",
+                "text": "small authoritative one-hour prefix ".repeat(20),
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }]
+        }));
+        let local_total = 500;
+        let plan = prepare_cache_commit(local_total, &req, true).exact_ttl_plan();
+        assert_eq!(plan.len, 1);
+        assert!(
+            plan.segments[0].end_tokens
+                < local_cache_min_tokens(&req.model).expect("known model minimum")
+        );
+        assert!(plan.segments[0].one_hour);
+
+        let initial = UsageBreakdown::flat(local_total);
+        let exact = TokenUsage {
+            uncached_input_tokens: 7,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 500,
+            output_tokens: 0,
+            total_tokens: 507,
+        };
+        let usage = UsageBreakdown::from_exact_token_usage_with_ttl_plan(initial, &exact, plan)
+            .expect("native cache write is authoritative");
+
+        assert_eq!(usage.cache_creation_input_tokens, 500);
+        assert_eq!(usage.cache_creation_5m_input_tokens, 0);
+        assert_eq!(usage.cache_creation_1h_input_tokens, 500);
+    }
+
+    #[test]
+    fn exact_partial_write_follows_the_ttl_of_the_uncached_suffix() {
+        let req = parse_request(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "system": [{
+                "type": "text",
+                "text": "durable-prefix ".repeat(2_000),
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }],
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "short-lived-suffix ".repeat(2_000),
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }]
+        }));
+        let total = 100_000;
+        let plan = ExactCacheTtlPlan::for_request(total, &req, true);
+        assert_eq!(plan.len, 2);
+        assert!(plan.segments[0].one_hour);
+        assert!(!plan.segments[1].one_hour);
+
+        let durable_prefix = plan.segments[0].end_tokens;
+        let complete_prefix = plan.segments[1].end_tokens;
+        let short_lived_suffix = complete_prefix.saturating_sub(durable_prefix);
+        assert!(durable_prefix >= local_cache_min_tokens(&req.model).expect("known model minimum"));
+        assert!(short_lived_suffix > 0);
+        // Exercise the native/local tokenizer scaling path as well as the TTL
+        // boundary itself.
+        let exact_read = durable_prefix.saturating_mul(2);
+        let exact_write = short_lived_suffix.saturating_mul(2);
+        let exact_cached_total = exact_read.saturating_add(exact_write);
+
+        let initial = UsageBreakdown {
+            input_tokens: 7,
+            cache_read_input_tokens: complete_prefix,
+            cache_creation_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let exact = TokenUsage {
+            uncached_input_tokens: 7,
+            cache_read_input_tokens: exact_read,
+            cache_write_input_tokens: exact_write,
+            output_tokens: 0,
+            total_tokens: 7i32.saturating_add(exact_cached_total),
+        };
+
+        let usage = UsageBreakdown::from_exact_token_usage_with_ttl_plan(initial, &exact, plan)
+            .expect("valid mixed-TTL native usage");
+        assert_eq!(usage.cache_read_input_tokens, exact_read);
+        assert_eq!(usage.cache_creation_input_tokens, exact_write);
+        assert_eq!(usage.cache_creation_5m_input_tokens, exact_write);
+        assert_eq!(usage.cache_creation_1h_input_tokens, 0);
+        assert_eq!(usage.total(), 7i32.saturating_add(exact_cached_total));
     }
 
     #[test]
@@ -2608,7 +4341,7 @@ mod tests {
                 {
                     "type": "text",
                     "text": anchor,
-                    "cache_control": {"type": "ephemeral", "ttl": "1h", "scope": "global"}
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
                 },
                 {"type": "text", "text": suffix}
             ],
@@ -2630,13 +4363,14 @@ mod tests {
         let first_cached = first_usage
             .cache_read_input_tokens
             .saturating_add(first_usage.cache_creation_input_tokens);
-        assert!(first_usage.cache_read_input_tokens > 0);
+        assert_eq!(first_usage.cache_read_input_tokens, 0);
         assert!(first_usage.cache_creation_input_tokens > 0);
         assert_eq!(
             first_usage.input_tokens,
             first_total.saturating_sub(first_cached)
         );
         assert!(first_usage.input_tokens > 0);
+        commit_successful_request(first_total, &first, true).await;
 
         let second = parse_request(serde_json::json!({
             "model": "claude-opus-4-8",
@@ -2707,10 +4441,17 @@ mod tests {
         let usage = compute_request_usage_breakdown_with_profile(total, &req, true).await;
 
         assert_eq!(total, 18_021);
-        assert_eq!(usage.input_tokens, 18);
         assert_eq!(usage.cache_read_input_tokens, 0);
-        assert_eq!(usage.cache_creation_input_tokens, 18_003);
-        assert_eq!(usage.cache_creation_5m_input_tokens, 18_003);
+        assert!(usage.input_tokens > 0);
+        assert!(usage.cache_creation_input_tokens > 0);
+        assert_eq!(
+            usage.cache_creation_input_tokens,
+            total.saturating_sub(usage.input_tokens)
+        );
+        assert_eq!(
+            usage.cache_creation_5m_input_tokens,
+            usage.cache_creation_input_tokens
+        );
         assert_eq!(usage.cache_creation_1h_input_tokens, 0);
         assert_eq!(usage.total(), total);
     }

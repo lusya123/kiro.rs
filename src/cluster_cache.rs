@@ -36,6 +36,10 @@ const MAX_LINE_LEN: usize = 64 * 1024; // 单行(协议头)最大 64 KiB
 // 熔断:共享后端一旦超时/出错,冷却 3s 内所有操作直接走本地,避免每请求 4+4 次 ×80ms 叠加延迟。
 const BREAKER_COOLDOWN_MS: i64 = 3_000;
 
+// 本地回退表只需低频回收过期项。若每次 register 都扫描整张表，连续回放 R 个
+// thinking signature 时会产生 1 + 2 + ... + R 次访问，重新形成 O(R²)。
+const LOCAL_STORE_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -226,13 +230,15 @@ impl ClusterCache {
                 breaker,
                 ..
             } => {
+                // Mirror successful shared writes locally as well. If the shared backend later
+                // trips its breaker, this process can still validate entries it issued itself
+                // instead of turning a transient Redis outage into a false cache/signature miss.
+                fallback.register(key, ttl);
                 if Self::cooling(breaker) {
-                    fallback.register(key, ttl);
                     return;
                 }
                 if redis_register(conn.clone(), key, ttl).await.is_none() {
                     Self::trip(breaker);
-                    fallback.register(key, ttl);
                 }
             }
         }
@@ -279,26 +285,55 @@ async fn try_connect(addr: &str) -> Option<redis::aio::MultiplexedConnection> {
 
 // ===================== 本地内存登记表(回退用) =====================
 
+struct LocalStoreState {
+    entries: HashMap<String, Instant>,
+    next_cleanup_at: Instant,
+    #[cfg(test)]
+    cleanup_scan_steps: usize,
+}
+
 pub struct LocalStore {
-    map: Mutex<HashMap<String, Instant>>,
+    state: Mutex<LocalStoreState>,
 }
 
 impl LocalStore {
     fn new() -> Self {
+        let now = Instant::now();
         LocalStore {
-            map: Mutex::new(HashMap::new()),
+            state: Mutex::new(LocalStoreState {
+                entries: HashMap::new(),
+                next_cleanup_at: now + LOCAL_STORE_CLEANUP_INTERVAL,
+                #[cfg(test)]
+                cleanup_scan_steps: 0,
+            }),
         }
     }
     fn exists(&self, key: &str) -> bool {
         let now = Instant::now();
-        let map = self.map.lock().unwrap_or_else(|e| e.into_inner());
-        map.get(key).map(|e| *e > now).unwrap_or(false)
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match state.entries.get(key).copied() {
+            Some(expires_at) if expires_at > now => true,
+            Some(_) => {
+                // 查询命中的过期项立即删除；其余过期项由低频全表清理回收。
+                state.entries.remove(key);
+                false
+            }
+            None => false,
+        }
     }
     fn register(&self, key: &str, ttl: Duration) {
         let now = Instant::now();
-        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
-        map.retain(|_, exp| *exp > now);
-        map.insert(key.to_string(), now + ttl);
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if now >= state.next_cleanup_at {
+            #[cfg(test)]
+            {
+                state.cleanup_scan_steps =
+                    state.cleanup_scan_steps.saturating_add(state.entries.len());
+            }
+            state.entries.retain(|_, expires_at| *expires_at > now);
+            state.next_cleanup_at = now + LOCAL_STORE_CLEANUP_INTERVAL;
+        }
+        state.entries.insert(key.to_string(), now + ttl);
     }
 }
 
@@ -644,5 +679,62 @@ mod tests {
         assert!(!s.exists("k"));
         s.register("k", ttl);
         assert!(s.exists("k"));
+    }
+
+    #[test]
+    fn local_store_register_is_constant_time_between_cleanup_ticks() {
+        let s = LocalStore::new();
+        let ttl = Duration::from_secs(300);
+        for index in 0..4_096 {
+            s.register(&format!("signature-{index}"), ttl);
+        }
+
+        let state = s.state.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(state.entries.len(), 4_096);
+        assert_eq!(
+            state.cleanup_scan_steps, 0,
+            "a burst of registrations must not rescan the accumulated table"
+        );
+    }
+
+    #[test]
+    fn local_store_cleanup_is_low_frequency_and_expired_lookup_is_eager() {
+        let s = LocalStore::new();
+        let now = Instant::now();
+        {
+            let mut state = s.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.entries.insert(
+                "expired-on-cleanup".to_string(),
+                now - Duration::from_secs(1),
+            );
+            state
+                .entries
+                .insert("live".to_string(), now + Duration::from_secs(300));
+            state.next_cleanup_at = now;
+        }
+
+        s.register("new", Duration::from_secs(300));
+        {
+            let state = s.state.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(!state.entries.contains_key("expired-on-cleanup"));
+            assert!(state.entries.contains_key("live"));
+            assert!(state.entries.contains_key("new"));
+            assert_eq!(state.cleanup_scan_steps, 2);
+        }
+
+        {
+            let mut state = s.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.entries.insert(
+                "expired-on-lookup".to_string(),
+                Instant::now() - Duration::from_secs(1),
+            );
+        }
+        assert!(!s.exists("expired-on-lookup"));
+        let state = s.state.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!state.entries.contains_key("expired-on-lookup"));
+        assert_eq!(
+            state.cleanup_scan_steps, 2,
+            "registers inside the cleanup window must remain O(1)"
+        );
     }
 }

@@ -80,9 +80,6 @@ pub struct ModelsResponse {
 
 // === Messages 端点类型 ===
 
-/// 最大思考预算 tokens
-const MAX_BUDGET_TOKENS: i32 = 24576;
-
 /// Thinking 配置
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Thinking {
@@ -119,21 +116,17 @@ where
     D: serde::Deserializer<'de>,
 {
     let value = i32::deserialize(deserializer)?;
-    Ok(value.min(MAX_BUDGET_TOKENS))
+    Ok(value)
 }
 
 /// OutputConfig 配置
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OutputConfig {
-    #[serde(default = "default_effort")]
-    pub effort: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// 结构化输出:`output_config.format`(json_schema)。仅入站捕获,不转发给 Kiro。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<serde_json::Value>,
-}
-
-fn default_effort() -> String {
-    "high".to_string()
 }
 
 fn default_reasoning_effort() -> String {
@@ -208,6 +201,42 @@ pub struct MessagesRequest {
     pub cache_control: Option<serde_json::Value>,
     /// Claude Code 请求中的 metadata，包含 session 信息
     pub metadata: Option<Metadata>,
+}
+
+/// Number of public messages that can actually reach the legacy Kiro wire.
+///
+/// Claude 4 no longer supports assistant prefill and Kiro requires the current
+/// message to be a user message. The converter therefore discards every
+/// trailing message after the final user turn. Token accounting, cache keys and
+/// context calibration must use the same slice or identical upstream requests
+/// can receive different usage solely because of discarded input.
+pub(super) fn effective_kiro_message_count(messages: &[Message]) -> Option<usize> {
+    let last = messages.last()?;
+    if last.role == "user" {
+        Some(messages.len())
+    } else {
+        messages
+            .iter()
+            .rposition(|message| message.role == "user")
+            .map(|index| index + 1)
+    }
+}
+
+/// Borrow the request when it is already Kiro-compatible, otherwise clone only
+/// to remove the unsupported trailing assistant prefill.
+pub(super) fn effective_kiro_request(
+    payload: &MessagesRequest,
+) -> std::borrow::Cow<'_, MessagesRequest> {
+    let Some(message_count) = effective_kiro_message_count(&payload.messages) else {
+        return std::borrow::Cow::Borrowed(payload);
+    };
+    if message_count == payload.messages.len() {
+        return std::borrow::Cow::Borrowed(payload);
+    }
+
+    let mut effective = payload.clone();
+    effective.messages.truncate(message_count);
+    std::borrow::Cow::Owned(effective)
 }
 
 fn default_max_tokens() -> i32 {
@@ -460,5 +489,34 @@ mod tests {
                 "{field} must reject a non-number"
             );
         }
+    }
+
+    #[test]
+    fn thinking_budget_is_preserved_without_a_transport_specific_cap() {
+        let mut body = base_request();
+        body["max_tokens"] = json!(200_000);
+        body["thinking"] = json!({
+            "type": "enabled",
+            "budget_tokens": 160_000
+        });
+
+        let request: MessagesRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(request.thinking.unwrap().budget_tokens, 160_000);
+    }
+
+    #[test]
+    fn format_only_output_config_keeps_effort_absent() {
+        let mut body = base_request();
+        body["output_config"] = json!({
+            "format": {
+                "type": "json_schema",
+                "schema": {"type": "object", "additionalProperties": false}
+            }
+        });
+
+        let request: MessagesRequest = serde_json::from_value(body).unwrap();
+        let output = request.output_config.unwrap();
+        assert!(output.effort.is_none());
+        assert!(output.format.is_some());
     }
 }

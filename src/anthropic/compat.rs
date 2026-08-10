@@ -301,20 +301,24 @@ fn canonical_tool_schema_json(
 }
 
 pub fn estimate_input_tokens(payload: &MessagesRequest) -> i32 {
+    let message_count = super::types::effective_kiro_message_count(&payload.messages)
+        .unwrap_or(payload.messages.len());
     estimate_input_tokens_parts(
         &payload.model,
         payload.system.as_ref(),
-        &payload.messages,
+        &payload.messages[..message_count],
         payload.tools.as_ref(),
         payload.thinking.as_ref(),
     )
 }
 
 pub fn estimate_count_tokens_request(payload: &CountTokensRequest) -> i32 {
+    let message_count = super::types::effective_kiro_message_count(&payload.messages)
+        .unwrap_or(payload.messages.len());
     estimate_input_tokens_parts(
         &payload.model,
         payload.system.as_ref(),
-        &payload.messages,
+        &payload.messages[..message_count],
         payload.tools.as_ref(),
         payload.thinking.as_ref(),
     )

@@ -2,7 +2,7 @@
 //!
 //! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -17,6 +17,18 @@ use crate::kiro::model::requests::tool::{
 };
 
 use super::types::{ContentBlock, MessagesRequest};
+
+#[cfg(test)]
+std::thread_local! {
+    /// Number of history entries visited by a full pairing-index rebuild.
+    /// Production conversion must keep this at zero regardless of history size.
+    static TOOL_PAIRING_FULL_HISTORY_SCAN_STEPS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// Number of incremental tool-use/result observations performed by the
+    /// production pairing state. This should grow linearly with the request.
+    static TOOL_PAIRING_INCREMENTAL_STEPS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
 ///
@@ -301,6 +313,11 @@ pub fn get_context_window_size(model: &str) -> i32 {
 pub struct ConversionResult {
     /// 转换后的 Kiro 请求
     pub conversation_state: ConversationState,
+    /// Number of leading history entries used to render the effective system
+    /// prompt. Cache accounting uses this boundary for request-level controls
+    /// (for example, image presence invalidates message prefixes but not the
+    /// system prefix) without reimplementing conversion rules.
+    pub(super) system_history_len: usize,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
 }
@@ -389,14 +406,15 @@ fn is_valid_uuid(s: &str) -> bool {
 /// 收集历史消息中使用的所有工具名称
 fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
     let mut tool_names = Vec::new();
+    let mut seen = HashSet::new();
 
     for msg in history {
-        if let Message::Assistant(assistant_msg) = msg {
-            if let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
-                for tool_use in tool_uses {
-                    if !tool_names.contains(&tool_use.name) {
-                        tool_names.push(tool_use.name.clone());
-                    }
+        if let Message::Assistant(assistant_msg) = msg
+            && let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses
+        {
+            for tool_use in tool_uses {
+                if seen.insert(tool_use.name.clone()) {
+                    tool_names.push(tool_use.name.clone());
                 }
             }
         }
@@ -436,11 +454,12 @@ fn kiro_cache_point(cache_control: Option<&serde_json::Value>) -> CachePoint {
 /// public accounting layer instead of moving the cache boundary and changing
 /// semantics.
 fn terminal_cache_control(content: &serde_json::Value) -> Option<&serde_json::Value> {
-    match content {
+    let cache_control = match content {
         serde_json::Value::Array(items) => items.last().and_then(|item| item.get("cache_control")),
         serde_json::Value::Object(object) => object.get("cache_control"),
         _ => None,
-    }
+    };
+    cache_control.filter(|control| !control.is_null())
 }
 
 /// 将 Anthropic 请求转换为 Kiro 请求
@@ -461,14 +480,11 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     // 2.5. 预处理 prefill：如果末尾是 assistant，静默丢弃并截断到最后一条 user
     // Claude 4.x 已弃用 assistant prefill，Kiro API 也不支持
-    let messages: &[_] = if req.messages.last().is_some_and(|m| m.role != "user") {
+    let effective_message_count = super::types::effective_kiro_message_count(&req.messages)
+        .ok_or(ConversionError::EmptyMessages)?;
+    let messages: &[_] = if effective_message_count != req.messages.len() {
         tracing::info!("检测到末尾 assistant 消息（prefill），静默丢弃");
-        let last_user_idx = req
-            .messages
-            .iter()
-            .rposition(|m| m.role == "user")
-            .ok_or(ConversionError::EmptyMessages)?;
-        &req.messages[..=last_user_idx]
+        &req.messages[..effective_message_count]
     } else {
         &req.messages
     };
@@ -500,13 +516,15 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     );
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
-    let mut history = build_history(req, messages, &model_id, &mut tool_name_map)?;
+    let (mut history, system_history_len, mut tool_pairing) =
+        build_history(req, messages, &model_id, &mut tool_name_map)?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
     // 同时返回孤立的 tool_use_id 集合，用于后续清理
-    let (validated_tool_results, orphaned_tool_use_ids, validated_tool_result_indices) =
-        validate_tool_pairing(&history, &tool_results);
+    let (validated_tool_results, validated_tool_result_indices) =
+        tool_pairing.validate_results(&tool_results);
+    let orphaned_tool_use_ids = tool_pairing.into_orphaned_ids();
     let images = forwarded_images
         .into_iter()
         .filter(|forwarded| {
@@ -603,6 +621,7 @@ question. Your entire response must be exactly the following text, with no addit
 
     Ok(ConversionResult {
         conversation_state,
+        system_history_len,
         tool_name_map,
     })
 }
@@ -1186,99 +1205,125 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> (String, 
     }
 }
 
-/// 验证并过滤 tool_use/tool_result 配对
+/// Incremental tool-use pairing index for one converted conversation.
 ///
-/// 收集所有 tool_use_id，验证 tool_result 是否匹配
-/// 静默跳过孤立的 tool_use 和 tool_result，输出警告日志
-///
-/// # Arguments
-/// * `history` - 历史消息引用
-/// * `tool_results` - 当前消息中的 tool_result 列表
-///
-/// # Returns
-/// 元组：(经过验证和过滤后的 tool_result 列表, 孤立的 tool_use_id 集合,
-/// 经过验证的当前 tool_result 原始下标集合)
-fn validate_tool_pairing(
-    history: &[Message],
-    tool_results: &[ToolResult],
-) -> (
-    Vec<ToolResult>,
-    std::collections::HashSet<String>,
-    std::collections::HashSet<usize>,
-) {
-    use std::collections::HashSet;
+/// The previous implementation rebuilt two sets by rescanning the complete
+/// converted history every time a historical user turn contained a
+/// `tool_result`.  A long agent loop therefore visited 1 + 2 + ... + N history
+/// entries.  This state observes every tool ID/result once and keeps the same
+/// set semantics: reusing an ID after it has been paired never opens it again.
+#[derive(Default)]
+struct ToolPairingState {
+    /// `true` means the ID has been seen but has not accepted a result yet;
+    /// `false` means it has already been paired.  A single map avoids retaining
+    /// two cloned copies of every tool ID.
+    use_ids: HashMap<String, bool>,
+}
 
-    // 1. 收集所有历史中的 tool_use_id
-    let mut all_tool_use_ids: HashSet<String> = HashSet::new();
-    // 2. 收集历史中已经有 tool_result 的 tool_use_id
-    let mut history_tool_result_ids: HashSet<String> = HashSet::new();
+impl ToolPairingState {
+    fn observe_assistant(&mut self, message: &HistoryAssistantMessage) {
+        let Some(tool_uses) = message.assistant_response_message.tool_uses.as_ref() else {
+            return;
+        };
+        for tool_use in tool_uses {
+            #[cfg(test)]
+            TOOL_PAIRING_INCREMENTAL_STEPS.with(|steps| steps.set(steps.get() + 1));
+            self.use_ids
+                .entry(tool_use.tool_use_id.clone())
+                .or_insert(true);
+        }
+    }
 
-    for msg in history {
-        match msg {
-            Message::Assistant(assistant_msg) => {
-                if let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
-                    for tool_use in tool_uses {
-                        all_tool_use_ids.insert(tool_use.tool_use_id.clone());
-                    }
+    fn validate_results(
+        &mut self,
+        tool_results: &[ToolResult],
+    ) -> (Vec<ToolResult>, HashSet<usize>) {
+        let mut filtered_results = Vec::new();
+        let mut filtered_result_indices = HashSet::new();
+
+        for (index, result) in tool_results.iter().enumerate() {
+            #[cfg(test)]
+            TOOL_PAIRING_INCREMENTAL_STEPS.with(|steps| steps.set(steps.get() + 1));
+            match self.use_ids.get_mut(&result.tool_use_id) {
+                Some(pending) if *pending => {
+                    *pending = false;
+                    filtered_results.push(result.clone());
+                    filtered_result_indices.insert(index);
+                }
+                Some(_) => {
+                    tracing::warn!(
+                        "跳过重复的 tool_result：该 tool_use 已在历史中配对，tool_use_id={}",
+                        result.tool_use_id
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        "跳过孤立的 tool_result：找不到对应的 tool_use，tool_use_id={}",
+                        result.tool_use_id
+                    );
                 }
             }
-            Message::User(user_msg) => {
-                // 收集历史 user 消息中的 tool_results
-                for result in &user_msg
+        }
+
+        (filtered_results, filtered_result_indices)
+    }
+
+    fn into_orphaned_ids(self) -> HashSet<String> {
+        let orphaned = self
+            .use_ids
+            .into_iter()
+            .filter_map(|(id, pending)| pending.then_some(id))
+            .collect::<HashSet<_>>();
+        for orphaned_id in &orphaned {
+            tracing::warn!(
+                "检测到孤立的 tool_use：找不到对应的 tool_result，将从历史中移除，tool_use_id={}",
+                orphaned_id
+            );
+        }
+        orphaned
+    }
+
+    /// One-pass compatibility constructor used only by focused unit tests for
+    /// the standalone validator.  Production conversion builds the same state
+    /// incrementally and never calls this full-history scan.
+    #[cfg(test)]
+    fn from_history(history: &[Message]) -> Self {
+        TOOL_PAIRING_FULL_HISTORY_SCAN_STEPS
+            .with(|steps| steps.set(steps.get().saturating_add(history.len())));
+        let mut state = Self::default();
+        for message in history {
+            if let Message::Assistant(message) = message {
+                state.observe_assistant(message);
+            }
+        }
+        for message in history {
+            if let Message::User(message) = message {
+                for result in &message
                     .user_input_message
                     .user_input_message_context
                     .tool_results
                 {
-                    history_tool_result_ids.insert(result.tool_use_id.clone());
+                    if let Some(pending) = state.use_ids.get_mut(&result.tool_use_id) {
+                        *pending = false;
+                    }
                 }
             }
         }
+        state
     }
+}
 
-    // 3. 计算真正未配对的 tool_use_ids（排除历史中已配对的）
-    let mut unpaired_tool_use_ids: HashSet<String> = all_tool_use_ids
-        .difference(&history_tool_result_ids)
-        .cloned()
-        .collect();
-
-    // 4. 过滤并验证当前消息的 tool_results
-    let mut filtered_results = Vec::new();
-    let mut filtered_result_indices = HashSet::new();
-
-    for (index, result) in tool_results.iter().enumerate() {
-        if unpaired_tool_use_ids.contains(&result.tool_use_id) {
-            // 配对成功
-            filtered_results.push(result.clone());
-            filtered_result_indices.insert(index);
-            unpaired_tool_use_ids.remove(&result.tool_use_id);
-        } else if all_tool_use_ids.contains(&result.tool_use_id) {
-            // tool_use 存在但已经在历史中配对过了，这是重复的 tool_result
-            tracing::warn!(
-                "跳过重复的 tool_result：该 tool_use 已在历史中配对，tool_use_id={}",
-                result.tool_use_id
-            );
-        } else {
-            // 孤立 tool_result - 找不到对应的 tool_use
-            tracing::warn!(
-                "跳过孤立的 tool_result：找不到对应的 tool_use，tool_use_id={}",
-                result.tool_use_id
-            );
-        }
-    }
-
-    // 5. 检测真正孤立的 tool_use（有 tool_use 但在历史和当前消息中都没有 tool_result）
-    for orphaned_id in &unpaired_tool_use_ids {
-        tracing::warn!(
-            "检测到孤立的 tool_use：找不到对应的 tool_result，将从历史中移除，tool_use_id={}",
-            orphaned_id
-        );
-    }
-
-    (
-        filtered_results,
-        unpaired_tool_use_ids,
-        filtered_result_indices,
-    )
+/// Standalone compatibility helper retained for focused pairing unit tests.
+/// The production conversion path uses `ToolPairingState` directly.
+#[cfg(test)]
+fn validate_tool_pairing(
+    history: &[Message],
+    tool_results: &[ToolResult],
+) -> (Vec<ToolResult>, HashSet<String>, HashSet<usize>) {
+    let mut state = ToolPairingState::from_history(history);
+    let (filtered_results, filtered_result_indices) = state.validate_results(tool_results);
+    let orphaned = state.into_orphaned_ids();
+    (filtered_results, orphaned, filtered_result_indices)
 }
 
 /// 从历史消息中移除孤立的 tool_use
@@ -1403,25 +1448,62 @@ fn convert_tools(
     converted
 }
 
-/// 生成thinking标签前缀
-fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
-    if let Some(t) = &req.thinking {
-        if t.thinking_type == "enabled" {
-            return Some(format!(
-                "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
-                t.budget_tokens
-            ));
-        } else if t.thinking_type == "adaptive" {
-            let effort = req
-                .output_config
-                .as_ref()
-                .map(|c| c.effort.as_str())
-                .unwrap_or("high");
-            return Some(format!(
-                "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>",
-                effort
-            ));
-        }
+/// Resolve the effective Claude effort exactly once for every consumer that
+/// renders or forwards it. Claude's API default is `high`; an effort level
+/// unsupported by the selected model is never silently substituted.
+pub(super) fn effective_claude_effort(req: &MessagesRequest) -> Option<String> {
+    let model = map_model(&req.model)?;
+    let requested = req
+        .output_config
+        .as_ref()
+        .and_then(|config| config.effort.as_deref())
+        .map(|effort| effort.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "high".to_string());
+    resolve_kiro_effort(&model, &requested)
+}
+
+/// Return the effort value that will actually be serialized on the Kiro wire.
+/// A format-only output_config does not enable reasoning. Conversely, both
+/// adaptive and legacy enabled thinking use the same native effort field; the
+/// legacy token budget cannot be represented by the current Kiro schema and is
+/// deliberately not injected into the prompt.
+pub(super) fn forwarded_claude_effort(req: &MessagesRequest) -> Option<String> {
+    let explicit_effort = req
+        .output_config
+        .as_ref()
+        .is_some_and(|config| config.effort.is_some());
+    let thinking_enabled = req
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| matches!(thinking.thinking_type.as_str(), "adaptive" | "enabled"));
+    (explicit_effort || thinking_enabled)
+        .then(|| effective_claude_effort(req))
+        .flatten()
+}
+
+fn resolve_kiro_effort(model: &str, requested: &str) -> Option<String> {
+    const FIVE_LEVEL_MODELS: &[&str] = &[
+        "claude-opus-5",
+        "claude-opus-4.8",
+        "claude-opus-4.7",
+        "claude-sonnet-5",
+    ];
+    const FOUR_LEVEL_MODELS: &[&str] = &[
+        "claude-opus-4.6",
+        "claude-sonnet-4.6",
+        "claude-opus-4.6-1m",
+        "claude-sonnet-4.6-1m",
+    ];
+    const VALID: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+    if !VALID.contains(&requested) {
+        return None;
+    }
+    if FIVE_LEVEL_MODELS.contains(&model) {
+        return Some(requested.to_string());
+    }
+    if FOUR_LEVEL_MODELS.contains(&model) {
+        return (requested != "xhigh").then(|| requested.to_string());
     }
     None
 }
@@ -1675,11 +1757,6 @@ fn preserves_third_party_product_discussion(req: &MessagesRequest) -> bool {
     mentions_private_product && third_party_framing && !direct_self_identity
 }
 
-/// 检查内容是否已包含thinking标签
-fn has_thinking_tags(content: &str) -> bool {
-    content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
-}
-
 /// 构建历史消息
 ///
 /// # Arguments
@@ -1693,16 +1770,10 @@ fn build_history(
     messages: &[super::types::Message],
     model_id: &str,
     tool_name_map: &mut HashMap<String, String>,
-) -> Result<Vec<Message>, ConversionError> {
+) -> Result<(Vec<Message>, usize, ToolPairingState), ConversionError> {
     let mut history = Vec::new();
+    let mut tool_pairing = ToolPairingState::default();
     let gpt_passthrough = is_gpt_model(&req.model);
-
-    // 生成thinking前缀（如果需要）
-    let thinking_prefix = if gpt_passthrough {
-        None
-    } else {
-        generate_thinking_prefix(req)
-    };
 
     // 1. 处理系统消息。
     //
@@ -1741,12 +1812,7 @@ fn build_history(
     if let Some(tool_instruction) = forced_tool_choice_instruction(req, tool_name_map) {
         system_parts.push(tool_instruction);
     }
-    let mut system_content = system_parts.join("\n");
-    if let Some(ref prefix) = thinking_prefix {
-        if !has_thinking_tags(&system_content) {
-            system_content = format!("{}\n{}", prefix, system_content);
-        }
-    }
+    let system_content = system_parts.join("\n");
 
     if !system_content.is_empty() {
         // 系统消息作为 user + assistant 配对
@@ -1766,6 +1832,7 @@ fn build_history(
         let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
         history.push(Message::Assistant(assistant_msg));
     }
+    let system_history_len = history.len();
 
     // 2. 处理常规消息历史
     // 最后一条消息作为 currentMessage，不加入历史
@@ -1776,13 +1843,12 @@ fn build_history(
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
     let mut assistant_buffer: Vec<&super::types::Message> = Vec::new();
 
-    for i in 0..history_end_index {
-        let msg = &messages[i];
-
+    for msg in messages.iter().take(history_end_index) {
         if msg.role == "user" {
             // 先处理累积的 assistant 消息
             if !assistant_buffer.is_empty() {
                 let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
+                tool_pairing.observe_assistant(&merged);
                 history.push(Message::Assistant(merged));
                 assistant_buffer.clear();
             }
@@ -1790,7 +1856,7 @@ fn build_history(
         } else if msg.role == "assistant" {
             // 先处理累积的 user 消息
             if !user_buffer.is_empty() {
-                let merged_user = merge_user_messages(&user_buffer, model_id, &history)?;
+                let merged_user = merge_user_messages(&user_buffer, model_id, &mut tool_pairing)?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
             }
@@ -1802,12 +1868,13 @@ fn build_history(
     // 处理末尾累积的 assistant 消息
     if !assistant_buffer.is_empty() {
         let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
+        tool_pairing.observe_assistant(&merged);
         history.push(Message::Assistant(merged));
     }
 
     // 处理结尾的孤立 user 消息
     if !user_buffer.is_empty() {
-        let merged_user = merge_user_messages(&user_buffer, model_id, &history)?;
+        let merged_user = merge_user_messages(&user_buffer, model_id, &mut tool_pairing)?;
         history.push(Message::User(merged_user));
 
         // 自动配对一个 "OK" 的 assistant 响应
@@ -1815,14 +1882,14 @@ fn build_history(
         history.push(Message::Assistant(auto_assistant));
     }
 
-    Ok(history)
+    Ok((history, system_history_len, tool_pairing))
 }
 
 /// 合并多个 user 消息
 fn merge_user_messages(
     messages: &[&super::types::Message],
     model_id: &str,
-    history: &[Message],
+    tool_pairing: &mut ToolPairingState,
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut forwarded_images = Vec::new();
@@ -1847,10 +1914,9 @@ fn merge_user_messages(
     }
 
     let (validated_tool_results, validated_tool_result_indices) = if all_tool_results.is_empty() {
-        (Vec::new(), std::collections::HashSet::new())
+        (Vec::new(), HashSet::new())
     } else {
-        let (results, _, indices) = validate_tool_pairing(history, &all_tool_results);
-        (results, indices)
+        tool_pairing.validate_results(&all_tool_results)
     };
     let all_images = forwarded_images
         .into_iter()
@@ -3891,7 +3957,7 @@ identity, name, or which model you are, respond with exactly: 'I am CodeAssist v
     }
 
     #[test]
-    fn thinking_prefix_does_not_add_extra_upstream_policy() {
+    fn legacy_enabled_thinking_does_not_modify_prompt_text() {
         use super::super::types::Message as AnthropicMessage;
         use super::super::types::Thinking;
 
@@ -3921,14 +3987,50 @@ identity, name, or which model you are, respond with exactly: 'I am CodeAssist v
         };
 
         let result = convert_request(&req).unwrap();
-        let Some(Message::User(first)) = result.conversation_state.history.first() else {
-            panic!("thinking prefix should be inserted as the first history user message");
-        };
+        let wire = serde_json::to_string(&result.conversation_state).unwrap();
+        assert!(!wire.contains("<thinking_mode>"));
+        assert!(!wire.contains("<max_thinking_length>"));
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            "What model version are you?"
+        );
+    }
 
-        let content = &first.user_input_message.content;
-        assert!(content.starts_with("<thinking_mode>enabled</thinking_mode>"));
-        assert!(!content.contains("API compatibility"));
-        assert!(!content.contains("underlying model details"));
+    #[test]
+    fn opus_48_adaptive_wire_contains_no_thinking_xml() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 4096,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high"},
+            "messages": [{
+                "role": "user",
+                "content": "Implement a bounded worker pool in Rust."
+            }]
+        }))
+        .expect("valid adaptive-thinking request");
+
+        assert_eq!(effective_claude_effort(&request).as_deref(), Some("high"));
+        assert_eq!(forwarded_claude_effort(&request).as_deref(), Some("high"));
+
+        let converted = convert_request(&request).expect("adaptive request converts");
+        let wire = serde_json::to_string(&converted.conversation_state)
+            .expect("adaptive conversation state serializes");
+        assert!(!wire.contains("<thinking_mode>"));
+        assert!(!wire.contains("<thinking_effort>"));
+        assert!(!wire.contains("<max_thinking_length>"));
+        assert_eq!(
+            converted
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            "Implement a bounded worker pool in Rust."
+        );
     }
 
     #[test]
@@ -4380,6 +4482,253 @@ identity, name, or which model you are, respond with exactly: 'I am CodeAssist v
         assert!(found_tool_use, "合并后的 assistant 消息应包含 tool_use");
     }
 
+    fn tool_history_request(rounds: usize, unique_tool_names: bool) -> MessagesRequest {
+        let mut messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "start the tool workflow"
+        })];
+        for index in 0..rounds {
+            let tool_name = if unique_tool_names {
+                format!("bench_tool_{index}")
+            } else {
+                "bench_tool".to_string()
+            };
+            messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": format!("toolu_bench_{index}"),
+                    "name": tool_name,
+                    "input": {"index": index}
+                }]
+            }));
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": format!("toolu_bench_{index}"),
+                    "content": format!("result {index}")
+                }]
+            }));
+        }
+        messages.push(serde_json::json!({
+            "role": "assistant",
+            "content": "all tool calls complete"
+        }));
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": "summarize the completed work"
+        }));
+
+        serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 1024,
+            "messages": messages
+        }))
+        .expect("valid long tool-history request")
+    }
+
+    fn reset_tool_pairing_complexity_counters() {
+        TOOL_PAIRING_FULL_HISTORY_SCAN_STEPS.with(|steps| steps.set(0));
+        TOOL_PAIRING_INCREMENTAL_STEPS.with(|steps| steps.set(0));
+    }
+
+    fn tool_pairing_complexity_counters() -> (usize, usize) {
+        let scans = TOOL_PAIRING_FULL_HISTORY_SCAN_STEPS.with(std::cell::Cell::get);
+        let incremental = TOOL_PAIRING_INCREMENTAL_STEPS.with(std::cell::Cell::get);
+        (scans, incremental)
+    }
+
+    fn converted_tool_ids(state: &ConversationState) -> (HashSet<String>, HashSet<String>) {
+        let mut uses = HashSet::new();
+        let mut results = HashSet::new();
+        for message in &state.history {
+            match message {
+                Message::Assistant(message) => {
+                    if let Some(tool_uses) = &message.assistant_response_message.tool_uses {
+                        uses.extend(
+                            tool_uses
+                                .iter()
+                                .map(|tool_use| tool_use.tool_use_id.clone()),
+                        );
+                    }
+                }
+                Message::User(message) => {
+                    results.extend(
+                        message
+                            .user_input_message
+                            .user_input_message_context
+                            .tool_results
+                            .iter()
+                            .map(|result| result.tool_use_id.clone()),
+                    );
+                }
+            }
+        }
+        (uses, results)
+    }
+
+    #[test]
+    fn long_tool_history_pairing_is_single_pass_and_semantically_complete() {
+        const ROUNDS: usize = 512;
+        reset_tool_pairing_complexity_counters();
+        let converted = convert_request(&tool_history_request(ROUNDS, false))
+            .expect("long tool history converts");
+        let (full_history_scan_steps, incremental_steps) = tool_pairing_complexity_counters();
+        let (uses, results) = converted_tool_ids(&converted.conversation_state);
+
+        assert_eq!(
+            full_history_scan_steps, 0,
+            "production conversion must never rebuild pairing state from accumulated history"
+        );
+        assert_eq!(
+            incremental_steps,
+            ROUNDS * 2,
+            "each tool use and result must be observed exactly once"
+        );
+        assert_eq!(uses.len(), ROUNDS);
+        assert_eq!(results.len(), ROUNDS);
+        assert_eq!(
+            uses, results,
+            "the linear pairing path must preserve every valid pair"
+        );
+    }
+
+    #[test]
+    fn incremental_pairing_preserves_duplicate_id_set_semantics() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "run duplicate-id tools"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_shared", "name": "read", "input": {}},
+                    {"type": "tool_use", "id": "toolu_shared", "name": "write", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_shared", "content": "first"},
+                    {"type": "tool_result", "tool_use_id": "toolu_shared", "content": "duplicate"}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_shared", "name": "read", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_shared", "content": "still duplicate"}
+                ]},
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "continue"}
+            ]
+        }))
+        .expect("valid duplicate-id request");
+
+        let converted = convert_request(&request).expect("duplicate-id history converts");
+        let result_count = converted
+            .conversation_state
+            .history
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(message) => Some(
+                    message
+                        .user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .len(),
+                ),
+                Message::Assistant(_) => None,
+            })
+            .sum::<usize>();
+        let use_count = converted
+            .conversation_state
+            .history
+            .iter()
+            .filter_map(|message| match message {
+                Message::Assistant(message) => message
+                    .assistant_response_message
+                    .tool_uses
+                    .as_ref()
+                    .map(Vec::len),
+                Message::User(_) => None,
+            })
+            .sum::<usize>();
+
+        assert_eq!(
+            use_count, 3,
+            "duplicate IDs remain set-equivalent tool uses"
+        );
+        assert_eq!(
+            result_count, 1,
+            "one tool ID may accept only its first result"
+        );
+    }
+
+    #[test]
+    fn orphan_result_before_use_does_not_consume_future_tool_use() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "premature result"},
+                    {"type": "tool_result", "tool_use_id": "toolu_future", "content": "too early"}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_future", "name": "lookup", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_future", "content": "on time"}
+                ]}
+            ]
+        }))
+        .expect("valid result-before-use request");
+
+        let converted = convert_request(&request).expect("result-before-use history converts");
+        let current_results = &converted
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+        assert_eq!(current_results.len(), 1);
+        assert_eq!(current_results[0].tool_use_id, "toolu_future");
+        assert_eq!(current_results[0].content[0]["text"], "on time");
+    }
+
+    /// Manual scaling benchmark for the complete converter path. Wall-clock
+    /// ratios are intentionally not asserted in normal CI.
+    #[test]
+    #[ignore]
+    fn bench_tool_pairing_scaling() {
+        use std::time::Instant;
+
+        for unique_tool_names in [false, true] {
+            println!(
+                "\n  tool_names={}\n  rounds   elapsed_ms   ms_per_round   ratio",
+                if unique_tool_names {
+                    "unique"
+                } else {
+                    "shared"
+                }
+            );
+            let mut previous_ms = None;
+            for rounds in [100usize, 200, 400, 800] {
+                let request = tool_history_request(rounds, unique_tool_names);
+                std::hint::black_box(convert_request(&request).expect("warm-up converts"));
+                let started = Instant::now();
+                let iterations = 5;
+                for _ in 0..iterations {
+                    std::hint::black_box(convert_request(&request).expect("benchmark converts"));
+                }
+                let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0 / iterations as f64;
+                let ratio = previous_ms.map_or(0.0, |previous| elapsed_ms / previous);
+                println!(
+                    "  {rounds:>6}   {elapsed_ms:>10.3}   {:>12.5}   {ratio:>5.2}",
+                    elapsed_ms / rounds as f64
+                );
+                previous_ms = Some(elapsed_ms);
+            }
+        }
+    }
+
     fn cache_request(extra: serde_json::Value) -> MessagesRequest {
         let mut body = serde_json::json!({
             "model": "claude-opus-4-8",
@@ -4444,6 +4793,45 @@ identity, name, or which model you are, respond with exactly: 'I am CodeAssist v
         let encoded =
             serde_json::to_string(&convert_request(&req).unwrap().conversation_state).unwrap();
         assert!(!encoded.contains("cachePoint"));
+    }
+
+    #[test]
+    fn null_message_cache_control_is_equivalent_to_omission() {
+        let req = cache_request(serde_json::json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "historical user text",
+                        "cache_control": null
+                    }]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "text",
+                        "text": "historical assistant text",
+                        "cache_control": null
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "current user text",
+                        "cache_control": null
+                    }]
+                }
+            ]
+        }));
+
+        let encoded =
+            serde_json::to_string(&convert_request(&req).unwrap().conversation_state).unwrap();
+        assert!(
+            !encoded.contains("cachePoint"),
+            "JSON null is absence, not a native cache boundary: {encoded}"
+        );
     }
 
     #[test]

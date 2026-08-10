@@ -20,6 +20,8 @@ pub enum EventType {
     Metadata,
     /// 上下文使用率事件
     ContextUsage,
+    /// 上游拒绝当前会话状态；这是终止错误，不能当作未知事件忽略。
+    InvalidState,
     /// 未知事件类型
     Unknown,
 }
@@ -34,6 +36,7 @@ impl EventType {
             "meteringEvent" => Self::Metering,
             "metadataEvent" => Self::Metadata,
             "contextUsageEvent" => Self::ContextUsage,
+            "invalidStateEvent" => Self::InvalidState,
             _ => Self::Unknown,
         }
     }
@@ -47,6 +50,7 @@ impl EventType {
             Self::Metering => "meteringEvent",
             Self::Metadata => "metadataEvent",
             Self::ContextUsage => "contextUsageEvent",
+            Self::InvalidState => "invalidStateEvent",
             Self::Unknown => "unknown",
         }
     }
@@ -83,6 +87,8 @@ pub enum Event {
     Metadata(super::MetadataEvent),
     /// 上下文使用率
     ContextUsage(super::ContextUsageEvent),
+    /// 当前会话状态被上游拒绝。
+    InvalidState(super::InvalidStateEvent),
     /// 未知事件（保留事件类型与原始 payload，便于新模型协议前向兼容）
     Unknown {
         event_type: String,
@@ -147,6 +153,10 @@ impl Event {
                 let payload = super::ContextUsageEvent::from_frame(&frame)?;
                 Ok(Self::ContextUsage(payload))
             }
+            EventType::InvalidState => {
+                let payload = super::InvalidStateEvent::from_frame(&frame)?;
+                Ok(Self::InvalidState(payload))
+            }
             EventType::Unknown => Ok(Self::Unknown {
                 event_type: event_type_str.to_string(),
                 payload: frame.payload,
@@ -207,6 +217,10 @@ mod tests {
             EventType::from_str("contextUsageEvent"),
             EventType::ContextUsage
         );
+        assert_eq!(
+            EventType::from_str("invalidStateEvent"),
+            EventType::InvalidState
+        );
         assert_eq!(EventType::from_str("unknown_type"), EventType::Unknown);
     }
 
@@ -224,6 +238,7 @@ mod tests {
         assert_eq!(EventType::Metering.as_str(), "meteringEvent");
         assert_eq!(EventType::Metadata.as_str(), "metadataEvent");
         assert_eq!(EventType::ContextUsage.as_str(), "contextUsageEvent");
+        assert_eq!(EventType::InvalidState.as_str(), "invalidStateEvent");
     }
 
     #[test]
@@ -250,6 +265,34 @@ mod tests {
                 assert!(!metadata.token_usage.is_present());
             }
             other => panic!("expected metadata event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_state_event_is_parsed_as_a_terminal_event() {
+        let mut headers = Headers::new();
+        headers.insert(
+            ":message-type".to_string(),
+            HeaderValue::String("event".to_string()),
+        );
+        headers.insert(
+            ":event-type".to_string(),
+            HeaderValue::String("invalidStateEvent".to_string()),
+        );
+
+        let event = Event::from_frame(Frame {
+            headers,
+            payload: br#"{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD","message":"too large"}"#
+                .to_vec(),
+        })
+        .expect("invalid state payload should parse");
+
+        match event {
+            Event::InvalidState(invalid) => {
+                assert_eq!(invalid.reason, "CONTENT_LENGTH_EXCEEDS_THRESHOLD");
+                assert_eq!(invalid.message, "too large");
+            }
+            other => panic!("expected invalid state event, got {other:?}"),
         }
     }
 

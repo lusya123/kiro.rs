@@ -3,13 +3,13 @@
 //! Anthropic 官方 thinking 块带 `signature`，客户端多轮续聊时把它原样回传，由 Anthropic
 //! 服务端验签。kiro-rs 链路（customer → sub2api → kiro-rs → Kiro 上游）里：
 //! - 新版 Kiro 模型会返回原生 reasoning signature，本服务原样透传。
-//! - 旧模型没有上游签名时才生成本地 HMAC 回退；converter 转发历史前仍会移除 signature。
+//! - AWS-B 只透传上游原生签名；缺失时不生成兼容外形。
+//! - 其他旧兼容 profile 仍可使用本地 HMAC；converter 转发历史前会移除 signature。
 //! - 真 Anthropic 永远看不到这些签名，客户端 SDK 自己也不验签。
 //!
-//! 本模块只负责生成本地回退签名，以及为仍需严格兼容的非 AWS-B profile 校验本地 HMAC。
-//! AWS-B 将入站 signature 视为不透明响应元数据并在 converter 中丢弃，不再通过进程本地登记
-//! 或外部签名尺寸/结构启发式判断其真伪。那些判断既无法验证外部提供方的密钥，也会在多容器
-//! replay、模型升级或长思考响应中误杀正常历史。
+//! 本模块同时维护 AWS-B 原生签名的精确回传登记。服务端无法离线验证上游的私有签名算法，
+//! 因此只接受本服务实际向客户端透传过、且 `模型 + 对外 thinking 文本 + signature` 完全一致的
+//! 组合。登记键只保存 SHA-256 摘要，并通过集群缓存跨容器共享；不会保存或记录原始思考与签名。
 //!
 //! 现在改为**无状态自校验 HMAC**：签名内部布局为 `[protobuf 头][随机体] || HMAC(密钥, 前面全部)`，
 //! 验签时用同一把密钥对"被签名区"重算 HMAC，与尾部 32 字节做常量时间比对。特性：
@@ -27,10 +27,16 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
+use std::time::Duration;
 use subtle::ConstantTimeEq;
 
 /// HMAC-SHA256 输出长度。
 const MAC_LEN: usize = 32;
+
+/// 原生 signature 允许回传的登记期限。官方 signature 对客户端是不透明的；这里的期限只用于
+/// 限制本地/Redis 登记表增长，不参与 prompt-cache TTL，也不会改变任何 token 计算。
+const DEFAULT_NATIVE_SIGNATURE_REGISTRY_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+const NATIVE_SIGNATURE_KEY_PREFIX: &str = "awsb:native-thinking-signature:v1:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignatureValidationFailure {
@@ -48,22 +54,6 @@ pub struct SignatureValidationDiagnostics {
     pub failure: SignatureValidationFailure,
 }
 
-// AWS-B keeps the observed Bedrock signature shapes instead of exposing the
-// Anthropic-shaped protobuf signature used by the AWS-P profile.
-const AWS_B40_RAW_BYTES: usize = 198;
-const AWS_B40_OPUS_46_RAW_BYTES: usize = 231;
-const AWS_B40_SONNET_45_RAW_BYTES: &[usize] = &[309, 357];
-const AWS_B40_HAIKU_45_RAW_BYTES: &[usize] = &[270, 285];
-const AWS_B40_ADAPTIVE_RAW_BYTES: usize = 372;
-const AWS_B_OPUS_48_THINKING_BLOB_BYTES: usize = 55;
-const AWS_B_OPUS_48_ADAPTIVE_MIN_BLOB_BYTES: usize = 55;
-const AWS_B_OPUS_48_ADAPTIVE_LOW_CONTEXT_MAX_BLOB_BYTES: usize = 256;
-const AWS_B_OPUS_48_ADAPTIVE_MAX_BLOB_BYTES: usize = 3_200;
-const AWS_B_OPUS_48_LARGE_CONTEXT_TOKENS: i32 = 10_000;
-const AWS_B_OPUS_48_CONTEXT_DIVISOR: usize = 10;
-const AWS_B_OPUS_48_CONTEXT_MAX_BYTES: usize = 2_600;
-const AWS_B_OPUS_48_CONTEXT_STAMP: &[u8; 12] = b"058264511794";
-
 /// 默认共享签名密钥。全车队镜像一致 → 零配置也能跨容器互验。
 /// 需要隔离/轮换时用环境变量 `KIRO_SIG_SECRET` 覆盖（**全车队配同一值**）。
 const DEFAULT_SECRET: &[u8] = b"kiro-rs/thinking-signature/v1/shared-hmac-secret";
@@ -77,6 +67,76 @@ fn signing_secret() -> &'static [u8] {
             .map(String::into_bytes)
             .unwrap_or_else(|| DEFAULT_SECRET.to_vec())
     })
+}
+
+fn native_signature_registry_ttl() -> Duration {
+    static TTL: OnceLock<Duration> = OnceLock::new();
+    *TTL.get_or_init(|| {
+        let seconds = std::env::var("KIRO_NATIVE_SIGNATURE_TTL_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|seconds| *seconds >= 60)
+            .unwrap_or(DEFAULT_NATIVE_SIGNATURE_REGISTRY_TTL_SECS);
+        Duration::from_secs(seconds)
+    })
+}
+
+fn update_len_prefixed(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+/// Build a privacy-preserving registry key bound to exactly what the client saw.
+/// Length-prefixing prevents ambiguous concatenations such as `(ab, c)` vs `(a, bc)`.
+fn native_signature_registry_key(model: &str, thinking: &str, signature: &str) -> String {
+    let canonical_model =
+        super::converter::map_model(model).unwrap_or_else(|| model.trim().to_ascii_lowercase());
+    let mut hasher = Sha256::new();
+    hasher.update(b"kiro-rs/aws-b/native-thinking-signature/v1\0");
+    update_len_prefixed(&mut hasher, canonical_model.as_bytes());
+    update_len_prefixed(&mut hasher, thinking.as_bytes());
+    update_len_prefixed(&mut hasher, signature.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    format!("{NATIVE_SIGNATURE_KEY_PREFIX}{hex}")
+}
+
+/// Register an opaque native signature before it is exposed to the client.
+/// Empty values are never registered, so an empty round-trip cannot become valid accidentally.
+pub async fn register_native_signature(model: &str, thinking: &str, signature: &str) {
+    if signature.is_empty() {
+        return;
+    }
+    let key = native_signature_registry_key(model, thinking, signature);
+    crate::cluster_cache::global()
+        .register(&key, native_signature_registry_ttl())
+        .await;
+}
+
+/// Validate a native signature by exact, model-and-content-bound round trip.
+///
+/// This deliberately does not attempt to reverse engineer or imitate the AWS/Anthropic private
+/// cryptographic format. Unknown imported signatures fail closed on the Kiro conversion path;
+/// the optional native Bedrock route remains responsible for official provider-side validation.
+pub async fn validate_native_signature(model: &str, thinking: &str, signature: &str) -> bool {
+    if signature.is_empty() {
+        return false;
+    }
+    let key = native_signature_registry_key(model, thinking, signature);
+    let registry = crate::cluster_cache::global();
+    if !registry.exists(&key).await {
+        return false;
+    }
+    // Successful conversation continuations refresh the retention window so active long-running
+    // sessions do not age out merely because the first thinking turn was created weeks earlier.
+    registry
+        .register(&key, native_signature_registry_ttl())
+        .await;
+    true
 }
 
 /// 手写 HMAC-SHA256（复用已有的 `sha2` 依赖，避免引入 `hmac` crate）。
@@ -117,78 +177,6 @@ fn rand_bytes(n: usize) -> Vec<u8> {
     v
 }
 
-fn generate_hmac_blob(raw_bytes: usize) -> String {
-    debug_assert!(raw_bytes > MAC_LEN);
-    let mut buf = rand_bytes(raw_bytes);
-    let signed_len = buf.len() - MAC_LEN;
-    let mac = hmac_sha256(signing_secret(), &buf[..signed_len]);
-    buf[signed_len..].copy_from_slice(&mac);
-    BASE64.encode(buf)
-}
-
-fn is_opus_4_8(model: &str) -> bool {
-    let lower = model.to_ascii_lowercase();
-    lower.contains("opus-4-8") || lower.contains("opus-4.8")
-}
-
-pub fn generate_aws_b40_signature_for_model(model: &str) -> String {
-    let lower = model.to_ascii_lowercase();
-    if is_opus_4_8(model) {
-        return generate_aws_bedrock_opus_48_signature(AWS_B_OPUS_48_THINKING_BLOB_BYTES, false);
-    }
-
-    let raw_bytes = if lower.contains("opus-4-6") || lower.contains("opus-4.6") {
-        AWS_B40_OPUS_46_RAW_BYTES
-    } else if lower.contains("sonnet-4-5") || lower.contains("sonnet-4.5") {
-        AWS_B40_SONNET_45_RAW_BYTES[fastrand::usize(..AWS_B40_SONNET_45_RAW_BYTES.len())]
-    } else if lower.contains("haiku-4-5") || lower.contains("haiku-4.5") {
-        AWS_B40_HAIKU_45_RAW_BYTES[fastrand::usize(..AWS_B40_HAIKU_45_RAW_BYTES.len())]
-    } else {
-        AWS_B40_RAW_BYTES
-    };
-    generate_hmac_blob(raw_bytes)
-}
-
-pub fn generate_aws_b40_adaptive_signature_for_model(
-    model: &str,
-    thinking_bytes: usize,
-    context_tokens: i32,
-    _cache_read_input_tokens: i32,
-) -> String {
-    if !is_opus_4_8(model) {
-        return generate_hmac_blob(AWS_B40_ADAPTIVE_RAW_BYTES);
-    }
-
-    if context_tokens < AWS_B_OPUS_48_LARGE_CONTEXT_TOKENS {
-        let blob_bytes = thinking_bytes
-            .saturating_add(fastrand::usize(..=160))
-            .saturating_sub(80)
-            .clamp(
-                AWS_B_OPUS_48_ADAPTIVE_MIN_BLOB_BYTES,
-                AWS_B_OPUS_48_ADAPTIVE_LOW_CONTEXT_MAX_BLOB_BYTES,
-            );
-        return generate_aws_bedrock_opus_48_signature(blob_bytes, false);
-    }
-
-    // Current Bedrock/POMO captures use the same stamped protobuf header for
-    // both cache creation and cache reads. The encrypted thinking payload still
-    // varies between generations, but its distribution does not flip merely
-    // because the prompt cache changed state.
-    let context_boost = ((context_tokens - AWS_B_OPUS_48_LARGE_CONTEXT_TOKENS) as usize
-        / AWS_B_OPUS_48_CONTEXT_DIVISOR)
-        .min(AWS_B_OPUS_48_CONTEXT_MAX_BYTES);
-    let blob_bytes = thinking_bytes
-        .saturating_mul(2)
-        .saturating_add(context_boost)
-        .saturating_add(fastrand::usize(..=480))
-        .saturating_sub(240)
-        .clamp(
-            AWS_B_OPUS_48_ADAPTIVE_MIN_BLOB_BYTES,
-            AWS_B_OPUS_48_ADAPTIVE_MAX_BLOB_BYTES,
-        );
-    generate_aws_bedrock_opus_48_signature(blob_bytes, true)
-}
-
 /// 追加 protobuf 变长整数(varint)。
 fn push_varint(buf: &mut Vec<u8>, mut v: usize) {
     loop {
@@ -204,55 +192,11 @@ fn push_varint(buf: &mut Vec<u8>, mut v: usize) {
     }
 }
 
-fn push_varint_field(buf: &mut Vec<u8>, field: u8, value: usize) {
-    buf.push(field << 3);
-    push_varint(buf, value);
-}
-
 /// 追加一个 length-delimited 字段:`tag(field<<3|2)` + `varint(len)` + `content`。
 fn push_len_field(buf: &mut Vec<u8>, field: u8, content: &[u8]) {
     buf.push((field << 3) | 2);
     push_varint(buf, content.len());
     buf.extend_from_slice(content);
-}
-
-/// Build the AWS Bedrock Opus 4.8 protobuf envelope observed on both enabled
-/// and adaptive thinking responses. The final 32 bytes of field 5 remain a
-/// local HMAC so signatures are still stateless and tamper-evident when they
-/// are returned through a non-Bedrock validation path.
-fn generate_aws_bedrock_opus_48_signature(
-    thinking_blob_bytes: usize,
-    include_large_context_stamp: bool,
-) -> String {
-    let thinking_blob_bytes = thinking_blob_bytes.max(MAC_LEN);
-
-    let mut f1 = Vec::with_capacity(if include_large_context_stamp { 113 } else { 99 });
-    push_varint_field(&mut f1, 1, 15);
-    push_varint_field(&mut f1, 2, 1);
-    push_varint_field(&mut f1, 3, 2);
-    push_len_field(&mut f1, 5, &rand_bytes(64));
-    push_len_field(&mut f1, 6, b"claude-quince");
-    push_varint_field(&mut f1, 7, 0);
-    push_len_field(&mut f1, 8, b"thinking");
-    if include_large_context_stamp {
-        push_len_field(&mut f1, 11, AWS_B_OPUS_48_CONTEXT_STAMP);
-    }
-
-    let mut inner = Vec::with_capacity(f1.len() + thinking_blob_bytes + 96);
-    push_len_field(&mut inner, 1, &f1);
-    push_len_field(&mut inner, 2, &rand_bytes(12));
-    push_len_field(&mut inner, 3, &rand_bytes(12));
-    push_len_field(&mut inner, 4, &rand_bytes(48));
-    push_len_field(&mut inner, 5, &rand_bytes(thinking_blob_bytes));
-
-    let mut buf = Vec::with_capacity(inner.len() + 8);
-    push_len_field(&mut buf, 2, &inner);
-    push_varint_field(&mut buf, 3, 1);
-
-    let mac_start = buf.len() - 2 - MAC_LEN;
-    let mac = hmac_sha256(signing_secret(), &buf[..mac_start]);
-    buf[mac_start..mac_start + MAC_LEN].copy_from_slice(&mac);
-    BASE64.encode(buf)
 }
 
 /// 生成一个 thinking signature，**在字节结构上复刻真 Anthropic 的 protobuf 布局**:
@@ -500,18 +444,17 @@ mod tests {
         assert!(!invalid_length.ends_with_field3);
         assert!(!invalid_length.has_bedrock_profile_markers);
 
-        let mut tampered = BASE64
-            .decode(generate_aws_b40_signature_for_model("claude-opus-4-8"))
-            .unwrap();
+        let mut tampered = BASE64.decode(generate_signature()).unwrap();
+        let decoded_len = tampered.len();
         tampered[40] ^= 0x01;
         let hmac_mismatch = validate_signature(&BASE64.encode(tampered)).unwrap_err();
         assert_eq!(
             hmac_mismatch.failure,
             SignatureValidationFailure::HmacMismatch
         );
-        assert_eq!(hmac_mismatch.decoded_len, Some(241));
+        assert_eq!(hmac_mismatch.decoded_len, Some(decoded_len));
         assert!(hmac_mismatch.ends_with_field3);
-        assert!(hmac_mismatch.has_bedrock_profile_markers);
+        assert!(!hmac_mismatch.has_bedrock_profile_markers);
     }
 
     #[test]
@@ -534,125 +477,56 @@ mod tests {
     }
 
     #[test]
-    fn aws_b40_signatures_keep_observed_bedrock_lengths() {
-        let cases: &[(&str, &[usize])] = &[
-            ("claude-opus-4-8", &[241]),
-            ("claude-opus-4-6", &[AWS_B40_OPUS_46_RAW_BYTES]),
-            ("claude-sonnet-4-5", AWS_B40_SONNET_45_RAW_BYTES),
-            ("claude-haiku-4-5", AWS_B40_HAIKU_45_RAW_BYTES),
-            ("claude-opus-4-7", &[AWS_B40_RAW_BYTES]),
-        ];
-
-        for (model, expected_lengths) in cases {
-            for _ in 0..20 {
-                let raw = BASE64
-                    .decode(generate_aws_b40_signature_for_model(model))
-                    .expect("AWS-B signature must decode");
-                assert!(
-                    expected_lengths.contains(&raw.len()),
-                    "unexpected AWS-B signature length for {model}: {}",
-                    raw.len()
-                );
-                assert!(
-                    verify_signature(&BASE64.encode(&raw)),
-                    "AWS-B must accept its own {model} signature"
-                );
-            }
-        }
-
-        let opus_48 = BASE64
-            .decode(generate_aws_b40_signature_for_model("claude-opus-4-8"))
-            .expect("Opus 4.8 AWS-B signature must decode");
-        assert_eq!(
-            &opus_48[..13],
-            &[
-                0x12, 0xec, 0x01, 0x0a, 0x63, 0x08, 0x0f, 0x10, 0x01, 0x18, 0x02, 0x2a, 0x40,
-            ]
+    fn native_registry_key_binds_model_thinking_and_signature_without_plaintext() {
+        let key = native_signature_registry_key(
+            "claude-opus-4-8",
+            "private reasoning text",
+            "opaque-signature-material",
         );
-        assert!(opus_48.windows(13).any(|w| w == b"claude-quince"));
-        assert!(opus_48.windows(8).any(|w| w == b"thinking"));
-        assert_eq!(&opus_48[opus_48.len() - 2..], &[0x18, 0x01]);
-        assert!(verify_signature(&BASE64.encode(&opus_48)));
+        assert!(key.starts_with(NATIVE_SIGNATURE_KEY_PREFIX));
+        assert!(!key.contains("private reasoning text"));
+        assert!(!key.contains("opaque-signature-material"));
+        assert_eq!(
+            key,
+            native_signature_registry_key(
+                "anthropic.claude-opus-4-8",
+                "private reasoning text",
+                "opaque-signature-material",
+            ),
+            "public aliases of the same upstream model must share a binding"
+        );
+        assert_ne!(
+            key,
+            native_signature_registry_key(
+                "claude-opus-4-8",
+                "modified reasoning text",
+                "opaque-signature-material",
+            )
+        );
+        assert_ne!(
+            key,
+            native_signature_registry_key(
+                "claude-opus-4-8",
+                "private reasoning text",
+                "modified-signature-material",
+            )
+        );
     }
 
-    #[test]
-    fn aws_b40_opus_48_adaptive_signature_tracks_current_bedrock_shape() {
-        for _ in 0..20 {
-            let low = generate_aws_b40_adaptive_signature_for_model("claude-opus-4-8", 303, 49, 0);
-            let low_raw = BASE64.decode(&low).expect("low-context signature decodes");
-            assert!((241..=443).contains(&low_raw.len()), "{}", low_raw.len());
-            let (low_inner_len, low_off) = parse_top_level(&low_raw);
-            assert_eq!(low_off + low_inner_len + 2, low_raw.len());
-            assert_eq!(&low_raw[low_off..low_off + 4], &[0x0a, 0x63, 0x08, 0x0f]);
-            assert!(verify_signature(&low));
-
-            let cache_create =
-                generate_aws_b40_adaptive_signature_for_model("claude-opus-4-8", 143, 35_000, 0);
-            let cache_create_raw = BASE64
-                .decode(&cache_create)
-                .expect("cache-creation signature decodes");
-            assert!(
-                (2_740..=3_240).contains(&cache_create_raw.len()),
-                "{}",
-                cache_create_raw.len()
-            );
-            let (cache_create_inner_len, cache_create_off) = parse_top_level(&cache_create_raw);
-            assert_eq!(
-                cache_create_off + cache_create_inner_len + 2,
-                cache_create_raw.len()
-            );
-            assert_eq!(
-                &cache_create_raw[cache_create_off..cache_create_off + 4],
-                &[0x0a, 0x71, 0x08, 0x0f]
-            );
-            assert!(
-                cache_create_raw
-                    .windows(12)
-                    .any(|window| { window == AWS_B_OPUS_48_CONTEXT_STAMP.as_slice() })
-            );
-            assert!(verify_signature(&cache_create));
-
-            let cache_read = generate_aws_b40_adaptive_signature_for_model(
-                "claude-opus-4-8",
-                143,
-                35_000,
-                34_250,
-            );
-            let cache_read_raw = BASE64
-                .decode(&cache_read)
-                .expect("large-context signature decodes");
-            assert!(
-                (2_740..=3_240).contains(&cache_read_raw.len()),
-                "{}",
-                cache_read_raw.len()
-            );
-            let (cache_read_inner_len, cache_read_off) = parse_top_level(&cache_read_raw);
-            assert_eq!(
-                cache_read_off + cache_read_inner_len + 2,
-                cache_read_raw.len()
-            );
-            assert_eq!(
-                &cache_read_raw[cache_read_off..cache_read_off + 4],
-                &[0x0a, 0x71, 0x08, 0x0f]
-            );
-            assert!(cache_read_raw.windows(13).any(|w| w == b"claude-quince"));
-            assert!(
-                cache_read_raw
-                    .windows(12)
-                    .any(|window| { window == AWS_B_OPUS_48_CONTEXT_STAMP.as_slice() })
-            );
-            assert!(verify_signature(&cache_read));
-        }
-
-        let legacy_model = BASE64
-            .decode(generate_aws_b40_adaptive_signature_for_model(
-                "claude-opus-4-7",
-                143,
-                35_000,
-                34_250,
-            ))
-            .expect("legacy adaptive signature decodes");
-        assert_eq!(legacy_model.len(), AWS_B40_ADAPTIVE_RAW_BYTES);
-        assert!(verify_signature(&BASE64.encode(legacy_model)));
+    #[tokio::test]
+    async fn native_registry_accepts_only_exact_registered_round_trip() {
+        let signature = format!("native-opaque-{}", fastrand::u64(..));
+        assert!(
+            !validate_native_signature("claude-opus-4-8", "visible thinking", &signature).await
+        );
+        register_native_signature("claude-opus-4-8", "visible thinking", &signature).await;
+        assert!(
+            validate_native_signature("anthropic.claude-opus-4-8", "visible thinking", &signature,)
+                .await
+        );
+        assert!(
+            !validate_native_signature("claude-opus-4-8", "changed thinking", &signature).await
+        );
+        assert!(!validate_native_signature("claude-opus-4-8", "visible thinking", "").await);
     }
 }

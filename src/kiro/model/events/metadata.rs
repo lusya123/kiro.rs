@@ -11,6 +11,27 @@ use crate::kiro::parser::frame::Frame;
 
 use super::base::EventPayload;
 
+/// Map Kiro's native completion reason onto the public Anthropic Messages API
+/// vocabulary.
+///
+/// Kiro reasons are intentionally kept as strings on [`MetadataEvent`] so a
+/// newer runtime cannot make event deserialization fail.  At the HTTP boundary
+/// we only expose reasons whose semantics are known, however: forwarding an
+/// unknown provider value as `stop_reason` would violate Anthropic's enum
+/// contract.  Callers should retain their existing conservative fallback when
+/// this function returns `None`.
+pub(crate) fn anthropic_stop_reason(native: &str) -> Option<&'static str> {
+    match native.trim().to_ascii_uppercase().as_str() {
+        "END_TURN" => Some("end_turn"),
+        "MAX_TOKENS" => Some("max_tokens"),
+        "TOOL_USE" => Some("tool_use"),
+        "STOP_SEQUENCE" => Some("stop_sequence"),
+        "REFUSAL" => Some("refusal"),
+        "MODEL_CONTEXT_WINDOW_EXCEEDED" => Some("model_context_window_exceeded"),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenUsage {
@@ -133,5 +154,34 @@ mod tests {
         let event: MetadataEvent = serde_json::from_str(r#"{"unknown":true}"#).unwrap();
 
         assert_eq!(event, MetadataEvent::default());
+    }
+
+    #[test]
+    fn maps_all_known_completion_reasons_to_anthropic_values() {
+        for (native, anthropic) in [
+            ("END_TURN", "end_turn"),
+            ("MAX_TOKENS", "max_tokens"),
+            ("TOOL_USE", "tool_use"),
+            ("STOP_SEQUENCE", "stop_sequence"),
+            ("REFUSAL", "refusal"),
+            (
+                "MODEL_CONTEXT_WINDOW_EXCEEDED",
+                "model_context_window_exceeded",
+            ),
+        ] {
+            assert_eq!(anthropic_stop_reason(native), Some(anthropic));
+        }
+
+        // Be tolerant of harmless wire casing/whitespace differences without
+        // widening the public enum accepted from an upstream runtime.
+        assert_eq!(anthropic_stop_reason("  refusal  "), Some("refusal"));
+        assert_eq!(anthropic_stop_reason("max_tokens"), Some("max_tokens"));
+    }
+
+    #[test]
+    fn unknown_completion_reason_is_not_exposed_as_public_stop_reason() {
+        assert_eq!(anthropic_stop_reason("FUTURE_PROVIDER_REASON"), None);
+        assert_eq!(anthropic_stop_reason(""), None);
+        assert_eq!(anthropic_stop_reason("   "), None);
     }
 }

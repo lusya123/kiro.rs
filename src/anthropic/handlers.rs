@@ -48,6 +48,7 @@ use super::websearch;
 
 const MAX_REMOTE_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const REMOTE_IMAGE_FETCH_TIMEOUT_SECS: u64 = 30;
+const REMOTE_IMAGE_DOH_TIMEOUT_SECS: u64 = 8;
 const MAX_REMOTE_IMAGE_REDIRECTS: usize = 5;
 const AUTO_CONTINUE_BASE_CHUNK_TOKENS: i32 = 8192;
 const AUTO_CONTINUE_ESTIMATED_CHUNK_TOKENS: i32 = 4096;
@@ -381,8 +382,19 @@ fn estimate_context_tokens(
 ) -> i32 {
     let mut total = 0i32;
     if !context.tools.is_empty() {
-        total +=
-            token::count_tokens(&serde_json::to_string(&context.tools).unwrap_or_default()) as i32;
+        // `tools` is a Kiro union. CachePoint entries are transport controls,
+        // not language-model prompt content, so continuation accounting must
+        // count only the actual tool specifications.
+        let tool_specifications = context
+            .tools
+            .iter()
+            .filter(|tool| tool.specification_ref().is_some())
+            .collect::<Vec<_>>();
+        if !tool_specifications.is_empty() {
+            total += token::count_tokens(
+                &serde_json::to_string(&tool_specifications).unwrap_or_default(),
+            ) as i32;
+        }
     }
     if !context.tool_results.is_empty() {
         let mut tool_results = context.tool_results.clone();
@@ -575,6 +587,20 @@ async fn normalize_remote_image_sources(payload: &mut MessagesRequest) -> Result
     Ok(())
 }
 
+/// Preserve the real local failure cause while exposing both layers involved in AWS-B URL input:
+/// the Bedrock-compatible image failure and this gateway's URL-to-base64 conversion step. This is
+/// applied uniformly to every remote-image failure (including nested tool results), never to a
+/// particular hostname, and never to already-base64 media.
+fn remote_image_error_message(error: String, aws_b40_compat: bool) -> String {
+    if aws_b40_compat {
+        format!(
+            "Could not process image (remote request failed): get file base64 from URL failed: {error}"
+        )
+    } else {
+        error
+    }
+}
+
 fn is_disallowed_remote_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => is_disallowed_remote_ipv4(ip),
@@ -614,6 +640,115 @@ fn is_disallowed_remote_ipv6(ip: Ipv6Addr) -> bool {
         || (segments[0] & 0xe000) != 0x2000
 }
 
+/// Clash and similar transparent proxies commonly return RFC 2544 benchmark
+/// addresses instead of the origin address. Treat this shape only as a signal
+/// to perform independent public DNS validation; the benchmark address itself
+/// is never used as proof that a destination is public.
+fn is_fake_ip_dns_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, _, _] = ip.octets();
+            a == 198 && (b == 18 || b == 19)
+        }
+        IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return is_fake_ip_dns_address(IpAddr::V4(mapped));
+            }
+            let segments = ip.segments();
+            // IPv4-translated form used by some fake-IP resolvers:
+            // ::ffff:0:198.18.x.y
+            if segments[..6] == [0, 0, 0, 0, 0xffff, 0] {
+                let translated = Ipv4Addr::new(
+                    (segments[6] >> 8) as u8,
+                    segments[6] as u8,
+                    (segments[7] >> 8) as u8,
+                    segments[7] as u8,
+                );
+                return is_fake_ip_dns_address(IpAddr::V4(translated));
+            }
+            false
+        }
+    }
+}
+
+/// Resolve a fake-IP hostname through a fixed TLS-protected DNS endpoint and
+/// return only independently validated public origin addresses. The resulting
+/// addresses are later pinned into reqwest, preserving DNS-rebinding defense.
+async fn resolve_public_image_host_via_doh(
+    host: &str,
+    port: u16,
+) -> Result<Vec<SocketAddr>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(REMOTE_IMAGE_DOH_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("Failed to create DNS validation client: {}", e))?;
+    let mut addresses = Vec::new();
+    let mut last_error = None;
+
+    for record_type in ["A", "AAAA"] {
+        let mut url = reqwest::Url::parse("https://cloudflare-dns.com/dns-query")
+            .expect("fixed DoH URL must parse");
+        url.query_pairs_mut()
+            .append_pair("name", host)
+            .append_pair("type", record_type);
+        let response = match client
+            .get(url)
+            .header("accept", "application/dns-json")
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = Some(error.to_string());
+                continue;
+            }
+        };
+        if !response.status().is_success() {
+            last_error = Some(format!("HTTP {}", response.status().as_u16()));
+            continue;
+        }
+        let body = match response.json::<serde_json::Value>().await {
+            Ok(body) => body,
+            Err(error) => {
+                last_error = Some(error.to_string());
+                continue;
+            }
+        };
+        if body.get("Status").and_then(serde_json::Value::as_u64) != Some(0) {
+            continue;
+        }
+        for answer in body
+            .get("Answer")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(ip) = answer
+                .get("data")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|data| data.parse::<IpAddr>().ok())
+            else {
+                continue;
+            };
+            if is_disallowed_remote_ip(ip) {
+                return Err("Image URL resolves to a private or reserved address".to_string());
+            }
+            addresses.push(SocketAddr::new(ip, port));
+        }
+    }
+
+    addresses.sort_unstable();
+    addresses.dedup();
+    if addresses.is_empty() {
+        return Err(last_error.map_or_else(
+            || "Image URL host did not resolve to a public address".to_string(),
+            |error| format!("Failed to validate image URL DNS: {}", error),
+        ));
+    }
+    Ok(addresses)
+}
+
 async fn remote_image_client(url: &reqwest::Url) -> Result<reqwest::Client, String> {
     if !matches!(url.scheme(), "http" | "https") {
         return Err("Image URL must use http or https".to_string());
@@ -650,12 +785,20 @@ async fn remote_image_client(url: &reqwest::Url) -> Result<reqwest::Client, Stri
         .iter()
         .any(|address| is_disallowed_remote_ip(address.ip()))
     {
-        return Err("Image URL resolves to a private or reserved address".to_string());
+        let fake_ip_only = host.parse::<IpAddr>().is_err()
+            && addresses
+                .iter()
+                .all(|address| is_fake_ip_dns_address(address.ip()));
+        if !fake_ip_only {
+            return Err("Image URL resolves to a private or reserved address".to_string());
+        }
+        addresses = resolve_public_image_host_via_doh(host, port).await?;
     }
 
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(REMOTE_IMAGE_FETCH_TIMEOUT_SECS))
         .redirect(reqwest::redirect::Policy::none())
+        .user_agent("kiro-rs-image-fetch/1.0")
         .no_proxy();
     if host.parse::<IpAddr>().is_err() {
         // Pin the validated DNS answers so the actual request cannot be redirected by DNS rebinding.
@@ -2462,7 +2605,7 @@ pub async fn post_messages(
     if let Some(response) = reject_invalid_model_reasoning(&payload) {
         return response;
     }
-    if let Some(response) = reject_invalid_opus_48_sampling(&payload, aws_b40_compat) {
+    if let Some(response) = reject_invalid_modern_sampling(&payload, aws_b40_compat) {
         return response;
     }
 
@@ -2477,19 +2620,20 @@ pub async fn post_messages(
     let gpt_passthrough = is_gpt_model(&payload.model);
     let aws_b40_initial_thinking_requested = aws_b40_compat
         && (payload.thinking.is_some() || payload.model.to_ascii_lowercase().contains("thinking"));
-    let aws_b40_initial_adaptive_signature = aws_b40_compat
-        && payload
-            .thinking
-            .as_ref()
-            .is_some_and(|thinking| thinking.thinking_type == "adaptive");
-    if let Some(response) = reject_invalid_thinking_signatures(&payload, aws_b40_compat) {
+    if let Some(response) = reject_invalid_thinking_signatures(&payload, aws_b40_compat).await {
         return response;
     }
     if aws_b40_compat {
         normalize_aws_b40_thinking(&mut payload);
         normalize_aws_b40_tool_choice(&mut payload);
+    } else {
+        // opus-4-8:合法的 type:enabled 归一化为 adaptive(匹配真 Claude 的 200 行为),再做校验。
+        normalize_opus_thinking(&mut payload);
     }
     if let Some(response) = kiro_request_preflight_error(&payload, aws_b40_compat) {
+        return response;
+    }
+    if let Some(response) = reject_invalid_thinking_request(&payload) {
         return response;
     }
 
@@ -2509,21 +2653,8 @@ pub async fn post_messages(
         }
     };
 
-    if !aws_b40_compat {
-        // opus-4-8:合法的 type:enabled 归一化为 adaptive(匹配真 Claude 的 200 行为),再做校验。
-        normalize_opus_thinking(&mut payload);
-        if let Some(response) = reject_invalid_thinking_request(&payload) {
-            return response;
-        }
-    }
     let aws_b40_thinking_requested =
         aws_b40_compat && (aws_b40_initial_thinking_requested || payload.thinking.is_some());
-    let aws_b40_adaptive_signature = aws_b40_compat
-        && (aws_b40_initial_adaptive_signature
-            || payload
-                .thinking
-                .as_ref()
-                .is_some_and(|thinking| thinking.thinking_type == "adaptive"));
 
     // 结构化输出:校验 output_config.format 并注入 schema 指令(非法 schema 直接 400)。
     if let Some(response) = apply_structured_output(&mut payload) {
@@ -2542,9 +2673,10 @@ pub async fn post_messages(
 
     if let Err(e) = normalize_remote_image_sources(&mut payload).await {
         tracing::warn!("远程图片处理失败: {}", e);
+        let message = remote_image_error_message(e, aws_b40_compat);
         return (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new("invalid_request_error", e)),
+            Json(ErrorResponse::new("invalid_request_error", message)),
         )
             .into_response();
     }
@@ -2731,14 +2863,17 @@ pub async fn post_messages(
             forced_application_identity_reply,
             tool_choice_forces_tool(&payload),
             aws_b40_compat,
-            aws_b40_adaptive_signature,
             aws_b40_thinking_requested,
             cache_commit,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = state.extract_thinking && thinking_enabled;
+        let extract_thinking = should_extract_nonstream_thinking(
+            state.extract_thinking,
+            thinking_enabled,
+            aws_b40_compat,
+        );
         handle_non_stream_request(
             provider,
             &request_body,
@@ -2757,7 +2892,6 @@ pub async fn post_messages(
             forced_application_identity_reply,
             tool_choice_forces_tool(&payload),
             aws_b40_compat,
-            aws_b40_adaptive_signature,
             cache_commit,
         )
         .await
@@ -2782,10 +2916,10 @@ async fn handle_stream_request(
     forced_application_identity_reply: Option<String>,
     force_tool_only: bool,
     aws_b40_compat: bool,
-    aws_b40_adaptive_signature: bool,
     aws_b40_thinking_requested: bool,
     cache_commit: super::cache::CacheCommit,
 ) -> Response {
+    let exact_cache_ttl_plan = cache_commit.exact_ttl_plan();
     // 调用 Kiro API（支持多凭据故障转移）
     let upstream_started = Instant::now();
     let response = match provider.call_api_stream(request_body).await {
@@ -2802,8 +2936,9 @@ async fn handle_stream_request(
         initial_usage_breakdown,
         tool_name_map,
     );
+    ctx.set_exact_cache_ttl_plan(exact_cache_ttl_plan);
     if aws_b40_compat {
-        ctx.enable_aws_b40_compat(aws_b40_adaptive_signature);
+        ctx.enable_aws_b40_compat();
         ctx.set_aws_b40_thinking_requested(aws_b40_thinking_requested);
         ctx.set_thinking_text_visible(thinking_wants_summary);
         ctx.set_input_context_calibration(input_context_calibration);
@@ -2814,15 +2949,8 @@ async fn handle_stream_request(
     if thinking_enabled && !expose_thinking {
         ctx.hide_thinking_blocks();
     }
-    // 为旧 Kiro 协议准备 thinking 回退；新版 reasoningContentEvent 到达后会自动取消。
-    // 仅影响显式 thinking 请求，真实答案和普通请求不变。
-    if thinking_enabled
-        && expose_thinking
-        && thinking_wants_summary
-        && super::compat::model_omits_thinking(model)
-    {
-        ctx.set_synthetic_thinking(Some(super::compat::synthetic_thinking()));
-    }
+    // AWS-B 只返回上游原生 reasoning/signature。旧协议没有该能力时不合成
+    // thinking 文本或本地签名，避免把兼容外形冒充为模型层完整性证明。
     ctx.set_output_token_limit(requested_max_tokens);
     if identity_sanitization {
         ctx.enable_identity_sanitization_with_profile(identity_sanitization_options(
@@ -2941,6 +3069,16 @@ fn create_sse_stream(
                                         match Event::from_frame(frame) {
                                             Ok(event) => {
                                                 let sse_events = ctx.process_kiro_event(&event);
+                                                if let Some((model, thinking, signature)) =
+                                                    ctx.take_native_signature_registration()
+                                                {
+                                                    super::signature::register_native_signature(
+                                                        &model,
+                                                        &thinking,
+                                                        &signature,
+                                                    )
+                                                    .await;
+                                                }
                                                 events.extend(sse_events);
                                             }
                                             Err(e) => {
@@ -2969,6 +3107,16 @@ fn create_sse_stream(
                             ctx.mark_upstream_fatal_event();
                             // 发送最终事件并结束
                             let final_events = ctx.generate_final_events();
+                            if let Some((model, thinking, signature)) =
+                                ctx.take_native_signature_registration()
+                            {
+                                super::signature::register_native_signature(
+                                    &model,
+                                    &thinking,
+                                    &signature,
+                                )
+                                .await;
+                            }
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
@@ -3057,6 +3205,16 @@ fn create_sse_stream(
                             }
                             // 流结束，发送最终事件
                             let final_events = ctx.generate_final_events();
+                            if let Some((model, thinking, signature)) =
+                                ctx.take_native_signature_registration()
+                            {
+                                super::signature::register_native_signature(
+                                    &model,
+                                    &thinking,
+                                    &signature,
+                                )
+                                .await;
+                            }
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
@@ -3101,9 +3259,9 @@ async fn handle_non_stream_request(
     forced_application_identity_reply: Option<String>,
     force_tool_only: bool,
     aws_b40_compat: bool,
-    aws_b40_adaptive_signature: bool,
     cache_commit: super::cache::CacheCommit,
 ) -> Response {
+    let exact_cache_ttl_plan = cache_commit.exact_ttl_plan();
     let mut text_content = String::new();
     let mut native_thinking_content = String::new();
     let mut upstream_thinking_signature: Option<String> = None;
@@ -3140,6 +3298,7 @@ async fn handle_non_stream_request(
         };
         let mut round_context_input_tokens: Option<i32> = None;
         let mut round_exact_input_tokens: Option<i32> = None;
+        let mut round_metered_input_tokens: Option<i32> = None;
         let mut round_exact_output_tokens: Option<i32> = None;
         let mut round_exact_usage: Option<super::cache::UsageBreakdown> = None;
 
@@ -3175,6 +3334,10 @@ async fn handle_non_stream_request(
         let mut round_tool_input_generated = String::new();
         let mut round_has_assistant_content = false;
         let mut round_reasoning_previous = String::new();
+        let mut round_has_completed_tool_use = false;
+        let mut round_has_terminal_evidence = false;
+        let mut round_has_native_stop_reason = false;
+        let mut round_refused = false;
         stop_reason = "end_turn".to_string();
 
         for result in decoder.decode_iter() {
@@ -3232,6 +3395,7 @@ async fn handle_non_stream_request(
 
                             // 如果是完整的工具调用，添加到列表
                             if tool_use.stop {
+                                round_has_completed_tool_use = true;
                                 let mut input: serde_json::Value = if buffer.is_empty() {
                                     serde_json::json!({})
                                 } else {
@@ -3300,25 +3464,60 @@ async fn handle_non_stream_request(
                             );
                         }
                         Event::Metadata(metadata) => {
-                            if let Some(exact) =
-                                super::cache::UsageBreakdown::from_exact_token_usage(
-                                    initial_usage_breakdown,
-                                    &metadata.token_usage,
-                                )
+                            let native = super::cache::reconcile_native_usage(
+                                model,
+                                initial_usage_breakdown,
+                                &metadata.token_usage,
+                                exact_cache_ttl_plan,
+                            );
+                            let mapped_stop_reason = metadata
+                                .stop_reason
+                                .as_deref()
+                                .and_then(crate::kiro::model::events::anthropic_stop_reason);
+                            if let Some(reason) = mapped_stop_reason {
+                                stop_reason = reason.to_string();
+                                round_has_native_stop_reason = true;
+                                round_refused |= reason == "refusal";
+                            } else if metadata
+                                .stop_reason
+                                .as_deref()
+                                .is_some_and(|reason| !reason.trim().is_empty())
                             {
-                                round_exact_input_tokens = Some(exact.total());
-                                round_exact_output_tokens =
-                                    Some(metadata.token_usage.output_tokens);
-                                round_exact_usage = Some(exact);
+                                tracing::warn!(
+                                    native_stop_reason = %metadata.stop_reason.as_deref().unwrap_or_default(),
+                                    "忽略未知 Kiro stopReason，保留安全的本地终止推断"
+                                );
+                            }
+                            if native.is_some()
+                                || mapped_stop_reason.is_some_and(|reason| reason != "refusal")
+                            {
+                                round_has_terminal_evidence = true;
+                            }
+                            if let Some(native) = native {
+                                round_exact_input_tokens = Some(native.aggregate_input_tokens);
+                                round_exact_output_tokens = Some(native.output_tokens);
+                                round_exact_usage = native.public_cache_usage;
                             }
                         }
                         Event::Metering(metering) => {
-                            if round_exact_input_tokens.is_none() && metering.input_tokens > 0 {
-                                round_exact_input_tokens = Some(metering.input_tokens);
+                            // A metering frame is terminal completion evidence,
+                            // but its aggregate input remains separate from the
+                            // exact cache-bucket authority above.
+                            round_has_terminal_evidence = true;
+                            if round_metered_input_tokens.is_none() && metering.input_tokens > 0 {
+                                round_metered_input_tokens = Some(metering.input_tokens);
                             }
                             if round_exact_output_tokens.is_none() && metering.output_tokens > 0 {
                                 round_exact_output_tokens = Some(metering.output_tokens);
                             }
+                        }
+                        Event::InvalidState(invalid) => {
+                            tracing::error!(
+                                reason = %invalid.reason,
+                                message = %invalid.message,
+                                "收到 invalidStateEvent，终止当前上游调用"
+                            );
+                            upstream_fatal_error = Some("upstream invalid state");
                         }
                         Event::Error { .. } => {
                             upstream_fatal_error = Some("upstream model error");
@@ -3326,6 +3525,7 @@ async fn handle_non_stream_request(
                         Event::Exception { exception_type, .. } => {
                             if exception_type == "ContentLengthExceededException" {
                                 stop_reason = "max_tokens".to_string();
+                                round_has_terminal_evidence = true;
                             } else {
                                 upstream_fatal_error = Some("upstream model exception");
                             }
@@ -3355,13 +3555,31 @@ async fn handle_non_stream_request(
             upstream_fatal_error = Some("truncated upstream event stream");
         }
 
-        if continuation_round == 0 && upstream_fatal_error.is_none() {
+        let round_has_completion_evidence =
+            round_has_completed_tool_use || round_has_terminal_evidence;
+        let exact_cache_allows_commit = if round_refused {
+            // A refusal must not warm the fallback registry merely because it
+            // is terminal. A native read proves that the prefix was already
+            // reusable; a write on a refused invocation does not.
+            round_exact_usage
+                .as_ref()
+                .is_some_and(|usage| usage.cache_read_input_tokens > 0)
+        } else {
+            round_exact_usage
+                .as_ref()
+                .is_none_or(|usage| usage.has_cache_usage())
+        };
+        if continuation_round == 0
+            && upstream_fatal_error.is_none()
+            && round_has_completion_evidence
+            && exact_cache_allows_commit
+        {
             if let Some(commit) = cache_commit.take() {
                 commit.commit().await;
             }
         }
 
-        if has_tool_use && stop_reason == "end_turn" {
+        if has_tool_use && stop_reason == "end_turn" && !round_has_native_stop_reason {
             stop_reason = "tool_use".to_string();
         }
 
@@ -3371,25 +3589,38 @@ async fn handle_non_stream_request(
             &round_reasoning_generated,
             &round_tool_input_generated,
         );
+        let round_context_authoritative_input_tokens = round_context_input_tokens.map(|context| {
+            if continuation_round == 0 && aws_b40_compat {
+                input_context_calibration.calibrate(
+                    model,
+                    round_estimated_input_tokens,
+                    Some(context),
+                )
+            } else {
+                super::billing::billable_input_tokens(round_estimated_input_tokens, Some(context))
+            }
+        });
         let round_input_tokens = if let Some(exact) = round_exact_input_tokens {
             exact.max(1)
+        } else if let Some(metered) = round_metered_input_tokens {
+            metered.max(1)
+        } else if let Some(context) = round_context_authoritative_input_tokens {
+            context.max(1)
         } else if continuation_round == 0 && aws_b40_compat {
-            input_context_calibration.calibrate(
-                model,
-                round_estimated_input_tokens,
-                round_context_input_tokens,
-            )
+            input_context_calibration.calibrate(model, round_estimated_input_tokens, None)
         } else {
-            super::billing::billable_input_tokens(
-                round_estimated_input_tokens,
-                round_context_input_tokens,
-            )
+            super::billing::billable_input_tokens(round_estimated_input_tokens, None)
         };
         if continuation_round == 0 {
             first_round_input_tokens = round_input_tokens;
-            first_round_authoritative_input_tokens = (round_exact_input_tokens.is_some()
-                || round_context_input_tokens.is_some())
-            .then_some(round_input_tokens);
+            first_round_authoritative_input_tokens =
+                super::stream::select_first_round_reconciled_input(
+                    initial_usage_breakdown,
+                    round_exact_input_tokens,
+                    round_metered_input_tokens,
+                    round_context_authoritative_input_tokens,
+                    round_input_tokens,
+                );
             exact_first_round_usage = round_exact_usage;
         } else {
             additional_round_input_tokens.push(round_input_tokens);
@@ -3540,7 +3771,16 @@ async fn handle_non_stream_request(
             // requested with display=summarized.
             let has_native_reasoning =
                 !native_thinking_content.is_empty() || upstream_thinking_signature.is_some();
-            let thinking = if has_native_reasoning {
+            let has_native_signature = upstream_thinking_signature.is_some();
+            let thinking = if aws_b40_compat && has_native_signature {
+                Some(profile_visible_thinking_text(
+                    native_thinking_content.clone(),
+                    aws_b40_compat,
+                    thinking_wants_summary,
+                ))
+            } else if aws_b40_compat {
+                None
+            } else if has_native_reasoning {
                 Some(profile_visible_thinking_text(
                     native_thinking_content.clone(),
                     aws_b40_compat,
@@ -3587,29 +3827,25 @@ async fn handle_non_stream_request(
                     || !thinking_text.is_empty()
                     || !redacted_thinking_blocks.is_empty()
                 {
-                    let signature = if has_native_reasoning {
-                        upstream_thinking_signature.clone().unwrap_or_else(|| {
-                            if aws_b40_compat {
-                                super::bedrock::signature(
-                                    model,
-                                    aws_b40_adaptive_signature,
-                                    &thinking_text,
-                                    usage_breakdown,
-                                )
-                            } else {
-                                super::signature::generate_signature()
-                            }
-                        })
-                    } else if aws_b40_compat {
-                        super::bedrock::signature(
-                            model,
-                            aws_b40_adaptive_signature,
-                            &thinking_text,
-                            usage_breakdown,
-                        )
+                    let signature = if aws_b40_compat {
+                        upstream_thinking_signature
+                            .clone()
+                            .expect("AWS-B thinking is emitted only with an upstream signature")
+                    } else if has_native_reasoning {
+                        upstream_thinking_signature
+                            .clone()
+                            .unwrap_or_else(super::signature::generate_signature)
                     } else {
                         super::signature::generate_signature()
                     };
+                    if aws_b40_compat {
+                        super::signature::register_native_signature(
+                            model,
+                            &thinking_text,
+                            &signature,
+                        )
+                        .await;
+                    }
                     content.push(json!({
                         "type": "thinking",
                         "thinking": thinking_text,
@@ -3773,23 +4009,22 @@ async fn handle_non_stream_request(
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
-/// 把 opus-4-8 上**合法的** `thinking:{type:enabled}` 归一化为 `adaptive`。
+/// 把 opus-4-8 上合法的 `thinking:{type:enabled}` 归一化为 `adaptive`。
 ///
-/// 真 Claude(经 pomoai/Bedrock 实测):opus-4-8 对 `type:enabled` 只在 `max_tokens<=budget_tokens`
-/// 或 `budget<1024` 时才 400,其余情况返回 **200**(正常应答)。此前本服务对所有 opus+enabled 一律 400,
-/// 反而把检测器的 thinking / thinking+tool 探针变成了 400 错误,拉低 Claude真伪 / native signal。
-/// 归一化为 adaptive 后:合法 enabled → 200,并产出 thinking 块(+签名),与真 Claude 的 200 行为一致。
-/// 非法 enabled(max<=budget / budget<1024)保持原样,交由 `reject_invalid_thinking_request` 按 Bedrock 400。
-/// 真实用户在 opus 上本就用 adaptive,不受影响。
+/// 非法的预算组合保持原样，随后由统一的 thinking 校验返回 400。
+/// 这样既保留旧 AWS-B 分支对合法手动 thinking 的兼容，也不会绕过
+/// 新增的模型能力与预算约束检查。
 fn normalize_opus_thinking(payload: &mut MessagesRequest) {
     if !super::compat::is_opus_4_8(&payload.model) {
         return;
     }
     let max_tokens = payload.max_tokens;
-    if let Some(t) = payload.thinking.as_mut() {
-        if t.thinking_type == "enabled" && t.budget_tokens >= 1024 && max_tokens > t.budget_tokens {
-            t.thinking_type = "adaptive".to_string();
-        }
+    if let Some(thinking) = payload.thinking.as_mut()
+        && thinking.thinking_type == "enabled"
+        && thinking.budget_tokens >= 1024
+        && max_tokens > thinking.budget_tokens
+    {
+        thinking.thinking_type = "adaptive".to_string();
     }
 }
 
@@ -3855,12 +4090,16 @@ fn normalize_aws_b40_thinking(payload: &mut MessagesRequest) {
                 normalized.budget_tokens = 20000;
             }
             if let Some(output_config) = payload.output_config.as_mut() {
-                if output_config.effort.trim().is_empty() {
-                    output_config.effort = "high".to_string();
+                if output_config
+                    .effort
+                    .as_deref()
+                    .is_none_or(|effort| effort.trim().is_empty())
+                {
+                    output_config.effort = Some("high".to_string());
                 }
             } else {
                 payload.output_config = Some(OutputConfig {
-                    effort: "high".to_string(),
+                    effort: Some("high".to_string()),
                     format: None,
                 });
             }
@@ -3917,6 +4156,18 @@ fn profile_thinking_wants_summary(payload: &MessagesRequest, _aws_b40_compat: bo
         .is_some_and(Thinking::wants_summary)
 }
 
+/// AWS-B explicit thinking is a per-request protocol contract. The legacy
+/// global extraction switch remains available for older profiles, but it must
+/// not discard a native reasoning block and signature that an AWS-B caller
+/// explicitly requested.
+fn should_extract_nonstream_thinking(
+    configured_extract_thinking: bool,
+    thinking_enabled: bool,
+    aws_b40_compat: bool,
+) -> bool {
+    thinking_enabled && (aws_b40_compat || configured_extract_thinking)
+}
+
 fn profile_visible_thinking_text(
     thinking: String,
     aws_b40_compat: bool,
@@ -3953,16 +4204,44 @@ fn kiro_model_request_fields(
     }
 
     let thinking_enabled = payload.thinking.as_ref().is_some_and(Thinking::is_enabled);
-    if !thinking_enabled {
+    let explicit_effort = payload
+        .output_config
+        .as_ref()
+        .and_then(|config| config.effort.as_ref());
+    if !thinking_enabled && explicit_effort.is_none() {
         return Ok(None);
     }
 
-    let requested = payload
+    if let Some(requested_effort) = payload
         .output_config
         .as_ref()
-        .map(|config| config.effort.trim().to_ascii_lowercase())
-        .unwrap_or_else(|| "medium".to_string());
-    let Some(effort) = resolve_kiro_effort(&model, &requested) else {
+        .and_then(|config| config.effort.as_deref())
+    {
+        const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+        let requested = requested_effort.trim().to_ascii_lowercase();
+        if !EFFORTS.contains(&requested.as_str()) {
+            return Err(format!(
+                "output_config.effort must be one of: {}",
+                EFFORTS.join(", ")
+            ));
+        }
+    }
+
+    // Effort controls the whole Claude response and does not require thinking.
+    // One shared resolver keeps the native request field and cache identity on
+    // the same official `high` default.
+    let Some(effort) = super::converter::forwarded_claude_effort(payload) else {
+        if let Some(requested_effort) = payload
+            .output_config
+            .as_ref()
+            .and_then(|config| config.effort.as_deref())
+        {
+            return Err(format!(
+                "output_config.effort '{}' is not supported for model '{}'",
+                requested_effort.trim().to_ascii_lowercase(),
+                payload.model
+            ));
+        }
         return Ok(None);
     };
 
@@ -4002,32 +4281,6 @@ fn normalize_gpt_reasoning(requested: &ReasoningConfig) -> Result<KiroReasoningC
     }
 
     Ok(KiroReasoningConfig { effort, mode })
-}
-
-fn resolve_kiro_effort(model: &str, requested: &str) -> Option<String> {
-    const FIVE_LEVEL_MODELS: &[&str] = &["claude-opus-4.8", "claude-opus-4.7", "claude-sonnet-5"];
-    const FOUR_LEVEL_MODELS: &[&str] = &[
-        "claude-opus-4.6",
-        "claude-sonnet-4.6",
-        "claude-opus-4.6-1m",
-        "claude-sonnet-4.6-1m",
-    ];
-    const VALID: &[&str] = &["low", "medium", "high", "xhigh", "max"];
-
-    if !VALID.contains(&requested) {
-        return None;
-    }
-    if FIVE_LEVEL_MODELS.contains(&model) {
-        return Some(requested.to_string());
-    }
-    if FOUR_LEVEL_MODELS.contains(&model) {
-        return Some(if requested == "xhigh" {
-            "max".to_string()
-        } else {
-            requested.to_string()
-        });
-    }
-    None
 }
 
 fn aws_b40_direct_response_is_trivial(payload: &MessagesRequest) -> bool {
@@ -4083,7 +4336,8 @@ fn suppress_trivial_nonstream_thinking_envelope(
 }
 
 fn aws_b40_model_supports_enabled_thinking(model: &str) -> bool {
-    super::bedrock::is_model_family(model, "opus", "4-6")
+    super::bedrock::is_model_family(model, "opus", "4-5")
+        || super::bedrock::is_model_family(model, "opus", "4-6")
         || super::bedrock::is_model_family(model, "sonnet", "4-5")
         || super::bedrock::is_model_family(model, "sonnet", "4-6")
         || super::bedrock::is_model_family(model, "haiku", "4-5")
@@ -4312,6 +4566,34 @@ fn apply_structured_output(payload: &mut MessagesRequest) -> Option<Response> {
 
 fn reject_invalid_thinking_request(payload: &MessagesRequest) -> Option<Response> {
     let thinking_type = payload.thinking.as_ref()?.thinking_type.as_str();
+    match thinking_type {
+        "adaptive" if !aws_b40_model_supports_adaptive_thinking(&payload.model) => {
+            return Some(thinking_error_response(
+                payload.stream,
+                format!(
+                    "thinking.type 'adaptive' is not supported for model '{}'",
+                    payload.model
+                ),
+            ));
+        }
+        "enabled" if !aws_b40_model_supports_enabled_thinking(&payload.model) => {
+            return Some(thinking_error_response(
+                payload.stream,
+                format!(
+                    "thinking.type 'enabled' is not supported for model '{}'",
+                    payload.model
+                ),
+            ));
+        }
+        "adaptive" | "enabled" | "disabled" => {}
+        other => {
+            return Some(thinking_error_response(
+                payload.stream,
+                format!("unsupported thinking.type '{other}'"),
+            ));
+        }
+    }
+
     if thinking_type == "enabled" && payload.thinking.as_ref()?.budget_tokens < 1024 {
         let message = format!(
             "***.enabled.budget_tokens: Input should be greater than or equal to 1024 (request id: {}) (request id: {})",
@@ -4320,10 +4602,6 @@ fn reject_invalid_thinking_request(payload: &MessagesRequest) -> Option<Response
         );
         return Some(thinking_error_response(payload.stream, message));
     }
-
-    // 注意:opus-4-8 对**合法的** type:enabled(budget>=1024 且 max_tokens>budget)会返回 200
-    // (经 pomoai/Bedrock 实测),不再 400。合法 enabled 已由 normalize_opus_thinking 归一化为
-    // adaptive;这里只保留对**非法** enabled 的 Bedrock 口径校验(budget<1024 / max<=budget)。
 
     // 一方契约：thinking.enabled 时 max_tokens 必须大于 budget_tokens，否则 400。
     // 仅对 enabled 生效（adaptive 的 budget_tokens 被覆写为标准值，不构成约束）。
@@ -4338,24 +4616,10 @@ fn reject_invalid_thinking_request(payload: &MessagesRequest) -> Option<Response
     None
 }
 
-fn reject_invalid_thinking_signatures(
+async fn reject_invalid_thinking_signatures(
     payload: &MessagesRequest,
     aws_b40_compat: bool,
 ) -> Option<Response> {
-    // AWS-B treats inbound thinking signatures as opaque response metadata.
-    // `convert_assistant_message` forwards only the thinking text to Kiro, so
-    // the signature is never an upstream authorization or integrity boundary.
-    // Missing and non-string signatures were already ignored, and the local
-    // fallback HMAC does not bind the thinking text. Rejecting another shape
-    // adds no protection and can break valid imported/replayed histories,
-    // including real multi-KiB Anthropic signatures.
-    //
-    // Keep the strict validator below for profiles that still require it, but
-    // never return "Invalid signature in thinking block" in AWS-B mode.
-    if aws_b40_compat {
-        return None;
-    }
-
     for (message_index, message) in payload.messages.iter().enumerate() {
         let Some(blocks) = message.content.as_array() else {
             continue;
@@ -4364,7 +4628,40 @@ fn reject_invalid_thinking_signatures(
             if block.get("type").and_then(|v| v.as_str()) != Some("thinking") {
                 continue;
             }
-            let Some(signature) = block.get("signature").and_then(|v| v.as_str()) else {
+            let signature = block.get("signature").and_then(|v| v.as_str());
+            let thinking = block.get("thinking").and_then(|v| v.as_str());
+
+            if aws_b40_compat {
+                let valid = match (thinking, signature) {
+                    (Some(thinking), Some(signature)) if !signature.is_empty() => {
+                        super::signature::validate_native_signature(
+                            &payload.model,
+                            thinking,
+                            signature,
+                        )
+                        .await
+                    }
+                    _ => false,
+                };
+                if !valid {
+                    tracing::warn!(
+                        message_index,
+                        block_index,
+                        signature_present = signature.is_some(),
+                        signature_encoded_len = signature.map(str::len).unwrap_or(0),
+                        thinking_present = thinking.is_some(),
+                        "rejected unregistered or invalid native thinking signature"
+                    );
+                    let message = format!(
+                        "messages.{}.content.{}: Invalid signature in thinking block",
+                        message_index, block_index
+                    );
+                    return Some(thinking_error_response(payload.stream, message));
+                }
+                continue;
+            }
+
+            let Some(signature) = signature else {
                 continue;
             };
             if let Err(diagnostics) = super::signature::validate_signature(signature) {
@@ -4505,13 +4802,6 @@ fn request_has_structured_output(payload: &MessagesRequest) -> bool {
         .as_ref()
         .and_then(|config| config.format.as_ref())
         .is_some()
-}
-
-fn adaptive_thinking_requested(payload: &MessagesRequest) -> bool {
-    payload
-        .thinking
-        .as_ref()
-        .is_some_and(|thinking| thinking.thinking_type == "adaptive")
 }
 
 fn strong_identity_can_bypass_available_tools(payload: &MessagesRequest) -> bool {
@@ -4780,15 +5070,11 @@ fn compat_direct_response(
         .map(|t| t.is_enabled())
         .unwrap_or(false);
     let thinking_wants_summary = profile_thinking_wants_summary(payload, aws_b40_compat);
-    let direct_thinking_envelope =
-        aws_b40_compat && payload.stream && !aws_b40_direct_response_is_trivial(payload);
     let mut content = Vec::new();
     let mut thinking_tokens = 0;
-    let thinking_text = if expose_thinking {
+    let thinking_text = if expose_thinking && !aws_b40_compat {
         if thinking_wants_summary {
             Some("I should follow the user's exact response constraint.".to_string())
-        } else if direct_thinking_envelope {
-            Some(String::new())
         } else {
             None
         }
@@ -4800,16 +5086,7 @@ fn compat_direct_response(
         if !thinking_text.is_empty() {
             thinking_tokens = token::count_tokens(thinking_text) as i32 + 6;
         }
-        let signature = if aws_b40_compat {
-            super::bedrock::signature(
-                &payload.model,
-                adaptive_thinking_requested(payload),
-                thinking_text,
-                usage_breakdown,
-            )
-        } else {
-            super::signature::generate_signature()
-        };
+        let signature = super::signature::generate_signature();
         content.push(json!({
             "type": "thinking",
             "thinking": thinking_text,
@@ -5067,16 +5344,7 @@ fn compat_direct_stream_response(
                 "index": 0,
                 "delta": {
                     "type": "signature_delta",
-                    "signature": if aws_b40_compat {
-                        super::bedrock::signature(
-                            &payload.model,
-                            adaptive_thinking_requested(payload),
-                            thinking_text,
-                            usage_breakdown,
-                        )
-                    } else {
-                        super::signature::generate_signature()
-                    }
+                    "signature": super::signature::generate_signature()
                 }
             }),
         ));
@@ -5266,33 +5534,46 @@ fn reject_invalid_model_reasoning(payload: &MessagesRequest) -> Option<Response>
     None
 }
 
-/// Enforce the Claude Opus 4.8 sampling contract at the AWS-B HTTP boundary.
+/// Enforce the modern Claude sampling contract at the AWS-B HTTP boundary.
 ///
-/// Opus 4.8 does not expose non-default sampling controls. Anthropic retains
+/// Opus 4.7 and later models do not expose non-default sampling controls.
+/// Anthropic retains
 /// narrow backwards compatibility for the default values (`temperature=1`
 /// and `top_p` in the documented 0.99..=1 range), while `top_k` is rejected
 /// whenever supplied. This function only validates request metadata; it never
 /// changes prompts, generation settings, or response text.
-fn reject_invalid_opus_48_sampling(
+fn reject_invalid_modern_sampling(
     payload: &MessagesRequest,
     aws_b40_compat: bool,
 ) -> Option<Response> {
-    if !aws_b40_compat || !super::compat::is_opus_4_8(&payload.model) {
+    let model = super::converter::map_model(&payload.model);
+    let rejects_sampling = model.as_deref().is_some_and(|model| {
+        matches!(
+            model,
+            "claude-opus-5" | "claude-opus-4.8" | "claude-opus-4.7" | "claude-sonnet-5"
+        )
+    });
+    if !aws_b40_compat || !rejects_sampling {
         return None;
     }
+    let model_name = payload.model.as_str();
 
     let message = if payload
         .temperature
         .is_some_and(|temperature| temperature != 1.0)
     {
-        Some("`temperature` must be omitted or set to 1 for Claude Opus 4.8")
+        Some(format!(
+            "`temperature` must be omitted or set to 1 for {model_name}"
+        ))
     } else if payload
         .top_p
         .is_some_and(|top_p| !(0.99..=1.0).contains(&top_p))
     {
-        Some("`top_p` must be omitted or between 0.99 and 1 for Claude Opus 4.8")
+        Some(format!(
+            "`top_p` must be omitted or between 0.99 and 1 for {model_name}"
+        ))
     } else if payload.top_k.is_some() {
-        Some("`top_k` is not supported for Claude Opus 4.8")
+        Some(format!("`top_k` is not supported for {model_name}"))
     } else {
         None
     }?;
@@ -5318,7 +5599,8 @@ fn reject_invalid_opus_48_sampling(
 /// 自定义 `budget_tokens`（如 5000/10000）作为精确控制，若强行覆写为 20000 会破坏其行为
 ///
 /// 触发后行为（与原 -thinking 后缀路径一致）：
-/// - 4.6+ opus / Sonnet 5：thinking={adaptive, 20000}，output_config={effort=high}
+/// - 4.6+ opus / Sonnet 5：thinking={adaptive, 20000}；未显式提供 effort 时
+///   才使用官方默认 high，显式 low/medium/high/xhigh/max 原样保留
 /// - 其他模型：thinking={enabled, 20000}
 fn model_is_opus_5(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
@@ -5380,15 +5662,11 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         display: preserved_display,
     });
 
-    if uses_adaptive_thinking {
-        if let Some(output_config) = payload.output_config.as_mut() {
-            output_config.effort = "high".to_string();
-        } else {
-            payload.output_config = Some(OutputConfig {
-                effort: "high".to_string(),
-                format: None,
-            });
-        }
+    if uses_adaptive_thinking && payload.output_config.is_none() {
+        payload.output_config = Some(OutputConfig {
+            effort: Some("high".to_string()),
+            format: None,
+        });
     }
 }
 
@@ -5496,7 +5774,7 @@ pub async fn post_messages_cc(
     if let Some(response) = reject_invalid_model_reasoning(&payload) {
         return response;
     }
-    if let Some(response) = reject_invalid_opus_48_sampling(&payload, aws_b40_compat) {
+    if let Some(response) = reject_invalid_modern_sampling(&payload, aws_b40_compat) {
         return response;
     }
 
@@ -5511,19 +5789,19 @@ pub async fn post_messages_cc(
     let gpt_passthrough = is_gpt_model(&payload.model);
     let aws_b40_initial_thinking_requested = aws_b40_compat
         && (payload.thinking.is_some() || payload.model.to_ascii_lowercase().contains("thinking"));
-    let aws_b40_initial_adaptive_signature = aws_b40_compat
-        && payload
-            .thinking
-            .as_ref()
-            .is_some_and(|thinking| thinking.thinking_type == "adaptive");
-    if let Some(response) = reject_invalid_thinking_signatures(&payload, aws_b40_compat) {
+    if let Some(response) = reject_invalid_thinking_signatures(&payload, aws_b40_compat).await {
         return response;
     }
     if aws_b40_compat {
         normalize_aws_b40_thinking(&mut payload);
         normalize_aws_b40_tool_choice(&mut payload);
+    } else {
+        normalize_opus_thinking(&mut payload);
     }
     if let Some(response) = kiro_request_preflight_error(&payload, aws_b40_compat) {
+        return response;
+    }
+    if let Some(response) = reject_invalid_thinking_request(&payload) {
         return response;
     }
 
@@ -5543,20 +5821,8 @@ pub async fn post_messages_cc(
         }
     };
 
-    if !aws_b40_compat {
-        normalize_opus_thinking(&mut payload);
-        if let Some(response) = reject_invalid_thinking_request(&payload) {
-            return response;
-        }
-    }
     let aws_b40_thinking_requested =
         aws_b40_compat && (aws_b40_initial_thinking_requested || payload.thinking.is_some());
-    let aws_b40_adaptive_signature = aws_b40_compat
-        && (aws_b40_initial_adaptive_signature
-            || payload
-                .thinking
-                .as_ref()
-                .is_some_and(|thinking| thinking.thinking_type == "adaptive"));
 
     // 结构化输出:校验 output_config.format 并注入 schema 指令(非法 schema 直接 400)。
     if let Some(response) = apply_structured_output(&mut payload) {
@@ -5574,9 +5840,10 @@ pub async fn post_messages_cc(
 
     if let Err(e) = normalize_remote_image_sources(&mut payload).await {
         tracing::warn!("远程图片处理失败: {}", e);
+        let message = remote_image_error_message(e, aws_b40_compat);
         return (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new("invalid_request_error", e)),
+            Json(ErrorResponse::new("invalid_request_error", message)),
         )
             .into_response();
     }
@@ -5755,7 +6022,6 @@ pub async fn post_messages_cc(
             forced_application_identity_reply,
             tool_choice_forces_tool(&payload),
             aws_b40_compat,
-            aws_b40_adaptive_signature,
             aws_b40_thinking_requested,
             cache_commit,
         )
@@ -5764,7 +6030,11 @@ pub async fn post_messages_cc(
         // 非流式响应：仅在配置开启时提取 thinking 块
         let cache_commit =
             super::cache::prepare_cache_commit(input_tokens, &payload, aws_b40_compat);
-        let extract_thinking = state.extract_thinking && thinking_enabled;
+        let extract_thinking = should_extract_nonstream_thinking(
+            state.extract_thinking,
+            thinking_enabled,
+            aws_b40_compat,
+        );
         handle_non_stream_request(
             provider,
             &request_body,
@@ -5783,7 +6053,6 @@ pub async fn post_messages_cc(
             forced_application_identity_reply,
             tool_choice_forces_tool(&payload),
             aws_b40_compat,
-            aws_b40_adaptive_signature,
             cache_commit,
         )
         .await
@@ -5811,10 +6080,10 @@ async fn handle_stream_request_buffered(
     forced_application_identity_reply: Option<String>,
     force_tool_only: bool,
     aws_b40_compat: bool,
-    aws_b40_adaptive_signature: bool,
     aws_b40_thinking_requested: bool,
     cache_commit: super::cache::CacheCommit,
 ) -> Response {
+    let exact_cache_ttl_plan = cache_commit.exact_ttl_plan();
     // 调用 Kiro API（支持多凭据故障转移）
     let upstream_started = Instant::now();
     let response = match provider.call_api_stream(request_body).await {
@@ -5831,8 +6100,9 @@ async fn handle_stream_request_buffered(
         initial_usage_breakdown,
         tool_name_map,
     );
+    ctx.set_exact_cache_ttl_plan(exact_cache_ttl_plan);
     if aws_b40_compat {
-        ctx.enable_aws_b40_compat(aws_b40_adaptive_signature);
+        ctx.enable_aws_b40_compat();
         ctx.set_aws_b40_thinking_requested(aws_b40_thinking_requested);
         ctx.set_thinking_text_visible(thinking_wants_summary);
         ctx.set_input_context_calibration(input_context_calibration);
@@ -5842,15 +6112,7 @@ async fn handle_stream_request_buffered(
     if thinking_enabled && !expose_thinking {
         ctx.hide_thinking_blocks();
     }
-    // 为旧 Kiro 协议准备 thinking 回退；新版 reasoningContentEvent 到达后会自动取消。
-    // 仅影响显式 thinking 请求，真实答案和普通请求不变。
-    if thinking_enabled
-        && expose_thinking
-        && thinking_wants_summary
-        && super::compat::model_omits_thinking(model)
-    {
-        ctx.set_synthetic_thinking(Some(super::compat::synthetic_thinking()));
-    }
+    // AWS-B 只透传原生 reasoning/signature，不为旧 Kiro 协议合成思考内容。
     ctx.set_output_token_limit(requested_max_tokens);
     if identity_sanitization {
         ctx.enable_identity_sanitization_with_profile(identity_sanitization_options(
@@ -5963,6 +6225,16 @@ fn create_buffered_sse_stream(
                                                 Ok(event) => {
                                                     // 缓冲事件（复用 StreamContext 的处理逻辑）
                                                     ctx.process_and_buffer(&event);
+                                                    if let Some((model, thinking, signature)) =
+                                                        ctx.take_native_signature_registration()
+                                                    {
+                                                        super::signature::register_native_signature(
+                                                            &model,
+                                                            &thinking,
+                                                            &signature,
+                                                        )
+                                                        .await;
+                                                    }
                                                 }
                                                 Err(e) => {
                                                     tracing::warn!("解析上游事件失败: {}", e);
@@ -5983,6 +6255,16 @@ fn create_buffered_sse_stream(
                                 ctx.mark_upstream_fatal_event();
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
+                                if let Some((model, thinking, signature)) =
+                                    ctx.take_native_signature_registration()
+                                {
+                                    super::signature::register_native_signature(
+                                        &model,
+                                        &thinking,
+                                        &signature,
+                                    )
+                                    .await;
+                                }
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
@@ -6076,6 +6358,16 @@ fn create_buffered_sse_stream(
                                 }
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
                                 let all_events = ctx.finish_and_get_all_events();
+                                if let Some((model, thinking, signature)) =
+                                    ctx.take_native_signature_registration()
+                                {
+                                    super::signature::register_native_signature(
+                                        &model,
+                                        &thinking,
+                                        &signature,
+                                    )
+                                    .await;
+                                }
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
@@ -6590,7 +6882,7 @@ mod tests {
         ] {
             let request = parse("claude-opus-4-8", extra.clone());
             assert!(
-                reject_invalid_opus_48_sampling(&request, true).is_none(),
+                reject_invalid_modern_sampling(&request, true).is_none(),
                 "compatible sampling parameters must pass: {extra}"
             );
         }
@@ -6606,7 +6898,7 @@ mod tests {
         ] {
             let request = parse("claude-opus-4-8", extra.clone());
             assert_eq!(
-                reject_invalid_opus_48_sampling(&request, true)
+                reject_invalid_modern_sampling(&request, true)
                     .expect("unsupported sampling parameter must be rejected")
                     .status(),
                 StatusCode::BAD_REQUEST,
@@ -6621,22 +6913,27 @@ mod tests {
             "anthropic.claude-opus-4-8",
             serde_json::json!({"temperature": 0.7}),
         );
-        assert!(reject_invalid_opus_48_sampling(&opus, true).is_some());
-        assert!(reject_invalid_opus_48_sampling(&opus, false).is_none());
+        assert!(reject_invalid_modern_sampling(&opus, true).is_some());
+        assert!(reject_invalid_modern_sampling(&opus, false).is_none());
 
         let sonnet = parse(
             "claude-sonnet-4-6",
             serde_json::json!({"temperature": 0.7, "top_k": 10}),
         );
-        assert!(reject_invalid_opus_48_sampling(&sonnet, true).is_none());
+        assert!(reject_invalid_modern_sampling(&sonnet, true).is_none());
     }
 
-    #[test]
-    fn aws_b_thinking_signatures_accept_valid_and_ignore_tampered_history() {
-        let signature =
-            super::super::signature::generate_aws_b40_signature_for_model("claude-opus-4-8");
-        let valid = parse(
+    #[tokio::test]
+    async fn aws_b_accepts_only_registered_native_signature_and_rejects_tampering() {
+        let signature = "opaque-native-upstream-signature".repeat(16);
+        super::super::signature::register_native_signature(
             "claude-opus-4-8",
+            "checked",
+            &signature,
+        )
+        .await;
+        let valid = parse(
+            "anthropic.claude-opus-4-8",
             serde_json::json!({
                 "messages": [
                     {
@@ -6651,10 +6948,11 @@ mod tests {
                 ]
             }),
         );
-        assert!(reject_invalid_thinking_signatures(&valid, true).is_none());
         assert!(
-            reject_invalid_thinking_signatures(&valid, false).is_none(),
-            "the strict profile must continue accepting an intact local HMAC"
+            reject_invalid_thinking_signatures(&valid, true)
+                .await
+                .is_none(),
+            "canonical model aliases must share the exact native registration"
         );
 
         let mut tampered_signature = valid.messages[0].content[0]["signature"]
@@ -6670,101 +6968,50 @@ mod tests {
         let mut tampered = valid.clone();
         tampered.messages[0].content[0]["signature"] =
             serde_json::Value::String(String::from_utf8(tampered_signature).unwrap());
-        assert!(
-            reject_invalid_thinking_signatures(&tampered, true).is_none(),
-            "AWS-B must ignore an inbound signature that is not forwarded upstream"
-        );
         assert_eq!(
-            reject_invalid_thinking_signatures(&tampered, false)
-                .expect("the strict profile must still reject a tampered signature")
+            reject_invalid_thinking_signatures(&tampered, true)
+                .await
+                .expect("a modified native signature must be rejected")
                 .status(),
             StatusCode::BAD_REQUEST
         );
-    }
 
-    #[test]
-    fn aws_b_ignores_foreign_signature_while_strict_profile_rejects_it() {
-        let mut foreign_signature = super::super::signature::generate_signature().into_bytes();
-        foreign_signature[30] = if foreign_signature[30] == b'A' {
-            b'B'
-        } else {
-            b'A'
-        };
-        let external = parse(
-            "claude-opus-4-8",
-            serde_json::json!({
-                "messages": [
-                    {
-                        "role": "assistant",
-                        "content": [{
-                            "type": "thinking",
-                            "thinking": "imported history",
-                            "signature": String::from_utf8(foreign_signature).unwrap()
-                        }]
-                    },
-                    {"role": "user", "content": "continue"}
-                ]
-            }),
-        );
-
-        assert!(reject_invalid_thinking_signatures(&external, true).is_none());
+        let mut changed_thinking = valid.clone();
+        changed_thinking.messages[0].content[0]["thinking"] =
+            serde_json::Value::String("changed".to_string());
         assert_eq!(
-            reject_invalid_thinking_signatures(&external, false)
-                .expect("the non-Bedrock profile remains strict")
+            reject_invalid_thinking_signatures(&changed_thinking, true)
+                .await
+                .expect("the native signature must be bound to the exact outbound thinking text")
                 .status(),
             StatusCode::BAD_REQUEST
         );
-    }
 
-    /// 曾经用进程内指纹登记判断“已签发签名是否被局部改动”。该判定在生产
-    /// 多容器 replay 中大量误杀，也无法验证 thinking 正文的完整性。
-    ///
-    /// 拒绝它换不来任何完整性保证，理由有二：
-    ///   1. 签名体是 `rand_bytes()` + HMAC（见 signature::generate_hmac_blob），
-    ///      **不绑定 thinking 正文**，无法证明思考内容未被篡改；
-    ///   2. 校验入口本就在缺少 `signature` 字段时直接放行，想伪造 thinking 的
-    ///      客户端只需省略该字段即可绕过——这道检查只惩罚老实回传签名的客户端。
-    ///
-    /// 因此 AWS-B 将入站签名整体视为不透明元数据并放行。
-    #[test]
-    fn aws_b_ignores_locally_modified_signature_history() {
-        use base64::Engine;
-        use base64::engine::general_purpose::STANDARD as BASE64;
-
-        let issued = super::super::signature::generate_signature();
-
-        let mut modified = BASE64.decode(issued).unwrap();
-        let midpoint = modified.len() / 2;
-        modified[midpoint] ^= 0x01;
-        let request = parse(
+        let local_hmac = super::super::signature::generate_signature();
+        let strict_profile = parse(
             "claude-opus-4-8",
             serde_json::json!({
-                "messages": [
-                    {
-                        "role": "assistant",
-                        "content": [{
-                            "type": "thinking",
-                            "thinking": "imported history",
-                            "signature": BASE64.encode(modified)
-                        }]
-                    },
-                    {"role": "user", "content": "continue"}
-                ]
+                "messages": [{
+                    "role": "assistant",
+                    "content": [{
+                        "type": "thinking",
+                        "thinking": "legacy",
+                        "signature": local_hmac
+                    }]
+                }, {"role": "user", "content": "continue"}]
             }),
         );
-
         assert!(
-            reject_invalid_thinking_signatures(&request, true).is_none(),
-            "重新序列化的已签发签名应放行，不应再返回 400"
+            reject_invalid_thinking_signatures(&strict_profile, false)
+                .await
+                .is_none(),
+            "non-AWS profiles must retain local HMAC validation"
         );
     }
 
-    /// AWS-B 不把入站 signature 送给 Kiro，上游请求只保留 thinking 文本；
-    /// 缺字段或非字符串值本来也会绕过旧校验。因此即使签名值本身损坏，也不能
-    /// 让一段原本可继续的历史会话在网关层被无意义地拒绝。
-    #[test]
-    fn aws_b_ignores_structurally_invalid_signature_but_strict_profile_rejects_it() {
-        for signature in ["!!!not-base64!!!", ""] {
+    #[tokio::test]
+    async fn aws_b_rejects_empty_malformed_and_unknown_native_signatures() {
+        for signature in ["!!!not-base64!!!", "", "unknown-opaque-signature"] {
             let request = parse(
                 "claude-opus-4-8",
                 serde_json::json!({
@@ -6782,62 +7029,44 @@ mod tests {
                 }),
             );
 
-            assert!(reject_invalid_thinking_signatures(&request, true).is_none());
             assert_eq!(
-                reject_invalid_thinking_signatures(&request, false)
-                    .expect("the strict profile must retain signature validation")
+                reject_invalid_thinking_signatures(&request, true)
+                    .await
+                    .expect("unregistered, empty, or malformed native signatures must fail closed")
                     .status(),
                 StatusCode::BAD_REQUEST
             );
         }
-    }
 
-    /// Production observed opaque signatures with decoded lengths 2,047 and
-    /// 4,603 bytes. Their contents are deliberately irrelevant in AWS-B because
-    /// the converter drops the field. Include an over-8-KiB case as well so a
-    /// future provider/model cannot reintroduce the same size-gate bug.
-    #[test]
-    fn aws_b_accepts_large_unknown_opaque_thinking_signatures() {
-        use base64::Engine;
-        use base64::engine::general_purpose::STANDARD as BASE64;
-
-        for (decoded_len, stream) in [(2_047, false), (4_603, true), (16_384, false)] {
-            let signature = BASE64.encode(vec![0xa5; decoded_len]);
+        for signature_value in [serde_json::Value::Null, serde_json::json!(123)] {
             let request = parse(
                 "claude-opus-4-8",
                 serde_json::json!({
-                    "stream": stream,
                     "messages": [
                         {
                             "role": "assistant",
                             "content": [{
                                 "type": "thinking",
-                                "thinking": "imported long-thinking history",
-                                "signature": signature
+                                "thinking": "missing or non-string signature",
+                                "signature": signature_value
                             }]
                         },
                         {"role": "user", "content": "continue"}
                     ]
                 }),
             );
-
-            assert!(
-                reject_invalid_thinking_signatures(&request, true).is_none(),
-                "AWS-B must ignore opaque signatures with decoded length {decoded_len}"
-            );
             assert_eq!(
-                reject_invalid_thinking_signatures(&request, false)
-                    .expect("the strict profile must still validate opaque signatures")
+                reject_invalid_thinking_signatures(&request, true)
+                    .await
+                    .expect("missing and non-string native signatures must be rejected")
                     .status(),
                 StatusCode::BAD_REQUEST
             );
         }
     }
 
-    /// 缺少 signature 字段时本就放行——这是“该检查无安全价值”的直接证据，
-    /// 固化下来避免以后有人误以为它能防伪造。
-    #[test]
-    fn aws_b_accepts_thinking_block_without_signature() {
+    #[tokio::test]
+    async fn aws_b_rejects_thinking_block_without_signature() {
         let request = parse(
             "claude-opus-4-8",
             serde_json::json!({
@@ -6851,7 +7080,13 @@ mod tests {
             }),
         );
 
-        assert!(reject_invalid_thinking_signatures(&request, true).is_none());
+        assert_eq!(
+            reject_invalid_thinking_signatures(&request, true)
+                .await
+                .expect("a native thinking block must include its signature")
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]
@@ -7045,7 +7280,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aws_b_direct_nonstream_only_adds_thinking_when_summarized() {
+    async fn aws_b_direct_nonstream_never_fabricates_thinking() {
         let request = |display: Option<&str>| {
             let thinking = match display {
                 Some(display) => serde_json::json!({
@@ -7095,9 +7330,8 @@ mod tests {
                 .expect("summarized response body"),
         )
         .expect("summarized JSON response");
-        assert_eq!(summarized_body["content"].as_array().unwrap().len(), 2);
-        assert_eq!(summarized_body["content"][0]["type"], "thinking");
-        assert_eq!(summarized_body["content"][1]["type"], "text");
+        assert_eq!(summarized_body["content"].as_array().unwrap().len(), 1);
+        assert_eq!(summarized_body["content"][0]["type"], "text");
     }
 
     #[test]
@@ -8977,7 +9211,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aws_b_platform_identity_adaptive_signature_is_cache_state_independent() {
+    async fn aws_b_platform_identity_direct_reply_has_no_local_signature() {
         let req = parse(
             "claude-opus-4-8",
             serde_json::json!({
@@ -9011,10 +9245,10 @@ mod tests {
             }),
         );
 
-        async fn signature_raw(
+        async fn has_signature_delta(
             req: &MessagesRequest,
             usage: super::super::cache::UsageBreakdown,
-        ) -> Vec<u8> {
+        ) -> bool {
             let response = compat_direct_response(req, usage, true)
                 .expect("platform identity should use the compatibility response");
             let body = String::from_utf8(
@@ -9024,28 +9258,18 @@ mod tests {
                     .to_vec(),
             )
             .expect("UTF-8 SSE");
-            let signature = body
-                .lines()
+            body.lines()
                 .filter_map(|line| line.strip_prefix("data: "))
                 .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                .find_map(|event| {
-                    (event
+                .any(|event| {
+                    event
                         .pointer("/delta/type")
                         .and_then(serde_json::Value::as_str)
-                        == Some("signature_delta"))
-                    .then(|| {
-                        event
-                            .pointer("/delta/signature")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string)
-                    })
-                    .flatten()
+                        == Some("signature_delta")
                 })
-                .expect("signature delta");
-            BASE64.decode(signature).expect("base64 signature")
         }
 
-        let cache_create = signature_raw(
+        let cache_create_has_signature = has_signature_delta(
             &req,
             super::super::cache::UsageBreakdown {
                 input_tokens: 246,
@@ -9056,10 +9280,9 @@ mod tests {
             },
         )
         .await;
-        assert!(cache_create.len() > 12);
-        assert_eq!(&cache_create[3..7], &[0x0a, 0x71, 0x08, 0x0f]);
+        assert!(!cache_create_has_signature);
 
-        let cache_read = signature_raw(
+        let cache_read_has_signature = has_signature_delta(
             &req,
             super::super::cache::UsageBreakdown {
                 input_tokens: 246,
@@ -9070,9 +9293,7 @@ mod tests {
             },
         )
         .await;
-        assert!(cache_read.len() > 12);
-        assert_eq!(&cache_read[3..7], &[0x0a, 0x71, 0x08, 0x0f]);
-        assert_ne!(cache_create, cache_read);
+        assert!(!cache_read_has_signature);
     }
 
     #[test]
@@ -9194,7 +9415,7 @@ mod tests {
     }
 
     #[test]
-    fn aws_b_preserves_opus_4_7_adaptive_thinking_for_success_first_tools() {
+    fn aws_b_preserves_opus_4_7_adaptive_thinking_and_effort() {
         let mut req = parse(
             "claude-opus-4-7-thinking",
             serde_json::json!({
@@ -9214,8 +9435,8 @@ mod tests {
         assert_eq!(
             req.output_config
                 .as_ref()
-                .map(|config| config.effort.as_str()),
-            Some("high")
+                .and_then(|config| config.effort.as_deref()),
+            Some("max")
         );
         assert_eq!(req.model, "claude-opus-4-7");
     }
@@ -9263,23 +9484,42 @@ mod tests {
     }
 
     #[test]
-    fn kiro_native_effort_defaults_to_medium_for_thinking_requests() {
-        let req = parse(
+    fn kiro_native_adaptive_effort_defaults_to_high_and_matches_explicit_high() {
+        let mut omitted = parse(
             "claude-opus-4-8",
             serde_json::json!({
                 "thinking": {"type": "adaptive"}
             }),
         );
+        let mut explicit = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "high"}
+            }),
+        );
 
-        let fields = kiro_model_request_fields(&req)
+        normalize_aws_b40_thinking(&mut omitted);
+        normalize_aws_b40_thinking(&mut explicit);
+
+        let omitted_fields = kiro_model_request_fields(&omitted)
             .expect("valid native effort")
             .expect("native model fields");
+        let explicit_fields = kiro_model_request_fields(&explicit)
+            .expect("valid explicit native effort")
+            .expect("explicit native model fields");
+
+        assert_eq!(omitted_fields, explicit_fields);
         assert_eq!(
-            fields
+            omitted_fields
                 .output_config
                 .as_ref()
                 .map(|config| config.effort.as_str()),
-            Some("medium")
+            Some("high")
+        );
+        assert_eq!(
+            serde_json::to_value(&omitted_fields).expect("serialize omitted effort fields"),
+            serde_json::to_value(&explicit_fields).expect("serialize explicit effort fields")
         );
     }
 
@@ -9414,7 +9654,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_native_effort_preserves_supported_levels_and_clamps_xhigh() {
+    fn kiro_native_effort_preserves_supported_levels_and_rejects_unsupported_xhigh() {
         let opus_48 = parse(
             "claude-opus-4-8",
             serde_json::json!({
@@ -9437,27 +9677,27 @@ mod tests {
                 "output_config": {"effort": "xhigh"}
             }),
         );
-        assert_eq!(
+        assert!(
             kiro_model_request_fields(&opus_46)
-                .expect("valid Claude effort")
-                .and_then(|fields| fields.output_config)
-                .map(|config| config.effort),
-            Some("max".to_string())
+                .expect_err("Opus 4.6 does not support xhigh")
+                .contains("is not supported for model")
         );
     }
 
     #[test]
-    fn kiro_native_effort_is_omitted_without_thinking_or_for_unknown_values() {
+    fn kiro_native_effort_works_without_thinking_and_rejects_unknown_values() {
         let no_thinking = parse(
             "claude-opus-4-8",
             serde_json::json!({
-                "output_config": {"effort": "high"}
+                "output_config": {"effort": "low"}
             }),
         );
-        assert!(
+        assert_eq!(
             kiro_model_request_fields(&no_thinking)
-                .expect("valid omitted thinking")
-                .is_none()
+                .expect("effort without thinking is valid")
+                .and_then(|fields| fields.output_config)
+                .map(|config| config.effort),
+            Some("low".to_string())
         );
 
         let unknown = parse(
@@ -9467,10 +9707,59 @@ mod tests {
                 "output_config": {"effort": "turbo"}
             }),
         );
+        let error = kiro_model_request_fields(&unknown)
+            .expect_err("unknown Claude effort must not be silently omitted");
+        assert!(error.contains("output_config.effort must be one of"));
+    }
+
+    #[test]
+    fn format_only_output_config_does_not_enable_or_validate_effort() {
+        let request = parse(
+            "claude-sonnet-4-5",
+            serde_json::json!({
+                "output_config": {
+                    "format": {
+                        "type": "json_schema",
+                        "schema": {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": false
+                        }
+                    }
+                }
+            }),
+        );
+
         assert!(
-            kiro_model_request_fields(&unknown)
-                .expect("unknown Claude effort is omitted")
+            kiro_model_request_fields(&request)
+                .expect("format-only config is valid")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn enabled_thinking_model_matrix_includes_opus_4_5() {
+        let opus_45 = parse(
+            "claude-opus-4-5-20251101",
+            serde_json::json!({
+                "max_tokens": 8192,
+                "thinking": {"type": "enabled", "budget_tokens": 4096}
+            }),
+        );
+        assert!(reject_invalid_thinking_request(&opus_45).is_none());
+
+        let opus_48 = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "max_tokens": 8192,
+                "thinking": {"type": "enabled", "budget_tokens": 4096}
+            }),
+        );
+        assert_eq!(
+            reject_invalid_thinking_request(&opus_48)
+                .expect("Opus 4.8 requires adaptive thinking")
+                .status(),
+            StatusCode::BAD_REQUEST
         );
     }
 
@@ -9704,9 +9993,7 @@ mod tests {
     }
 
     #[test]
-    fn opus_4_7_with_adaptive_max_effort_is_normalized() {
-        // 客户实际场景（xueding_aws_req.json）：model=claude-opus-4-7 + adaptive + effort=max
-        // 新逻辑：adaptive 字段触发"虚拟 -thinking 后缀"路径，完全覆写
+    fn opus_4_7_with_adaptive_preserves_explicit_max_effort() {
         let mut req = parse(
             "claude-opus-4-7",
             serde_json::json!({
@@ -9720,8 +10007,11 @@ mod tests {
         assert_eq!(thinking.thinking_type, "adaptive");
         // adaptive 模式 budget_tokens 被覆写为标准 20000（adaptive 不依赖 budget）
         assert_eq!(thinking.budget_tokens, 20000);
-        // effort 被覆写为 high（覆盖客户传入的 max）
-        assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
+        // Explicit effort overrides the official high default.
+        assert_eq!(
+            req.output_config.as_ref().unwrap().effort.as_deref(),
+            Some("max")
+        );
     }
 
     #[test]
@@ -9731,7 +10021,10 @@ mod tests {
             serde_json::json!({"thinking": {"type": "adaptive"}}),
         );
         override_thinking_from_model_name(&mut req);
-        assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
+        assert_eq!(
+            req.output_config.as_ref().unwrap().effort.as_deref(),
+            Some("high")
+        );
         assert_eq!(req.thinking.as_ref().unwrap().thinking_type, "adaptive");
     }
 
@@ -9742,7 +10035,10 @@ mod tests {
         let thinking = req.thinking.as_ref().unwrap();
         assert_eq!(thinking.thinking_type, "adaptive");
         assert_eq!(thinking.budget_tokens, 20000);
-        assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
+        assert_eq!(
+            req.output_config.as_ref().unwrap().effort.as_deref(),
+            Some("high")
+        );
     }
 
     #[test]
@@ -9766,7 +10062,10 @@ mod tests {
         let thinking = req.thinking.as_ref().unwrap();
         assert_eq!(thinking.thinking_type, "adaptive");
         assert_eq!(thinking.budget_tokens, 20000);
-        assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
+        assert_eq!(
+            req.output_config.as_ref().unwrap().effort.as_deref(),
+            Some("high")
+        );
     }
 
     #[test]
@@ -9790,7 +10089,18 @@ mod tests {
         let thinking = req.thinking.as_ref().unwrap();
         assert_eq!(thinking.thinking_type, "adaptive");
         assert_eq!(thinking.budget_tokens, 20000);
-        assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
+        assert_eq!(
+            req.output_config.as_ref().unwrap().effort.as_deref(),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn aws_b_explicit_thinking_ignores_legacy_extract_toggle() {
+        assert!(should_extract_nonstream_thinking(false, true, true));
+        assert!(should_extract_nonstream_thinking(true, true, true));
+        assert!(!should_extract_nonstream_thinking(false, true, false));
+        assert!(!should_extract_nonstream_thinking(true, false, true));
     }
 
     #[test]
@@ -9804,7 +10114,7 @@ mod tests {
             assert_eq!(
                 req.output_config
                     .as_ref()
-                    .map(|config| config.effort.as_str()),
+                    .and_then(|config| config.effort.as_deref()),
                 Some("high"),
                 "model={model}"
             );
@@ -9838,13 +10148,17 @@ mod tests {
             );
             normalize_aws_b40_thinking(&mut req);
             let output_config = req.output_config.as_ref().expect("output_config retained");
-            assert_eq!(output_config.effort, "high", "model={model}");
+            assert_eq!(
+                output_config.effort.as_deref(),
+                Some("max"),
+                "model={model}"
+            );
             assert!(output_config.format.is_some(), "model={model}");
         }
     }
 
     #[test]
-    fn generation_5_thinking_sends_adaptive_high_prefix_upstream() {
+    fn generation_5_thinking_sends_native_high_without_xml_prefix() {
         for model in ["claude-opus-5-thinking", "claude-sonnet-5-thinking"] {
             let mut req = parse(model, serde_json::json!({}));
             override_thinking_from_model_name(&mut req);
@@ -9854,16 +10168,16 @@ mod tests {
                 .expect("conversation state serializes");
 
             assert!(
-                wire.contains("<thinking_mode>adaptive</thinking_mode>"),
-                "model={model}"
+                !wire.contains("<thinking_mode>") && !wire.contains("<thinking_effort>"),
+                "adaptive effort must not be duplicated in the prompt: model={model}"
             );
-            assert!(
-                wire.contains("<thinking_effort>high</thinking_effort>"),
+            assert_eq!(
+                kiro_model_request_fields(&req)
+                    .expect("valid native effort")
+                    .and_then(|fields| fields.output_config)
+                    .map(|config| config.effort),
+                Some("high".to_string()),
                 "model={model}"
-            );
-            assert!(
-                !wire.contains("<max_thinking_length>"),
-                "adaptive 5th-generation requests must not use the legacy budget prefix: {model}"
             );
         }
     }
@@ -9911,7 +10225,10 @@ mod tests {
         );
         override_thinking_from_model_name(&mut req);
         assert_eq!(req.thinking.as_ref().unwrap().budget_tokens, 5000);
-        assert_eq!(req.output_config.as_ref().unwrap().effort, "max");
+        assert_eq!(
+            req.output_config.as_ref().unwrap().effort.as_deref(),
+            Some("max")
+        );
     }
 
     #[test]
@@ -9947,9 +10264,9 @@ mod tests {
     }
 
     /// Claude Code 普通用户：opus 4.6 + thinking enabled，不传 output_config
-    /// 验证：补 output_config 不影响 enabled 模式的 prefix 生成
+    /// 验证：enabled 只使用原生 effort，不改写用户 prompt
     #[test]
-    fn claude_code_opus_4_6_thinking_enabled_prefix_unchanged() {
+    fn claude_code_opus_4_6_thinking_enabled_uses_native_effort_only() {
         let mut req = parse(
             "claude-opus-4-6",
             serde_json::json!({
@@ -9958,35 +10275,15 @@ mod tests {
         );
         override_thinking_from_model_name(&mut req);
 
-        // 跑 convert_request 拿到注入的前缀
+        // Kiro conversation 中不应出现兼容 XML。
         let result = crate::anthropic::converter::convert_request(&req).unwrap();
-        let kiro_json = serde_json::to_value(&result.conversation_state).unwrap();
-        let history = kiro_json
-            .pointer("/history")
-            .and_then(|v| v.as_array())
-            .unwrap();
-        let first_user_content = history
-            .iter()
-            .find_map(|m| {
-                m.pointer("/userInputMessage/content")
-                    .and_then(|v| v.as_str())
-            })
-            .unwrap_or("");
-
-        // enabled 模式的前缀是 <max_thinking_length>，不依赖 effort
-        assert!(
-            first_user_content.contains("<thinking_mode>enabled</thinking_mode>"),
-            "enabled 模式前缀必须保留"
-        );
-        assert!(
-            first_user_content.contains("<max_thinking_length>15000</max_thinking_length>"),
-            "客户传入的 budget_tokens 必须保留到上游"
-        );
-        // enabled 模式不应注入 effort 标签
-        assert!(
-            !first_user_content.contains("<thinking_effort>"),
-            "enabled 模式不应有 thinking_effort 标签"
-        );
+        let kiro_json = serde_json::to_string(&result.conversation_state).unwrap();
+        assert!(!kiro_json.contains("<thinking_mode>"));
+        assert!(!kiro_json.contains("<max_thinking_length>"));
+        let fields = kiro_model_request_fields(&req)
+            .unwrap()
+            .expect("opus 4.6 supports native effort");
+        assert_eq!(fields.output_config.unwrap().effort, "high");
     }
 
     /// Claude Code 普通用户：opus 4.6-thinking 后缀（旧行为路径）
@@ -9998,7 +10295,10 @@ mod tests {
         let t = req.thinking.as_ref().unwrap();
         assert_eq!(t.thinking_type, "adaptive");
         assert_eq!(t.budget_tokens, 20000);
-        assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
+        assert_eq!(
+            req.output_config.as_ref().unwrap().effort.as_deref(),
+            Some("high")
+        );
     }
 
     /// Claude Code 普通用户：什么都不传 thinking 时，函数应直接 return
@@ -10040,14 +10340,20 @@ mod tests {
         let mut req: MessagesRequest = serde_json::from_value(raw).expect("反序列化必须成功");
         assert_eq!(req.model, "claude-opus-4-7");
         assert_eq!(req.thinking.as_ref().unwrap().thinking_type, "adaptive");
-        assert_eq!(req.output_config.as_ref().unwrap().effort, "max");
+        assert_eq!(
+            req.output_config.as_ref().unwrap().effort.as_deref(),
+            Some("max")
+        );
 
         // 步骤 2: 规整 thinking / effort
         override_thinking_from_model_name(&mut req);
         // 客户传的 thinking 配置应保留
         assert_eq!(req.thinking.as_ref().unwrap().thinking_type, "adaptive");
-        // effort 被规整为 high
-        assert_eq!(req.output_config.as_ref().unwrap().effort, "high");
+        // Explicit max overrides the official high default.
+        assert_eq!(
+            req.output_config.as_ref().unwrap().effort.as_deref(),
+            Some("max")
+        );
 
         // 步骤 3: thinking_enabled 判定
         let thinking_enabled = req
@@ -10075,27 +10381,19 @@ mod tests {
             "上游收到的 modelId 必须是 claude-opus-4.7"
         );
 
-        // thinking 前缀注入：history 第一条 user 消息含 adaptive + effort=high
-        let history = kiro_json
-            .pointer("/history")
-            .and_then(|v| v.as_array())
-            .expect("history 必须存在");
-        let first_user_content = history
-            .iter()
-            .find_map(|m| {
-                m.pointer("/userInputMessage/content")
-                    .and_then(|v| v.as_str())
-            })
-            .expect("history 必须包含至少一条 user 消息");
-
+        // Adaptive effort is a native root field and must not alter the prompt.
+        let conversation_wire = serde_json::to_string(&kiro_json).unwrap();
         assert!(
-            first_user_content.contains("<thinking_mode>adaptive</thinking_mode>"),
-            "system message 前缀必须包含 adaptive 模式标签，实际内容: {}",
-            &first_user_content[..first_user_content.len().min(200)]
+            !conversation_wire.contains("<thinking_mode>")
+                && !conversation_wire.contains("<thinking_effort>"),
+            "adaptive thinking must not inject XML into model-visible content"
         );
-        assert!(
-            first_user_content.contains("<thinking_effort>high</thinking_effort>"),
-            "system message 前缀必须包含 effort=high 标签"
+        assert_eq!(
+            kiro_model_request_fields(&req)
+                .expect("valid native effort")
+                .and_then(|fields| fields.output_config)
+                .map(|config| config.effort),
+            Some("max".to_string())
         );
 
         // 步骤 5: 响应回写 model 字段验证（这一层在 handle_non_stream_request 内部）
@@ -10288,6 +10586,41 @@ mod tests {
         assert!(
             estimated > token::count_tokens(AUTO_CONTINUE_PROMPT) as i32,
             "continuation billing estimate must include prior user and assistant history"
+        );
+    }
+
+    #[test]
+    fn continuation_estimator_does_not_count_native_cache_points_as_prompt_text() {
+        let with_cache_point: crate::kiro::model::requests::conversation::UserInputMessageContext =
+            serde_json::from_value(json!({
+                "tools": [
+                    {
+                        "toolSpecification": {
+                            "name": "lookup",
+                            "description": "Look up a value",
+                            "inputSchema": {"json": {"type": "object", "properties": {}}}
+                        }
+                    },
+                    {"cachePoint": {"type": "default", "ttl": "1h"}}
+                ]
+            }))
+            .expect("context with native cache point");
+        let without_cache_point: crate::kiro::model::requests::conversation::UserInputMessageContext =
+            serde_json::from_value(json!({
+                "tools": [{
+                    "toolSpecification": {
+                        "name": "lookup",
+                        "description": "Look up a value",
+                        "inputSchema": {"json": {"type": "object", "properties": {}}}
+                    }
+                }]
+            }))
+            .expect("context without native cache point");
+
+        assert_eq!(
+            estimate_context_tokens(&with_cache_point, 0),
+            estimate_context_tokens(&without_cache_point, 0),
+            "cachePoint is a transport control and must not become billable language input"
         );
     }
 
@@ -10600,6 +10933,16 @@ mod tests {
     }
 
     #[test]
+    fn remote_image_error_mapping_is_systemic_and_profile_scoped() {
+        let cause = "Image URL host did not resolve to a public address".to_string();
+        let aws_b = remote_image_error_message(cause.clone(), true);
+        assert!(aws_b.contains("Could not process image (remote request failed)"));
+        assert!(aws_b.contains("get file base64 from URL failed"));
+        assert!(aws_b.ends_with(&cause));
+        assert_eq!(remote_image_error_message(cause.clone(), false), cause);
+    }
+
+    #[test]
     fn remote_image_ip_policy_blocks_private_and_reserved_ranges() {
         for ip in [
             "0.0.0.0",
@@ -10626,6 +10969,18 @@ mod tests {
         assert!(!is_disallowed_remote_ip(
             "2606:4700:4700::1111".parse().unwrap()
         ));
+    }
+
+    #[test]
+    fn fake_ip_dns_detection_is_narrow_and_does_not_make_it_public() {
+        for ip in ["198.18.0.231", "198.19.255.254", "::ffff:0:c612:e7"] {
+            let ip = ip.parse().unwrap();
+            assert!(is_fake_ip_dns_address(ip));
+            assert!(is_disallowed_remote_ip(ip));
+        }
+        for ip in ["198.17.255.255", "198.20.0.1", "10.0.0.1", "8.8.8.8"] {
+            assert!(!is_fake_ip_dns_address(ip.parse().unwrap()));
+        }
     }
 
     #[tokio::test]
