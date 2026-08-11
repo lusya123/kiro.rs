@@ -751,11 +751,12 @@ fn local_cache_min_tokens(model: &str) -> Option<i32> {
 
 /// Cache-registry mutation prepared from the exact request prefix.
 ///
-/// Planning usage is deliberately read-only.  The caller owns this value and
-/// commits it only after the first upstream model invocation has completed
-/// successfully.  This prevents validation failures, local compatibility
-/// replies and failed provider calls from warming the public cache-accounting
-/// registry even though no upstream prompt cache could have been created.
+/// Planning usage is deliberately read-only. The caller owns this value and
+/// commits it only after the request has produced a successful response. That
+/// includes approved local compatibility responses: the registry models the
+/// public Anthropic prefix-cache contract, while Kiro usage is accounted as an
+/// ordinary upstream input/output request. Validation failures and failed
+/// provider calls must never warm this local accounting registry.
 #[derive(Debug, Default)]
 pub(super) struct CacheCommit {
     entries: Vec<(CacheKey, CacheTtl)>,
@@ -778,10 +779,10 @@ impl CacheCommit {
     }
 }
 
-/// Prepare the registry keys that may become warm after a successful upstream
-/// invocation.  This is intentionally separate from usage planning: the
-/// latter may run for a local short-circuit response and must never mutate
-/// cache state.
+/// Prepare the registry keys that may become warm after a successful response.
+/// This is intentionally separate from usage planning so the first response is
+/// still reported as a creation and only a later matching prefix becomes a
+/// read. Merely inspecting or validating a request must never mutate state.
 pub(super) fn prepare_cache_commit(
     total_input_tokens: i32,
     req: &MessagesRequest,

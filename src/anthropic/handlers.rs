@@ -2753,7 +2753,10 @@ pub async fn post_messages(
             aws_b40_compat,
         )
         .await;
-        return super::code_execution::handle_request(&payload, usage);
+        let cache_commit =
+            super::cache::prepare_cache_commit(input_tokens, &payload, aws_b40_compat);
+        let response = super::code_execution::handle_request(&payload, usage);
+        return finish_local_response(response, cache_commit).await;
     }
     if !gpt_passthrough && aws_b40_compat {
         super::code_execution::remove_unrequested_optional_tools(&mut payload);
@@ -2867,16 +2870,17 @@ pub async fn post_messages(
         super::bedrock::InputContextCalibration::default()
     };
 
+    // The prefix registry is a local Anthropic accounting layer. Prepare it
+    // before choosing the response path so a successful in-process reply can
+    // warm the same Redis prefix as a successful provider-backed reply.
+    let cache_commit = super::cache::prepare_cache_commit(input_tokens, &payload, aws_b40_compat);
     if let Some(response) =
         compat_direct_response(&payload, initial_usage_breakdown, aws_b40_compat)
     {
+        let response = finish_local_response(response, cache_commit).await;
         apply_compat_reply_delay(aws_b40_compat).await;
         return response;
     }
-
-    // Usage planning is read-only.  Carry the exact prefix keys into the real
-    // upstream path and mark them warm only after that invocation completes.
-    let cache_commit = super::cache::prepare_cache_commit(input_tokens, &payload, aws_b40_compat);
 
     // 检查是否启用了 thinking，以及是否向客户端暴露 thinking 块。
     let thinking_enabled = payload
@@ -5019,6 +5023,21 @@ fn profile_direct_text_output_tokens(answer: &str, aws_b40_compat: bool) -> i32 
     }
 }
 
+/// Complete the transactional update for an in-process response.
+///
+/// Cache usage is planned before response selection, so the current call keeps
+/// its cold/write accounting. A successful local response then warms the Redis
+/// prefix for the next matching call, exactly like a completed provider call.
+async fn finish_local_response(
+    response: Response,
+    cache_commit: super::cache::CacheCommit,
+) -> Response {
+    if response.status().is_success() {
+        cache_commit.commit().await;
+    }
+    response
+}
+
 fn compat_direct_response(
     payload: &MessagesRequest,
     mut usage_breakdown: super::cache::UsageBreakdown,
@@ -6006,7 +6025,10 @@ pub async fn post_messages_cc(
             aws_b40_compat,
         )
         .await;
-        return super::code_execution::handle_request(&payload, usage);
+        let cache_commit =
+            super::cache::prepare_cache_commit(input_tokens, &payload, aws_b40_compat);
+        let response = super::code_execution::handle_request(&payload, usage);
+        return finish_local_response(response, cache_commit).await;
     }
     if !gpt_passthrough && aws_b40_compat {
         super::code_execution::remove_unrequested_optional_tools(&mut payload);
@@ -6118,9 +6140,11 @@ pub async fn post_messages_cc(
         super::bedrock::InputContextCalibration::default()
     };
 
+    let cache_commit = super::cache::prepare_cache_commit(input_tokens, &payload, aws_b40_compat);
     if let Some(response) =
         compat_direct_response(&payload, initial_usage_breakdown, aws_b40_compat)
     {
+        let response = finish_local_response(response, cache_commit).await;
         apply_compat_reply_delay(aws_b40_compat).await;
         return response;
     }
@@ -6144,8 +6168,6 @@ pub async fn post_messages_cc(
 
     if payload.stream {
         // 流式响应（缓冲模式）
-        let cache_commit =
-            super::cache::prepare_cache_commit(input_tokens, &payload, aws_b40_compat);
         handle_stream_request_buffered(
             provider,
             &request_body,
@@ -6170,8 +6192,6 @@ pub async fn post_messages_cc(
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
-        let cache_commit =
-            super::cache::prepare_cache_commit(input_tokens, &payload, aws_b40_compat);
         let extract_thinking = should_extract_nonstream_thinking(
             state.extract_thinking,
             thinking_enabled,
@@ -6967,6 +6987,112 @@ mod tests {
                 assert_eq!(body["usage"]["cache_creation_input_tokens"], 0);
                 assert_eq!(body["usage"]["cache_read_input_tokens"], 0);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_sonnet_compat_responses_preserve_planned_cache_usage() {
+        let estimated = super::super::cache::UsageBreakdown {
+            input_tokens: 65,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 50_215,
+            cache_creation_5m_input_tokens: 50_215,
+            cache_creation_1h_input_tokens: 0,
+        };
+        for model in ["claude-sonnet-4-6", "claude-sonnet-5"] {
+            for stream in [false, true] {
+                let payload = parse(
+                    model,
+                    serde_json::json!({
+                        "stream": stream,
+                        "system": [{
+                            "type": "text",
+                            "text": "stable local compatibility prefix",
+                            "cache_control": {"type": "ephemeral"}
+                        }],
+                        "messages": [{
+                            "role": "user",
+                            "content": "Reply with exactly: CACHE_BILLING_GUARD"
+                        }]
+                    }),
+                );
+                let response = compat_direct_response(&payload, estimated, true)
+                    .expect("local compatibility response");
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("response body");
+                if stream {
+                    let events = String::from_utf8(bytes.to_vec())
+                        .expect("UTF-8 SSE")
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("data: "))
+                        .map(|line| {
+                            serde_json::from_str::<serde_json::Value>(line).expect("SSE event")
+                        })
+                        .collect::<Vec<_>>();
+                    for usage in events
+                        .iter()
+                        .filter_map(|event| match event["type"].as_str() {
+                            Some("message_start") => Some(&event["message"]["usage"]),
+                            Some("message_delta") => Some(&event["usage"]),
+                            _ => None,
+                        })
+                    {
+                        assert_eq!(usage["input_tokens"], 65, "{model}");
+                        assert_eq!(usage["cache_creation_input_tokens"], 50_215, "{model}");
+                        assert_eq!(usage["cache_read_input_tokens"], 0, "{model}");
+                    }
+                } else {
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&bytes).expect("JSON response");
+                    assert_eq!(body["usage"]["input_tokens"], 65, "{model}");
+                    assert_eq!(
+                        body["usage"]["cache_creation_input_tokens"], 50_215,
+                        "{model}"
+                    );
+                    assert_eq!(body["usage"]["cache_read_input_tokens"], 0, "{model}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_local_sonnet_response_warms_next_prefix_match() {
+        for model in ["claude-sonnet-4-6", "claude-sonnet-5"] {
+            let payload = parse(
+                model,
+                serde_json::json!({
+                    "system": [{
+                        "type": "text",
+                        "text": format!("local-registry-transition-{model} ").repeat(2_000),
+                        "cache_control": {"type": "ephemeral"}
+                    }],
+                    "messages": [{
+                        "role": "user",
+                        "content": "Reply with exactly: CACHE_REGISTRY_WARM"
+                    }]
+                }),
+            );
+            let total = 50_280;
+            let first = super::super::cache::compute_request_usage_breakdown_with_profile(
+                total, &payload, true,
+            )
+            .await;
+            assert!(first.cache_creation_input_tokens > 0, "{model}: cold write");
+            assert_eq!(first.cache_read_input_tokens, 0, "{model}: initially cold");
+
+            let commit = super::super::cache::prepare_cache_commit(total, &payload, true);
+            let response = compat_direct_response(&payload, first, true)
+                .expect("local compatibility response");
+            let response = finish_local_response(response, commit).await;
+            assert!(response.status().is_success());
+
+            let second = super::super::cache::compute_request_usage_breakdown_with_profile(
+                total, &payload, true,
+            )
+            .await;
+            assert_eq!(second.cache_creation_input_tokens, 0, "{model}: no rewrite");
+            assert!(second.cache_read_input_tokens > 0, "{model}: warm read");
         }
     }
 
