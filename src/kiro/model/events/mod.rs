@@ -21,5 +21,5 @@ pub(crate) use metadata::anthropic_stop_reason;
 #[allow(unused_imports)]
 pub use metadata::{MetadataEvent, TokenUsage};
 pub use metering::MeteringEvent;
-pub use reasoning::ReasoningContentEvent;
+pub use reasoning::{ReasoningContentEvent, ThinkingMetadataEvent};
 pub use tool_use::ToolUseEvent;

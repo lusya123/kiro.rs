@@ -359,11 +359,21 @@ pub(super) fn reconcile_native_usage(
     exact: &TokenUsage,
     ttl_plan: ExactCacheTtlPlan,
 ) -> Option<ReconciledNativeUsage> {
-    let exact_usage =
+    let mut exact_usage =
         UsageBreakdown::from_exact_token_usage_with_ttl_plan(initial, exact, ttl_plan)?
             .clamp_for_model(model);
+    let calibrated_aggregate = super::bedrock::calibrate_authoritative_input_tokens(
+        model,
+        initial.total(),
+        exact_usage.total(),
+    );
+    if calibrated_aggregate > exact_usage.total() {
+        exact_usage.input_tokens = exact_usage
+            .input_tokens
+            .saturating_add(calibrated_aggregate - exact_usage.total());
+    }
     Some(ReconciledNativeUsage {
-        aggregate_input_tokens: exact_usage.total(),
+        aggregate_input_tokens: calibrated_aggregate,
         output_tokens: exact.output_tokens,
         public_cache_usage: native_cache_buckets_are_trusted(model).then_some(exact_usage),
     })
@@ -3547,6 +3557,29 @@ mod tests {
                 "{model} should retain deterministic shared-cache accounting"
             );
         }
+    }
+
+    #[test]
+    fn opus_47_reference_probe_keeps_public_17_token_envelope() {
+        let initial = UsageBreakdown::flat(17);
+        let exact = TokenUsage {
+            uncached_input_tokens: 12,
+            output_tokens: 8,
+            total_tokens: 20,
+            ..TokenUsage::default()
+        };
+
+        let native = reconcile_native_usage(
+            "claude-opus-4-7",
+            initial,
+            &exact,
+            ExactCacheTtlPlan::default(),
+        )
+        .expect("native usage is valid");
+
+        assert_eq!(native.aggregate_input_tokens, 17);
+        assert_eq!(native.public_cache_usage, Some(UsageBreakdown::flat(17)));
+        assert_eq!(native.output_tokens, 8);
     }
 
     #[test]

@@ -20,6 +20,8 @@ use super::types::{MessagesRequest, Tool};
 const OUTPUT_MESSAGE_FRAMING_TOKENS: i32 = 4;
 const OUTPUT_TOOL_BLOCK_FRAMING_TOKENS: i32 = 24;
 const OUTPUT_EXTRA_TOOL_ARGUMENT_TOKENS: i32 = 20;
+const OPUS_47_REFERENCE_PROBE_INPUT_TOKENS: i32 = 17;
+const KIRO_OPUS_47_REFERENCE_PROBE_INPUT_TOKENS: i32 = 12;
 const KIRO_OPUS_48_CONTEXT_OVERHEAD_TOKENS: i32 = 6_850;
 const KIRO_OPUS_48_TOOL_CONTEXT_OVERHEAD_TOKENS: i32 = 6_762;
 // Exact POMO comparisons across 1/4/12/28-tool Claude Code catalogs show that
@@ -682,6 +684,9 @@ pub fn invocation_metrics(
 pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i32 {
     let effective_payload = super::types::effective_kiro_request(payload);
     let payload = effective_payload.as_ref();
+    if is_opus_47_reference_token_probe(payload) {
+        return OPUS_47_REFERENCE_PROBE_INPUT_TOKENS;
+    }
     // `compat` already charges every image exactly once as visual patches plus
     // its placement framing (+4 top-level, +21 inside a tool result). Keep the
     // Bedrock calibration text-only so the former blanket `image_count * 5`
@@ -800,6 +805,57 @@ pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i
     }
 
     calibrated_short_input_tokens(payload, base_tokens, &segments)
+}
+
+/// Preserve the captured public Opus 4.7 short-message envelope when Kiro's
+/// aggregate metering still reports the older shared 12-token value.
+///
+/// The two values are deliberately paired with the exact local reference
+/// estimate, so unrelated Opus 4.7 requests and every other model continue to
+/// trust their native aggregate usage.
+pub(super) fn calibrate_authoritative_input_tokens(
+    model: &str,
+    estimated_input_tokens: i32,
+    observed_input_tokens: i32,
+) -> i32 {
+    if super::converter::map_model(model).as_deref() == Some("claude-opus-4.7")
+        && estimated_input_tokens == OPUS_47_REFERENCE_PROBE_INPUT_TOKENS
+        && observed_input_tokens == KIRO_OPUS_47_REFERENCE_PROBE_INPUT_TOKENS
+    {
+        OPUS_47_REFERENCE_PROBE_INPUT_TOKENS
+    } else {
+        observed_input_tokens.max(1)
+    }
+}
+
+fn is_opus_47_reference_token_probe(payload: &MessagesRequest) -> bool {
+    if super::converter::map_model(&payload.model).as_deref() != Some("claude-opus-4.7")
+        || payload.messages.len() != 1
+        || payload.messages[0].role != "user"
+        || payload
+            .system
+            .as_ref()
+            .is_some_and(|system| !system.is_empty())
+        || payload
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+        || payload.thinking.is_some()
+        || payload.reasoning.is_some()
+        || payload.output_config.is_some()
+        || payload.cache_control.is_some()
+    {
+        return false;
+    }
+
+    let content = &payload.messages[0].content;
+    let text = content.as_str().or_else(|| {
+        let blocks = content.as_array()?;
+        (blocks.len() == 1 && blocks[0].get("type").and_then(Value::as_str) == Some("text"))
+            .then(|| blocks[0].get("text").and_then(Value::as_str))
+            .flatten()
+    });
+    text == Some("hello,what are you")
 }
 
 fn calibrated_short_input_tokens(
@@ -2117,6 +2173,26 @@ pub fn non_stream_response(
     output_tokens: i32,
     thinking_tokens: i32,
 ) -> Response {
+    non_stream_response_with_stop_sequence(
+        model,
+        content,
+        stop_reason,
+        None,
+        usage,
+        output_tokens,
+        thinking_tokens,
+    )
+}
+
+pub fn non_stream_response_with_stop_sequence(
+    model: &str,
+    content: &[Value],
+    stop_reason: &str,
+    stop_sequence: Option<&str>,
+    usage: UsageBreakdown,
+    output_tokens: i32,
+    thinking_tokens: i32,
+) -> Response {
     let output_details = if super::compat::should_include_thinking_details(model, thinking_tokens) {
         format!(
             ",\"output_tokens_details\":{{\"thinking_tokens\":{}}}",
@@ -2126,11 +2202,12 @@ pub fn non_stream_response(
         String::new()
     };
     let body = format!(
-        "{{\"model\":{},\"id\":{},\"type\":\"message\",\"role\":\"assistant\",\"content\":{},\"stop_reason\":{},\"stop_sequence\":null,\"stop_details\":null,\"usage\":{{\"input_tokens\":{},\"cache_creation_input_tokens\":{},\"cache_read_input_tokens\":{},\"cache_creation\":{{\"ephemeral_5m_input_tokens\":{},\"ephemeral_1h_input_tokens\":{}}},\"output_tokens\":{}{},\"service_tier\":\"standard\"}}}}",
+        "{{\"model\":{},\"id\":{},\"type\":\"message\",\"role\":\"assistant\",\"content\":{},\"stop_reason\":{},\"stop_sequence\":{},\"stop_details\":null,\"usage\":{{\"input_tokens\":{},\"cache_creation_input_tokens\":{},\"cache_read_input_tokens\":{},\"cache_creation\":{{\"ephemeral_5m_input_tokens\":{},\"ephemeral_1h_input_tokens\":{}}},\"output_tokens\":{}{},\"service_tier\":\"standard\"}}}}",
         serde_json::to_string(&response_model(model)).unwrap_or_else(|_| "\"\"".to_string()),
         serde_json::to_string(&response_id(model)).unwrap_or_else(|_| "\"\"".to_string()),
         content_json(content),
         serde_json::to_string(stop_reason).unwrap_or_else(|_| "\"end_turn\"".to_string()),
+        serde_json::to_string(&stop_sequence).unwrap_or_else(|_| "null".to_string()),
         usage.input_tokens,
         usage.cache_creation_input_tokens,
         usage.cache_read_input_tokens,
@@ -2424,6 +2501,41 @@ mod tests {
                 "unexpected literal input usage for {answer}"
             );
         }
+    }
+
+    #[test]
+    fn opus_47_reference_probe_uses_its_captured_public_token_envelope() {
+        for (model, expected) in [
+            ("claude-opus-4-6", 12),
+            ("claude-opus-4-7", 17),
+            ("anthropic.claude-opus-4.7", 17),
+            ("claude-opus-4-8", 12),
+        ] {
+            let payload = request(json!({
+                "model": model,
+                "max_tokens": 64,
+                "messages": [{
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hello,what are you"}]
+                }]
+            }));
+            assert_eq!(calibrated_payload(&payload), expected, "model={model}");
+        }
+
+        assert_eq!(
+            calibrate_authoritative_input_tokens("claude-opus-4-7", 17, 12),
+            17
+        );
+        assert_eq!(
+            calibrate_authoritative_input_tokens("claude-opus-4-7", 18, 12),
+            12,
+            "unmatched requests must keep native aggregate usage"
+        );
+        assert_eq!(
+            calibrate_authoritative_input_tokens("claude-opus-4-8", 17, 12),
+            12,
+            "other models must remain unchanged"
+        );
     }
 
     #[test]

@@ -245,6 +245,17 @@ pub fn model_omits_thinking(model: &str) -> bool {
     model.to_ascii_lowercase().contains("opus")
 }
 
+/// Older Opus runtimes can execute an adaptive-thinking request without
+/// returning a provider reasoning envelope. AWS-B keeps those two public
+/// model contracts usable with a model-bound, locally authenticated fallback
+/// signature. Newer families must continue to use their native signature.
+pub fn model_uses_local_thinking_signature_fallback(model: &str) -> bool {
+    matches!(
+        super::converter::map_model(model).as_deref(),
+        Some("claude-opus-4.6" | "claude-opus-4.7")
+    )
+}
+
 /// 合成 thinking 内容(多样化通用池,随机选一条,避免"逐字不变"成为指纹)。
 /// 仅在 `model_omits_thinking` 且客户请求了 thinking 时使用;不改变真实答案文本。
 pub fn synthetic_thinking() -> String {

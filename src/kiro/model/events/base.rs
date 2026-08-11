@@ -12,6 +12,8 @@ pub enum EventType {
     AssistantResponse,
     /// 原生 reasoning 事件
     ReasoningContent,
+    /// 原生 reasoning 签名与 token 元数据事件
+    ThinkingMetadata,
     /// 工具使用事件
     ToolUse,
     /// 计费事件
@@ -32,6 +34,7 @@ impl EventType {
         match s {
             "assistantResponseEvent" => Self::AssistantResponse,
             "reasoningContentEvent" => Self::ReasoningContent,
+            "thinkingMetadataEvent" => Self::ThinkingMetadata,
             "toolUseEvent" => Self::ToolUse,
             "meteringEvent" => Self::Metering,
             "metadataEvent" => Self::Metadata,
@@ -46,6 +49,7 @@ impl EventType {
         match self {
             Self::AssistantResponse => "assistantResponseEvent",
             Self::ReasoningContent => "reasoningContentEvent",
+            Self::ThinkingMetadata => "thinkingMetadataEvent",
             Self::ToolUse => "toolUseEvent",
             Self::Metering => "meteringEvent",
             Self::Metadata => "metadataEvent",
@@ -79,6 +83,8 @@ pub enum Event {
     AssistantResponse(super::AssistantResponseEvent),
     /// 模型原生 reasoning 响应
     ReasoningContent(super::ReasoningContentEvent),
+    /// 模型原生 reasoning 签名元数据
+    ThinkingMetadata(super::ThinkingMetadataEvent),
     /// 工具使用
     ToolUse(super::ToolUseEvent),
     /// 计费
@@ -136,6 +142,10 @@ impl Event {
             EventType::ReasoningContent => {
                 let payload = super::ReasoningContentEvent::from_frame(&frame)?;
                 Ok(Self::ReasoningContent(payload))
+            }
+            EventType::ThinkingMetadata => {
+                let payload = super::ThinkingMetadataEvent::from_frame(&frame)?;
+                Ok(Self::ThinkingMetadata(payload))
             }
             EventType::ToolUse => {
                 let payload = super::ToolUseEvent::from_frame(&frame)?;
@@ -297,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_event_preserves_type_and_payload() {
+    fn thinking_metadata_event_is_typed_and_preserves_signature() {
         let mut headers = Headers::new();
         headers.insert(
             ":message-type".to_string(),
@@ -316,11 +326,39 @@ mod tests {
         .expect("unknown event should remain parseable");
 
         match event {
+            Event::ThinkingMetadata(metadata) => {
+                assert_eq!(metadata.signature, "opaque");
+                assert_eq!(metadata.token_count, 42);
+            }
+            other => panic!("expected thinking metadata event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_event_preserves_type_and_payload() {
+        let mut headers = Headers::new();
+        headers.insert(
+            ":message-type".to_string(),
+            HeaderValue::String("event".to_string()),
+        );
+        headers.insert(
+            ":event-type".to_string(),
+            HeaderValue::String("futureEvent".to_string()),
+        );
+        let payload = br#"{"future":true}"#.to_vec();
+
+        let event = Event::from_frame(Frame {
+            headers,
+            payload: payload.clone(),
+        })
+        .expect("unknown event should remain parseable");
+
+        match event {
             Event::Unknown {
                 event_type,
                 payload: actual,
             } => {
-                assert_eq!(event_type, "thinkingMetadataEvent");
+                assert_eq!(event_type, "futureEvent");
                 assert_eq!(actual, payload);
             }
             other => panic!("expected unknown event, got {other:?}"),

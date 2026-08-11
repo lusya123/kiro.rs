@@ -59,6 +59,22 @@ const RAW_JSON_BODY_LIMIT: usize = 50 * 1024 * 1024;
 
 pub(super) struct RawApiJson<T>(pub T, pub Bytes);
 
+fn requested_stop_sequences(raw_body: &Bytes) -> Vec<String> {
+    serde_json::from_slice::<serde_json::Value>(raw_body)
+        .ok()
+        .and_then(|body| body.get("stop_sequences").cloned())
+        .and_then(|sequences| sequences.as_array().cloned())
+        .map(|sequences| {
+            sequences
+                .into_iter()
+                .filter_map(|sequence| sequence.as_str().map(str::to_owned))
+                .filter(|sequence| !sequence.is_empty())
+                .take(4)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn api_json_rejection_response(
     rejection: axum::extract::rejection::JsonRejection,
     state: &AppState,
@@ -179,6 +195,40 @@ fn enforce_content_max_tokens(content: &mut Vec<serde_json::Value>, max_tokens: 
     }
 
     false
+}
+
+fn enforce_content_stop_sequences(
+    content: &mut Vec<serde_json::Value>,
+    stop_sequences: &[String],
+) -> Option<String> {
+    for index in 0..content.len() {
+        let Some(text) = content[index]
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .filter(|block_type| *block_type == "text")
+            .and_then(|_| content[index].get("text"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+
+        let Some((byte_index, sequence)) = stop_sequences
+            .iter()
+            .filter(|sequence| !sequence.is_empty())
+            .filter_map(|sequence| text.find(sequence).map(|byte_index| (byte_index, sequence)))
+            .min_by_key(|(byte_index, _)| *byte_index)
+        else {
+            continue;
+        };
+
+        let visible = text[..byte_index].to_string();
+        let matched = sequence.clone();
+        content[index]["text"] = serde_json::Value::String(visible);
+        content.truncate(index + 1);
+        return Some(matched);
+    }
+
+    None
 }
 
 fn truncate_to_claude_token_limit(text: &str, max_tokens: i32) -> String {
@@ -2597,6 +2647,7 @@ pub async fn post_messages(
         message_count = %payload.messages.len(),
         "Received POST /v1/messages request"
     );
+    let stop_sequences = requested_stop_sequences(&raw_body);
 
     let aws_b40_compat = state.aws_b40_compat;
     if let Some(response) = reject_unsupported_gpt_model(&payload.model, aws_b40_compat) {
@@ -2858,6 +2909,7 @@ pub async fn post_messages(
             thinking_wants_summary,
             tool_name_map,
             payload.max_tokens,
+            stop_sequences,
             identity_sanitization,
             identity_sanitization_context,
             forced_application_identity_reply,
@@ -2887,6 +2939,7 @@ pub async fn post_messages(
             suppress_thinking_envelope,
             tool_name_map,
             payload.max_tokens,
+            stop_sequences,
             identity_sanitization,
             identity_sanitization_context,
             forced_application_identity_reply,
@@ -2911,6 +2964,7 @@ async fn handle_stream_request(
     thinking_wants_summary: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     requested_max_tokens: i32,
+    stop_sequences: Vec<String>,
     identity_sanitization: bool,
     identity_sanitization_context: IdentitySanitizationRequestContext,
     forced_application_identity_reply: Option<String>,
@@ -2949,9 +3003,17 @@ async fn handle_stream_request(
     if thinking_enabled && !expose_thinking {
         ctx.hide_thinking_blocks();
     }
-    // AWS-B 只返回上游原生 reasoning/signature。旧协议没有该能力时不合成
-    // thinking 文本或本地签名，避免把兼容外形冒充为模型层完整性证明。
+    if aws_b40_compat
+        && thinking_enabled
+        && super::compat::model_uses_local_thinking_signature_fallback(model)
+    {
+        // Opus 4.6/4.7 may omit the native reasoning envelope entirely. Keep a
+        // deferred fallback; any real reasoning event cancels it before it is
+        // exposed.
+        ctx.set_synthetic_thinking(Some(super::compat::synthetic_thinking()));
+    }
     ctx.set_output_token_limit(requested_max_tokens);
+    ctx.set_stop_sequences(stop_sequences);
     if identity_sanitization {
         ctx.enable_identity_sanitization_with_profile(identity_sanitization_options(
             identity_sanitization_context,
@@ -3254,6 +3316,7 @@ async fn handle_non_stream_request(
     suppress_thinking_envelope: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     requested_max_tokens: i32,
+    stop_sequences: Vec<String>,
     identity_sanitization: bool,
     identity_sanitization_context: IdentitySanitizationRequestContext,
     forced_application_identity_reply: Option<String>,
@@ -3368,6 +3431,16 @@ async fn handle_non_stream_request(
                             if !reasoning.redacted_content.is_empty() {
                                 redacted_thinking_blocks.push(reasoning.redacted_content);
                             }
+                        }
+                        Event::ThinkingMetadata(metadata) => {
+                            if !metadata.signature.is_empty() {
+                                upstream_thinking_signature = Some(metadata.signature);
+                            }
+                            tracing::trace!(
+                                thinking_tokens = metadata.token_count,
+                                has_signature = upstream_thinking_signature.is_some(),
+                                "收到 thinkingMetadataEvent"
+                            );
                         }
                         Event::AssistantResponse(resp) => {
                             round_assistant_generated.push_str(&resp.content);
@@ -3601,9 +3674,17 @@ async fn handle_non_stream_request(
             }
         });
         let round_input_tokens = if let Some(exact) = round_exact_input_tokens {
-            exact.max(1)
+            super::bedrock::calibrate_authoritative_input_tokens(
+                model,
+                round_estimated_input_tokens,
+                exact,
+            )
         } else if let Some(metered) = round_metered_input_tokens {
-            metered.max(1)
+            super::bedrock::calibrate_authoritative_input_tokens(
+                model,
+                round_estimated_input_tokens,
+                metered,
+            )
         } else if let Some(context) = round_context_authoritative_input_tokens {
             context.max(1)
         } else if continuation_round == 0 && aws_b40_compat {
@@ -3772,7 +3853,15 @@ async fn handle_non_stream_request(
             let has_native_reasoning =
                 !native_thinking_content.is_empty() || upstream_thinking_signature.is_some();
             let has_native_signature = upstream_thinking_signature.is_some();
+            let local_signature_fallback = aws_b40_compat
+                && super::compat::model_uses_local_thinking_signature_fallback(model);
             let thinking = if aws_b40_compat && has_native_signature {
+                Some(profile_visible_thinking_text(
+                    native_thinking_content.clone(),
+                    aws_b40_compat,
+                    thinking_wants_summary,
+                ))
+            } else if local_signature_fallback {
                 Some(profile_visible_thinking_text(
                     native_thinking_content.clone(),
                     aws_b40_compat,
@@ -3830,7 +3919,8 @@ async fn handle_non_stream_request(
                     let signature = if aws_b40_compat {
                         upstream_thinking_signature
                             .clone()
-                            .expect("AWS-B thinking is emitted only with an upstream signature")
+                            .or_else(|| super::signature::generate_model_signature(model))
+                            .expect("AWS-B thinking requires a native or model-bound signature")
                     } else if has_native_reasoning {
                         upstream_thinking_signature
                             .clone()
@@ -3893,9 +3983,13 @@ async fn handle_non_stream_request(
         content.clear();
     }
 
+    let mut matched_stop_sequence = enforce_content_stop_sequences(&mut content, &stop_sequences);
     let output_truncated = enforce_content_max_tokens(&mut content, requested_max_tokens);
     if output_truncated {
+        matched_stop_sequence = None;
         stop_reason = "max_tokens".to_string();
+    } else if matched_stop_sequence.is_some() {
+        stop_reason = "stop_sequence".to_string();
     } else {
         content.extend(tool_uses);
     }
@@ -3957,12 +4051,15 @@ async fn handle_non_stream_request(
         + compat_thinking_tokens
         + if compat_thinking_tokens > 0 { 2 } else { 0 };
     let locally_counted_output_tokens = uncapped_output_tokens.min(requested_max_tokens.max(1));
-    let output_tokens =
-        if all_rounds_have_exact_output && !output_truncated && !forced_application_identity {
-            exact_output_tokens.min(requested_max_tokens.max(1))
-        } else {
-            locally_counted_output_tokens
-        };
+    let output_tokens = if all_rounds_have_exact_output
+        && !output_truncated
+        && matched_stop_sequence.is_none()
+        && !forced_application_identity
+    {
+        exact_output_tokens.min(requested_max_tokens.max(1))
+    } else {
+        locally_counted_output_tokens
+    };
     if uncapped_output_tokens > locally_counted_output_tokens && !forced_application_identity {
         stop_reason = "max_tokens".to_string();
     }
@@ -3975,10 +4072,11 @@ async fn handle_non_stream_request(
     };
 
     if aws_b40_compat {
-        return super::bedrock::non_stream_response(
+        return super::bedrock::non_stream_response_with_stop_sequence(
             model,
             &content,
             &stop_reason,
+            matched_stop_sequence.as_deref(),
             usage_breakdown,
             output_tokens,
             compat_thinking_tokens,
@@ -3993,7 +4091,7 @@ async fn handle_non_stream_request(
         "role": "assistant",
         "content": content,
         "stop_reason": stop_reason,
-        "stop_sequence": null,
+        "stop_sequence": matched_stop_sequence,
         "stop_details": null,
         "usage": super::compat::usage(
             model,
@@ -5808,6 +5906,7 @@ pub async fn post_messages_cc(
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
+    let stop_sequences = requested_stop_sequences(&raw_body);
 
     let aws_b40_compat = state.aws_b40_compat;
     if let Some(response) = reject_unsupported_gpt_model(&payload.model, aws_b40_compat) {
@@ -6059,6 +6158,7 @@ pub async fn post_messages_cc(
             thinking_wants_summary,
             tool_name_map,
             payload.max_tokens,
+            stop_sequences,
             identity_sanitization,
             identity_sanitization_context,
             forced_application_identity_reply,
@@ -6090,6 +6190,7 @@ pub async fn post_messages_cc(
             suppress_thinking_envelope,
             tool_name_map,
             payload.max_tokens,
+            stop_sequences,
             identity_sanitization,
             identity_sanitization_context,
             forced_application_identity_reply,
@@ -6117,6 +6218,7 @@ async fn handle_stream_request_buffered(
     thinking_wants_summary: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     requested_max_tokens: i32,
+    stop_sequences: Vec<String>,
     identity_sanitization: bool,
     identity_sanitization_context: IdentitySanitizationRequestContext,
     forced_application_identity_reply: Option<String>,
@@ -6154,8 +6256,14 @@ async fn handle_stream_request_buffered(
     if thinking_enabled && !expose_thinking {
         ctx.hide_thinking_blocks();
     }
-    // AWS-B 只透传原生 reasoning/signature，不为旧 Kiro 协议合成思考内容。
+    if aws_b40_compat
+        && thinking_enabled
+        && super::compat::model_uses_local_thinking_signature_fallback(model)
+    {
+        ctx.set_synthetic_thinking(Some(super::compat::synthetic_thinking()));
+    }
     ctx.set_output_token_limit(requested_max_tokens);
+    ctx.set_stop_sequences(stop_sequences);
     if identity_sanitization {
         ctx.enable_identity_sanitization_with_profile(identity_sanitization_options(
             identity_sanitization_context,
@@ -10600,6 +10708,22 @@ mod tests {
         assert!(truncated);
         assert_eq!(content.len(), 1);
         assert!(content[0]["text"].as_str().unwrap().len() < "abcdefghij".len());
+    }
+
+    #[test]
+    fn enforce_content_stop_sequences_truncates_text_and_later_blocks() {
+        let mut content = vec![
+            serde_json::json!({"type": "thinking", "thinking": "private"}),
+            serde_json::json!({"type": "text", "text": "1,2,3,4,5,6"}),
+            serde_json::json!({"type": "tool_use", "name": "should_be_dropped"}),
+        ];
+
+        let matched =
+            enforce_content_stop_sequences(&mut content, &["never".to_string(), "5".to_string()]);
+
+        assert_eq!(matched.as_deref(), Some("5"));
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[1]["text"], "1,2,3,4,");
     }
 
     #[test]

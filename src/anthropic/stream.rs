@@ -126,6 +126,34 @@ fn text_delta_chunks(text: &str) -> Vec<&str> {
     chunks
 }
 
+fn earliest_stop_sequence(text: &str, sequences: &[String]) -> Option<(usize, usize)> {
+    sequences
+        .iter()
+        .enumerate()
+        .filter(|(_, sequence)| !sequence.is_empty())
+        .filter_map(|(sequence_index, sequence)| {
+            text.find(sequence)
+                .map(|byte_index| (byte_index, sequence_index))
+        })
+        .min_by_key(|(byte_index, sequence_index)| (*byte_index, *sequence_index))
+}
+
+fn trailing_stop_sequence_prefix_len(text: &str, sequences: &[String]) -> usize {
+    text.char_indices()
+        .map(|(byte_index, _)| byte_index)
+        .chain(std::iter::once(text.len()))
+        .filter_map(|byte_index| {
+            let suffix = &text[byte_index..];
+            (!suffix.is_empty()
+                && sequences
+                    .iter()
+                    .any(|sequence| sequence.starts_with(suffix)))
+            .then_some(suffix.len())
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// 需要跳过的包裹字符
 ///
 /// 当 thinking 标签被这些字符包裹时，认为是在引用标签而非真正的标签：
@@ -519,6 +547,8 @@ pub struct SseStateManager {
     next_block_index: i32,
     /// 当前 stop_reason
     stop_reason: Option<String>,
+    /// 命中的客户端 stop sequence。
+    stop_sequence: Option<String>,
     /// 是否有工具调用
     has_tool_use: bool,
     /// 是否已发出"首个 content_block_start 之后的确定性 ping"
@@ -542,6 +572,7 @@ impl SseStateManager {
             message_ended: false,
             next_block_index: 0,
             stop_reason: None,
+            stop_sequence: None,
             has_tool_use: false,
             first_block_started: false,
             emit_initial_ping: true,
@@ -577,11 +608,21 @@ impl SseStateManager {
 
     pub fn clear_stop_reason(&mut self) {
         self.stop_reason = None;
+        self.stop_sequence = None;
     }
 
     /// 设置 stop_reason
     pub fn set_stop_reason(&mut self, reason: impl Into<String>) {
-        self.stop_reason = Some(reason.into());
+        let reason = reason.into();
+        if reason != "stop_sequence" {
+            self.stop_sequence = None;
+        }
+        self.stop_reason = Some(reason);
+    }
+
+    pub fn set_stop_sequence(&mut self, sequence: impl Into<String>) {
+        self.stop_reason = Some("stop_sequence".to_string());
+        self.stop_sequence = Some(sequence.into());
     }
 
     /// 检查是否存在非 thinking 类型的内容块（如 text 或 tool_use）
@@ -745,7 +786,7 @@ impl SseStateManager {
                     "type": "message_delta",
                     "delta": {
                         "stop_reason": self.get_stop_reason(),
-                        "stop_sequence": null,
+                        "stop_sequence": self.stop_sequence,
                         "stop_details": null
                     },
                     "usage": super::compat::stream_delta_usage(
@@ -807,6 +848,12 @@ pub struct StreamContext {
     output_token_limit: Option<i32>,
     /// 是否已经因为输出 token 上限停止向客户端发送文本
     output_token_limit_reached: bool,
+    /// 客户端请求的文本停止序列。
+    stop_sequences: Vec<String>,
+    /// 为识别跨上游 chunk 的停止序列而暂存的短文本尾部。
+    stop_sequence_pending: String,
+    /// 是否已经命中停止序列并停止暴露后续内容。
+    stop_sequence_reached: bool,
     /// 已收到的上游助手原始文本，用于 max_tokens 截断后的续写上下文
     pub assistant_raw_content: String,
     /// Native reasoning generated during the current upstream invocation.
@@ -1005,6 +1052,9 @@ impl StreamContext {
             thinking_text_acc: String::new(),
             output_token_limit: None,
             output_token_limit_reached: false,
+            stop_sequences: Vec::new(),
+            stop_sequence_pending: String::new(),
+            stop_sequence_reached: false,
             assistant_raw_content: String::new(),
             upstream_reasoning_current_round: String::new(),
             upstream_tool_input_current_round: String::new(),
@@ -1074,6 +1124,15 @@ impl StreamContext {
 
     pub fn set_aws_b40_thinking_requested(&mut self, requested: bool) {
         self.aws_b40_thinking_requested = requested;
+    }
+
+    pub fn set_stop_sequences(&mut self, sequences: Vec<String>) {
+        self.stop_sequences = sequences
+            .into_iter()
+            .filter(|sequence| !sequence.is_empty())
+            .collect();
+        self.stop_sequence_pending.clear();
+        self.stop_sequence_reached = false;
     }
 
     pub fn set_input_context_calibration(
@@ -1307,7 +1366,10 @@ impl StreamContext {
         if self.output_token_limit_reached
             && !matches!(
                 event,
-                Event::ContextUsage(_) | Event::Metadata(_) | Event::Metering(_)
+                Event::ThinkingMetadata(_)
+                    | Event::ContextUsage(_)
+                    | Event::Metadata(_)
+                    | Event::Metering(_)
             )
         {
             return Vec::new();
@@ -1315,6 +1377,7 @@ impl StreamContext {
 
         match event {
             Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
+            Event::ThinkingMetadata(metadata) => self.process_thinking_metadata(metadata),
             Event::AssistantResponse(resp) => {
                 if tracing::enabled!(tracing::Level::TRACE) {
                     let fields = resp.extra_field_names();
@@ -1778,6 +1841,37 @@ impl StreamContext {
         events
     }
 
+    fn process_thinking_metadata(
+        &mut self,
+        metadata: &crate::kiro::model::events::ThinkingMetadataEvent,
+    ) -> Vec<SseEvent> {
+        if metadata.signature.is_empty() {
+            return Vec::new();
+        }
+
+        // Opus 4.6/4.7 deliver their opaque signature in this trailing event,
+        // rather than on reasoningContentEvent itself. Once it arrives, close
+        // the buffered native block through the exact same registration and
+        // signature-delta path used by Opus 4.8.
+        self.pending_synthetic_thinking = None;
+        self.upstream_thinking_signature = Some(metadata.signature.clone());
+        tracing::trace!(
+            thinking_tokens = metadata.token_count,
+            "收到 thinkingMetadataEvent"
+        );
+
+        if !self.thinking_enabled || self.forced_application_identity_reply.is_some() {
+            return Vec::new();
+        }
+
+        let mut events = Vec::new();
+        if self.thinking_block_index.is_none() {
+            events.extend(self.start_native_reasoning_block());
+        }
+        events.extend(self.finish_native_reasoning_block());
+        events
+    }
+
     fn start_native_reasoning_block(&mut self) -> Vec<SseEvent> {
         self.native_reasoning_active = true;
         self.outbound_native_thinking_block.clear();
@@ -2022,15 +2116,46 @@ impl StreamContext {
     }
 
     fn emit_text_delta_events(&mut self, text: &str) -> Vec<SseEvent> {
-        let mut events = Vec::new();
         // 强制工具调用时先缓冲前导文本；一旦工具出现就连同后续文本一起丢弃。
         // 若整轮没有工具，generate_final_events 会关闭抑制并回放缓冲内容。
         if self.suppress_text_blocks {
             if self.tool_block_indices.is_empty() {
                 self.forced_tool_text_pending.push_str(text);
             }
-            return events;
+            return Vec::new();
         }
+        if self.stop_sequence_reached {
+            return Vec::new();
+        }
+        if self.stop_sequences.is_empty() {
+            return self.emit_text_delta_events_unfiltered(text);
+        }
+
+        self.stop_sequence_pending.push_str(text);
+        if let Some((byte_index, sequence_index)) =
+            earliest_stop_sequence(&self.stop_sequence_pending, &self.stop_sequences)
+        {
+            let visible = self.stop_sequence_pending[..byte_index].to_string();
+            let matched = self.stop_sequences[sequence_index].clone();
+            self.stop_sequence_pending.clear();
+            self.stop_sequence_reached = true;
+            // Reuse the existing terminal-content gate so later upstream text
+            // or tool frames cannot leak past the client-requested boundary.
+            self.output_token_limit_reached = true;
+            self.state_manager.set_stop_sequence(matched);
+            return self.emit_text_delta_events_unfiltered(&visible);
+        }
+
+        let retained =
+            trailing_stop_sequence_prefix_len(&self.stop_sequence_pending, &self.stop_sequences);
+        let emit_len = self.stop_sequence_pending.len().saturating_sub(retained);
+        let visible = self.stop_sequence_pending[..emit_len].to_string();
+        self.stop_sequence_pending.drain(..emit_len);
+        self.emit_text_delta_events_unfiltered(&visible)
+    }
+
+    fn emit_text_delta_events_unfiltered(&mut self, text: &str) -> Vec<SseEvent> {
+        let mut events = Vec::new();
         let Some(text) = self.apply_output_token_limit(text) else {
             return events;
         };
@@ -2100,15 +2225,28 @@ impl StreamContext {
         events
     }
 
+    fn flush_pending_stop_sequence_text(&mut self) -> Vec<SseEvent> {
+        if self.stop_sequence_reached || self.stop_sequence_pending.is_empty() {
+            self.stop_sequence_pending.clear();
+            return Vec::new();
+        }
+        let pending = std::mem::take(&mut self.stop_sequence_pending);
+        self.emit_text_delta_events_unfiltered(&pending)
+    }
+
     /// 直接发出一个完整的合成 thinking 块(用于上游不产思考、但客户请求了 thinking 的情况,如 opus)。
     /// 发出后置 `thinking_extracted=true`,后续真实内容走文本路径。
     fn emit_synthetic_thinking_block(&mut self, synth: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
-        if self.aws_b40_compat {
-            // A local string cannot stand in for model-layer reasoning or its
-            // signature. AWS-B therefore exposes no synthetic thinking block.
+        let local_signature_fallback = self.aws_b40_compat
+            && super::compat::model_uses_local_thinking_signature_fallback(&self.model);
+        if self.aws_b40_compat && !local_signature_fallback {
             self.thinking_extracted = true;
             return events;
+        }
+        if local_signature_fallback && self.upstream_thinking_signature.is_none() {
+            self.upstream_thinking_signature =
+                super::signature::generate_model_signature(&self.model);
         }
         if self.expose_thinking {
             let idx = self.state_manager.next_block_index();
@@ -2126,9 +2264,21 @@ impl StreamContext {
                     }
                 }),
             ));
-            events.push(self.create_thinking_delta_event(idx, synth));
+            // A local fallback authenticates the compatibility envelope; it
+            // must not present generic gateway text as model reasoning.
+            if !self.aws_b40_compat {
+                events.push(self.create_thinking_delta_event(idx, synth));
+            }
             if let Some(signature) = self.create_signature_delta_event(idx) {
                 events.push(signature);
+            }
+            if local_signature_fallback
+                && let Some(signature) = self.upstream_thinking_signature.as_ref()
+            {
+                self.pending_native_signature_registration = Some((
+                    self.outbound_native_thinking_block.clone(),
+                    signature.clone(),
+                ));
             }
             if let Some(stop) = self.state_manager.handle_content_block_stop(idx) {
                 events.push(stop);
@@ -2197,7 +2347,9 @@ impl StreamContext {
         let signature = if let Some(signature) = self.upstream_thinking_signature.as_ref() {
             signature.clone()
         } else if self.aws_b40_compat {
-            return None;
+            super::compat::model_uses_local_thinking_signature_fallback(&self.model)
+                .then(|| super::signature::generate_model_signature(&self.model))
+                .flatten()?
         } else {
             super::signature::generate_signature()
         };
@@ -2649,7 +2801,11 @@ impl StreamContext {
             return exact.max(1);
         }
         if let Some(metered) = self.metered_current_input_tokens {
-            return metered.max(1);
+            return super::bedrock::calibrate_authoritative_input_tokens(
+                &self.model,
+                self.input_tokens,
+                metered,
+            );
         }
         if let Some(context) = self.context_authoritative_input_tokens() {
             return context.max(1);
@@ -2887,6 +3043,7 @@ impl StreamContext {
             let pending = std::mem::take(&mut self.forced_tool_text_pending);
             events.extend(self.emit_text_delta_events(&pending));
         }
+        events.extend(self.flush_pending_stop_sequence_text());
 
         // If the upstream transport ends before its final tool `stop=true`
         // frame, emit every argument byte already received before closing the
@@ -2978,6 +3135,7 @@ impl StreamContext {
             && !self.state_manager.has_tool_use()
             && !forced_application_identity
             && !self.native_stop_reason_received
+            && self.state_manager.get_stop_reason() != "stop_sequence"
         {
             self.state_manager.set_stop_reason("max_tokens");
         }
@@ -3296,6 +3454,14 @@ impl BufferedStreamContext {
 
     pub fn set_thinking_text_visible(&mut self, visible: bool) {
         self.inner.set_thinking_text_visible(visible);
+    }
+
+    pub fn set_synthetic_thinking(&mut self, thinking: Option<String>) {
+        self.inner.set_synthetic_thinking(thinking);
+    }
+
+    pub fn set_stop_sequences(&mut self, sequences: Vec<String>) {
+        self.inner.set_stop_sequences(sequences);
     }
 
     pub fn enable_aws_b40_compat(&mut self) {
@@ -3953,6 +4119,40 @@ mod tests {
     }
 
     #[test]
+    fn aws_b_legacy_opus_fallback_emits_only_model_bound_signature() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-7", 17, true, true, HashMap::new());
+        ctx.enable_aws_b40_compat();
+
+        let events = ctx.emit_synthetic_thinking_block("gateway fallback text");
+        assert!(events.iter().any(|event| {
+            event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "thinking"
+        }));
+        assert!(!events.iter().any(|event| {
+            event.data["delta"]["type"] == "thinking_delta"
+                && !event.data["delta"]["thinking"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .is_empty()
+        }));
+        let signature = events
+            .iter()
+            .find(|event| event.data["delta"]["type"] == "signature_delta")
+            .and_then(|event| event.data["delta"]["signature"].as_str())
+            .expect("model-bound signature");
+        assert!(super::super::signature::validate_signature(signature).is_ok());
+        assert_eq!(
+            ctx.take_native_signature_registration(),
+            Some((
+                "claude-opus-4-7".to_string(),
+                String::new(),
+                signature.to_string(),
+            ))
+        );
+    }
+
+    #[test]
     fn aws_p_synthetic_thinking_keeps_single_delta() {
         let thinking = "Inspect the request, calculate the result, and answer clearly.";
         let mut ctx =
@@ -4110,6 +4310,53 @@ mod tests {
             ))
         );
         assert!(ctx.take_native_signature_registration().is_none());
+    }
+
+    #[test]
+    fn aws_b_trailing_thinking_metadata_closes_opus_47_reasoning_block() {
+        use crate::kiro::model::events::{ReasoningContentEvent, ThinkingMetadataEvent};
+
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-7", 17, true, true, HashMap::new());
+        ctx.enable_aws_b40_compat();
+        ctx.set_thinking_text_visible(true);
+        let _ = ctx.generate_initial_events();
+        let first = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            text: "Plan carefully".to_string(),
+            ..Default::default()
+        }));
+        assert!(
+            first.is_empty(),
+            "AWS-B buffers reasoning until it is signed"
+        );
+
+        let events = ctx.process_kiro_event(&Event::ThinkingMetadata(ThinkingMetadataEvent {
+            signature: "opus-47-native-signature".to_string(),
+            token_count: 9,
+        }));
+
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.data["delta"]["thinking"].as_str())
+                .collect::<String>(),
+            "Plan carefully"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| event.data["delta"]["type"] == "signature_delta")
+                .and_then(|event| event.data["delta"]["signature"].as_str()),
+            Some("opus-47-native-signature")
+        );
+        assert_eq!(
+            ctx.take_native_signature_registration(),
+            Some((
+                "claude-opus-4-7".to_string(),
+                "Plan carefully".to_string(),
+                "opus-47-native-signature".to_string(),
+            ))
+        );
     }
 
     #[test]
@@ -6478,6 +6725,27 @@ mod tests {
         );
         assert!(!thinking.contains("synthetic fallback"), "{thinking}");
         assert_eq!(text, "SAFE");
+    }
+
+    #[test]
+    fn stop_sequence_split_across_chunks_truncates_stream_and_sets_metadata() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 10, false, true, HashMap::new());
+        ctx.set_stop_sequences(vec!["<STOP>".to_string()]);
+
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_assistant_response("alpha<ST"));
+        events.extend(ctx.process_assistant_response("OP>omega"));
+        events.extend(ctx.process_assistant_response("must not leak"));
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_text_content(&events), "alpha");
+        let message_delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "stop_sequence");
+        assert_eq!(message_delta.data["delta"]["stop_sequence"], "<STOP>");
     }
 
     #[test]

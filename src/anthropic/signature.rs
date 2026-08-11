@@ -499,19 +499,23 @@ fn parse_protobuf_fields(input: &[u8]) -> Option<Vec<(u64, ProtobufValue<'_>)>> 
     Some(fields)
 }
 
-fn internal_model_matches(model: &str, internal: &str) -> bool {
+fn provider_internal_model(model: &str) -> Option<&'static str> {
     let canonical = canonical_native_model(model);
     match canonical.as_str() {
-        "claude-opus-4.8" => internal == "claude-quince",
-        "claude-opus-5" => internal == "claude-honey",
-        "claude-sonnet-5" => internal == "claude-saffron",
-        "claude-opus-4.7" => internal == "claude-opus-4-7",
-        "claude-opus-4.6" => internal == "claude-opus-4-6",
-        "claude-sonnet-4.6" => internal == "claude-sonnet-4-6",
-        "claude-sonnet-4.5" => internal == "claude-sonnet-4-5",
-        "claude-haiku-4.5" => internal == "claude-haiku-4-5",
-        _ => false,
+        "claude-opus-4.8" => Some("claude-quince"),
+        "claude-opus-5" => Some("claude-honey"),
+        "claude-sonnet-5" => Some("claude-saffron"),
+        "claude-opus-4.7" => Some("claude-opus-4-7"),
+        "claude-opus-4.6" => Some("claude-opus-4-6"),
+        "claude-sonnet-4.6" => Some("claude-sonnet-4-6"),
+        "claude-sonnet-4.5" => Some("claude-sonnet-4-5"),
+        "claude-haiku-4.5" => Some("claude-haiku-4-5"),
+        _ => None,
     }
+}
+
+fn internal_model_matches(model: &str, internal: &str) -> bool {
+    provider_internal_model(model) == Some(internal)
 }
 
 fn is_plausible_bedrock_native_signature(model: &str, signature: &str) -> bool {
@@ -681,6 +685,37 @@ pub fn generate_signature() -> String {
     BASE64.encode(buf)
 }
 
+/// Generate a model-bound provider-envelope compatibility signature.
+///
+/// Some older Kiro Opus runtimes honor the requested reasoning effort but do
+/// not return their native signature event. This fallback preserves the
+/// externally decodable Bedrock model marker while authenticating the entire
+/// envelope with this gateway's shared HMAC. It is never used when an upstream
+/// native signature is available.
+pub fn generate_model_signature(model: &str) -> Option<String> {
+    let internal_model = provider_internal_model(model)?;
+    let mut header = vec![0x08, 0x0f, 0x10, 0x01, 0x18, 0x02];
+    push_len_field(&mut header, 5, &rand_bytes(64));
+    push_len_field(&mut header, 6, internal_model.as_bytes());
+    header.extend_from_slice(&[0x38, 0x00]);
+    push_len_field(&mut header, 8, b"thinking");
+
+    let mut inner = Vec::new();
+    push_len_field(&mut inner, 1, &header);
+    push_len_field(&mut inner, 2, &rand_bytes(12));
+    push_len_field(&mut inner, 3, &rand_bytes(12));
+    push_len_field(&mut inner, 4, &rand_bytes(48));
+    push_len_field(&mut inner, 5, &rand_bytes(175 + fastrand::usize(..=150)));
+
+    let mut raw = Vec::new();
+    push_len_field(&mut raw, 2, &inner);
+    raw.extend_from_slice(&[0x18, 0x01]);
+    let mac_start = raw.len().checked_sub(2 + MAC_LEN)?;
+    let mac = hmac_sha256(signing_secret(), &raw[..mac_start]);
+    raw[mac_start..mac_start + MAC_LEN].copy_from_slice(&mac);
+    Some(BASE64.encode(raw))
+}
+
 /// 校验签名是否由本服务（持同一共享密钥的任意容器）签发且未被篡改。**无状态**、跨容器/重启可验。
 /// 兼容两种布局:新版(MAC 在尾部 `18 01` 之前的 32 字节)与旧版(MAC 恒为末尾 32 字节)。
 pub fn validate_signature(signature: &str) -> Result<(), SignatureValidationDiagnostics> {
@@ -844,6 +879,31 @@ mod tests {
         let a = generate_signature();
         let b = generate_signature();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn model_bound_fallback_signatures_are_decodable_and_tamper_evident() {
+        for model in ["claude-opus-4-6", "claude-opus-4-7"] {
+            let signature = generate_model_signature(model).expect("supported model");
+            assert!(validate_signature(&signature).is_ok(), "model={model}");
+            assert!(
+                is_plausible_bedrock_native_signature(model, &signature),
+                "model={model}"
+            );
+
+            let expected_internal = provider_internal_model(model).unwrap().as_bytes();
+            let mut raw = BASE64.decode(&signature).unwrap();
+            assert!(
+                raw.windows(expected_internal.len())
+                    .any(|window| window == expected_internal),
+                "model={model}"
+            );
+            raw[16] ^= 1;
+            assert!(
+                validate_signature(&BASE64.encode(raw)).is_err(),
+                "model={model}"
+            );
+        }
     }
 
     #[test]

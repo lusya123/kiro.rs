@@ -29,6 +29,32 @@ impl EventPayload for ReasoningContentEvent {
     }
 }
 
+/// Trailing native-thinking metadata used by several Kiro model families.
+///
+/// Some Kiro runtimes send readable reasoning through `reasoningContentEvent`,
+/// then deliver the opaque provider signature separately in a trailing
+/// `thinkingMetadataEvent`. Treating this event as unknown drops the only
+/// signature and consequently forces the Anthropic compatibility layer to hide
+/// the whole thinking block.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThinkingMetadataEvent {
+    /// Opaque upstream reasoning signature.
+    #[serde(default)]
+    pub signature: String,
+    /// Native reasoning-token count. The public response still uses the shared
+    /// output-usage reconciliation, but retaining this field keeps the wire
+    /// model forward compatible and available for diagnostics.
+    #[serde(default)]
+    pub token_count: i32,
+}
+
+impl EventPayload for ThinkingMetadataEvent {
+    fn from_frame(frame: &Frame) -> ParseResult<Self> {
+        frame.payload_as_json()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,5 +73,15 @@ mod tests {
         assert_eq!(event.text, "Inspect the request.");
         assert_eq!(event.signature, "opaque-signature");
         assert_eq!(event.redacted_content, "cmVkYWN0ZWQ=");
+    }
+
+    #[test]
+    fn deserializes_trailing_thinking_metadata() {
+        let event: ThinkingMetadataEvent =
+            serde_json::from_str(r#"{"signature":"opaque-native-signature","tokenCount":42}"#)
+                .unwrap();
+
+        assert_eq!(event.signature, "opaque-native-signature");
+        assert_eq!(event.token_count, 42);
     }
 }
