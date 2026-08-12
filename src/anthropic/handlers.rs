@@ -7293,6 +7293,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn message_entrypoints_bypass_unknown_thinking_signatures_before_cache_processing() {
+        let request = parse(
+            "claude-opus-5",
+            serde_json::json!({
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "thinking",
+                            "thinking": "provider-issued history",
+                            "signature": "unknown-opaque-signature"
+                        }]
+                    },
+                    {"role": "user", "content": "continue the analysis"}
+                ]
+            }),
+        );
+
+        let v1 = post_messages(
+            State(AppState::new("test-key", true, true)),
+            HeaderMap::new(),
+            RawApiJson(request.clone(), Bytes::new()),
+        )
+        .await;
+        assert_eq!(
+            v1.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "/v1/messages must pass the unknown signature and reach provider selection"
+        );
+
+        let cc = post_messages_cc(
+            State(AppState::new("test-key", true, true)),
+            HeaderMap::new(),
+            RawApiJson(request, Bytes::new()),
+        )
+        .await;
+        assert_eq!(
+            cc.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "/cc/v1/messages must pass the unknown signature and reach provider selection"
+        );
+    }
+
+    #[tokio::test]
     async fn aws_b_rejects_empty_malformed_and_unknown_native_signatures() {
         for signature in ["!!!not-base64!!!", "", "unknown-opaque-signature"] {
             let request = parse(
