@@ -2671,9 +2671,14 @@ pub async fn post_messages(
     let gpt_passthrough = is_gpt_model(&payload.model);
     let aws_b40_initial_thinking_requested = aws_b40_compat
         && (payload.thinking.is_some() || payload.model.to_ascii_lowercase().contains("thinking"));
-    if let Some(response) = reject_invalid_thinking_signatures(&payload, aws_b40_compat).await {
-        return response;
-    }
+    // Temporarily disable inbound thinking-signature rejection. Production clients can replay
+    // provider signatures that are valid for their conversation but absent from this fleet's
+    // registry; rejecting them here returns 400 before the prompt-cache path can run. Keep the
+    // validator and its tests intact so the guard can be restored after the registry contract is
+    // made reliable across gateways and upgrades.
+    // if let Some(response) = reject_invalid_thinking_signatures(&payload, aws_b40_compat).await {
+    //     return response;
+    // }
     if aws_b40_compat {
         normalize_aws_b40_thinking(&mut payload);
         normalize_aws_b40_tool_choice(&mut payload);
@@ -5949,9 +5954,12 @@ pub async fn post_messages_cc(
     let gpt_passthrough = is_gpt_model(&payload.model);
     let aws_b40_initial_thinking_requested = aws_b40_compat
         && (payload.thinking.is_some() || payload.model.to_ascii_lowercase().contains("thinking"));
-    if let Some(response) = reject_invalid_thinking_signatures(&payload, aws_b40_compat).await {
-        return response;
-    }
+    // Temporarily disable inbound thinking-signature rejection for the Claude Code endpoint too.
+    // See the matching /v1/messages comment above. The validation implementation remains in place
+    // for diagnostics and a future re-enable once cross-gateway registration is dependable.
+    // if let Some(response) = reject_invalid_thinking_signatures(&payload, aws_b40_compat).await {
+    //     return response;
+    // }
     if aws_b40_compat {
         normalize_aws_b40_thinking(&mut payload);
         normalize_aws_b40_tool_choice(&mut payload);
