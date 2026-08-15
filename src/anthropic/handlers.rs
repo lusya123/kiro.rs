@@ -152,17 +152,18 @@ fn begin_continuation_billing_after_connect<T, E>(
 
 fn estimate_profile_input_tokens(
     payload: &MessagesRequest,
-    aws_b40_compat: bool,
+    _aws_b40_compat: bool,
     aws_b40_thinking_requested: bool,
 ) -> i32 {
     let base_tokens = super::compat::estimate_input_tokens(payload);
-    if aws_b40_compat {
-        let calibrated = super::bedrock::calibrated_input_tokens(payload, base_tokens);
-        if aws_b40_thinking_requested && payload.thinking.is_none() {
-            calibrated.saturating_add(4)
-        } else {
-            calibrated
-        }
+    // Public input usage is request-local accounting.  Do not feed the local
+    // BPE result through the historical Bedrock calibration curve: that curve
+    // adds a character-count multiplier above 1,024 characters and turns
+    // ordinary English from roughly 1.1 tokens/word into roughly 2.8.  Besides
+    // being inaccurate, it makes a harmless length boundary look like a token
+    // cliff.  Protocol framing is already included by `estimate_input_tokens`.
+    if aws_b40_thinking_requested && payload.thinking.is_none() {
+        base_tokens.saturating_add(4)
     } else {
         base_tokens
     }
@@ -2859,8 +2860,8 @@ pub async fn post_messages(
             "已解析 GPT 身份处理策略"
         );
     }
-    // Start with the local estimator. AWS-B may refine large requests at the
-    // end of the real upstream call using its contextUsage event.
+    // Public input usage is request-local and final at this point. Upstream
+    // usage events are never allowed to resize or repartition it.
     let input_tokens =
         estimate_profile_input_tokens(&payload, aws_b40_compat, aws_b40_thinking_requested);
     let initial_usage_breakdown = super::cache::compute_request_usage_breakdown_with_profile(
@@ -3316,9 +3317,9 @@ async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
-    input_tokens: i32,
+    _input_tokens: i32,
     initial_usage_breakdown: super::cache::UsageBreakdown,
-    input_context_calibration: super::bedrock::InputContextCalibration,
+    _input_context_calibration: super::bedrock::InputContextCalibration,
     thinking_enabled: bool,
     expose_thinking: bool,
     thinking_wants_summary: bool,
@@ -3341,12 +3342,8 @@ async fn handle_non_stream_request(
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason: String;
-    let mut first_round_input_tokens = input_tokens.max(1);
-    let mut first_round_authoritative_input_tokens: Option<i32> = None;
-    let mut additional_round_input_tokens = Vec::new();
     let mut upstream_fatal_error: Option<&'static str> = None;
     let mut cache_commit = Some(cache_commit);
-    let mut exact_first_round_usage: Option<super::cache::UsageBreakdown> = None;
     let mut exact_output_tokens = 0i32;
     let mut all_rounds_have_exact_output = true;
 
@@ -3363,16 +3360,7 @@ async fn handle_non_stream_request(
     let max_continuation_rounds = auto_continue_round_limit(requested_max_tokens);
 
     loop {
-        let round_estimated_input_tokens = if continuation_round == 0 {
-            input_tokens
-        } else {
-            estimate_kiro_request_input_tokens(&current_request_body, input_tokens)
-        };
-        let mut round_context_input_tokens: Option<i32> = None;
-        let mut round_exact_input_tokens: Option<i32> = None;
-        let mut round_metered_input_tokens: Option<i32> = None;
         let mut round_exact_output_tokens: Option<i32> = None;
-        let mut round_exact_usage: Option<super::cache::UsageBreakdown> = None;
 
         let response = match provider.call_api(&current_request_body).await {
             Ok(resp) => resp,
@@ -3401,9 +3389,6 @@ async fn handle_non_stream_request(
         }
 
         let mut chunk_text_content = String::new();
-        let mut round_assistant_generated = String::new();
-        let mut round_reasoning_generated = String::new();
-        let mut round_tool_input_generated = String::new();
         let mut round_has_assistant_content = false;
         let mut round_reasoning_previous = String::new();
         let mut round_has_completed_tool_use = false;
@@ -3432,7 +3417,6 @@ async fn handle_non_stream_request(
                                 );
                                 round_reasoning_previous = reasoning.text;
                                 native_thinking_content.push_str(&delta);
-                                round_reasoning_generated.push_str(&delta);
                             }
                             if !reasoning.signature.is_empty() {
                                 upstream_thinking_signature = Some(reasoning.signature);
@@ -3452,7 +3436,6 @@ async fn handle_non_stream_request(
                             );
                         }
                         Event::AssistantResponse(resp) => {
-                            round_assistant_generated.push_str(&resp.content);
                             let content = if continuation_round > 0 && !round_has_assistant_content
                             {
                                 super::stream::merge_continuation_text(&text_content, &resp.content)
@@ -3467,8 +3450,6 @@ async fn handle_non_stream_request(
                         }
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
-                            round_tool_input_generated.push_str(&tool_use.input);
-
                             // 累积工具的 JSON 输入
                             let buffer = tool_json_buffers
                                 .entry(tool_use.tool_use_id.clone())
@@ -3529,18 +3510,17 @@ async fn handle_non_stream_request(
                             }
                         }
                         Event::ContextUsage(context_usage) => {
-                            // 从上下文使用百分比计算实际的 input_tokens
+                            // 仅记录上游上下文占用；不参与公共输入 usage。
                             let window_size = get_context_window_size(model);
                             let actual_input_tokens =
                                 (context_usage.context_usage_percentage * (window_size as f64)
                                     / 100.0) as i32;
-                            round_context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
                                 stop_reason = "model_context_window_exceeded".to_string();
                             }
                             tracing::debug!(
-                                "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
+                                "收到 contextUsageEvent: {}%, 观测 context tokens: {}（不参与公共输入 usage）",
                                 context_usage.context_usage_percentage,
                                 actual_input_tokens
                             );
@@ -3576,9 +3556,7 @@ async fn handle_non_stream_request(
                                 round_has_terminal_evidence = true;
                             }
                             if let Some(native) = native {
-                                round_exact_input_tokens = Some(native.aggregate_input_tokens);
                                 round_exact_output_tokens = Some(native.output_tokens);
-                                round_exact_usage = native.public_cache_usage;
                             }
                         }
                         Event::Metering(metering) => {
@@ -3586,9 +3564,6 @@ async fn handle_non_stream_request(
                             // but its aggregate input remains separate from the
                             // exact cache-bucket authority above.
                             round_has_terminal_evidence = true;
-                            if round_metered_input_tokens.is_none() && metering.input_tokens > 0 {
-                                round_metered_input_tokens = Some(metering.input_tokens);
-                            }
                             if round_exact_output_tokens.is_none() && metering.output_tokens > 0 {
                                 round_exact_output_tokens = Some(metering.output_tokens);
                             }
@@ -3639,22 +3614,10 @@ async fn handle_non_stream_request(
 
         let round_has_completion_evidence =
             round_has_completed_tool_use || round_has_terminal_evidence;
-        let exact_cache_allows_commit = if round_refused {
-            // A refusal must not warm the fallback registry merely because it
-            // is terminal. A native read proves that the prefix was already
-            // reusable; a write on a refused invocation does not.
-            round_exact_usage
-                .as_ref()
-                .is_some_and(|usage| usage.cache_read_input_tokens > 0)
-        } else {
-            round_exact_usage
-                .as_ref()
-                .is_none_or(|usage| usage.has_cache_usage())
-        };
         if continuation_round == 0
             && upstream_fatal_error.is_none()
             && round_has_completion_evidence
-            && exact_cache_allows_commit
+            && !round_refused
         {
             if let Some(commit) = cache_commit.take() {
                 commit.commit().await;
@@ -3665,56 +3628,6 @@ async fn handle_non_stream_request(
             stop_reason = "tool_use".to_string();
         }
 
-        let round_context_input_tokens = super::bedrock::context_input_without_current_generation(
-            round_context_input_tokens,
-            &round_assistant_generated,
-            &round_reasoning_generated,
-            &round_tool_input_generated,
-        );
-        let round_context_authoritative_input_tokens = round_context_input_tokens.map(|context| {
-            if continuation_round == 0 && aws_b40_compat {
-                input_context_calibration.calibrate(
-                    model,
-                    round_estimated_input_tokens,
-                    Some(context),
-                )
-            } else {
-                super::billing::billable_input_tokens(round_estimated_input_tokens, Some(context))
-            }
-        });
-        let round_input_tokens = if let Some(exact) = round_exact_input_tokens {
-            super::bedrock::calibrate_authoritative_input_tokens(
-                model,
-                round_estimated_input_tokens,
-                exact,
-            )
-        } else if let Some(metered) = round_metered_input_tokens {
-            super::bedrock::calibrate_authoritative_input_tokens(
-                model,
-                round_estimated_input_tokens,
-                metered,
-            )
-        } else if let Some(context) = round_context_authoritative_input_tokens {
-            context.max(1)
-        } else if continuation_round == 0 && aws_b40_compat {
-            input_context_calibration.calibrate(model, round_estimated_input_tokens, None)
-        } else {
-            super::billing::billable_input_tokens(round_estimated_input_tokens, None)
-        };
-        if continuation_round == 0 {
-            first_round_input_tokens = round_input_tokens;
-            first_round_authoritative_input_tokens =
-                super::stream::select_first_round_reconciled_input(
-                    initial_usage_breakdown,
-                    round_exact_input_tokens,
-                    round_metered_input_tokens,
-                    round_context_authoritative_input_tokens,
-                    round_input_tokens,
-                );
-            exact_first_round_usage = round_exact_usage;
-        } else {
-            additional_round_input_tokens.push(round_input_tokens);
-        }
         if let Some(output_tokens) = round_exact_output_tokens {
             exact_output_tokens = exact_output_tokens.saturating_add(output_tokens.max(0));
         } else {
@@ -3798,45 +3711,10 @@ async fn handle_non_stream_request(
         stop_reason = "end_turn".to_string();
     }
 
-    // A real upstream AWS-B cache split is billable only after Kiro emits
-    // contextUsageEvent. Client-controlled tool catalogs must never authorize
-    // the locally estimated split when that event is missing.
-    let ordinary_input_adjustment = first_round_authoritative_input_tokens
-        .map(|authoritative| {
-            input_context_calibration.cache_input_adjustment(input_tokens, authoritative)
-        })
-        .unwrap_or(0);
-    let usage_breakdown = if let Some(mut exact) = exact_first_round_usage {
-        exact.input_tokens = additional_round_input_tokens
-            .iter()
-            .fold(exact.input_tokens, |total, round| {
-                total.saturating_add((*round).max(1))
-            });
-        exact
-    } else {
-        super::cache::finalize_request_usage(
-            initial_usage_breakdown,
-            first_round_authoritative_input_tokens,
-            first_round_input_tokens,
-            &additional_round_input_tokens,
-            ordinary_input_adjustment,
-            model,
-            aws_b40_compat,
-        )
-    };
-    let usage_breakdown = if exact_first_round_usage.is_none()
-        && aws_b40_compat
-        && additional_round_input_tokens.is_empty()
-        && upstream_fatal_error.is_none()
-    {
-        input_context_calibration.calibrate_authoritative_direct_catalog_usage(
-            model,
-            usage_breakdown,
-            first_round_authoritative_input_tokens.is_some(),
-        )
-    } else {
-        usage_breakdown
-    };
+    // The client sent exactly one request. Internal continuation calls and all
+    // response-side token observations are operational details, not additional
+    // client input, so the original local plan is the final public usage.
+    let usage_breakdown = super::cache::finalize_request_usage(initial_usage_breakdown, model);
 
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
@@ -5045,7 +4923,7 @@ async fn finish_local_response(
 
 fn compat_direct_response(
     payload: &MessagesRequest,
-    mut usage_breakdown: super::cache::UsageBreakdown,
+    usage_breakdown: super::cache::UsageBreakdown,
     aws_b40_compat: bool,
 ) -> Option<Response> {
     // GPT models must always reach the selected Kiro upstream model. The
@@ -5106,21 +4984,12 @@ fn compat_direct_response(
     {
         return None;
     }
-    let local_calibrated_usage = if aws_b40_compat {
-        let calibrated = super::bedrock::InputContextCalibration::for_request(payload)
-            .calibrate_local_direct_compat_usage(&payload.model, usage_breakdown);
-        (calibrated != usage_breakdown).then_some(calibrated)
-    } else {
-        None
-    };
-    if let Some(calibrated) = local_calibrated_usage {
-        usage_breakdown = calibrated;
-    }
     let aws_b40_exact_reply = aws_b40_compat
         .then(|| aws_b40_exact_text_reply(probe_payload))
         .flatten();
     let mut used_prompt_extraction_reply = false;
-    let (mut text, mut output_tokens, forced_input_tokens) = if let Some(answer) = doc_reply {
+    let (mut text, mut output_tokens, _legacy_forced_input_tokens) = if let Some(answer) = doc_reply
+    {
         // D19:直接用抽取的 PDF 文本/token 作答,按真实 token 数计量。
         let output_tokens = token::count_tokens(&answer) as i32;
         (answer, output_tokens, None)
@@ -5211,19 +5080,8 @@ fn compat_direct_response(
         }
     }
     let output_tokens = output_tokens.min(payload.max_tokens.max(1));
-    if let Some(input_tokens) = forced_input_tokens {
-        usage_breakdown.input_tokens = input_tokens;
-    }
     let usage_breakdown = if aws_b40_compat {
-        super::cache::finalize_request_usage(
-            usage_breakdown,
-            None,
-            usage_breakdown.total().max(1),
-            &[],
-            0,
-            &payload.model,
-            false,
-        )
+        super::cache::finalize_request_usage(usage_breakdown, &payload.model)
     } else {
         usage_breakdown.clamp_for_model(&payload.model)
     };
@@ -5834,6 +5692,54 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     }
 }
 
+/// Mirror the request-side thinking alias normalization for the local
+/// `count_tokens` estimator. `CountTokensRequest` intentionally has no
+/// `max_tokens`, so this only resolves the effective framing mode; request
+/// validity remains the responsibility of the messages endpoint.
+fn normalize_count_tokens_thinking(payload: &mut CountTokensRequest) {
+    if is_gpt_family_name(&payload.model) {
+        return;
+    }
+
+    let model_lower = payload.model.to_ascii_lowercase();
+    let has_thinking_suffix = model_lower.contains("thinking");
+    let has_explicit_adaptive = payload
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.thinking_type == "adaptive");
+    if has_thinking_suffix || has_explicit_adaptive {
+        let thinking_type = if has_explicit_adaptive || model_uses_adaptive_thinking(&model_lower) {
+            "adaptive"
+        } else {
+            "enabled"
+        };
+        let display = payload
+            .thinking
+            .as_ref()
+            .and_then(|thinking| thinking.display.clone());
+        payload.thinking = Some(Thinking {
+            thinking_type: thinking_type.to_string(),
+            budget_tokens: 20000,
+            display,
+        });
+    }
+
+    let Some(thinking) = payload.thinking.as_mut() else {
+        return;
+    };
+    match thinking.thinking_type.as_str() {
+        "enabled" if aws_b40_model_supports_enabled_thinking(&payload.model) => {}
+        "enabled" if aws_b40_model_supports_adaptive_thinking(&payload.model) => {
+            thinking.thinking_type = "adaptive".to_string();
+            thinking.budget_tokens = 20000;
+        }
+        "adaptive" if aws_b40_model_supports_adaptive_thinking(&payload.model) => {}
+        "disabled" => payload.thinking = None,
+        "enabled" | "adaptive" => payload.thinking = None,
+        _ => {}
+    }
+}
+
 /// POST /v1/messages/count_tokens
 ///
 /// 计算消息的 token 数量
@@ -5873,7 +5779,7 @@ pub async fn count_tokens_public(
 async fn count_tokens_for_profile(
     state: AppState,
     headers: HeaderMap,
-    payload: CountTokensRequest,
+    mut payload: CountTokensRequest,
     raw_body: Bytes,
 ) -> Response {
     tracing::info!(
@@ -5899,10 +5805,17 @@ async fn count_tokens_for_profile(
             return thinking_error_response(false, message);
         }
 
-        if super::compat::is_opus_4_8(&payload.model) && thinking.thinking_type == "enabled" {
+        if !state.aws_b40_compat
+            && super::compat::is_opus_4_8(&payload.model)
+            && thinking.thinking_type == "enabled"
+        {
             let message = "\"***.***.enabled\" is not supported for this model. Use \"***.***.adaptive\" and \"output_config.effort\" to control thinking behavior.";
             return thinking_error_response(false, message);
         }
+    }
+
+    if state.aws_b40_compat {
+        normalize_count_tokens_thinking(&mut payload);
     }
 
     let total_tokens = super::compat::estimate_count_tokens_request(&payload);
@@ -5916,8 +5829,8 @@ async fn count_tokens_for_profile(
 /// POST /cc/v1/messages
 ///
 /// Claude Code 兼容端点，与 /v1/messages 的区别在于：
-/// - 流式响应会等待 kiro 端返回 contextUsageEvent 后再发送 message_start
-/// - message_start 中的 input_tokens 会应用短输入保护计费策略
+/// - 流式响应会缓冲后一次性发送
+/// - 输入 usage 与 `/v1` 共用请求侧本地确定性口径，不接受上游改写
 pub async fn post_messages_cc(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -6232,8 +6145,8 @@ pub async fn post_messages_cc(
 
 /// 处理流式请求（缓冲版本）
 ///
-/// 与 `handle_stream_request` 不同，此函数会缓冲所有事件直到流结束，
-/// 然后用计费策略修正后的 input_tokens 生成 message_start 事件。
+/// 与 `handle_stream_request` 不同，此函数会缓冲所有事件直到流结束。
+/// message_start 使用请求发出前已经确定的本地输入 usage。
 async fn handle_stream_request_buffered(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -6325,7 +6238,7 @@ async fn handle_stream_request_buffered(
 /// 工作流程：
 /// 1. 等待上游流完成，期间只发送 ping 保活信号
 /// 2. 使用 StreamContext 的事件处理逻辑处理所有 Kiro 事件，结果缓存
-/// 3. 流结束后，用计费策略修正后的 input_tokens 更正 message_start 事件
+/// 3. 流结束后，保持 message_start 与最终 usage 使用同一本地快照
 /// 4. 一次性发送所有事件
 fn create_buffered_sse_stream(
     response: reqwest::Response,
@@ -7870,7 +7783,7 @@ mod tests {
         .expect("UTF-8 SSE");
 
         assert_eq!(streamed_text(&body), "pong");
-        assert!(body.contains("\"input_tokens\":32"));
+        assert!(body.contains("\"input_tokens\":33"));
         assert!(body.contains("\"output_tokens\":4"));
         assert!(body.contains("amazon-bedrock-invocationMetrics"));
     }
@@ -7910,7 +7823,7 @@ mod tests {
             streamed_text(&body),
             r#"{"a":"ztset","b":37,"c":"ZT-AFE02317"}"#
         );
-        assert!(body.contains("\"input_tokens\":115"));
+        assert!(body.contains("\"input_tokens\":106"));
         assert!(body.contains("\"output_tokens\":30"));
         assert!(body.contains("amazon-bedrock-invocationMetrics"));
     }
@@ -9435,23 +9348,23 @@ mod tests {
             .iter()
             .find(|event| event["type"] == "message_start")
             .expect("message_start")["message"]["usage"];
-        assert_eq!(start_usage["input_tokens"], 369);
-        assert_eq!(start_usage["cache_creation_input_tokens"], 34_250);
+        assert_eq!(start_usage["input_tokens"], 329);
+        assert_eq!(start_usage["cache_creation_input_tokens"], 38_679);
         assert_eq!(start_usage["cache_read_input_tokens"], 0);
         let final_usage = &events
             .iter()
             .find(|event| event["type"] == "message_delta")
             .expect("message_delta")["usage"];
-        assert_eq!(final_usage["input_tokens"], 369);
-        assert_eq!(final_usage["cache_creation_input_tokens"], 34_250);
+        assert_eq!(final_usage["input_tokens"], 329);
+        assert_eq!(final_usage["cache_creation_input_tokens"], 38_679);
         assert_eq!(final_usage["cache_read_input_tokens"], 0);
         assert_eq!(final_usage["output_tokens"], 60);
         let metrics = &events
             .iter()
             .find(|event| event["type"] == "message_stop")
             .expect("message_stop")["amazon-bedrock-invocationMetrics"];
-        assert_eq!(metrics["inputTokenCount"], 369);
-        assert_eq!(metrics["cacheWriteInputTokenCount"], 34_250);
+        assert_eq!(metrics["inputTokenCount"], 329);
+        assert_eq!(metrics["cacheWriteInputTokenCount"], 38_679);
         assert_eq!(metrics["cacheReadInputTokenCount"], 0);
         assert_eq!(metrics["outputTokenCount"], 60);
     }
@@ -10239,8 +10152,206 @@ mod tests {
         );
         assert_eq!(
             estimate_profile_input_tokens(&req, true, thinking_requested),
-            33
+            super::super::compat::estimate_input_tokens(&req)
         );
+    }
+
+    #[test]
+    fn aws_b_plain_text_usage_has_no_long_text_multiplier_or_threshold_cliff() {
+        let vocabulary = [
+            "careful",
+            "local",
+            "token",
+            "accounting",
+            "keeps",
+            "identical",
+            "requests",
+            "stable",
+            "while",
+            "ordinary",
+            "english",
+            "prose",
+            "grows",
+            "across",
+            "length",
+            "boundaries",
+        ];
+        let word_counts = [35usize, 101, 167, 332, 662, 1_322];
+
+        for model in [
+            "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001",
+            "claude-sonnet-4-6",
+            "claude-sonnet-5",
+            "claude-sonnet-5-thinking",
+            "claude-sonnet-4-6-thinking",
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-7-thinking",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-opus-5-thinking",
+        ] {
+            let mut observations = Vec::new();
+            for word_count in word_counts {
+                let text = vocabulary
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(word_count)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let mut req = parse(
+                    model,
+                    serde_json::json!({
+                        "max_tokens": 64,
+                        "messages": [{"role": "user", "content": text}]
+                    }),
+                );
+                let initial_thinking_requested =
+                    req.thinking.is_some() || req.model.to_ascii_lowercase().contains("thinking");
+                normalize_aws_b40_thinking(&mut req);
+                let thinking_requested = initial_thinking_requested || req.thinking.is_some();
+                let tokenizer_tokens = super::super::compat::estimate_input_tokens(&req);
+                let public_tokens = estimate_profile_input_tokens(&req, true, thinking_requested);
+                assert_eq!(
+                    public_tokens, tokenizer_tokens,
+                    "{model} must not apply a length-based Bedrock calibration"
+                );
+                observations.push(public_tokens);
+            }
+
+            let long_slope = f64::from(observations[5] - observations[3])
+                / (word_counts[5] - word_counts[3]) as f64;
+            assert!(
+                long_slope < 1.8,
+                "{model} reintroduced an implausible long-text slope: {long_slope:.2} tokens/word"
+            );
+        }
+    }
+
+    #[test]
+    fn aws_b_count_tokens_matches_effective_thinking_alias_framing() {
+        let request = |model: &str, thinking: Option<serde_json::Value>| {
+            let mut body = serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "Reply with exactly OK."}]
+            });
+            if let Some(thinking) = thinking {
+                body["thinking"] = thinking;
+            }
+            serde_json::from_value::<CountTokensRequest>(body).expect("valid count request")
+        };
+
+        let plain = request("claude-sonnet-4-6", None);
+        let plain_tokens = super::super::compat::estimate_count_tokens_request(&plain);
+
+        let mut enabled_alias = request("claude-sonnet-4-6-thinking", None);
+        normalize_count_tokens_thinking(&mut enabled_alias);
+        assert_eq!(
+            enabled_alias
+                .thinking
+                .as_ref()
+                .map(|thinking| thinking.thinking_type.as_str()),
+            Some("enabled")
+        );
+        assert_eq!(
+            super::super::compat::estimate_count_tokens_request(&enabled_alias),
+            plain_tokens + 19
+        );
+
+        let mut adaptive_alias = request("claude-opus-4-7-thinking", None);
+        normalize_count_tokens_thinking(&mut adaptive_alias);
+        assert_eq!(
+            adaptive_alias
+                .thinking
+                .as_ref()
+                .map(|thinking| thinking.thinking_type.as_str()),
+            Some("adaptive")
+        );
+        assert_eq!(
+            super::super::compat::estimate_count_tokens_request(&adaptive_alias),
+            plain_tokens
+        );
+
+        let mut adaptive_conversion = request(
+            "claude-opus-4-8",
+            Some(serde_json::json!({"type": "enabled", "budget_tokens": 4096})),
+        );
+        normalize_count_tokens_thinking(&mut adaptive_conversion);
+        assert_eq!(
+            adaptive_conversion
+                .thinking
+                .as_ref()
+                .map(|thinking| thinking.thinking_type.as_str()),
+            Some("adaptive")
+        );
+        assert_eq!(
+            super::super::compat::estimate_count_tokens_request(&adaptive_conversion),
+            plain_tokens
+        );
+    }
+
+    #[test]
+    fn aws_b_complex_request_shapes_use_only_local_tokenizer_accounting() {
+        let long_text = "stable local accounting across every request shape "
+            .repeat(180)
+            .trim_end()
+            .to_string();
+        let requests = [
+            parse(
+                "claude-opus-4-8",
+                serde_json::json!({
+                    "system": [{"type": "text", "text": long_text, "cache_control": {"type": "ephemeral"}}],
+                    "messages": [{"role": "user", "content": "Summarize the supplied context."}]
+                }),
+            ),
+            parse(
+                "claude-sonnet-4-6",
+                serde_json::json!({
+                    "messages": [
+                        {"role": "user", "content": long_text},
+                        {"role": "assistant", "content": "Acknowledged."},
+                        {"role": "user", "content": "Continue with the same context."}
+                    ]
+                }),
+            ),
+            parse(
+                "claude-opus-4-8",
+                serde_json::json!({
+                    "tools": [{
+                        "name": "lookup_records",
+                        "description": long_text,
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string"},
+                                "limit": {"type": "integer"}
+                            },
+                            "required": ["query"]
+                        }
+                    }],
+                    "messages": [{"role": "user", "content": "Use the tool."}]
+                }),
+            ),
+            parse(
+                "claude-opus-4-8",
+                serde_json::json!({
+                    "thinking": {"type": "adaptive"},
+                    "output_config": {"effort": "high"},
+                    "messages": [{"role": "user", "content": long_text}]
+                }),
+            ),
+        ];
+
+        for request in requests {
+            let expected = super::super::compat::estimate_input_tokens(&request);
+            let actual = estimate_profile_input_tokens(&request, true, request.thinking.is_some());
+            assert_eq!(
+                actual, expected,
+                "system, cache, multi-turn, tools, and thinking must not enable remote-derived input calibration"
+            );
+        }
     }
 
     #[test]

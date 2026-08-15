@@ -825,13 +825,11 @@ pub struct StreamContext {
     pub model: String,
     /// 消息 ID
     pub message_id: String,
-    /// 首轮客户请求输入 tokens。续写时 input_tokens 会切换为下一轮输入。
-    pub initial_input_tokens: i32,
     /// 输入 tokens（估算值）
     pub input_tokens: i32,
     /// 从 contextUsageEvent 计算的实际输入 tokens
     pub context_input_tokens: Option<i32>,
-    /// 已完成的自动续写轮次输入；首轮由独立 cache split 结算。
+    /// 已完成的自动续写轮次上游观测值，仅供内部诊断，不进入公共输入 usage。
     additional_round_input_tokens: Vec<i32>,
     /// 是否已经从首轮进入自动续写。
     continuation_started: bool,
@@ -902,8 +900,7 @@ pub struct StreamContext {
     /// AWS-B uses the real Kiro context-usage event after removing its fixed
     /// runtime prompt. Disabled for AWS-P and for short requests.
     input_context_calibration: super::bedrock::InputContextCalibration,
-    /// 首轮确实收到 contextUsageEvent 时保留其校准后总量。`None` 不能用本地
-    /// 虚拟缓存估算冒充权威值。
+    /// 首轮上游输入观测值，仅供内部诊断，不进入公共输入 usage。
     first_round_authoritative_input_tokens: Option<i32>,
     /// Exact cache/input split from `metadataEvent.tokenUsage`, when the
     /// selected Kiro runtime exposes it.
@@ -1041,7 +1038,6 @@ impl StreamContext {
             state_manager: SseStateManager::new(),
             model: model.into(),
             message_id: id::message_id(),
-            initial_input_tokens: input_tokens,
             input_tokens,
             context_input_tokens: None,
             additional_round_input_tokens: Vec::new(),
@@ -1256,13 +1252,9 @@ impl StreamContext {
     }
 
     fn stream_start_usage_breakdown(&self) -> super::cache::UsageBreakdown {
-        if self.aws_b40_compat && self.initial_usage_breakdown.has_cache_usage() {
-            // Kiro's authoritative context event arrives after message_start.
-            // Do not expose locally estimated virtual-cache usage as billable
-            // fact before that reconciliation is possible. The final
-            // message_delta carries the complete corrected usage.
-            return super::cache::UsageBreakdown::flat(1);
-        }
+        // Input usage is fully determined before the upstream call. Keep the
+        // first SSE frame identical to the final delta; response-side usage
+        // events are diagnostic only and cannot rewrite client input.
         self.initial_usage_breakdown.clamp_for_model(&self.model)
     }
 
@@ -1403,7 +1395,7 @@ impl StreamContext {
                         .set_stop_reason("model_context_window_exceeded");
                 }
                 tracing::debug!(
-                    "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
+                    "收到 contextUsageEvent: {}%, 观测 context tokens: {}（不参与公共输入 usage）",
                     context_usage.context_usage_percentage,
                     actual_input_tokens
                 );
@@ -2849,54 +2841,7 @@ impl StreamContext {
     }
 
     fn final_usage_breakdown_uncapped(&self) -> super::cache::UsageBreakdown {
-        let current_input_tokens = self.current_billable_input_tokens();
-        let authoritative_first_round_input_tokens = if self.continuation_started {
-            self.first_round_authoritative_input_tokens
-        } else {
-            self.current_first_round_reconciled_input_tokens(current_input_tokens)
-        };
-        let mut additional_round_input_tokens = self.additional_round_input_tokens.clone();
-        if self.continuation_started {
-            additional_round_input_tokens.push(current_input_tokens);
-        }
-        let ordinary_input_adjustment = authoritative_first_round_input_tokens
-            .map(|first_round_input_tokens| {
-                self.input_context_calibration
-                    .cache_input_adjustment(self.initial_input_tokens, first_round_input_tokens)
-            })
-            .unwrap_or(0);
-        let usage = if let Some(mut exact) = self.exact_first_round_usage {
-            exact.input_tokens = additional_round_input_tokens
-                .iter()
-                .fold(exact.input_tokens, |total, round| {
-                    total.saturating_add((*round).max(1))
-                });
-            exact
-        } else {
-            super::cache::finalize_request_usage(
-                self.initial_usage_breakdown,
-                authoritative_first_round_input_tokens,
-                self.initial_input_tokens,
-                &additional_round_input_tokens,
-                ordinary_input_adjustment,
-                &self.model,
-                self.aws_b40_compat,
-            )
-        };
-        if self.exact_first_round_usage.is_none()
-            && self.aws_b40_compat
-            && !self.continuation_started
-            && !self.upstream_fatal_event
-        {
-            self.input_context_calibration
-                .calibrate_authoritative_direct_catalog_usage(
-                    &self.model,
-                    usage,
-                    authoritative_first_round_input_tokens.is_some(),
-                )
-        } else {
-            usage
-        }
+        super::cache::finalize_request_usage(self.initial_usage_breakdown, &self.model)
     }
 
     /// 生成最终事件序列
@@ -3064,8 +3009,7 @@ impl StreamContext {
             events.extend(self.emit_text_delta_events(" "));
         }
 
-        // 自动续写会产生多次上游调用；最终 usage 需要包含所有内部调用的输入。
-        // 短请求使用客户请求估算，避免 Kiro 固定上下文底噪让“你好”显示 4K+ input。
+        // 自动续写属于服务端内部调用，不得增加客户端这一次请求的输入 usage。
         let breakdown = self.final_usage_breakdown();
 
         // 最终 output_tokens 用 ctoc 对累积的完整输出文本算一次(贪心跨块不可加,故不能逐块累加)。
@@ -3276,22 +3220,13 @@ impl StreamContext {
             return false;
         }
 
-        // Refusal metadata is completion evidence for the response, not for a
-        // speculative local cache write. An exact native read proves that the
-        // prefix was already reusable before the refusal; an exact write does
-        // not prove that a refused invocation committed a reusable prefix.
+        // Refusals do not warm a speculative local cache entry. Remote token
+        // buckets are intentionally irrelevant to this decision.
         if self.first_round_refused {
-            return self
-                .exact_first_round_usage
-                .is_some_and(|usage| usage.cache_read_input_tokens > 0);
+            return false;
         }
 
-        // A verified native cache split can veto registry warming when the
-        // provider explicitly reports zero cache activity. Models whose
-        // native cache buckets are known to be unstable leave this field
-        // empty and intentionally retain deterministic registry behavior.
-        self.exact_first_round_usage
-            .is_none_or(|usage| usage.has_cache_usage())
+        true
     }
 
     fn apply_output_token_limit(&mut self, text: &str) -> Option<String> {
@@ -3408,13 +3343,13 @@ impl IntoInitialUsageBreakdown for bool {
 
 /// 缓冲流处理上下文 - 用于 /cc/v1/messages 流式请求
 ///
-/// 与 `StreamContext` 不同，此上下文会缓冲所有事件直到流结束，
-/// 然后用从 `contextUsageEvent` 计算的正确 `input_tokens` 更正 `message_start` 事件。
+/// 与 `StreamContext` 不同，此上下文会缓冲所有事件直到流结束。
+/// 输入 usage 在请求发往上游前已经确定；缓冲只改变事件发送时机。
 ///
 /// 工作流程：
 /// 1. 使用 `StreamContext` 正常处理所有 Kiro 事件
 /// 2. 把生成的 SSE 事件缓存起来（而不是立即发送）
-/// 3. 流结束时，找到 `message_start` 事件并更新其 `input_tokens`
+/// 3. 流结束时，确保 `message_start` 与最终 usage 使用同一本地快照
 /// 4. 一次性返回所有事件
 pub struct BufferedStreamContext {
     /// 内部流处理上下文（复用现有的事件处理逻辑）
@@ -3517,7 +3452,7 @@ impl BufferedStreamContext {
     ///
     /// 此方法会：
     /// 1. 生成最终事件（message_delta, message_stop）
-    /// 2. 用正确的 input_tokens 更正 message_start 事件
+    /// 2. 用原始请求的本地 usage 快照统一 message_start
     /// 3. 返回所有缓冲的事件
     pub fn finish_and_get_all_events(&mut self) -> Vec<SseEvent> {
         // 如果从未处理过事件，也要生成初始事件
@@ -3531,7 +3466,7 @@ impl BufferedStreamContext {
         let final_events = self.inner.generate_final_events();
         self.event_buffer.extend(final_events);
 
-        // 获取 profile 校准后的 input/cache 拆分；自动续写的额外输入只计入普通 input。
+        // 获取原始请求侧的确定性 input/cache 拆分；不计内部自动续写。
         let breakdown = self.inner.final_usage_breakdown();
 
         // 更正 message_start 事件中的 usage（input + cache 字段全部按拆分后回填）
@@ -3807,7 +3742,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_cache_usage_is_window_validated_before_commit() {
+    fn remote_cache_usage_cannot_veto_local_registry_commit() {
         let request = serde_json::from_value::<super::super::types::MessagesRequest>(json!({
             "model": "claude-opus-4-8",
             "max_tokens": 32,
@@ -3848,7 +3783,7 @@ mod tests {
             ctx.exact_first_round_usage,
             Some(super::super::cache::UsageBreakdown::flat(1))
         );
-        assert!(!ctx.upstream_succeeded_for_cache());
+        assert!(ctx.upstream_succeeded_for_cache());
     }
 
     #[test]
@@ -3865,7 +3800,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_zero_cache_metadata_prevents_local_registry_warming() {
+    fn exact_zero_cache_metadata_cannot_prevent_local_registry_warming() {
         let initial = super::super::cache::UsageBreakdown {
             input_tokens: 1,
             cache_read_input_tokens: 0,
@@ -3894,7 +3829,7 @@ mod tests {
             },
         ));
 
-        assert!(!ctx.upstream_succeeded_for_cache());
+        assert!(ctx.upstream_succeeded_for_cache());
     }
 
     #[test]
@@ -3994,7 +3929,7 @@ mod tests {
     }
 
     #[test]
-    fn refusal_preserves_exact_native_cache_activity() {
+    fn refusal_does_not_warm_local_registry_even_with_native_cache_read() {
         let request = serde_json::from_value::<super::super::types::MessagesRequest>(json!({
             "model": "claude-opus-4-8",
             "max_tokens": 32,
@@ -4044,7 +3979,7 @@ mod tests {
         assert_eq!(exact.input_tokens, 1);
         assert_eq!(exact.cache_read_input_tokens, 99);
         assert_eq!(ctx.state_manager.get_stop_reason(), "refusal");
-        assert!(ctx.upstream_succeeded_for_cache());
+        assert!(!ctx.upstream_succeeded_for_cache());
     }
 
     #[test]
@@ -4755,7 +4690,7 @@ mod tests {
     }
 
     #[test]
-    fn aws_b_message_start_defers_virtual_cache_usage_until_final_delta() {
+    fn aws_b_message_start_uses_same_local_usage_as_final_delta() {
         let usage = super::super::cache::UsageBreakdown {
             input_tokens: 100,
             cache_read_input_tokens: 40,
@@ -4781,16 +4716,16 @@ mod tests {
                 .as_str()
                 .is_some_and(|id| id.starts_with("msg_bdrk_") && id.len() == 61)
         );
-        assert_eq!(response_usage["input_tokens"], 1);
-        assert_eq!(response_usage["cache_read_input_tokens"], 0);
-        assert_eq!(response_usage["cache_creation_input_tokens"], 0);
+        assert_eq!(response_usage["input_tokens"], 100);
+        assert_eq!(response_usage["cache_read_input_tokens"], 40);
+        assert_eq!(response_usage["cache_creation_input_tokens"], 30);
         assert_eq!(
             response_usage["cache_creation"]["ephemeral_5m_input_tokens"],
-            0
+            10
         );
         assert_eq!(
             response_usage["cache_creation"]["ephemeral_1h_input_tokens"],
-            0
+            20
         );
         assert_eq!(response_usage["output_tokens"], 1);
         assert_eq!(response_usage["service_tier"], "standard");
@@ -4837,7 +4772,7 @@ mod tests {
     }
 
     #[test]
-    fn aws_b_in_window_local_cache_usage_is_held_when_context_event_is_missing() {
+    fn aws_b_in_window_local_cache_usage_needs_no_context_event() {
         let initial = super::super::cache::UsageBreakdown {
             input_tokens: 2,
             cache_read_input_tokens: 0,
@@ -4855,17 +4790,17 @@ mod tests {
         ctx.enable_aws_b40_compat();
 
         let start = ctx.create_message_start_event();
-        assert_eq!(start["message"]["usage"]["input_tokens"], 1);
-        assert_eq!(start["message"]["usage"]["cache_creation_input_tokens"], 0);
-        assert_eq!(start["message"]["usage"]["cache_read_input_tokens"], 0);
+        assert_eq!(start["message"]["usage"]["input_tokens"], 2);
         assert_eq!(
-            ctx.final_usage_breakdown(),
-            super::super::cache::UsageBreakdown::flat(1)
+            start["message"]["usage"]["cache_creation_input_tokens"],
+            522_472
         );
+        assert_eq!(start["message"]["usage"]["cache_read_input_tokens"], 0);
+        assert_eq!(ctx.final_usage_breakdown(), initial);
     }
 
     #[test]
-    fn aws_b_metering_aggregate_does_not_authorize_cached_usage() {
+    fn aws_b_metering_aggregate_cannot_modify_local_input_usage() {
         let initial = super::super::cache::UsageBreakdown {
             input_tokens: 20,
             cache_read_input_tokens: 0,
@@ -4891,11 +4826,7 @@ mod tests {
         assert_eq!(cached.exact_current_input_tokens, None);
         assert_eq!(cached.metered_current_input_tokens, Some(171));
         assert_eq!(cached.current_billable_input_tokens(), 171);
-        assert_eq!(
-            cached.final_usage_breakdown(),
-            super::super::cache::UsageBreakdown::flat(1),
-            "metering has no cache buckets and cannot unlock a local cache split"
-        );
+        assert_eq!(cached.final_usage_breakdown(), initial);
 
         let mut ordinary = StreamContext::new_with_thinking(
             "claude-opus-4-8",
@@ -4913,8 +4844,8 @@ mod tests {
         ));
         assert_eq!(
             ordinary.final_usage_breakdown(),
-            super::super::cache::UsageBreakdown::flat(171),
-            "aggregate metering remains usable for ordinary flat input"
+            super::super::cache::UsageBreakdown::flat(170),
+            "aggregate metering must not replace request-local input"
         );
     }
 
@@ -5109,31 +5040,21 @@ mod tests {
 
         let event = ctx.create_message_start_event();
         let start_usage = &event["message"]["usage"];
-        assert_eq!(start_usage["input_tokens"], 1);
-        assert_eq!(start_usage["cache_creation_input_tokens"], 0);
+        assert_eq!(start_usage["input_tokens"], 32);
+        assert_eq!(start_usage["cache_creation_input_tokens"], 37_317);
         assert_eq!(start_usage["cache_read_input_tokens"], 0);
-        assert_eq!(
-            ctx.final_usage_breakdown(),
-            super::super::cache::UsageBreakdown::flat(1),
-            "tool_0..27 and matching byte size are not upstream usage authority"
-        );
+        assert_eq!(ctx.final_usage_breakdown(), raw);
 
-        // This fixture has no >10k-character tool descriptions, so its Kiro
-        // context envelope is the visible total plus the fixed/tool-wire
-        // overhead. The context event authorizes the narrow historical
-        // catalog reconciliation only for the final usage.
+        // A different end-of-turn context observation cannot rewrite input.
         ctx.context_input_tokens = Some(45_515);
         let final_usage = ctx.final_usage_breakdown();
-        assert_eq!(final_usage.input_tokens, 89);
-        assert_eq!(final_usage.cache_creation_input_tokens, 34_250);
-        assert_eq!(final_usage.cache_creation_5m_input_tokens, 34_250);
-        assert_eq!(final_usage.cache_read_input_tokens, 0);
+        assert_eq!(final_usage, raw);
 
         ctx.mark_upstream_fatal_event();
         assert_eq!(
             ctx.final_usage_breakdown(),
             raw,
-            "an upstream fatal event must disable authoritative catalog rewriting"
+            "response state must not rewrite request-local input usage"
         );
     }
 
@@ -6947,7 +6868,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_probe_sentinel_is_swallowed_and_billed() {
+    fn completion_probe_sentinel_is_swallowed_without_changing_client_input() {
         let mut ctx =
             StreamContext::new_with_thinking("test-model", 2000, false, false, HashMap::new());
         ctx.context_input_tokens = Some(5000);
@@ -6965,7 +6886,7 @@ mod tests {
             .iter()
             .find(|e| e.event == "message_delta")
             .expect("message_delta should be emitted");
-        assert_eq!(message_delta.data["usage"]["input_tokens"], 9000);
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 2000);
         assert_eq!(message_delta.data["usage"]["output_tokens"], 0);
     }
 
@@ -7007,7 +6928,7 @@ mod tests {
     }
 
     #[test]
-    fn continuation_billing_accumulates_each_round_input() {
+    fn continuation_does_not_accumulate_internal_rounds_into_client_input() {
         let mut ctx =
             StreamContext::new_with_thinking("test-model", 2000, false, false, HashMap::new());
         ctx.context_input_tokens = Some(5000);
@@ -7019,7 +6940,7 @@ mod tests {
             .iter()
             .find(|e| e.event == "message_delta")
             .expect("message_delta should be emitted");
-        assert_eq!(message_delta.data["usage"]["input_tokens"], 9000);
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 2000);
         assert!(
             message_delta.data["usage"]["output_tokens"]
                 .as_i64()
@@ -7029,7 +6950,7 @@ mod tests {
     }
 
     #[test]
-    fn continuation_billing_allows_aggregate_above_one_context_window() {
+    fn continuation_keeps_original_client_input_below_context_window() {
         let mut ctx = StreamContext::new_with_thinking(
             "claude-opus-4-8",
             600_000,
@@ -7043,13 +6964,13 @@ mod tests {
 
         let usage = ctx.final_usage_breakdown();
 
-        assert_eq!(usage.input_tokens, 1_200_000);
+        assert_eq!(usage.input_tokens, 600_000);
         assert_eq!(usage.cache_read_input_tokens, 0);
         assert_eq!(usage.cache_creation_input_tokens, 0);
     }
 
     #[test]
-    fn cached_continuation_billing_keeps_cache_split_and_adds_later_input() {
+    fn cached_continuation_keeps_original_local_cache_split() {
         let initial = super::super::cache::UsageBreakdown {
             input_tokens: 100,
             cache_read_input_tokens: 3954,
@@ -7073,7 +6994,7 @@ mod tests {
             .find(|event| event.event == "message_delta")
             .expect("message_delta")
             .data["usage"];
-        assert_eq!(usage["input_tokens"], 4046);
+        assert_eq!(usage["input_tokens"], 100);
         assert_eq!(usage["cache_read_input_tokens"], 3954);
         assert_eq!(usage["cache_creation_input_tokens"], 0);
     }

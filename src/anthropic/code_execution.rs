@@ -124,20 +124,9 @@ fn explicitly_requests_code_execution(payload: &MessagesRequest) -> bool {
 
 pub fn handle_request(payload: &MessagesRequest, usage: super::cache::UsageBreakdown) -> Response {
     let started = Instant::now();
-    let calibration = super::bedrock::InputContextCalibration::for_request(payload);
-    let usage = calibration.calibrate_local_direct_compat_usage(&payload.model, usage);
-    // This path has no upstream invocation and therefore no contextUsageEvent
-    // by design. Preserve a physically valid local split, but run it through
-    // the same single-round window guard as upstream-backed responses.
-    let usage = super::cache::finalize_request_usage(
-        usage,
-        None,
-        usage.total().max(1),
-        &[],
-        0,
-        &payload.model,
-        false,
-    );
+    // This path uses the exact same request-local input plan as every
+    // provider-backed response. Generated output cannot modify input usage.
+    let usage = super::cache::finalize_request_usage(usage, &payload.model);
     let execution = extract_last_user_text(payload).and_then(|text| {
         extract_arithmetic_expression(&text)
             .and_then(|expression| {

@@ -401,12 +401,14 @@ AWS-B 会根据模型自动生成公开消息 ID，不需要额外的容器启�
 
 | 端点 | 方法 | 描述 |
 |------|------|------|
-| `/cc/v1/messages` | POST | 创建消息（缓冲模式，确保 `input_tokens` 准确） |
+| `/cc/v1/messages` | POST | 创建消息（缓冲模式，输入 usage 与 `/v1` 使用相同的本地确定性口径） |
 | `/cc/v1/messages/count_tokens` | POST | 估算 Token 数量（与 `/v1` 相同） |
 
 > **`/cc/v1/messages` 与 `/v1/messages` 的区别**：
-> - `/v1/messages`：实时流式返回，`message_start` 中的 `input_tokens` 是估算值
-> - `/cc/v1/messages`：缓冲模式，等待上游流完成后，用从 `contextUsageEvent` 计算的准确 `input_tokens` 更正 `message_start`，然后一次性返回所有事件
+> - `/v1/messages`：实时流式返回；`message_start` 与最终 `message_delta` 使用同一份请求侧本地输入 usage
+> - `/cc/v1/messages`：缓冲模式；仅延迟发送事件，不会用上游 `metadataEvent`、`meteringEvent` 或 `contextUsageEvent` 改写输入 usage
+> - 输入总量与缓存拆分在请求发往上游前完成；自动续写和本轮输出不会增加客户端请求的 `input_tokens`
+> - 普通文本和缓存前缀统一使用本地 Claude BPE 加固定协议框架；不存在 1024 字符分界，也不会叠加字符数比例补偿
 > - 等待期间会每 25 秒发送 `ping` 事件保活
 
 ### Thinking 模式

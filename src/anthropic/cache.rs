@@ -634,57 +634,17 @@ fn clamp_cache_creation(creation_5m: i32, creation_1h: i32, budget: i32) -> (i32
     (budget - scaled_1h, scaled_1h)
 }
 
-/// Produce the final public usage after validating every upstream round.
+/// Produce the final public input usage from request-local accounting only.
 ///
-/// Every upstream AWS-B cache split requires Kiro's context event; without it
-/// the locally fabricated cache estimate is held instead of billed. Local
-/// short-circuit responses explicitly opt out because they make no upstream
-/// request and keep their usage physically bounded here.
+/// The request tokenizer and the local prompt-cache registry are the sole
+/// authorities for public input usage. Upstream metadata, metering,
+/// `contextUsageEvent`, generated output, and internal continuation calls must
+/// never resize or repartition the client's input. This guarantees that the
+/// same normalized request and the same local cache state produce the same
+/// public input usage regardless of how the model answers.
 ///
-/// A model context window applies to one upstream invocation. Continuation
-/// rounds are therefore validated independently and only then accumulated.
-/// The final aggregate may legitimately exceed one context window.
-pub fn finalize_request_usage(
-    initial: UsageBreakdown,
-    authoritative_first_round_input_tokens: Option<i32>,
-    estimated_first_round_input_tokens: i32,
-    additional_round_input_tokens: &[i32],
-    ordinary_input_adjustment: i32,
-    model: &str,
-    authoritative_cache_context_required: bool,
-) -> UsageBreakdown {
-    let first_round = if authoritative_cache_context_required
-        && initial.has_cache_usage()
-        && authoritative_first_round_input_tokens.is_none()
-    {
-        tracing::warn!(
-            estimated_input = estimated_first_round_input_tokens,
-            estimated_cache_read = initial.cache_read_input_tokens,
-            estimated_cache_creation = initial.cache_creation_input_tokens,
-            "AWS-B 缓存请求缺少 Kiro contextUsageEvent，已暂停首轮异常输入计费"
-        );
-        UsageBreakdown::flat(1)
-    } else {
-        let first_round_input_tokens = authoritative_first_round_input_tokens
-            .unwrap_or(estimated_first_round_input_tokens)
-            .max(1);
-        reconcile_initial_input(initial, first_round_input_tokens, ordinary_input_adjustment)
-            .clamp_for_model(model)
-    };
-
-    let additional_input_tokens =
-        additional_round_input_tokens
-            .iter()
-            .fold(0i32, |total, round| {
-                let validated = UsageBreakdown::flat((*round).max(1)).clamp_for_model(model);
-                total.saturating_add(validated.input_tokens)
-            });
-    UsageBreakdown {
-        input_tokens: first_round
-            .input_tokens
-            .saturating_add(additional_input_tokens),
-        ..first_round
-    }
+pub fn finalize_request_usage(initial: UsageBreakdown, model: &str) -> UsageBreakdown {
+    initial.clamp_for_model(model)
 }
 
 /// Reconcile the first-round cache split after an upstream context event.
@@ -1951,26 +1911,23 @@ fn calibrated_prefix_tokens_at(
     system_segments: &[String],
     content_segments: &[Value],
     position: PrefixPosition,
-    aws_b40_compat: bool,
+    _aws_b40_compat: bool,
 ) -> Option<i32> {
     let tools = tools.get(..position.tool_count)?;
     let system_segments = system_segments.get(..position.system_count)?;
     let content_segments = content_segments.get(..position.content_count)?;
     #[cfg(test)]
     PREFIX_TOKENIZATION_CALLS.with(|calls| calls.set(calls.get() + 1));
-    let base_tokens =
-        super::compat::estimate_prefix_tokens(&req.model, system_segments, content_segments, tools);
-    Some(if aws_b40_compat {
-        super::bedrock::calibrated_cache_prefix_tokens(
-            &req.model,
-            base_tokens,
-            system_segments,
-            content_segments,
-            tools,
-        )
-    } else {
-        base_tokens
-    })
+    // Cache creation/read buckets must use the same request-local tokenizer as
+    // the full input.  The old Bedrock prefix calibration applied the same
+    // length-based character multiplier as full-request accounting, so cache
+    // tokens could also jump at the 1,024-character boundary.
+    Some(super::compat::estimate_prefix_tokens(
+        &req.model,
+        system_segments,
+        content_segments,
+        tools,
+    ))
 }
 
 fn has_direct_cache_control(v: &Value) -> bool {
@@ -2683,7 +2640,7 @@ mod tests {
     }
 
     #[test]
-    fn finalizer_holds_cached_estimate_without_authoritative_context() {
+    fn finalizer_preserves_local_cache_plan_without_remote_context() {
         let estimated = UsageBreakdown {
             input_tokens: 7,
             cache_read_input_tokens: 0,
@@ -2692,25 +2649,13 @@ mod tests {
             cache_creation_1h_input_tokens: 0,
         };
 
-        let usage = finalize_request_usage(
-            estimated,
-            None,
-            estimated.total(),
-            &[],
-            0,
-            "claude-opus-4-8",
-            true,
-        );
+        let usage = finalize_request_usage(estimated, "claude-opus-4-8");
 
-        assert_eq!(
-            usage,
-            UsageBreakdown::flat(1),
-            "a plausible in-window virtual-cache estimate is still not authoritative"
-        );
+        assert_eq!(usage, estimated);
     }
 
     #[test]
-    fn finalizer_does_not_authorize_catalog_sized_cache_without_context_event() {
+    fn finalizer_keeps_request_local_catalog_usage_without_context_event() {
         let locally_calibrated_catalog = UsageBreakdown {
             input_tokens: 77,
             cache_read_input_tokens: 0,
@@ -2719,25 +2664,13 @@ mod tests {
             cache_creation_1h_input_tokens: 0,
         };
 
-        let usage = finalize_request_usage(
-            locally_calibrated_catalog,
-            None,
-            locally_calibrated_catalog.total(),
-            &[],
-            0,
-            "claude-opus-4-8",
-            true,
-        );
+        let usage = finalize_request_usage(locally_calibrated_catalog, "claude-opus-4-8");
 
-        assert_eq!(
-            usage,
-            UsageBreakdown::flat(1),
-            "a client-reproducible catalog shape cannot authorize upstream cache billing"
-        );
+        assert_eq!(usage, locally_calibrated_catalog);
     }
 
     #[test]
-    fn finalizer_validates_each_continuation_without_clamping_legitimate_aggregate() {
+    fn finalizer_ignores_remote_totals_and_internal_continuations() {
         let initial = UsageBreakdown {
             input_tokens: 100,
             cache_read_input_tokens: 0,
@@ -2745,48 +2678,17 @@ mod tests {
             cache_creation_5m_input_tokens: 699_900,
             cache_creation_1h_input_tokens: 0,
         };
-        let usage = finalize_request_usage(
-            initial,
-            Some(700_000),
-            initial.total(),
-            &[600_000, 500_000],
-            0,
-            "claude-opus-4-8",
-            true,
-        );
+        let usage = finalize_request_usage(initial, "claude-opus-4-8");
 
-        assert_eq!(usage.total(), 1_800_000);
+        assert_eq!(usage.total(), 700_000);
         assert_eq!(usage.cache_creation_input_tokens, 699_900);
 
-        let with_impossible_round = finalize_request_usage(
-            initial,
-            Some(700_000),
-            initial.total(),
-            &[1_200_000],
-            0,
-            "claude-opus-4-8",
-            true,
-        );
-        assert_eq!(
-            with_impossible_round.total(),
-            700_001,
-            "only the impossible continuation round is held"
-        );
+        let with_impossible_round = finalize_request_usage(initial, "claude-opus-4-8");
+        assert_eq!(with_impossible_round, initial);
 
-        let impossible_initial = finalize_request_usage(
-            UsageBreakdown::flat(1_200_000),
-            Some(1_200_000),
-            1_200_000,
-            &[100_000],
-            0,
-            "claude-opus-4-8",
-            true,
-        );
-        assert_eq!(
-            impossible_initial.total(),
-            100_001,
-            "an impossible first round is held without erasing a valid continuation"
-        );
+        let impossible_initial =
+            finalize_request_usage(UsageBreakdown::flat(1_200_000), "claude-opus-4-8");
+        assert_eq!(impossible_initial, UsageBreakdown::flat(1));
     }
 
     #[test]
@@ -3017,6 +2919,49 @@ mod tests {
         serde_json::from_value(body).expect("valid")
     }
 
+    #[test]
+    fn aws_b_cache_prefix_uses_local_tokenizer_across_long_text_boundary() {
+        for char_target in [1_023usize, 1_024, 1_025, 4_096] {
+            let text = "stable cache prefix "
+                .repeat(char_target / "stable cache prefix ".len() + 1)
+                .chars()
+                .take(char_target)
+                .collect::<String>();
+            let req = parse_request(serde_json::json!({
+                "model": "claude-opus-4-8",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": text,
+                        "cache_control": {"type": "ephemeral"}
+                    }]
+                }]
+            }));
+            let content_segments = vec![req.messages[0].content.clone()];
+            let expected = super::super::compat::estimate_prefix_tokens(
+                &req.model,
+                &[],
+                &content_segments,
+                &[],
+            );
+            let actual = calibrated_prefix_tokens_at(
+                &req,
+                &[],
+                &[],
+                &content_segments,
+                PrefixPosition {
+                    tool_count: 0,
+                    system_count: 0,
+                    content_count: 1,
+                },
+                true,
+            )
+            .expect("valid cache prefix position");
+            assert_eq!(actual, expected, "unexpected jump at {char_target} chars");
+        }
+    }
+
     async fn commit_successful_request(
         total_input_tokens: i32,
         req: &MessagesRequest,
@@ -3139,6 +3084,35 @@ mod tests {
                 "Opus 4.8 and Opus 5 are different upstream models"
             );
         }
+    }
+
+    #[test]
+    fn forwarded_cache_key_ignores_session_metadata_and_conversation_id() {
+        let request_with_session = |session_id: &str| {
+            parse_request(serde_json::json!({
+                "model": "claude-opus-4-8",
+                "cache_control": {"type": "ephemeral"},
+                "metadata": {"user_id": session_id},
+                "messages": [{"role": "user", "content": "stable shared-cluster prefix"}]
+            }))
+        };
+
+        let first = request_with_session("11111111-1111-4111-8111-111111111111");
+        let second = request_with_session("22222222-2222-4222-8222-222222222222");
+        let first_wire = super::super::converter::convert_request(&first).expect("first converts");
+        let second_wire =
+            super::super::converter::convert_request(&second).expect("second converts");
+
+        assert_ne!(
+            first_wire.conversation_state.conversation_id,
+            second_wire.conversation_state.conversation_id,
+            "the upstream requests should retain their independent conversation identities"
+        );
+        assert_eq!(
+            automatic_cache_key(&first),
+            automatic_cache_key(&second),
+            "session metadata and generated conversation IDs must not fragment the shared cluster cache"
+        );
     }
 
     #[test]
