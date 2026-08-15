@@ -9,7 +9,8 @@
 //! 2. 有 → 作为客户端连上它(可以是真 Redis,也可以是别的容器起的内嵌服务)。
 //! 3. 没有 → 抢占 `bind` 该端口:抢到的容器就地启动**内嵌的 Redis 协议兼容迷你服务**
 //!    (无需镜像装 redis-server);抢不到的(竞态输了)回退去连已经起来的那个。
-//! 4. 全部连不上 → 退回**本地内存**登记表,绝不让请求失败(降级为单容器行为)。
+//! 4. 暂时连不上 → 退回**本地内存**登记表保证请求继续，同时后台重新连接或竞争接管 owner；
+//!    恢复后把仍有效的本地热键合并回共享服务，避免集群永久分裂。
 //!
 //! 高并发:客户端用 `redis` 的 MultiplexedConnection(单连接多路复用,几条连接扛上万并发);
 //! 每个 API 请求只做 1~4 次极小操作(EXISTS/SET EX);所有操作带短超时,超时/故障即本地回退。
@@ -18,11 +19,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::RwLock;
 
 const OP_TIMEOUT: Duration = Duration::from_millis(80);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
@@ -35,6 +37,22 @@ const MAX_LINE_LEN: usize = 64 * 1024; // 单行(协议头)最大 64 KiB
 
 // 熔断:共享后端一旦超时/出错,冷却 3s 内所有操作直接走本地,避免每请求 4+4 次 ×80ms 叠加延迟。
 const BREAKER_COOLDOWN_MS: i64 = 3_000;
+
+// 共享 owner 消失后，现有客户端必须自行恢复，不能永久退化成各进程独立缓存。
+// 单 loopback 地址可以立即竞争 bind（内核保证只会有一个胜者）；多候选地址仍给 primary
+// 约 6 秒恢复窗口，随后才允许后续候选接管，避免跨容器候选发生脑裂。
+const RECOVERY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const PRIMARY_RECOVERY_GRACE_ROUNDS: usize = 60;
+const RECOVERY_REPLAY_BATCH: usize = 256;
+const RECOVERY_REPLAY_TIMEOUT: Duration = Duration::from_secs(1);
+// 一个进程发现旧 owner 连接已断时，不应立刻把共享未命中当成冷缓存返回。给重新选主、
+// 重连及其他进程的本地热键回灌一个很短的窗口；这只发生在故障后的首批请求上。
+const RECOVERY_READ_WAIT: Duration = Duration::from_millis(750);
+const RECOVERY_READ_POLL: Duration = Duration::from_millis(20);
+
+const ROLE_RECOVERING: u8 = 0;
+const ROLE_OWNER: u8 = 1;
+const ROLE_CLIENT: u8 = 2;
 
 // 本地回退表只需低频回收过期项。若每次 register 都扫描整张表，连续回放 R 个
 // thinking signature 时会产生 1 + 2 + ... + R 次访问，重新形成 O(R²)。
@@ -70,15 +88,163 @@ pub async fn init(addr: &str) {
     let _ = STORE.set(cache);
 }
 
+struct ManagedConnection {
+    generation: u64,
+    conn: redis::aio::MultiplexedConnection,
+}
+
+pub(crate) struct SharedBackend {
+    candidates: Vec<String>,
+    connection: RwLock<Option<ManagedConnection>>,
+    next_generation: AtomicU64,
+    recovering: AtomicBool,
+    role: AtomicU8,
+    breaker: AtomicI64,
+}
+
+impl SharedBackend {
+    fn new(
+        candidates: Vec<String>,
+        connection: Option<redis::aio::MultiplexedConnection>,
+        role: u8,
+    ) -> Self {
+        let managed = connection.map(|conn| ManagedConnection {
+            generation: 1,
+            conn,
+        });
+        Self {
+            candidates,
+            connection: RwLock::new(managed),
+            next_generation: AtomicU64::new(2),
+            recovering: AtomicBool::new(false),
+            role: AtomicU8::new(role),
+            breaker: AtomicI64::new(0),
+        }
+    }
+
+    fn role(&self) -> &'static str {
+        match self.role.load(Ordering::Relaxed) {
+            ROLE_OWNER => "owner",
+            ROLE_CLIENT => "client",
+            _ => "recovering",
+        }
+    }
+
+    fn cooling(&self) -> bool {
+        self.breaker.load(Ordering::Relaxed) > now_ms()
+    }
+
+    fn trip(&self) {
+        self.breaker
+            .store(now_ms() + BREAKER_COOLDOWN_MS, Ordering::Relaxed);
+    }
+
+    async fn connection(&self) -> Option<(u64, redis::aio::MultiplexedConnection)> {
+        self.connection
+            .read()
+            .await
+            .as_ref()
+            .map(|managed| (managed.generation, managed.conn.clone()))
+    }
+
+    async fn invalidate(&self, generation: u64) {
+        let mut connection = self.connection.write().await;
+        if connection
+            .as_ref()
+            .is_some_and(|managed| managed.generation == generation)
+        {
+            *connection = None;
+            self.role.store(ROLE_RECOVERING, Ordering::Relaxed);
+        }
+    }
+
+    async fn install(&self, conn: redis::aio::MultiplexedConnection, role: u8) {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        *self.connection.write().await = Some(ManagedConnection { generation, conn });
+        self.role.store(role, Ordering::Relaxed);
+        self.breaker.store(0, Ordering::Relaxed);
+    }
+
+    async fn wait_for_connection(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Option<(u64, redis::aio::MultiplexedConnection)> {
+        loop {
+            if let Some(connection) = self.connection().await {
+                return Some(connection);
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            tokio::time::sleep(RECOVERY_READ_POLL.min(deadline - now)).await;
+        }
+    }
+
+    fn schedule_recovery(self: &Arc<Self>, fallback: Arc<LocalStore>) {
+        if self
+            .recovering
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let backend = self.clone();
+        tokio::spawn(async move {
+            backend.role.store(ROLE_RECOVERING, Ordering::Relaxed);
+            let mut rounds = 0usize;
+            loop {
+                for candidate in &backend.candidates {
+                    if let Some(conn) = try_connect(candidate).await {
+                        tracing::info!("集群缓存:故障后重新连接共享服务 {}", candidate);
+                        backend.install(conn.clone(), ROLE_CLIENT).await;
+                        replay_local_entries(conn, &fallback).await;
+                        backend.recovering.store(false, Ordering::Release);
+                        return;
+                    }
+                }
+
+                // 单地址/loopback 部署由所有存活进程竞争同一个 bind，内核只允许一个新 owner。
+                // 多候选部署也始终优先恢复 primary。
+                if let Some(primary) = backend.candidates.first()
+                    && let Some(conn) = try_own_candidate(primary).await
+                {
+                    tracing::warn!("集群缓存:原 owner 不可达，本进程已接管 {}", primary);
+                    backend.install(conn.clone(), ROLE_OWNER).await;
+                    replay_local_entries(conn, &fallback).await;
+                    backend.recovering.store(false, Ordering::Release);
+                    return;
+                }
+
+                // 只有 primary 持续不可达约 6 秒后，才允许后续候选接管。
+                if rounds >= PRIMARY_RECOVERY_GRACE_ROUNDS {
+                    for candidate in backend.candidates.iter().skip(1) {
+                        if let Some(conn) = try_own_candidate(candidate).await {
+                            tracing::warn!(
+                                "集群缓存:primary 持续不可达，本进程已接管候选 {}",
+                                candidate
+                            );
+                            backend.install(conn.clone(), ROLE_OWNER).await;
+                            replay_local_entries(conn, &fallback).await;
+                            backend.recovering.store(false, Ordering::Release);
+                            return;
+                        }
+                    }
+                }
+
+                rounds = rounds.saturating_add(1);
+                tokio::time::sleep(RECOVERY_RETRY_INTERVAL).await;
+            }
+        });
+    }
+}
+
 pub enum ClusterCache {
     /// 共享:通过 redis 协议连接(真 Redis 或别的容器起的内嵌服务)。
     Shared {
-        conn: redis::aio::MultiplexedConnection,
+        backend: Arc<SharedBackend>,
         /// 共享后端异常时的兜底本地表。
-        fallback: LocalStore,
-        role: &'static str, // "owner" | "client"
-        /// 熔断:值 > now_ms() 表示共享后端冷却中,期间直接走本地,避免超时叠加。
-        breaker: Arc<AtomicI64>,
+        fallback: Arc<LocalStore>,
     },
     /// 纯本地(无共享地址或全部失败)。
     Local(LocalStore),
@@ -89,18 +255,23 @@ impl ClusterCache {
         ClusterCache::Local(LocalStore::new())
     }
 
-    fn shared(conn: redis::aio::MultiplexedConnection, role: &'static str) -> Self {
+    fn shared(conn: redis::aio::MultiplexedConnection, role: u8, candidates: Vec<String>) -> Self {
         ClusterCache::Shared {
-            conn,
-            fallback: LocalStore::new(),
-            role,
-            breaker: Arc::new(AtomicI64::new(0)),
+            backend: Arc::new(SharedBackend::new(candidates, Some(conn), role)),
+            fallback: Arc::new(LocalStore::new()),
+        }
+    }
+
+    fn recovering(candidates: Vec<String>) -> Self {
+        ClusterCache::Shared {
+            backend: Arc::new(SharedBackend::new(candidates, None, ROLE_RECOVERING)),
+            fallback: Arc::new(LocalStore::new()),
         }
     }
 
     pub fn role(&self) -> &'static str {
         match self {
-            ClusterCache::Shared { role, .. } => role,
+            ClusterCache::Shared { backend, .. } => backend.role(),
             ClusterCache::Local(_) => "local",
         }
     }
@@ -124,40 +295,22 @@ impl ClusterCache {
             return ClusterCache::local();
         }
 
-        // 尝试成为 `cand` 的 owner:bind 成功(该名字解析到本机 IP,或 loopback)才算。
-        async fn try_own(cand: &str) -> Option<ClusterCache> {
-            if !is_loopback_addr(cand) {
-                tracing::warn!(
-                    "集群缓存:即将在非回环地址 {} 启动内嵌服务(无鉴权的键值服务)。\
-                     请确保该地址仅在可信内网可达,勿暴露到公网。",
-                    cand
-                );
-            }
-            let listener = TcpListener::bind(cand).await.ok()?;
-            spawn_embedded_server(listener);
-            for _ in 0..20 {
-                if let Some(conn) = try_connect(cand).await {
-                    tracing::info!("集群缓存:本容器成为 owner,内嵌共享服务已启动于 {}", cand);
-                    return Some(ClusterCache::shared(conn, "owner"));
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            tracing::warn!("集群缓存:{} 内嵌服务已起但自连失败", cand);
-            None
-        }
-
         // 1) 任一候选连得上 → client(primary owner 已在)
         for cand in &candidates {
             if let Some(conn) = try_connect(cand).await {
                 tracing::info!("集群缓存:连接到已有共享服务 {}", cand);
-                return ClusterCache::shared(conn, "client");
+                return ClusterCache::shared(conn, ROLE_CLIENT, candidates.clone());
             }
         }
 
         // 2) primary 抢占:只 bind **第一个**候选。名字==本机的容器立即成为 primary owner;
         //    其他容器 bind 远端名字会失败,落到下面的等待逻辑——**不会**在此各自称王(防脑裂)。
-        if let Some(owner) = try_own(&candidates[0]).await {
-            return owner;
+        if let Some(conn) = try_own_candidate(&candidates[0]).await {
+            tracing::info!(
+                "集群缓存:本容器成为 owner,内嵌共享服务已启动于 {}",
+                candidates[0]
+            );
+            return ClusterCache::shared(conn, ROLE_OWNER, candidates);
         }
 
         // 3) 本容器不是 primary(或 primary 尚在启动)。**先给 primary 充足时间**(~6s)重试连接
@@ -167,53 +320,71 @@ impl ClusterCache {
             for cand in &candidates {
                 if let Some(conn) = try_connect(cand).await {
                     tracing::info!("集群缓存:连接到 owner {}", cand);
-                    return ClusterCache::shared(conn, "client");
+                    return ClusterCache::shared(conn, ROLE_CLIENT, candidates.clone());
                 }
             }
         }
 
         // 4) primary 确实持续不可达 → 由后续候选里"与自己同名"的容器接管成为 failover owner。
         for cand in candidates.iter().skip(1) {
-            if let Some(owner) = try_own(cand).await {
-                return owner;
+            if let Some(conn) = try_own_candidate(cand).await {
+                tracing::info!("集群缓存:本容器成为 failover owner {}", cand);
+                return ClusterCache::shared(conn, ROLE_OWNER, candidates.clone());
             }
         }
 
-        // 5) 收尾:再试一轮连接(可能刚有人接管),否则退回本地。
+        // 5) 收尾:再试一轮连接(可能刚有人接管)。仍失败时保留候选地址并在后台持续恢复；
+        //    不能永久固定为本地缓存，否则启动时的一次网络抖动就会拆散整个集群。
         for cand in &candidates {
             if let Some(conn) = try_connect(cand).await {
-                return ClusterCache::shared(conn, "client");
+                return ClusterCache::shared(conn, ROLE_CLIENT, candidates.clone());
             }
         }
-        tracing::warn!("集群缓存:无法连接任何候选 {:?},退回本地", candidates);
-        ClusterCache::local()
-    }
-
-    fn cooling(breaker: &AtomicI64) -> bool {
-        breaker.load(Ordering::Relaxed) > now_ms()
-    }
-    fn trip(breaker: &AtomicI64) {
-        breaker.store(now_ms() + BREAKER_COOLDOWN_MS, Ordering::Relaxed);
+        tracing::warn!(
+            "集群缓存:暂时无法连接任何候选 {:?},先用本地回退并后台恢复",
+            candidates
+        );
+        let cache = ClusterCache::recovering(candidates);
+        if let ClusterCache::Shared { backend, fallback } = &cache {
+            backend.schedule_recovery(fallback.clone());
+        }
+        cache
     }
 
     /// 只读:该前缀是否已登记(不写入)。用于 cache_plan 的"找最高已命中前缀"。
     pub async fn exists(&self, key: &str) -> bool {
         match self {
             ClusterCache::Local(s) => s.exists(key),
-            ClusterCache::Shared {
-                conn,
-                fallback,
-                breaker,
-                ..
-            } => {
-                if Self::cooling(breaker) {
-                    return fallback.exists(key);
+            ClusterCache::Shared { backend, fallback } => {
+                if backend.cooling() {
+                    backend.schedule_recovery(fallback.clone());
+                    return exists_after_recovery(backend, fallback, key).await;
                 }
+                let Some((generation, conn)) = backend.connection().await else {
+                    backend.schedule_recovery(fallback.clone());
+                    return exists_after_recovery(backend, fallback, key).await;
+                };
                 match redis_exists(conn.clone(), key).await {
-                    Some(v) => v,
+                    Some(true) => true,
+                    Some(false) => {
+                        // 新 owner 启动后共享表为空时，本进程的回退镜像仍可证明该键曾成功提交。
+                        // 立即补写共享表，让后续其他容器也恢复命中。
+                        if let Some(ttl) = fallback.live_ttl(key) {
+                            if redis_register(conn, key, ttl).await.is_none() {
+                                backend.trip();
+                                backend.invalidate(generation).await;
+                                backend.schedule_recovery(fallback.clone());
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    }
                     None => {
-                        Self::trip(breaker);
-                        fallback.exists(key)
+                        backend.trip();
+                        backend.invalidate(generation).await;
+                        backend.schedule_recovery(fallback.clone());
+                        exists_after_recovery(backend, fallback, key).await
                     }
                 }
             }
@@ -224,24 +395,70 @@ impl ClusterCache {
     pub async fn register(&self, key: &str, ttl: Duration) {
         match self {
             ClusterCache::Local(s) => s.register(key, ttl),
-            ClusterCache::Shared {
-                conn,
-                fallback,
-                breaker,
-                ..
-            } => {
+            ClusterCache::Shared { backend, fallback } => {
                 // Mirror successful shared writes locally as well. If the shared backend later
                 // trips its breaker, this process can still validate entries it issued itself
                 // instead of turning a transient Redis outage into a false cache/signature miss.
                 fallback.register(key, ttl);
-                if Self::cooling(breaker) {
+                if backend.cooling() {
+                    backend.schedule_recovery(fallback.clone());
                     return;
                 }
-                if redis_register(conn.clone(), key, ttl).await.is_none() {
-                    Self::trip(breaker);
+                let Some((generation, conn)) = backend.connection().await else {
+                    backend.schedule_recovery(fallback.clone());
+                    return;
+                };
+                if redis_register(conn, key, ttl).await.is_none() {
+                    backend.trip();
+                    backend.invalidate(generation).await;
+                    backend.schedule_recovery(fallback.clone());
                 }
             }
         }
+    }
+}
+
+/// 共享连接故障后的同请求重读。先尊重本进程的热键镜像；若本地没有，则等待后台完成
+/// 选主/重连，并在短窗口内反复确认共享表，让其他存活进程有机会把热键回灌进新 owner。
+async fn exists_after_recovery(
+    backend: &Arc<SharedBackend>,
+    fallback: &Arc<LocalStore>,
+    key: &str,
+) -> bool {
+    if fallback.exists(key) {
+        return true;
+    }
+
+    let deadline = tokio::time::Instant::now() + RECOVERY_READ_WAIT;
+    loop {
+        let Some((generation, conn)) = backend.wait_for_connection(deadline).await else {
+            return fallback.exists(key);
+        };
+        match redis_exists(conn.clone(), key).await {
+            Some(true) => return true,
+            Some(false) => {
+                // 本进程可能在等待期间由另一个并发请求登记了该键；同步补进共享表。
+                if let Some(ttl) = fallback.live_ttl(key) {
+                    if redis_register(conn, key, ttl).await.is_some() {
+                        return true;
+                    }
+                    backend.trip();
+                    backend.invalidate(generation).await;
+                    backend.schedule_recovery(fallback.clone());
+                }
+            }
+            None => {
+                backend.trip();
+                backend.invalidate(generation).await;
+                backend.schedule_recovery(fallback.clone());
+            }
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return fallback.exists(key);
+        }
+        tokio::time::sleep(RECOVERY_READ_POLL.min(deadline - now)).await;
     }
 }
 
@@ -265,6 +482,65 @@ async fn redis_register(
         Ok(Ok(_)) => Some(()),
         _ => None,
     }
+}
+
+async fn replay_local_entries(mut conn: redis::aio::MultiplexedConnection, fallback: &LocalStore) {
+    let entries = fallback.live_entries();
+    if entries.is_empty() {
+        return;
+    }
+    let mut replayed = 0usize;
+    for chunk in entries.chunks(RECOVERY_REPLAY_BATCH) {
+        let mut pipeline = redis::pipe();
+        for (key, ttl) in chunk {
+            pipeline
+                .cmd("SET")
+                .arg(key)
+                .arg(1)
+                .arg("EX")
+                .arg(ttl.as_secs().max(1))
+                .ignore();
+        }
+        match tokio::time::timeout(
+            RECOVERY_REPLAY_TIMEOUT,
+            pipeline.query_async::<()>(&mut conn),
+        )
+        .await
+        {
+            Ok(Ok(())) => replayed += chunk.len(),
+            _ => {
+                tracing::warn!(
+                    replayed,
+                    remaining = entries.len().saturating_sub(replayed),
+                    "集群缓存:恢复后回放本地热键中断"
+                );
+                return;
+            }
+        }
+    }
+    tracing::info!(replayed, "集群缓存:已把本地回退热键合并回共享服务");
+}
+
+/// 尝试抢占一个候选地址并启动内嵌共享服务。`bind` 是跨进程选主原语：同一地址只会有
+/// 一个胜者，其余进程下一轮会作为 client 连到胜者。
+async fn try_own_candidate(candidate: &str) -> Option<redis::aio::MultiplexedConnection> {
+    let listener = TcpListener::bind(candidate).await.ok()?;
+    if !is_loopback_addr(candidate) {
+        tracing::warn!(
+            "集群缓存:即将在非回环地址 {} 启动内嵌服务(无鉴权的键值服务)。\
+             请确保该地址仅在可信内网可达,勿暴露到公网。",
+            candidate
+        );
+    }
+    spawn_embedded_server(listener);
+    for _ in 0..20 {
+        if let Some(conn) = try_connect(candidate).await {
+            return Some(conn);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tracing::warn!("集群缓存:{} 内嵌服务已起但自连失败", candidate);
+    None
 }
 
 async fn try_connect(addr: &str) -> Option<redis::aio::MultiplexedConnection> {
@@ -334,6 +610,30 @@ impl LocalStore {
             state.next_cleanup_at = now + LOCAL_STORE_CLEANUP_INTERVAL;
         }
         state.entries.insert(key.to_string(), now + ttl);
+    }
+
+    fn live_ttl(&self, key: &str) -> Option<Duration> {
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match state.entries.get(key).copied() {
+            Some(expires_at) if expires_at > now => Some(expires_at.duration_since(now)),
+            Some(_) => {
+                state.entries.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn live_entries(&self) -> Vec<(String, Duration)> {
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.entries.retain(|_, expires_at| *expires_at > now);
+        state
+            .entries
+            .iter()
+            .map(|(key, expires_at)| (key.clone(), expires_at.duration_since(now)))
+            .collect()
     }
 }
 
@@ -598,8 +898,16 @@ mod tests {
         spawn_embedded_server(listener);
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let c1 = ClusterCache::shared(try_connect(&addr).await.expect("connect1"), "owner");
-        let c2 = ClusterCache::shared(try_connect(&addr).await.expect("connect2"), "client");
+        let c1 = ClusterCache::shared(
+            try_connect(&addr).await.expect("connect1"),
+            ROLE_OWNER,
+            vec![addr.clone()],
+        );
+        let c2 = ClusterCache::shared(
+            try_connect(&addr).await.expect("connect2"),
+            ROLE_CLIENT,
+            vec![addr.clone()],
+        );
         let ttl = Duration::from_secs(300);
         // 容器1 登记 prefixA;容器2 应能看到(跨容器共享)
         assert!(!c1.exists("prefixA").await);
@@ -656,7 +964,8 @@ mod tests {
         // 服务仍存活:新客户端能正常读写。
         let c = ClusterCache::shared(
             try_connect(&addr).await.expect("恶意输入后服务应仍存活"),
-            "client",
+            ROLE_CLIENT,
+            vec![addr.clone()],
         );
         let ttl = Duration::from_secs(300);
         assert!(!c.exists("k").await);
@@ -735,6 +1044,108 @@ mod tests {
         assert_eq!(
             state.cleanup_scan_steps, 2,
             "registers inside the cleanup window must remain O(1)"
+        );
+    }
+
+    #[test]
+    fn local_store_live_entries_excludes_expired_and_preserves_ttl() {
+        let s = LocalStore::new();
+        s.register("live", Duration::from_secs(300));
+        {
+            let mut state = s.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.entries.insert(
+                "expired".to_string(),
+                Instant::now() - Duration::from_secs(1),
+            );
+        }
+
+        let entries = s.live_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "live");
+        assert!(entries[0].1 > Duration::from_secs(0));
+        assert!(entries[0].1 <= Duration::from_secs(300));
+        assert!(
+            !s.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entries
+                .contains_key("expired")
+        );
+    }
+
+    #[tokio::test]
+    async fn recovering_cache_elects_owner_and_replays_local_entries() {
+        // 模拟原 owner 已退出且端口已经释放：当前节点先在本地登记，再后台抢占端口。
+        // 新 owner 就绪时，本地热键必须回灌到共享服务，其他节点才能继续命中。
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+
+        let cache = ClusterCache::recovering(vec![addr.clone()]);
+        cache
+            .register("registered-during-outage", Duration::from_secs(300))
+            .await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut fresh = None;
+        while tokio::time::Instant::now() < deadline {
+            if cache.role() == "owner" {
+                fresh = try_connect(&addr).await;
+                if fresh.is_some() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let conn = fresh.expect("应在后台接管已释放的共享缓存端口");
+        assert_eq!(cache.role(), "owner");
+        assert_eq!(
+            redis_exists(conn.clone(), "registered-during-outage").await,
+            Some(true),
+            "接管后应把故障窗口内的本地登记回灌到共享服务"
+        );
+
+        cache
+            .register("registered-after-recovery", Duration::from_secs(300))
+            .await;
+        assert_eq!(
+            redis_exists(conn, "registered-after-recovery").await,
+            Some(true),
+            "恢复后的新登记应直接写入共享服务"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_read_waits_for_another_nodes_replay() {
+        // 模拟本节点刚连上空的新 owner，而另一个存活节点稍后才回灌热键。本节点应在
+        // 同一次读取里等到该键出现，不能先向客户虚报一次 cache_creation。
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        spawn_embedded_server(listener);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let cache = ClusterCache::shared(
+            try_connect(&addr).await.expect("connect cache client"),
+            ROLE_CLIENT,
+            vec![addr.clone()],
+        );
+        let replay_conn = try_connect(&addr).await.expect("connect replay client");
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            assert_eq!(
+                redis_register(replay_conn, "late-replayed-key", Duration::from_secs(300)).await,
+                Some(())
+            );
+        });
+
+        let (backend, fallback) = match &cache {
+            ClusterCache::Shared { backend, fallback } => (backend, fallback),
+            ClusterCache::Local(_) => unreachable!(),
+        };
+        assert!(
+            exists_after_recovery(backend, fallback, "late-replayed-key").await,
+            "应等待其他节点完成回灌后判为 cache_read"
         );
     }
 }
