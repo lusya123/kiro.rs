@@ -4069,8 +4069,17 @@ mod tests {
             StatusCode::FORBIDDEN
         );
 
-        let sonnet_46 = request(json!({"model": "claude-sonnet-4-6-thinking"}));
-        assert!(request_preflight_error(&sonnet_46).is_none());
+        for supported_alias in [
+            "claude-sonnet-4-6-thinking",
+            "claude-opus-5-thinking",
+            "claude-sonnet-5-thinking",
+        ] {
+            let request = request(json!({"model": supported_alias}));
+            assert!(
+                request_preflight_error(&request).is_none(),
+                "supported thinking alias must remain routable: {supported_alias}"
+            );
+        }
     }
 
     #[test]

@@ -5624,6 +5624,8 @@ fn reject_invalid_modern_sampling(
 /// - 4.6+ opus / Sonnet 5：thinking={adaptive, 20000}；未显式提供 effort 时
 ///   才使用官方默认 high，显式 low/medium/high/xhigh/max 原样保留
 /// - 其他模型：thinking={enabled, 20000}
+/// - 已支持的 `*-thinking` 别名继续可用；thinking 文本是否可见仍由请求体
+///   `display` 控制，缺省/omitted 为空，summarized 返回可读摘要
 fn model_is_opus_5(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
     lower.contains("opus-5") || lower.contains("opus-5.0") || lower.contains("opus 5")
@@ -10561,14 +10563,41 @@ mod tests {
     #[test]
     fn opus_5_thinking_suffix_uses_adaptive_thinking() {
         let mut req = parse("claude-opus-5-thinking", serde_json::json!({}));
-        override_thinking_from_model_name(&mut req);
+        assert!(super::super::bedrock::request_preflight_error(&req).is_none());
+        normalize_aws_b40_thinking(&mut req);
+        assert_eq!(req.model, "claude-opus-5");
         let thinking = req.thinking.as_ref().unwrap();
         assert_eq!(thinking.thinking_type, "adaptive");
         assert_eq!(thinking.budget_tokens, 20000);
+        assert_eq!(thinking.display, None);
+        assert!(!profile_thinking_wants_summary(&req, true));
         assert_eq!(
             req.output_config.as_ref().unwrap().effort.as_deref(),
             Some("high")
         );
+
+        for (display, wants_summary) in [("omitted", false), ("summarized", true)] {
+            let mut req = parse(
+                "claude-opus-5-thinking",
+                serde_json::json!({
+                    "thinking": {"type": "adaptive", "display": display}
+                }),
+            );
+            assert!(super::super::bedrock::request_preflight_error(&req).is_none());
+            normalize_aws_b40_thinking(&mut req);
+            assert_eq!(req.model, "claude-opus-5");
+            assert_eq!(
+                req.thinking
+                    .as_ref()
+                    .and_then(|thinking| thinking.display.as_deref()),
+                Some(display)
+            );
+            assert_eq!(
+                profile_thinking_wants_summary(&req, true),
+                wants_summary,
+                "display={display}"
+            );
+        }
     }
 
     #[test]
