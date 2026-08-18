@@ -8,14 +8,14 @@
 //! - 真 Anthropic 永远看不到这些签名，客户端 SDK 自己也不验签。
 //!
 //! 本模块同时维护 AWS-B 原生签名的精确回传登记。服务端无法离线验证上游的私有签名算法，
-//! 因此正常路径只接受本服务实际向客户端透传过的 `模型 + signature` 组合。登记键只保存
+//! 因此正常路径只接受本服务实际向客户端透传过的 `AWS-B 渠道 + signature` 组合。登记键只保存
 //! SHA-256 摘要，并通过集群缓存跨容器共享；不会保存或记录原始思考与签名。公开 thinking
 //! 摘要不参与绑定，这与 Bedrock 对空 thinking 文本的实际回放语义一致。
 //!
 //! 从旧版本升级到严格登记版时，升级前签发的原生 AWS 签名没有登记记录。生产可通过一个带绝对
-//! 截止时间的迁移窗口导入结构完整、内部模型匹配的 Bedrock 签名；需要长期兼容跨网关、跨升级
-//! 会话时，也可显式设置 `KIRO_NATIVE_SIGNATURE_ACCEPT_PROVIDER_ENVELOPE=true`。两种模式仍拒绝空值、
-//! 畸形值和内部模型不匹配，并用分块指纹识别本服务已签发值的常见单点篡改；导入后立即转入精确
+//! 截止时间的迁移窗口导入结构完整、内部模型属于 AWS-B 渠道的 Bedrock 签名；需要长期兼容跨网关、
+//! 跨升级会话时，也可显式设置 `KIRO_NATIVE_SIGNATURE_ACCEPT_PROVIDER_ENVELOPE=true`。两种模式仍拒绝空值、
+//! 畸形值和渠道外内部模型，并用分块指纹识别本服务已签发值的常见单点篡改；导入后立即转入精确
 //! 登记。两种导入方式默认都关闭，避免普通部署无意开启未知签名兼容路径。
 //!
 //! 现在改为**无状态自校验 HMAC**：签名内部布局为 `[protobuf 头][随机体] || HMAC(密钥, 前面全部)`，
@@ -48,10 +48,15 @@ const MAC_LEN: usize = 32;
 const DEFAULT_NATIVE_SIGNATURE_REGISTRY_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 const NATIVE_SIGNATURE_KEY_PREFIX: &str = "awsb:native-thinking-signature:v1:";
 const NATIVE_SIGNATURE_V2_KEY_PREFIX: &str = "awsb:native-thinking-signature:v2:";
-const NATIVE_SIGNATURE_FINGERPRINT_KEY_PREFIX: &str =
+const NATIVE_SIGNATURE_V3_KEY_PREFIX: &str = "awsb:native-thinking-signature:v3:";
+const NATIVE_SIGNATURE_V2_FINGERPRINT_KEY_PREFIX: &str =
     "awsb:native-thinking-signature:fingerprint:v2:";
+const NATIVE_SIGNATURE_V3_FINGERPRINT_KEY_PREFIX: &str =
+    "awsb:native-thinking-signature:fingerprint:v3:";
+const NATIVE_SIGNATURE_CHANNEL: &[u8] = b"aws-b/bedrock";
 const NATIVE_SIGNATURE_FINGERPRINT_PARTS: usize = 4;
-const NATIVE_SIGNATURE_NEAR_MATCH_THRESHOLD: usize = 3;
+const NATIVE_SIGNATURE_V2_NEAR_MATCH_THRESHOLD: usize = 2;
+const NATIVE_SIGNATURE_V3_NEAR_MATCH_THRESHOLD: usize = 3;
 const MAX_NATIVE_SIGNATURE_RAW_BYTES: usize = 2 * 1024 * 1024;
 const DURABLE_REDIS_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const DURABLE_REDIS_OPERATION_TIMEOUT: Duration = Duration::from_millis(80);
@@ -288,7 +293,17 @@ fn native_signature_v2_registry_key(model: &str, signature: &str) -> String {
     format!("{NATIVE_SIGNATURE_V2_KEY_PREFIX}{}", digest_hex(hasher))
 }
 
-fn native_signature_fingerprint_keys(model: &str, signature: &str) -> Vec<String> {
+/// V3 binds provider signatures to the AWS-B channel. A conversation may change Claude models
+/// while remaining on this channel, so the requested model is intentionally absent.
+fn native_signature_v3_registry_key(signature: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kiro-rs/aws-b/native-thinking-signature/v3\0");
+    update_len_prefixed(&mut hasher, NATIVE_SIGNATURE_CHANNEL);
+    update_len_prefixed(&mut hasher, signature.as_bytes());
+    format!("{NATIVE_SIGNATURE_V3_KEY_PREFIX}{}", digest_hex(hasher))
+}
+
+fn native_signature_v2_fingerprint_keys(model: &str, signature: &str) -> Vec<String> {
     let Ok(raw) = BASE64.decode(signature) else {
         return Vec::new();
     };
@@ -307,7 +322,33 @@ fn native_signature_fingerprint_keys(model: &str, signature: &str) -> Vec<String
             hasher.update((part as u64).to_be_bytes());
             update_len_prefixed(&mut hasher, &raw[start..end]);
             format!(
-                "{NATIVE_SIGNATURE_FINGERPRINT_KEY_PREFIX}{}",
+                "{NATIVE_SIGNATURE_V2_FINGERPRINT_KEY_PREFIX}{}",
+                digest_hex(hasher)
+            )
+        })
+        .collect()
+}
+
+fn native_signature_v3_fingerprint_keys(signature: &str) -> Vec<String> {
+    let Ok(raw) = BASE64.decode(signature) else {
+        return Vec::new();
+    };
+    if raw.len() < 32 || raw.len() > MAX_NATIVE_SIGNATURE_RAW_BYTES {
+        return Vec::new();
+    }
+    let encoded = signature.as_bytes();
+    (0..NATIVE_SIGNATURE_FINGERPRINT_PARTS)
+        .map(|part| {
+            let start = part * encoded.len() / NATIVE_SIGNATURE_FINGERPRINT_PARTS;
+            let end = (part + 1) * encoded.len() / NATIVE_SIGNATURE_FINGERPRINT_PARTS;
+            let mut hasher = Sha256::new();
+            hasher.update(b"kiro-rs/aws-b/native-thinking-signature/fingerprint/v3\0");
+            update_len_prefixed(&mut hasher, NATIVE_SIGNATURE_CHANNEL);
+            hasher.update((encoded.len() as u64).to_be_bytes());
+            hasher.update((part as u64).to_be_bytes());
+            update_len_prefixed(&mut hasher, &encoded[start..end]);
+            format!(
+                "{NATIVE_SIGNATURE_V3_FINGERPRINT_KEY_PREFIX}{}",
                 digest_hex(hasher)
             )
         })
@@ -321,16 +362,18 @@ pub async fn register_native_signature(model: &str, thinking: &str, signature: &
         return;
     }
     let mut keys = vec![
-        // Keep writing V1 throughout a rolling upgrade so old containers can validate responses
-        // issued by new containers before the whole fleet has switched to V2.
+        // Keep writing V1/V2 throughout a rolling upgrade so old containers can validate responses
+        // issued by new containers before the whole fleet has switched to V3.
         native_signature_registry_key(model, thinking, signature),
         native_signature_v2_registry_key(model, signature),
+        native_signature_v3_registry_key(signature),
     ];
-    keys.extend(native_signature_fingerprint_keys(model, signature));
+    keys.extend(native_signature_v2_fingerprint_keys(model, signature));
+    keys.extend(native_signature_v3_fingerprint_keys(signature));
     register_native_registry_keys(&keys).await;
 }
 
-/// Validate a native signature by exact, model-bound round trip.
+/// Validate a native signature by exact, channel-bound round trip.
 ///
 /// This deliberately does not attempt to reverse engineer or imitate the AWS/Anthropic private
 /// cryptographic format. Unknown imported signatures fail closed on the Kiro conversion path;
@@ -339,10 +382,27 @@ pub async fn validate_native_signature(model: &str, thinking: &str, signature: &
     if signature.is_empty() {
         return false;
     }
+    let v3_key = native_signature_v3_registry_key(signature);
+    if native_registry_exists(&v3_key).await {
+        register_native_signature(model, thinking, signature).await;
+        return true;
+    }
+
+    // V1/V2 remain readable during rolling upgrades. A same-model hit promotes the signature into
+    // the channel-wide V3 namespace. Provider envelopes also reveal the issuing model, allowing a
+    // cross-model replay to recover an old V2 registration and promote it without accepting an
+    // unknown value.
     let v2_key = native_signature_v2_registry_key(model, signature);
     let v1_key = native_signature_registry_key(model, thinking, signature);
     if native_registry_exists(&v2_key).await || native_registry_exists(&v1_key).await {
-        // Refresh every associated key and promote an exact V1 hit into the durable V2 namespace.
+        register_native_signature(model, thinking, signature).await;
+        return true;
+    }
+    if let Some(source_model) = native_signature_internal_model(signature)
+        .as_deref()
+        .and_then(canonical_model_for_internal_model)
+        && native_registry_exists(&native_signature_v2_registry_key(source_model, signature)).await
+    {
         register_native_signature(model, thinking, signature).await;
         return true;
     }
@@ -404,33 +464,47 @@ pub enum NativeSignatureImportResult {
 /// Import one pre-registry Bedrock signature during a bounded production migration.
 ///
 /// This is intentionally separate from normal exact validation. A signature that shares at least
-/// three of four model-and-length-bound chunks with one already issued by this fleet is a typical
+/// three of four channel-and-length-bound chunks with one already issued by this fleet is a typical
 /// single-point modification and remains rejected. Four matches recover an exact value if an
 /// interrupted Redis write left only its fingerprints. A completely unknown value must pass the
-/// observed Bedrock protobuf envelope and internal-model checks before being registered.
+/// observed Bedrock protobuf envelope and channel-membership checks before being registered.
 pub async fn import_native_signature_during_migration(
     model: &str,
     thinking: &str,
     signature: &str,
 ) -> NativeSignatureImportResult {
-    if !is_plausible_bedrock_native_signature(model, signature) {
+    if !is_plausible_bedrock_native_signature(signature) {
         return NativeSignatureImportResult::InvalidStructure;
     }
-    let fingerprint_keys = native_signature_fingerprint_keys(model, signature);
-    let matches = join_all(
-        fingerprint_keys
+    let mut fingerprint_groups = vec![native_signature_v3_fingerprint_keys(signature)];
+    fingerprint_groups.extend(
+        AWS_B_NATIVE_MODELS
             .iter()
-            .map(|key| native_registry_exists(key)),
-    )
-    .await
-    .into_iter()
-    .filter(|matched| *matched)
-    .count();
-    if matches == NATIVE_SIGNATURE_FINGERPRINT_PARTS {
+            .map(|(canonical, _)| native_signature_v2_fingerprint_keys(canonical, signature)),
+    );
+    let match_counts = join_all(fingerprint_groups.iter().map(|keys| async move {
+        join_all(keys.iter().map(|key| native_registry_exists(key)))
+            .await
+            .into_iter()
+            .filter(|matched| *matched)
+            .count()
+    }))
+    .await;
+    if match_counts.contains(&NATIVE_SIGNATURE_FINGERPRINT_PARTS) {
         register_native_signature(model, thinking, signature).await;
         return NativeSignatureImportResult::RecoveredExactFingerprint;
     }
-    if matches >= NATIVE_SIGNATURE_NEAR_MATCH_THRESHOLD {
+    let channel_near_match = match_counts
+        .first()
+        .is_some_and(|matches| *matches >= NATIVE_SIGNATURE_V3_NEAR_MATCH_THRESHOLD);
+    // A single Base64 character can change two decoded bytes. If that happens across an old V2
+    // raw-byte partition boundary, only two of four legacy fingerprints remain. V3 partitions the
+    // encoded characters and therefore retains the stricter three-of-four threshold.
+    let legacy_near_match = match_counts
+        .iter()
+        .skip(1)
+        .any(|matches| *matches >= NATIVE_SIGNATURE_V2_NEAR_MATCH_THRESHOLD);
+    if channel_near_match || legacy_near_match {
         return NativeSignatureImportResult::RegisteredNearMatch;
     }
     register_native_signature(model, thinking, signature).await;
@@ -499,39 +573,42 @@ fn parse_protobuf_fields(input: &[u8]) -> Option<Vec<(u64, ProtobufValue<'_>)>> 
     Some(fields)
 }
 
+const AWS_B_NATIVE_MODELS: &[(&str, &str)] = &[
+    ("claude-opus-4.8", "claude-quince"),
+    ("claude-opus-5", "claude-honey"),
+    ("claude-sonnet-5", "claude-saffron"),
+    ("claude-opus-4.7", "claude-opus-4-7"),
+    ("claude-opus-4.6", "claude-opus-4-6"),
+    ("claude-sonnet-4.6", "claude-sonnet-4-6"),
+    ("claude-sonnet-4.5", "claude-sonnet-4-5"),
+    ("claude-haiku-4.5", "claude-haiku-4-5"),
+];
+
 fn provider_internal_model(model: &str) -> Option<&'static str> {
     let canonical = canonical_native_model(model);
-    match canonical.as_str() {
-        "claude-opus-4.8" => Some("claude-quince"),
-        "claude-opus-5" => Some("claude-honey"),
-        "claude-sonnet-5" => Some("claude-saffron"),
-        "claude-opus-4.7" => Some("claude-opus-4-7"),
-        "claude-opus-4.6" => Some("claude-opus-4-6"),
-        "claude-sonnet-4.6" => Some("claude-sonnet-4-6"),
-        "claude-sonnet-4.5" => Some("claude-sonnet-4-5"),
-        "claude-haiku-4.5" => Some("claude-haiku-4-5"),
-        _ => None,
-    }
+    AWS_B_NATIVE_MODELS
+        .iter()
+        .find_map(|(candidate, internal)| (*candidate == canonical).then_some(*internal))
 }
 
-fn internal_model_matches(model: &str, internal: &str) -> bool {
-    provider_internal_model(model) == Some(internal)
+fn canonical_model_for_internal_model(internal: &str) -> Option<&'static str> {
+    AWS_B_NATIVE_MODELS
+        .iter()
+        .find_map(|(canonical, candidate)| (*candidate == internal).then_some(*canonical))
 }
 
-fn is_plausible_bedrock_native_signature(model: &str, signature: &str) -> bool {
+fn native_signature_internal_model(signature: &str) -> Option<String> {
     let Ok(raw) = BASE64.decode(signature) else {
-        return false;
+        return None;
     };
     if raw.len() < 128
         || raw.len() > MAX_NATIVE_SIGNATURE_RAW_BYTES
         || raw.first() != Some(&0x12)
         || !raw.ends_with(&[0x18, 0x01])
     {
-        return false;
+        return None;
     }
-    let Some(top) = parse_protobuf_fields(&raw) else {
-        return false;
-    };
+    let top = parse_protobuf_fields(&raw)?;
     let mut inner = None;
     let mut terminal = false;
     for (field, value) in top {
@@ -542,11 +619,9 @@ fn is_plausible_bedrock_native_signature(model: &str, signature: &str) -> bool {
         }
     }
     let (Some(inner), true) = (inner, terminal) else {
-        return false;
+        return None;
     };
-    let Some(inner_fields) = parse_protobuf_fields(inner) else {
-        return false;
-    };
+    let inner_fields = parse_protobuf_fields(inner)?;
     let mut header = None;
     let mut required_payload_fields = [false; 4];
     for (field, value) in inner_fields {
@@ -559,11 +634,9 @@ fn is_plausible_bedrock_native_signature(model: &str, signature: &str) -> bool {
         }
     }
     if required_payload_fields.iter().any(|present| !present) {
-        return false;
+        return None;
     }
-    let Some(header_fields) = header.and_then(parse_protobuf_fields) else {
-        return false;
-    };
+    let header_fields = header.and_then(parse_protobuf_fields)?;
     let mut internal_model = None;
     let mut thinking_marker = false;
     for (field, value) in header_fields {
@@ -575,8 +648,14 @@ fn is_plausible_bedrock_native_signature(model: &str, signature: &str) -> bool {
             }
         }
     }
-    thinking_marker
-        && internal_model.is_some_and(|internal| internal_model_matches(model, internal))
+    thinking_marker.then_some(internal_model?.to_string())
+}
+
+fn is_plausible_bedrock_native_signature(signature: &str) -> bool {
+    native_signature_internal_model(signature)
+        .as_deref()
+        .and_then(canonical_model_for_internal_model)
+        .is_some()
 }
 
 /// 手写 HMAC-SHA256（复用已有的 `sha2` 依赖，避免引入 `hmac` crate）。
@@ -887,7 +966,7 @@ mod tests {
             let signature = generate_model_signature(model).expect("supported model");
             assert!(validate_signature(&signature).is_ok(), "model={model}");
             assert!(
-                is_plausible_bedrock_native_signature(model, &signature),
+                is_plausible_bedrock_native_signature(&signature),
                 "model={model}"
             );
 
@@ -1051,10 +1130,20 @@ mod tests {
             v2,
             native_signature_v2_registry_key("claude-opus-5", "opaque-signature-material")
         );
+
+        let v3 = native_signature_v3_registry_key("opaque-signature-material");
+        assert_eq!(
+            v3,
+            native_signature_v3_registry_key("opaque-signature-material")
+        );
+        assert_ne!(
+            v3,
+            native_signature_v3_registry_key("modified-signature-material")
+        );
     }
 
     #[tokio::test]
-    async fn native_registry_binds_model_and_signature_but_not_public_thinking_summary() {
+    async fn native_registry_binds_channel_and_signature_but_not_model_or_public_thinking() {
         let signature = format!("native-opaque-{}", fastrand::u64(..));
         assert!(
             !validate_native_signature("claude-opus-4-8", "visible thinking", &signature).await
@@ -1065,7 +1154,12 @@ mod tests {
                 .await
         );
         assert!(validate_native_signature("claude-opus-4-8", "changed thinking", &signature).await);
-        assert!(!validate_native_signature("claude-opus-5", "visible thinking", &signature).await);
+        for replay_model in ["claude-opus-5", "claude-sonnet-5"] {
+            assert!(
+                validate_native_signature(replay_model, "visible thinking", &signature).await,
+                "a signature issued by the same AWS-B channel must replay on {replay_model}"
+            );
+        }
         assert!(
             !validate_native_signature(
                 "claude-opus-4-8",
@@ -1075,5 +1169,46 @@ mod tests {
             .await
         );
         assert!(!validate_native_signature("claude-opus-4-8", "visible thinking", "").await);
+    }
+
+    #[tokio::test]
+    async fn legacy_model_registration_promotes_on_first_cross_model_channel_replay() {
+        let signature = native_bedrock_signature_for_test("claude-quince");
+        let legacy_v2 = native_signature_v2_registry_key("claude-opus-4-8", &signature);
+        register_native_registry_keys(&[legacy_v2]).await;
+
+        assert!(
+            validate_native_signature("claude-sonnet-5", "", &signature).await,
+            "the provider envelope must recover its issuing model's V2 key and promote to V3"
+        );
+        assert!(
+            native_registry_exists(&native_signature_v3_registry_key(&signature)).await,
+            "a recovered rolling-upgrade signature must be promoted into the channel namespace"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_rejects_every_single_base64_character_mutation() {
+        let signature = native_bedrock_signature_for_test("claude-quince");
+        register_native_signature("claude-opus-4-8", "", &signature).await;
+
+        for index in 0..signature.len() {
+            if signature.as_bytes()[index] == b'=' {
+                continue;
+            }
+            let mut mutated = signature.as_bytes().to_vec();
+            mutated[index] = if mutated[index] == b'A' { b'B' } else { b'A' };
+            let mutated = String::from_utf8(mutated).expect("base64 stays ASCII");
+            let result =
+                import_native_signature_during_migration("claude-sonnet-5", "", &mutated).await;
+            assert!(
+                matches!(
+                    result,
+                    NativeSignatureImportResult::RegisteredNearMatch
+                        | NativeSignatureImportResult::InvalidStructure
+                ),
+                "single-character mutation at encoded index {index} was accepted as {result:?}"
+            );
+        }
     }
 }

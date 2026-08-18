@@ -2672,14 +2672,9 @@ pub async fn post_messages(
     let gpt_passthrough = is_gpt_model(&payload.model);
     let aws_b40_initial_thinking_requested = aws_b40_compat
         && (payload.thinking.is_some() || payload.model.to_ascii_lowercase().contains("thinking"));
-    // Temporarily disable inbound thinking-signature rejection. Production clients can replay
-    // provider signatures that are valid for their conversation but absent from this fleet's
-    // registry; rejecting them here returns 400 before the prompt-cache path can run. Keep the
-    // validator and its tests intact so the guard can be restored after the registry contract is
-    // made reliable across gateways and upgrades.
-    // if let Some(response) = reject_invalid_thinking_signatures(&payload, aws_b40_compat).await {
-    //     return response;
-    // }
+    if let Some(response) = reject_invalid_thinking_signatures(&payload, aws_b40_compat).await {
+        return response;
+    }
     if aws_b40_compat {
         normalize_aws_b40_thinking(&mut payload);
         normalize_aws_b40_tool_choice(&mut payload);
@@ -5869,12 +5864,9 @@ pub async fn post_messages_cc(
     let gpt_passthrough = is_gpt_model(&payload.model);
     let aws_b40_initial_thinking_requested = aws_b40_compat
         && (payload.thinking.is_some() || payload.model.to_ascii_lowercase().contains("thinking"));
-    // Temporarily disable inbound thinking-signature rejection for the Claude Code endpoint too.
-    // See the matching /v1/messages comment above. The validation implementation remains in place
-    // for diagnostics and a future re-enable once cross-gateway registration is dependable.
-    // if let Some(response) = reject_invalid_thinking_signatures(&payload, aws_b40_compat).await {
-    //     return response;
-    // }
+    if let Some(response) = reject_invalid_thinking_signatures(&payload, aws_b40_compat).await {
+        return response;
+    }
     if aws_b40_compat {
         normalize_aws_b40_thinking(&mut payload);
         normalize_aws_b40_tool_choice(&mut payload);
@@ -7208,7 +7200,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn message_entrypoints_bypass_unknown_thinking_signatures_before_cache_processing() {
+    async fn message_entrypoints_reject_unknown_thinking_signatures_before_cache_processing() {
         let request = parse(
             "claude-opus-5",
             serde_json::json!({
@@ -7232,10 +7224,13 @@ mod tests {
             RawApiJson(request.clone(), Bytes::new()),
         )
         .await;
-        assert_eq!(
-            v1.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "/v1/messages must pass the unknown signature and reach provider selection"
+        assert_eq!(v1.status(), StatusCode::BAD_REQUEST);
+        let v1_body = axum::body::to_bytes(v1.into_body(), usize::MAX)
+            .await
+            .expect("/v1/messages error body");
+        assert!(
+            String::from_utf8_lossy(&v1_body).contains("Invalid signature"),
+            "/v1/messages must report the signature validation failure"
         );
 
         let cc = post_messages_cc(
@@ -7244,10 +7239,13 @@ mod tests {
             RawApiJson(request, Bytes::new()),
         )
         .await;
-        assert_eq!(
-            cc.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "/cc/v1/messages must pass the unknown signature and reach provider selection"
+        assert_eq!(cc.status(), StatusCode::BAD_REQUEST);
+        let cc_body = axum::body::to_bytes(cc.into_body(), usize::MAX)
+            .await
+            .expect("/cc/v1/messages error body");
+        assert!(
+            String::from_utf8_lossy(&cc_body).contains("Invalid signature"),
+            "/cc/v1/messages must report the signature validation failure"
         );
     }
 
@@ -7359,16 +7357,19 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
 
-        let mismatched_model = parse(
+        let same_channel_different_model = parse(
             "claude-sonnet-5",
             serde_json::json!({"messages": legacy.messages}),
         );
-        assert_eq!(
-            reject_invalid_thinking_signatures_with_import_policy(&mismatched_model, true, true,)
-                .await
-                .expect("the internal Bedrock model must match the requested model")
-                .status(),
-            StatusCode::BAD_REQUEST
+        assert!(
+            reject_invalid_thinking_signatures_with_import_policy(
+                &same_channel_different_model,
+                true,
+                true,
+            )
+            .await
+            .is_none(),
+            "a valid Bedrock signature belongs to the AWS-B channel, not one requested model"
         );
     }
 
