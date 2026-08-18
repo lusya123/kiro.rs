@@ -349,8 +349,8 @@ impl UsageBreakdown {
 ///
 /// Production billing evidence on 2026-08-09 showed identical Sonnet 5
 /// requests repeatedly reporting the same 88k-89k cache write and zero reads,
-/// while Opus 4.7/4.8/5 correctly transitioned from write to read.  Therefore
-/// only those verified Opus families may replace the public cache split.  All
+/// while Opus 4.6/4.7/4.8/5 correctly transition from write to read. Therefore
+/// only those verified Opus families may replace the public cache split. All
 /// other models still use the validated native aggregate totals, but keep the
 /// deterministic cache plan computed before the request.
 pub(super) fn reconcile_native_usage(
@@ -382,7 +382,7 @@ pub(super) fn reconcile_native_usage(
 fn native_cache_buckets_are_trusted(model: &str) -> bool {
     matches!(
         super::converter::map_model(model).as_deref(),
-        Some("claude-opus-4.7" | "claude-opus-4.8" | "claude-opus-5")
+        Some("claude-opus-4.6" | "claude-opus-4.7" | "claude-opus-4.8" | "claude-opus-5")
     )
 }
 
@@ -3510,6 +3510,7 @@ mod tests {
     #[test]
     fn only_verified_opus_families_trust_native_cache_buckets() {
         for model in [
+            "claude-opus-4-6",
             "claude-opus-4-7",
             "claude-opus-4.8",
             "claude-opus-5-thinking",
@@ -3523,7 +3524,6 @@ mod tests {
         for model in [
             "claude-sonnet-4-6",
             "claude-sonnet-5",
-            "claude-opus-4-6",
             "claude-opus-4-5-20251101",
             "claude-haiku-4-5-20251001",
         ] {
@@ -3615,7 +3615,12 @@ mod tests {
         };
         plan.len = 1;
 
-        for model in ["claude-opus-4-7", "claude-opus-4-8", "claude-opus-5"] {
+        for model in [
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+        ] {
             let native = reconcile_native_usage(model, initial, &exact, plan)
                 .expect("native totals are valid");
             assert_eq!(
