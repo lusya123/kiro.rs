@@ -574,6 +574,7 @@ fn parse_protobuf_fields(input: &[u8]) -> Option<Vec<(u64, ProtobufValue<'_>)>> 
 }
 
 const AWS_B_NATIVE_MODELS: &[(&str, &str)] = &[
+    ("claude-opus-4.5", "claude-opus-4-5"),
     ("claude-opus-4.8", "claude-quince"),
     ("claude-opus-5", "claude-honey"),
     ("claude-sonnet-5", "claude-saffron"),
@@ -962,7 +963,17 @@ mod tests {
 
     #[test]
     fn model_bound_fallback_signatures_are_decodable_and_tamper_evident() {
-        for model in ["claude-opus-4-6", "claude-opus-4-7"] {
+        for model in [
+            "claude-opus-4-5",
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-6",
+            "claude-sonnet-5",
+            "claude-haiku-4-5",
+        ] {
             let signature = generate_model_signature(model).expect("supported model");
             assert!(validate_signature(&signature).is_ok(), "model={model}");
             assert!(

@@ -2705,8 +2705,7 @@ pub async fn post_messages(
         }
     };
 
-    let aws_b40_thinking_requested =
-        aws_b40_compat && (aws_b40_initial_thinking_requested || payload.thinking.is_some());
+    let aws_b40_thinking_requested = aws_b40_initial_thinking_requested;
 
     // 结构化输出:校验 output_config.format 并注入 schema 指令(非法 schema 直接 400)。
     if let Some(response) = apply_structured_output(&mut payload) {
@@ -3009,6 +3008,7 @@ async fn handle_stream_request(
         ctx.hide_thinking_blocks();
     }
     if aws_b40_compat
+        && aws_b40_thinking_requested
         && thinking_enabled
         && super::compat::model_uses_local_thinking_signature_fallback(model)
     {
@@ -4040,6 +4040,27 @@ fn normalize_aws_b40_thinking(payload: &mut MessagesRequest) {
     // 已有 Opus 4.8 的显式 adaptive 请求必须原样保留；它在 AWS-B 下没有
     // `output_config` 也是一种经过校准的合法形态，不能因为这次扩展而补上 effort。
     let model_lower = payload.model.to_ascii_lowercase();
+    if payload.thinking.is_none() && aws_b40_model_supports_adaptive_thinking(&payload.model) {
+        payload.thinking = Some(Thinking {
+            thinking_type: "adaptive".to_string(),
+            budget_tokens: 20_000,
+            display: None,
+        });
+        if let Some(output_config) = payload.output_config.as_mut() {
+            if output_config
+                .effort
+                .as_deref()
+                .is_none_or(|effort| effort.trim().is_empty())
+            {
+                output_config.effort = Some("high".to_string());
+            }
+        } else {
+            payload.output_config = Some(OutputConfig {
+                effort: Some("high".to_string()),
+                format: None,
+            });
+        }
+    }
     if model_lower.contains("thinking")
         || model_is_opus_5(&model_lower)
         || model_is_sonnet_5(&model_lower)
@@ -5896,8 +5917,7 @@ pub async fn post_messages_cc(
         }
     };
 
-    let aws_b40_thinking_requested =
-        aws_b40_compat && (aws_b40_initial_thinking_requested || payload.thinking.is_some());
+    let aws_b40_thinking_requested = aws_b40_initial_thinking_requested;
 
     // 结构化输出:校验 output_config.format 并注入 schema 指令(非法 schema 直接 400)。
     if let Some(response) = apply_structured_output(&mut payload) {
@@ -6192,6 +6212,7 @@ async fn handle_stream_request_buffered(
         ctx.hide_thinking_blocks();
     }
     if aws_b40_compat
+        && aws_b40_thinking_requested
         && thinking_enabled
         && super::compat::model_uses_local_thinking_signature_fallback(model)
     {
@@ -9789,6 +9810,111 @@ mod tests {
         );
         assert!(req.output_config.is_none());
         assert_eq!(req.model, "claude-opus-4-8");
+    }
+
+    #[test]
+    fn aws_b_omitted_thinking_defaults_modern_models_to_adaptive_high() {
+        for model in [
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-4-6",
+            "claude-sonnet-5",
+        ] {
+            let mut req = parse(model, serde_json::json!({}));
+
+            normalize_aws_b40_thinking(&mut req);
+
+            assert_eq!(
+                req.thinking
+                    .as_ref()
+                    .map(|thinking| thinking.thinking_type.as_str()),
+                Some("adaptive"),
+                "model={model}"
+            );
+            assert_eq!(
+                req.output_config
+                    .as_ref()
+                    .and_then(|config| config.effort.as_deref()),
+                Some("high"),
+                "model={model}"
+            );
+        }
+    }
+
+    #[test]
+    fn aws_b_explicit_thinking_parameters_override_the_implicit_default() {
+        for model in [
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-4-6",
+            "claude-sonnet-5",
+        ] {
+            let mut disabled = parse(model, serde_json::json!({"thinking": {"type": "disabled"}}));
+            normalize_aws_b40_thinking(&mut disabled);
+            assert!(disabled.thinking.is_none(), "model={model}");
+            assert!(disabled.output_config.is_none(), "model={model}");
+
+            let mut adaptive = parse(
+                model,
+                serde_json::json!({
+                    "thinking": {"type": "adaptive"},
+                    "output_config": {"effort": "low"}
+                }),
+            );
+            normalize_aws_b40_thinking(&mut adaptive);
+            assert_eq!(
+                adaptive
+                    .thinking
+                    .as_ref()
+                    .map(|thinking| thinking.thinking_type.as_str()),
+                Some("adaptive"),
+                "model={model}"
+            );
+            assert_eq!(
+                adaptive
+                    .output_config
+                    .as_ref()
+                    .and_then(|config| config.effort.as_deref()),
+                Some("low"),
+                "model={model}"
+            );
+        }
+
+        for model in [
+            "claude-opus-4-5-20251101",
+            "claude-opus-4-6",
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5-20251001",
+        ] {
+            let mut enabled = parse(
+                model,
+                serde_json::json!({
+                    "max_tokens": 8192,
+                    "thinking": {"type": "enabled", "budget_tokens": 4096}
+                }),
+            );
+            normalize_aws_b40_thinking(&mut enabled);
+            let thinking = enabled.thinking.as_ref().expect("enabled thinking");
+            assert_eq!(thinking.thinking_type, "enabled", "model={model}");
+            assert_eq!(thinking.budget_tokens, 4096, "model={model}");
+        }
+
+        let mut invalid = parse(
+            "claude-opus-5",
+            serde_json::json!({"thinking": {"type": "invalid"}}),
+        );
+        normalize_aws_b40_thinking(&mut invalid);
+        assert_eq!(
+            kiro_request_preflight_error(&invalid, true)
+                .expect("invalid explicit thinking must be rejected")
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]

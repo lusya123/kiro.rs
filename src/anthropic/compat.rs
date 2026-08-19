@@ -245,14 +245,25 @@ pub fn model_omits_thinking(model: &str) -> bool {
     model.to_ascii_lowercase().contains("opus")
 }
 
-/// Older Opus runtimes can execute an adaptive-thinking request without
-/// returning a provider reasoning envelope. AWS-B keeps those two public
-/// model contracts usable with a model-bound, locally authenticated fallback
-/// signature. Newer families must continue to use their native signature.
+/// Kiro runtimes can execute an explicit thinking request without returning a
+/// provider reasoning signature. AWS-B prefers the native signature whenever
+/// it is available, but keeps the public thinking contract usable with a
+/// model-bound, locally authenticated fallback for every supported Claude
+/// model whose provider envelope we can reproduce and validate.
 pub fn model_uses_local_thinking_signature_fallback(model: &str) -> bool {
     matches!(
         super::converter::map_model(model).as_deref(),
-        Some("claude-opus-4.6" | "claude-opus-4.7")
+        Some(
+            "claude-opus-4.5"
+                | "claude-opus-4.6"
+                | "claude-opus-4.7"
+                | "claude-opus-4.8"
+                | "claude-opus-5"
+                | "claude-sonnet-4.5"
+                | "claude-sonnet-4.6"
+                | "claude-sonnet-5"
+                | "claude-haiku-4.5"
+        )
     )
 }
 

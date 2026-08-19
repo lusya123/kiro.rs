@@ -1892,11 +1892,20 @@ impl StreamContext {
         if !self.native_reasoning_active {
             return Vec::new();
         }
+        let local_signature_fallback = self.aws_b40_compat
+            && self.upstream_thinking_signature.is_none()
+            && super::compat::model_uses_local_thinking_signature_fallback(&self.model);
+        let mut events = Vec::new();
+        if local_signature_fallback && self.thinking_block_index.is_none() {
+            events.extend(self.start_native_reasoning_block());
+        }
         self.native_reasoning_active = false;
         self.thinking_extracted = true;
 
-        let mut events = Vec::new();
-        if self.aws_b40_compat && self.upstream_thinking_signature.is_none() {
+        if self.aws_b40_compat
+            && self.upstream_thinking_signature.is_none()
+            && !local_signature_fallback
+        {
             let raw = std::mem::take(&mut self.thinking_pending_raw);
             if !raw.is_empty() {
                 self.thinking_tokens += estimate_tokens(&raw);
@@ -4041,16 +4050,52 @@ mod tests {
     }
 
     #[test]
-    fn aws_b_synthetic_thinking_is_suppressed() {
+    fn aws_b_modern_synthetic_thinking_emits_only_a_signed_envelope() {
         let thinking = "Inspect the request, calculate the result, and answer clearly.";
         let mut ctx =
             StreamContext::new_with_thinking("claude-opus-4-8", 1, true, true, HashMap::new());
         ctx.enable_aws_b40_compat();
 
         let events = ctx.emit_synthetic_thinking_block(thinking);
-        assert!(events.is_empty());
+        assert!(events.iter().any(|event| {
+            event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "thinking"
+        }));
+        assert!(!events.iter().any(|event| {
+            event.data["delta"]["type"] == "thinking_delta"
+                && !event.data["delta"]["thinking"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .is_empty()
+        }));
+        let signature = events
+            .iter()
+            .find(|event| event.data["delta"]["type"] == "signature_delta")
+            .and_then(|event| event.data["delta"]["signature"].as_str())
+            .expect("modern fallback must emit a model-bound signature");
+        assert!(super::super::signature::validate_signature(signature).is_ok());
         assert!(ctx.thinking_text_acc.is_empty());
         assert_eq!(ctx.thinking_tokens, 0);
+    }
+
+    #[test]
+    fn aws_b_opus_4_5_synthetic_thinking_emits_a_valid_signature() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-5-20251101",
+            1,
+            true,
+            true,
+            HashMap::new(),
+        );
+        ctx.enable_aws_b40_compat();
+
+        let events = ctx.emit_synthetic_thinking_block("Plan carefully");
+        let signature = events
+            .iter()
+            .find(|event| event.data["delta"]["type"] == "signature_delta")
+            .and_then(|event| event.data["delta"]["signature"].as_str())
+            .expect("Opus 4.5 explicit thinking must be signed");
+        assert!(super::super::signature::validate_signature(signature).is_ok());
     }
 
     #[test]
@@ -4085,6 +4130,59 @@ mod tests {
                 signature.to_string(),
             ))
         );
+    }
+
+    #[test]
+    fn aws_b_modern_model_signs_native_reasoning_when_upstream_signature_is_missing() {
+        use crate::kiro::model::events::ReasoningContentEvent;
+
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-5", 17, true, true, HashMap::new());
+        ctx.enable_aws_b40_compat();
+        ctx.set_aws_b40_thinking_requested(true);
+        ctx.set_thinking_text_visible(true);
+        let _ = ctx.generate_initial_events();
+
+        let pending = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            text: "Plan carefully".to_string(),
+            ..Default::default()
+        }));
+        assert!(
+            pending.is_empty(),
+            "unsigned reasoning must remain buffered"
+        );
+
+        let events = ctx.generate_final_events();
+        let start = events
+            .iter()
+            .position(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "thinking"
+            })
+            .expect("explicit thinking must produce a thinking block");
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.data["delta"]["thinking"].as_str())
+                .collect::<String>(),
+            "Plan carefully"
+        );
+        let (signature_position, signature) = events
+            .iter()
+            .enumerate()
+            .find_map(|(position, event)| {
+                (event.data["delta"]["type"] == "signature_delta")
+                    .then(|| event.data["delta"]["signature"].as_str())
+                    .flatten()
+                    .map(|signature| (position, signature))
+            })
+            .expect("explicit thinking must produce a signature delta");
+        assert!(super::super::signature::validate_signature(signature).is_ok());
+        let stop = events
+            .iter()
+            .position(|event| event.event == "content_block_stop" && event.data["index"] == 0)
+            .expect("thinking block must be closed");
+        assert!(start < signature_position && signature_position < stop);
     }
 
     #[test]
@@ -5152,7 +5250,7 @@ mod tests {
     }
 
     #[test]
-    fn aws_b_tool_only_response_does_not_gain_synthetic_thinking() {
+    fn aws_b_tool_only_response_gets_signed_envelope_before_tool_use() {
         let mut ctx =
             StreamContext::new_with_thinking("claude-opus-4-8", 1, true, true, HashMap::new());
         ctx.enable_aws_b40_compat();
@@ -5170,7 +5268,19 @@ mod tests {
             .filter_map(|event| event.data["content_block"]["type"].as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(block_types, vec!["tool_use"]);
+        assert_eq!(block_types, vec!["thinking", "tool_use"]);
+        let signature_position = events
+            .iter()
+            .position(|event| event.data["delta"]["type"] == "signature_delta")
+            .expect("explicit thinking must be signed before tool use");
+        let tool_position = events
+            .iter()
+            .position(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("tool block");
+        assert!(signature_position < tool_position);
     }
 
     #[test]
