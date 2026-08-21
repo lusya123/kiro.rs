@@ -4696,7 +4696,7 @@ async fn reject_invalid_thinking_signatures_with_import_policy(
                         "rejected unregistered or invalid native thinking signature"
                     );
                     let message = format!(
-                        "messages.{}.content.{}: Invalid signature in thinking block",
+                        "messages.{}.content.{}: Invalid `signature` in `thinking` block",
                         message_index, block_index
                     );
                     return Some(thinking_error_response(payload.stream, message));
@@ -4719,7 +4719,7 @@ async fn reject_invalid_thinking_signatures_with_import_policy(
                     "rejected invalid thinking signature"
                 );
                 let message = format!(
-                    "messages.{}.content.{}: Invalid signature in thinking block",
+                    "messages.{}.content.{}: Invalid `signature` in `thinking` block",
                     message_index, block_index
                 );
                 return Some(thinking_error_response(payload.stream, message));
@@ -7221,7 +7221,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn message_entrypoints_reject_unknown_thinking_signatures_before_cache_processing() {
+    async fn message_entrypoints_use_upstream_signature_error_contract() {
         let request = parse(
             "claude-opus-5",
             serde_json::json!({
@@ -7249,9 +7249,12 @@ mod tests {
         let v1_body = axum::body::to_bytes(v1.into_body(), usize::MAX)
             .await
             .expect("/v1/messages error body");
-        assert!(
-            String::from_utf8_lossy(&v1_body).contains("Invalid signature"),
-            "/v1/messages must report the signature validation failure"
+        let v1_body: serde_json::Value =
+            serde_json::from_slice(&v1_body).expect("/v1/messages error JSON");
+        assert_eq!(
+            v1_body["error"]["message"],
+            "messages.0.content.0: Invalid `signature` in `thinking` block",
+            "/v1/messages must mirror the upstream signature error contract"
         );
 
         let cc = post_messages_cc(
@@ -7264,9 +7267,12 @@ mod tests {
         let cc_body = axum::body::to_bytes(cc.into_body(), usize::MAX)
             .await
             .expect("/cc/v1/messages error body");
-        assert!(
-            String::from_utf8_lossy(&cc_body).contains("Invalid signature"),
-            "/cc/v1/messages must report the signature validation failure"
+        let cc_body: serde_json::Value =
+            serde_json::from_slice(&cc_body).expect("/cc/v1/messages error JSON");
+        assert_eq!(
+            cc_body["error"]["message"],
+            "messages.0.content.0: Invalid `signature` in `thinking` block",
+            "/cc/v1/messages must mirror the upstream signature error contract"
         );
     }
 
