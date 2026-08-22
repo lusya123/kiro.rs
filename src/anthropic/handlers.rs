@@ -27,7 +27,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::json;
 use std::time::Duration;
 use tokio::time::{Instant, interval_at};
@@ -59,20 +59,30 @@ const RAW_JSON_BODY_LIMIT: usize = 50 * 1024 * 1024;
 
 pub(super) struct RawApiJson<T>(pub T, pub Bytes);
 
-fn requested_stop_sequences(raw_body: &Bytes) -> Vec<String> {
-    serde_json::from_slice::<serde_json::Value>(raw_body)
-        .ok()
-        .and_then(|body| body.get("stop_sequences").cloned())
-        .and_then(|sequences| sequences.as_array().cloned())
-        .map(|sequences| {
-            sequences
+#[derive(Debug, Default, Deserialize)]
+struct RequestBodyMetadata {
+    #[serde(default)]
+    stop_sequences: Vec<serde_json::Value>,
+}
+
+impl RequestBodyMetadata {
+    fn parse(raw_body: &[u8]) -> serde_json::Result<ParsedRequestBodyMetadata> {
+        let metadata: Self = serde_json::from_slice(raw_body)?;
+        Ok(ParsedRequestBodyMetadata {
+            stop_sequences: metadata
+                .stop_sequences
                 .into_iter()
                 .filter_map(|sequence| sequence.as_str().map(str::to_owned))
                 .filter(|sequence| !sequence.is_empty())
                 .take(4)
-                .collect()
+                .collect(),
         })
-        .unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Default)]
+struct ParsedRequestBodyMetadata {
+    stop_sequences: Vec<String>,
 }
 
 fn api_json_rejection_response(
@@ -138,6 +148,28 @@ fn auto_continue_round_limit(requested_max_tokens: i32) -> usize {
 
 fn effective_auto_continue_max_tokens(requested_max_tokens: i32) -> i32 {
     requested_max_tokens.max(1)
+}
+
+fn retain_request_body_for_auto_continue(
+    request_body: String,
+    requested_max_tokens: i32,
+) -> Option<String> {
+    (auto_continue_round_limit(effective_auto_continue_max_tokens(requested_max_tokens)) > 0)
+        .then_some(request_body)
+}
+
+fn prepare_provider_request_body(
+    request_body: String,
+    requested_max_tokens: i32,
+) -> (Bytes, Option<String>) {
+    if auto_continue_round_limit(effective_auto_continue_max_tokens(requested_max_tokens)) == 0 {
+        (Bytes::from(request_body), None)
+    } else {
+        (
+            Bytes::copy_from_slice(request_body.as_bytes()),
+            Some(request_body),
+        )
+    }
 }
 
 fn begin_continuation_billing_after_connect<T, E>(
@@ -318,6 +350,52 @@ fn extract_explicit_end_markers(text: &str) -> Vec<String> {
         }
     }
     markers
+}
+
+#[derive(Debug, Default)]
+struct ContinuationCompletionTarget {
+    numeric_target: Option<u64>,
+    end_markers: Vec<String>,
+}
+
+impl ContinuationCompletionTarget {
+    fn from_request_body(request_body: &str) -> Self {
+        let request_text = extract_request_text_for_completion_check(request_body);
+        let request_text_lower = request_text.to_lowercase();
+        let numeric_target = if request_text.contains('到')
+            || request_text.contains('至')
+            || request_text_lower.contains(" to ")
+            || request_text_lower.contains(" through ")
+        {
+            let numbers = extract_u64_numbers(&request_text);
+            numbers
+                .contains(&1)
+                .then(|| numbers.into_iter().filter(|number| *number > 1).max())
+                .flatten()
+        } else {
+            None
+        };
+
+        Self {
+            numeric_target,
+            end_markers: extract_explicit_end_markers(&request_text),
+        }
+    }
+
+    fn completed(&self, content: &str) -> bool {
+        let Some(last_line) = content.lines().rev().find(|line| !line.trim().is_empty()) else {
+            return false;
+        };
+        let last_line = last_line.trim_end();
+        self.numeric_target
+            .is_some_and(|target| last_line.trim() == target.to_string())
+            || self.end_markers.iter().any(|marker| {
+                last_line
+                    .find(marker)
+                    .map(|index| last_line[index + marker.len()..].trim().is_empty())
+                    .unwrap_or(false)
+            })
+    }
 }
 
 fn continuation_target_completed(request_body: &str, content: &str) -> bool {
@@ -1129,109 +1207,119 @@ fn contains_any_identity_phrase(haystack: &str, phrases: &[&str]) -> bool {
 /// Remove code and quoted literals before looking for a user-authored identity
 /// question. Identity-shaped text inside a Rust fixture, JSON example, shell
 /// snippet, or quotation is data rather than an instruction.
-pub(super) fn identity_instruction_text(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
+pub(super) fn identity_instruction_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.bytes().any(|byte| matches!(byte, b'`' | b'\'' | b'"')) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+
     let mut result = String::with_capacity(text.len());
-    let mut index = 0;
+    let mut chars = text.char_indices().peekable();
     let mut fenced = false;
     let mut inline_code = false;
     let mut quote: Option<char> = None;
     let mut escaped = false;
 
-    while index < chars.len() {
-        if quote.is_none()
-            && !inline_code
-            && index + 2 < chars.len()
-            && chars[index] == '`'
-            && chars[index + 1] == '`'
-            && chars[index + 2] == '`'
-        {
+    while let Some((byte_index, ch)) = chars.next() {
+        if quote.is_none() && !inline_code && text[byte_index..].starts_with("```") {
             fenced = !fenced;
             result.push(' ');
-            index += 3;
+            chars.next();
+            chars.next();
             continue;
         }
         if fenced {
-            if chars[index] == '\n' {
+            if ch == '\n' {
                 result.push('\n');
             } else {
                 result.push(' ');
             }
-            index += 1;
             continue;
         }
 
-        if quote.is_none() && chars[index] == '`' {
+        if quote.is_none() && ch == '`' {
             inline_code = !inline_code;
             result.push(' ');
-            index += 1;
             continue;
         }
         if inline_code {
-            result.push(if chars[index] == '\n' { '\n' } else { ' ' });
-            index += 1;
+            result.push(if ch == '\n' { '\n' } else { ' ' });
             continue;
         }
 
         if let Some(delimiter) = quote {
             if escaped {
                 escaped = false;
-            } else if chars[index] == '\\' {
+            } else if ch == '\\' {
                 escaped = true;
-            } else if chars[index] == delimiter {
+            } else if ch == delimiter {
                 quote = None;
             }
-            result.push(if chars[index] == '\n' { '\n' } else { ' ' });
-            index += 1;
+            result.push(if ch == '\n' { '\n' } else { ' ' });
             continue;
         }
 
-        if chars[index] == '"' {
+        if ch == '"' {
             quote = Some('"');
             result.push(' ');
-            index += 1;
             continue;
         }
-        if chars[index] == '\'' {
-            let previous_is_word =
-                index > 0 && (chars[index - 1].is_alphanumeric() || chars[index - 1] == '_');
-            let next_is_word = index + 1 < chars.len()
-                && (chars[index + 1].is_alphanumeric() || chars[index + 1] == '_');
-            let has_closing_quote = chars[index + 1..].contains(&'\'');
+        if ch == '\'' {
+            let previous_is_word = text[..byte_index]
+                .chars()
+                .next_back()
+                .is_some_and(|previous| previous.is_alphanumeric() || previous == '_');
+            let after_quote = &text[byte_index + ch.len_utf8()..];
+            let next_is_word = after_quote
+                .chars()
+                .next()
+                .is_some_and(|next| next.is_alphanumeric() || next == '_');
+            let has_closing_quote = after_quote.contains('\'');
             if !previous_is_word && next_is_word && has_closing_quote {
                 quote = Some('\'');
                 result.push(' ');
-                index += 1;
                 continue;
             }
         }
 
-        result.push(chars[index]);
-        index += 1;
+        result.push(ch);
     }
 
-    result
+    std::borrow::Cow::Owned(result)
 }
 
 /// Treat camelCase and the common schema separators (`_`, `-`, `/`) as the
 /// same token boundary. This lets identity fields be recognized without
 /// matching arbitrary substrings such as `runtime_productivity`.
-fn normalize_identity_tokens(text: &str) -> String {
+fn normalize_identity_tokens(text: &str) -> std::borrow::Cow<'_, str> {
+    let already_normalized = text.bytes().enumerate().all(|(index, byte)| match byte {
+        b'a'..=b'z' | b'0'..=b'9' => true,
+        b' ' => index > 0 && text.as_bytes()[index - 1] != b' ',
+        _ => false,
+    }) && !text.ends_with(' ');
+    if already_normalized {
+        return std::borrow::Cow::Borrowed(text);
+    }
+
     let mut result = String::with_capacity(text.len());
     let mut previous_was_lower_or_digit = false;
+    let mut separator_pending = false;
     for ch in text.chars() {
         if ch.is_ascii_uppercase() && previous_was_lower_or_digit {
-            result.push(' ');
+            separator_pending = true;
         }
         if ch.is_ascii_alphanumeric() {
+            if separator_pending && !result.is_empty() {
+                result.push(' ');
+            }
             result.push(ch.to_ascii_lowercase());
             previous_was_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+            separator_pending = false;
         } else {
-            result.push(' ');
+            separator_pending = true;
             previous_was_lower_or_digit = false;
         }
     }
-    result.split_whitespace().collect::<Vec<_>>().join(" ")
+    std::borrow::Cow::Owned(result)
 }
 
 /// A third-party label only disables self-identity protection when the caller
@@ -1400,11 +1488,85 @@ fn system_contains_identity_persona_injection(system_text: &str) -> bool {
     })
 }
 
+fn has_contextual_self_identity_probe(normalized_instruction: &str) -> bool {
+    contains_any_identity_phrase(
+        normalized_instruction,
+        &[
+            "actual product name for the assistant serving this response",
+            "product name for the assistant serving this response",
+            "identity of the assistant serving this response",
+            "model of the assistant serving this response",
+            "provider of the assistant serving this response",
+            "runtime of the assistant serving this response",
+            "actual product name for this assistant",
+            "actual product name for the current assistant",
+            "actual product name for the responding assistant",
+            "actual product name for this service",
+            "actual product name for the current service",
+            "actual product name for the responding service",
+            "actual product name for this assistant service",
+            "actual product name for the current assistant service",
+            "actual product name for the responding assistant service",
+            "actual product name for the service serving this response",
+            "actual product name for the current service serving this response",
+            "actual product name for the responding service serving this response",
+            "identity of this assistant",
+            "identity of the current assistant",
+            "identity of the responding assistant",
+            "identity of this service",
+            "identity of the current service",
+            "identity of the responding service",
+            "assistant service serving this response",
+        ],
+    )
+}
+
+fn identity_lowercase_is_noop(text: &str) -> bool {
+    text.chars().flat_map(char::to_lowercase).eq(text.chars())
+}
+
+fn lowercase_identity_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if identity_lowercase_is_noop(text) {
+        std::borrow::Cow::Borrowed(text)
+    } else {
+        std::borrow::Cow::Owned(text.to_lowercase())
+    }
+}
+
+fn into_lowercase_identity_text(text: std::borrow::Cow<'_, str>) -> std::borrow::Cow<'_, str> {
+    match text {
+        std::borrow::Cow::Borrowed(text) => lowercase_identity_text(text),
+        std::borrow::Cow::Owned(text) if identity_lowercase_is_noop(&text) => {
+            std::borrow::Cow::Owned(text)
+        }
+        std::borrow::Cow::Owned(text) => std::borrow::Cow::Owned(text.to_lowercase()),
+    }
+}
+
+fn latest_user_identity_text(payload: &MessagesRequest) -> std::borrow::Cow<'_, str> {
+    let Some(message) = payload
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+    else {
+        return std::borrow::Cow::Borrowed("");
+    };
+    if let serde_json::Value::String(text) = &message.content {
+        return std::borrow::Cow::Borrowed(text);
+    }
+
+    let mut text = String::new();
+    append_message_content_text(&message.content, &mut text);
+    text.push('\n');
+    std::borrow::Cow::Owned(text)
+}
+
 fn request_identity_sanitization_context(
     payload: &MessagesRequest,
 ) -> IdentitySanitizationRequestContext {
     let mut system_text = String::new();
-    let mut user_text = String::new();
+    let user_text = latest_user_identity_text(payload);
     let output_schema_text = payload
         .output_config
         .as_ref()
@@ -1417,21 +1579,17 @@ fn request_identity_sanitization_context(
             system_text.push('\n');
         }
     }
-    if let Some(message) = payload
-        .messages
-        .iter()
-        .rev()
-        .find(|message| message.role == "user")
-    {
-        append_message_content_text(&message.content, &mut user_text);
-        user_text.push('\n');
-    }
-
     let instruction_text = identity_instruction_text(&user_text);
-    let lower = instruction_text.to_lowercase();
-    let normalized_instruction = normalize_identity_tokens(&instruction_text);
+    let short_identity_instruction = instruction_text.trim().chars().count() <= 120;
+    let negated_third_party_data_classification =
+        negates_third_party_data_classification(&instruction_text);
     let tool_text = selected_identity_tool_text(payload, &instruction_text);
     let tool_lower = tool_text.to_lowercase();
+    let normalized_instruction = normalize_identity_tokens(&instruction_text);
+    let contextual_self_identity_probe =
+        has_contextual_self_identity_probe(&normalized_instruction);
+    drop(normalized_instruction);
+    let lower = into_lowercase_identity_text(instruction_text);
     let system_persona_injection = system_contains_identity_persona_injection(&system_text);
     let target = super::identity::IdentityTarget::for_model(&payload.model);
     let trusted_application_persona =
@@ -1502,37 +1660,7 @@ fn request_identity_sanitization_context(
             "谁提供了你",
         ],
     );
-    let contextual_self_identity_probe = contains_any_identity_phrase(
-        &normalized_instruction,
-        &[
-            "actual product name for the assistant serving this response",
-            "product name for the assistant serving this response",
-            "identity of the assistant serving this response",
-            "model of the assistant serving this response",
-            "provider of the assistant serving this response",
-            "runtime of the assistant serving this response",
-            "actual product name for this assistant",
-            "actual product name for the current assistant",
-            "actual product name for the responding assistant",
-            "actual product name for this service",
-            "actual product name for the current service",
-            "actual product name for the responding service",
-            "actual product name for this assistant service",
-            "actual product name for the current assistant service",
-            "actual product name for the responding assistant service",
-            "actual product name for the service serving this response",
-            "actual product name for the current service serving this response",
-            "actual product name for the responding service serving this response",
-            "identity of this assistant",
-            "identity of the current assistant",
-            "identity of the responding assistant",
-            "identity of this service",
-            "identity of the current service",
-            "identity of the responding service",
-            "assistant service serving this response",
-        ],
-    );
-    let short_identity_label_probe = instruction_text.trim().chars().count() <= 120
+    let short_identity_label_probe = short_identity_instruction
         && contains_any_identity_phrase(
             &lower,
             &[
@@ -1984,8 +2112,6 @@ fn request_identity_sanitization_context(
     ]
     .iter()
     .any(|framing| lower.contains(framing));
-    let negated_third_party_data_classification =
-        negates_third_party_data_classification(&instruction_text);
     let explicitly_labeled_third_party_data = !rejects_third_party_discussion
         && !negated_third_party_data_classification
         && [
@@ -2648,7 +2774,9 @@ pub async fn post_messages(
         message_count = %payload.messages.len(),
         "Received POST /v1/messages request"
     );
-    let stop_sequences = requested_stop_sequences(&raw_body);
+    let stop_sequences = RequestBodyMetadata::parse(&raw_body)
+        .unwrap_or_default()
+        .stop_sequences;
 
     let aws_b40_compat = state.aws_b40_compat;
     if let Some(response) = reject_unsupported_gpt_model(&payload.model, aws_b40_compat) {
@@ -2668,6 +2796,7 @@ pub async fn post_messages(
     {
         return provider.proxy_messages(&headers, raw_body).await;
     }
+    drop(raw_body);
 
     let gpt_passthrough = is_gpt_model(&payload.model);
     let aws_b40_initial_thinking_requested = aws_b40_compat
@@ -2822,23 +2951,12 @@ pub async fn post_messages(
         profile_arn: None,
         additional_model_request_fields,
     };
-
-    let request_body = match serde_json::to_string(&kiro_request) {
-        Ok(body) => body,
-        Err(e) => {
-            tracing::error!("序列化请求失败: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "internal_error",
-                    format!("序列化请求失败: {}", e),
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    tracing::debug!("Kiro request body: {}", request_body);
+    let upstream_model = kiro_request
+        .conversation_state
+        .current_message
+        .user_input_message
+        .model_id
+        .clone();
 
     let identity_sanitization_context = request_identity_sanitization_context(&payload);
     let identity_sanitization =
@@ -2874,13 +2992,7 @@ pub async fn post_messages(
     // before choosing the response path so a successful in-process reply can
     // warm the same Redis prefix as a successful provider-backed reply.
     let cache_commit = super::cache::prepare_cache_commit(input_tokens, &payload, aws_b40_compat);
-    if let Some(response) =
-        compat_direct_response(&payload, initial_usage_breakdown, aws_b40_compat)
-    {
-        let response = finish_local_response(response, cache_commit).await;
-        apply_compat_reply_delay(aws_b40_compat).await;
-        return response;
-    }
+    let compat_response = compat_direct_response(&payload, initial_usage_breakdown, aws_b40_compat);
 
     // 检查是否启用了 thinking，以及是否向客户端暴露 thinking 块。
     let thinking_enabled = payload
@@ -2899,12 +3011,49 @@ pub async fn post_messages(
 
     let tool_name_map = conversion_result.tool_name_map;
 
-    if payload.stream {
+    let stream_requested = payload.stream;
+    let requested_max_tokens = payload.max_tokens;
+    let force_tool_only = tool_choice_forces_tool(&payload);
+    let requested_model = std::mem::take(&mut payload.model);
+    drop(payload);
+
+    // The converted Kiro request already owns every value needed on the wire.
+    // Release the Anthropic request tree before allocating the equally large
+    // serialized body, so large prompts are not resident three times at once.
+    let request_body = match serde_json::to_string(&kiro_request) {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::error!("序列化请求失败: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "internal_error",
+                    format!("序列化请求失败: {}", e),
+                )),
+            )
+                .into_response();
+        }
+    };
+    drop(kiro_request);
+
+    tracing::debug!(
+        request_body_bytes = request_body.len(),
+        "Kiro request serialization complete"
+    );
+
+    if let Some(response) = compat_response {
+        let response = finish_local_response(response, cache_commit).await;
+        apply_compat_reply_delay(aws_b40_compat).await;
+        return response;
+    }
+
+    if stream_requested {
         // 流式响应
         handle_stream_request(
             provider,
-            &request_body,
-            &payload.model,
+            request_body,
+            requested_model,
+            upstream_model,
             input_tokens,
             initial_usage_breakdown,
             input_context_calibration,
@@ -2912,12 +3061,12 @@ pub async fn post_messages(
             expose_thinking,
             thinking_wants_summary,
             tool_name_map,
-            payload.max_tokens,
+            requested_max_tokens,
             stop_sequences,
             identity_sanitization,
             identity_sanitization_context,
             forced_application_identity_reply,
-            tool_choice_forces_tool(&payload),
+            force_tool_only,
             aws_b40_compat,
             aws_b40_thinking_requested,
             cache_commit,
@@ -2932,8 +3081,9 @@ pub async fn post_messages(
         );
         handle_non_stream_request(
             provider,
-            &request_body,
-            &payload.model,
+            request_body,
+            &requested_model,
+            &upstream_model,
             input_tokens,
             initial_usage_breakdown,
             input_context_calibration,
@@ -2942,12 +3092,12 @@ pub async fn post_messages(
             thinking_wants_summary,
             suppress_thinking_envelope,
             tool_name_map,
-            payload.max_tokens,
+            requested_max_tokens,
             stop_sequences,
             identity_sanitization,
             identity_sanitization_context,
             forced_application_identity_reply,
-            tool_choice_forces_tool(&payload),
+            force_tool_only,
             aws_b40_compat,
             cache_commit,
         )
@@ -2958,8 +3108,9 @@ pub async fn post_messages(
 /// 处理流式请求
 async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
-    request_body: &str,
-    model: &str,
+    request_body: String,
+    model: String,
+    upstream_model: String,
     input_tokens: i32,
     initial_usage_breakdown: super::cache::UsageBreakdown,
     input_context_calibration: super::bedrock::InputContextCalibration,
@@ -2978,9 +3129,14 @@ async fn handle_stream_request(
     cache_commit: super::cache::CacheCommit,
 ) -> Response {
     let exact_cache_ttl_plan = cache_commit.exact_ttl_plan();
+    let (provider_body, request_body) =
+        prepare_provider_request_body(request_body, requested_max_tokens);
     // 调用 Kiro API（支持多凭据故障转移）
     let upstream_started = Instant::now();
-    let response = match provider.call_api_stream(request_body).await {
+    let response = match provider
+        .call_api_stream_for_model(provider_body, &upstream_model)
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e, aws_b40_compat),
     };
@@ -2988,7 +3144,7 @@ async fn handle_stream_request(
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(
-        model,
+        &model,
         input_tokens,
         thinking_enabled,
         initial_usage_breakdown,
@@ -3010,7 +3166,7 @@ async fn handle_stream_request(
     if aws_b40_compat
         && aws_b40_thinking_requested
         && thinking_enabled
-        && super::compat::model_uses_local_thinking_signature_fallback(model)
+        && super::compat::model_uses_local_thinking_signature_fallback(&model)
     {
         // Opus 4.6/4.7 may omit the native reasoning envelope entirely. Keep a
         // deferred fallback; any real reasoning event cancels it before it is
@@ -3035,7 +3191,7 @@ async fn handle_stream_request(
         ctx,
         initial_events,
         provider,
-        request_body.to_string(),
+        request_body,
         requested_max_tokens,
         aws_b40_compat,
         cache_commit,
@@ -3062,13 +3218,24 @@ fn create_ping_sse(aws_b40_compat: bool) -> Bytes {
     ))
 }
 
+fn serialize_sse_events_lazily(
+    events: Vec<SseEvent>,
+    aws_b40_compat: bool,
+) -> impl Stream<Item = Result<Bytes, Infallible>> {
+    stream::iter(
+        events
+            .into_iter()
+            .map(move |event| Ok(Bytes::from(event.to_profile_sse_string(aws_b40_compat)))),
+    )
+}
+
 /// 创建 SSE 事件流
 fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
-    request_body: String,
+    request_body: Option<String>,
     requested_max_tokens: i32,
     aws_b40_compat: bool,
     cache_commit: super::cache::CacheCommit,
@@ -3084,7 +3251,6 @@ fn create_sse_stream(
     let body_stream = response.bytes_stream();
     let requested_max_tokens = effective_auto_continue_max_tokens(requested_max_tokens);
     let max_continuation_rounds = auto_continue_round_limit(requested_max_tokens);
-
     let processing_stream = stream::unfold(
         (
             body_stream,
@@ -3162,12 +3328,9 @@ fn create_sse_stream(
                             }
 
                             // 转换为 SSE 字节流
-                            let bytes: Vec<Result<Bytes, Infallible>> = events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
-                                .collect();
+                            let bytes = serialize_sse_events_lazily(events, aws_b40_compat);
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds, cache_commit)))
+                            Some((bytes, (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds, cache_commit)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
@@ -3184,11 +3347,9 @@ fn create_sse_stream(
                                 )
                                 .await;
                             }
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds, cache_commit)))
+                            let bytes =
+                                serialize_sse_events_lazily(final_events, aws_b40_compat);
+                            Some((bytes, (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds, cache_commit)))
                         }
                         None => {
                             let mut continuation_reason = "unknown";
@@ -3207,10 +3368,12 @@ fn create_sse_stream(
                             }
                             if continuation_round < max_continuation_rounds
                                 && ctx.should_auto_continue(requested_max_tokens)
-                                && !continuation_target_completed(
-                                    &request_body,
-                                    ctx.assistant_raw_content(),
-                                )
+                                && request_body.as_deref().is_some_and(|request_body| {
+                                    !continuation_target_completed(
+                                        request_body,
+                                        ctx.assistant_raw_content(),
+                                    )
+                                })
                             {
                                 if continuation_reason == "unknown" {
                                     continuation_reason = "max_tokens";
@@ -3218,11 +3381,14 @@ fn create_sse_stream(
                                 let assistant_content =
                                     ctx.assistant_raw_content().to_string();
                                 let continuation_prompt = AUTO_CONTINUE_PROMPT;
-                                if let Some(next_request_body) = build_continuation_request_body(
-                                    &request_body,
-                                    &assistant_content,
-                                    continuation_prompt,
-                                ) {
+                                if let Some(next_request_body) = request_body
+                                    .as_deref()
+                                    .and_then(|request_body| build_continuation_request_body(
+                                        request_body,
+                                        &assistant_content,
+                                        continuation_prompt,
+                                    ))
+                                {
                                     let next_estimated_input_tokens =
                                         estimate_kiro_request_input_tokens(&next_request_body, 1);
                                     match begin_continuation_billing_after_connect(
@@ -3249,7 +3415,10 @@ fn create_sse_stream(
                                             );
                                             let next_body_stream = next_response.bytes_stream();
                                             return Some((
-                                                stream::iter(Vec::<Result<Bytes, Infallible>>::new()),
+                                                serialize_sse_events_lazily(
+                                                    Vec::new(),
+                                                    aws_b40_compat,
+                                                ),
                                                 (
                                                     next_body_stream,
                                                     ctx,
@@ -3257,7 +3426,7 @@ fn create_sse_stream(
                                                     false,
                                                     ping_interval,
                                                     provider,
-                                                    next_request_body,
+                                                    Some(next_request_body),
                                                     continuation_round + 1,
                                                     max_continuation_rounds,
                                                     cache_commit,
@@ -3282,20 +3451,20 @@ fn create_sse_stream(
                                 )
                                 .await;
                             }
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_profile_sse_string(aws_b40_compat))))
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds, cache_commit)))
+                            let bytes =
+                                serialize_sse_events_lazily(final_events, aws_b40_compat);
+                            Some((bytes, (body_stream, ctx, decoder, true, ping_interval, provider, request_body, continuation_round, max_continuation_rounds, cache_commit)))
                         }
                     }
                 }
                 // 发送 ping 保活
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
-                    let bytes: Vec<Result<Bytes, Infallible>> =
-                        vec![Ok(create_ping_sse(aws_b40_compat))];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds, cache_commit)))
+                    let bytes = serialize_sse_events_lazily(
+                        vec![SseEvent::new("ping", json!({"type": "ping"}))],
+                        aws_b40_compat,
+                    );
+                    Some((bytes, (body_stream, ctx, decoder, false, ping_interval, provider, request_body, continuation_round, max_continuation_rounds, cache_commit)))
                 }
             }
         },
@@ -3310,8 +3479,9 @@ use super::converter::get_context_window_size;
 /// 处理非流式请求
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
-    request_body: &str,
+    request_body: String,
     model: &str,
+    upstream_model: &str,
     _input_tokens: i32,
     initial_usage_breakdown: super::cache::UsageBreakdown,
     _input_context_calibration: super::bedrock::InputContextCalibration,
@@ -3349,15 +3519,25 @@ async fn handle_non_stream_request(
     let mut tool_output_ids: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
 
-    let mut current_request_body = request_body.to_string();
+    let mut current_request_body = request_body;
     let mut continuation_round = 0usize;
     let requested_max_tokens = effective_auto_continue_max_tokens(requested_max_tokens);
     let max_continuation_rounds = auto_continue_round_limit(requested_max_tokens);
+    let continuation_completion_target =
+        ContinuationCompletionTarget::from_request_body(&current_request_body);
 
     loop {
         let mut round_exact_output_tokens: Option<i32> = None;
 
-        let response = match provider.call_api(&current_request_body).await {
+        let provider_body = if max_continuation_rounds == 0 {
+            Bytes::from(std::mem::take(&mut current_request_body))
+        } else {
+            Bytes::copy_from_slice(current_request_body.as_bytes())
+        };
+        let response = match provider
+            .call_api_for_model(provider_body, upstream_model)
+            .await
+        {
             Ok(resp) => resp,
             Err(e) => return map_provider_error(e, aws_b40_compat),
         };
@@ -3644,7 +3824,7 @@ async fn handle_non_stream_request(
             && !has_tool_use
             && output_tokens_estimate < requested_max_tokens
             && !chunk_text_content.trim().is_empty()
-            && !continuation_target_completed(request_body, &text_content)
+            && !continuation_completion_target.completed(&text_content)
         {
             let continuation_prompt = AUTO_CONTINUE_PROMPT;
             if let Some(next_request_body) = build_continuation_request_body(
@@ -5861,7 +6041,9 @@ pub async fn post_messages_cc(
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
-    let stop_sequences = requested_stop_sequences(&raw_body);
+    let stop_sequences = RequestBodyMetadata::parse(&raw_body)
+        .unwrap_or_default()
+        .stop_sequences;
 
     let aws_b40_compat = state.aws_b40_compat;
     if let Some(response) = reject_unsupported_gpt_model(&payload.model, aws_b40_compat) {
@@ -5881,6 +6063,7 @@ pub async fn post_messages_cc(
     {
         return provider.proxy_messages(&headers, raw_body).await;
     }
+    drop(raw_body);
 
     let gpt_passthrough = is_gpt_model(&payload.model);
     let aws_b40_initial_thinking_requested = aws_b40_compat
@@ -6029,23 +6212,12 @@ pub async fn post_messages_cc(
         profile_arn: None,
         additional_model_request_fields,
     };
-
-    let request_body = match serde_json::to_string(&kiro_request) {
-        Ok(body) => body,
-        Err(e) => {
-            tracing::error!("序列化请求失败: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "internal_error",
-                    format!("序列化请求失败: {}", e),
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    tracing::debug!("Kiro request body: {}", request_body);
+    let upstream_model = kiro_request
+        .conversation_state
+        .current_message
+        .user_input_message
+        .model_id
+        .clone();
 
     let identity_sanitization_context = request_identity_sanitization_context(&payload);
     let identity_sanitization =
@@ -6076,13 +6248,7 @@ pub async fn post_messages_cc(
     };
 
     let cache_commit = super::cache::prepare_cache_commit(input_tokens, &payload, aws_b40_compat);
-    if let Some(response) =
-        compat_direct_response(&payload, initial_usage_breakdown, aws_b40_compat)
-    {
-        let response = finish_local_response(response, cache_commit).await;
-        apply_compat_reply_delay(aws_b40_compat).await;
-        return response;
-    }
+    let compat_response = compat_direct_response(&payload, initial_usage_breakdown, aws_b40_compat);
 
     // 检查是否启用了 thinking，以及是否向客户端暴露 thinking 块。
     let thinking_enabled = payload
@@ -6101,12 +6267,48 @@ pub async fn post_messages_cc(
 
     let tool_name_map = conversion_result.tool_name_map;
 
-    if payload.stream {
+    let stream_requested = payload.stream;
+    let requested_max_tokens = payload.max_tokens;
+    let force_tool_only = tool_choice_forces_tool(&payload);
+    let requested_model = std::mem::take(&mut payload.model);
+    drop(payload);
+
+    // Keep the buffered endpoint on the same allocation order as /v1:
+    // release the source request tree before allocating the wire JSON.
+    let request_body = match serde_json::to_string(&kiro_request) {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::error!("序列化请求失败: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "internal_error",
+                    format!("序列化请求失败: {}", e),
+                )),
+            )
+                .into_response();
+        }
+    };
+    drop(kiro_request);
+
+    tracing::debug!(
+        request_body_bytes = request_body.len(),
+        "Kiro request serialization complete"
+    );
+
+    if let Some(response) = compat_response {
+        let response = finish_local_response(response, cache_commit).await;
+        apply_compat_reply_delay(aws_b40_compat).await;
+        return response;
+    }
+
+    if stream_requested {
         // 流式响应（缓冲模式）
         handle_stream_request_buffered(
             provider,
-            &request_body,
-            &payload.model,
+            request_body,
+            requested_model,
+            upstream_model,
             input_tokens,
             initial_usage_breakdown,
             input_context_calibration,
@@ -6114,12 +6316,12 @@ pub async fn post_messages_cc(
             expose_thinking,
             thinking_wants_summary,
             tool_name_map,
-            payload.max_tokens,
+            requested_max_tokens,
             stop_sequences,
             identity_sanitization,
             identity_sanitization_context,
             forced_application_identity_reply,
-            tool_choice_forces_tool(&payload),
+            force_tool_only,
             aws_b40_compat,
             aws_b40_thinking_requested,
             cache_commit,
@@ -6134,8 +6336,9 @@ pub async fn post_messages_cc(
         );
         handle_non_stream_request(
             provider,
-            &request_body,
-            &payload.model,
+            request_body,
+            &requested_model,
+            &upstream_model,
             input_tokens,
             initial_usage_breakdown,
             input_context_calibration,
@@ -6144,12 +6347,12 @@ pub async fn post_messages_cc(
             thinking_wants_summary,
             suppress_thinking_envelope,
             tool_name_map,
-            payload.max_tokens,
+            requested_max_tokens,
             stop_sequences,
             identity_sanitization,
             identity_sanitization_context,
             forced_application_identity_reply,
-            tool_choice_forces_tool(&payload),
+            force_tool_only,
             aws_b40_compat,
             cache_commit,
         )
@@ -6163,8 +6366,9 @@ pub async fn post_messages_cc(
 /// message_start 使用请求发出前已经确定的本地输入 usage。
 async fn handle_stream_request_buffered(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
-    request_body: &str,
-    model: &str,
+    request_body: String,
+    model: String,
+    upstream_model: String,
     estimated_input_tokens: i32,
     initial_usage_breakdown: super::cache::UsageBreakdown,
     input_context_calibration: super::bedrock::InputContextCalibration,
@@ -6183,9 +6387,14 @@ async fn handle_stream_request_buffered(
     cache_commit: super::cache::CacheCommit,
 ) -> Response {
     let exact_cache_ttl_plan = cache_commit.exact_ttl_plan();
+    let (provider_body, request_body) =
+        prepare_provider_request_body(request_body, requested_max_tokens);
     // 调用 Kiro API（支持多凭据故障转移）
     let upstream_started = Instant::now();
-    let response = match provider.call_api_stream(request_body).await {
+    let response = match provider
+        .call_api_stream_for_model(provider_body, &upstream_model)
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e, aws_b40_compat),
     };
@@ -6193,7 +6402,7 @@ async fn handle_stream_request_buffered(
 
     // 创建缓冲流处理上下文
     let mut ctx = BufferedStreamContext::new(
-        model,
+        &model,
         estimated_input_tokens,
         thinking_enabled,
         initial_usage_breakdown,
@@ -6214,7 +6423,7 @@ async fn handle_stream_request_buffered(
     if aws_b40_compat
         && aws_b40_thinking_requested
         && thinking_enabled
-        && super::compat::model_uses_local_thinking_signature_fallback(model)
+        && super::compat::model_uses_local_thinking_signature_fallback(&model)
     {
         ctx.set_synthetic_thinking(Some(super::compat::synthetic_thinking()));
     }
@@ -6232,7 +6441,7 @@ async fn handle_stream_request_buffered(
         response,
         ctx,
         provider,
-        request_body.to_string(),
+        request_body,
         requested_max_tokens,
         aws_b40_compat,
         cache_commit,
@@ -6259,7 +6468,7 @@ fn create_buffered_sse_stream(
     response: reqwest::Response,
     ctx: BufferedStreamContext,
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
-    request_body: String,
+    request_body: Option<String>,
     requested_max_tokens: i32,
     aws_b40_compat: bool,
     cache_commit: super::cache::CacheCommit,
@@ -6267,7 +6476,6 @@ fn create_buffered_sse_stream(
     let body_stream = response.bytes_stream();
     let requested_max_tokens = effective_auto_continue_max_tokens(requested_max_tokens);
     let max_continuation_rounds = auto_continue_round_limit(requested_max_tokens);
-
     stream::unfold(
         (
             body_stream,
@@ -6394,10 +6602,12 @@ fn create_buffered_sse_stream(
                                 }
                                 if continuation_round < max_continuation_rounds
                                     && ctx.should_auto_continue(requested_max_tokens)
-                                    && !continuation_target_completed(
-                                        &request_body,
-                                        ctx.assistant_raw_content(),
-                                    )
+                                    && request_body.as_deref().is_some_and(|request_body| {
+                                        !continuation_target_completed(
+                                            request_body,
+                                            ctx.assistant_raw_content(),
+                                        )
+                                    })
                                 {
                                     if continuation_reason == "unknown" {
                                         continuation_reason = "max_tokens";
@@ -6405,12 +6615,13 @@ fn create_buffered_sse_stream(
                                     let assistant_content =
                                         ctx.assistant_raw_content().to_string();
                                     let continuation_prompt = AUTO_CONTINUE_PROMPT;
-                                    if let Some(next_request_body) =
-                                        build_continuation_request_body(
-                                            &request_body,
+                                    if let Some(next_request_body) = request_body
+                                        .as_deref()
+                                        .and_then(|request_body| build_continuation_request_body(
+                                            request_body,
                                             &assistant_content,
                                             continuation_prompt,
-                                        )
+                                        ))
                                     {
                                         let next_estimated_input_tokens =
                                             estimate_kiro_request_input_tokens(
@@ -6449,7 +6660,7 @@ fn create_buffered_sse_stream(
                                                         false,
                                                         ping_interval,
                                                         provider,
-                                                        next_request_body,
+                                                        Some(next_request_body),
                                                         continuation_round + 1,
                                                         max_continuation_rounds,
                                                         cache_commit,
@@ -6494,6 +6705,254 @@ mod tests {
     use super::*;
     use crate::anthropic::types::MessagesRequest;
 
+    fn legacy_identity_instruction_text(text: &str) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        let mut result = String::with_capacity(text.len());
+        let mut index = 0;
+        let mut fenced = false;
+        let mut inline_code = false;
+        let mut quote: Option<char> = None;
+        let mut escaped = false;
+
+        while index < chars.len() {
+            if quote.is_none()
+                && !inline_code
+                && index + 2 < chars.len()
+                && chars[index] == '`'
+                && chars[index + 1] == '`'
+                && chars[index + 2] == '`'
+            {
+                fenced = !fenced;
+                result.push(' ');
+                index += 3;
+                continue;
+            }
+            if fenced {
+                result.push(if chars[index] == '\n' { '\n' } else { ' ' });
+                index += 1;
+                continue;
+            }
+
+            if quote.is_none() && chars[index] == '`' {
+                inline_code = !inline_code;
+                result.push(' ');
+                index += 1;
+                continue;
+            }
+            if inline_code {
+                result.push(if chars[index] == '\n' { '\n' } else { ' ' });
+                index += 1;
+                continue;
+            }
+
+            if let Some(delimiter) = quote {
+                if escaped {
+                    escaped = false;
+                } else if chars[index] == '\\' {
+                    escaped = true;
+                } else if chars[index] == delimiter {
+                    quote = None;
+                }
+                result.push(if chars[index] == '\n' { '\n' } else { ' ' });
+                index += 1;
+                continue;
+            }
+
+            if chars[index] == '"' {
+                quote = Some('"');
+                result.push(' ');
+                index += 1;
+                continue;
+            }
+            if chars[index] == '\'' {
+                let previous_is_word =
+                    index > 0 && (chars[index - 1].is_alphanumeric() || chars[index - 1] == '_');
+                let next_is_word = index + 1 < chars.len()
+                    && (chars[index + 1].is_alphanumeric() || chars[index + 1] == '_');
+                let has_closing_quote = chars[index + 1..].contains(&'\'');
+                if !previous_is_word && next_is_word && has_closing_quote {
+                    quote = Some('\'');
+                    result.push(' ');
+                    index += 1;
+                    continue;
+                }
+            }
+
+            result.push(chars[index]);
+            index += 1;
+        }
+
+        result
+    }
+
+    fn legacy_normalize_identity_tokens(text: &str) -> String {
+        let mut result = String::with_capacity(text.len());
+        let mut previous_was_lower_or_digit = false;
+        for ch in text.chars() {
+            if ch.is_ascii_uppercase() && previous_was_lower_or_digit {
+                result.push(' ');
+            }
+            if ch.is_ascii_alphanumeric() {
+                result.push(ch.to_ascii_lowercase());
+                previous_was_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+            } else {
+                result.push(' ');
+                previous_was_lower_or_digit = false;
+            }
+        }
+        result.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn short_stream_does_not_retain_request_body_for_continuation() {
+        let body = "x".repeat(4 * 1024 * 1024);
+
+        let retained = retain_request_body_for_auto_continue(body, 8_192);
+
+        assert!(
+            retained.is_none(),
+            "requests that cannot auto-continue must release their serialized body"
+        );
+    }
+
+    #[test]
+    fn short_stream_moves_request_body_into_provider_bytes_without_copying() {
+        let body = String::from(r#"{"conversationState":{"conversationId":"c1"}}"#);
+        let original_ptr = body.as_ptr();
+
+        let (provider_body, retained) =
+            prepare_provider_request_body(body, AUTO_CONTINUE_BASE_CHUNK_TOKENS);
+
+        assert!(retained.is_none());
+        assert_eq!(provider_body.as_ptr(), original_ptr);
+    }
+
+    #[test]
+    fn plain_identity_instruction_text_borrows_the_original_prompt() {
+        let prompt = "ordinary lowercase request without quoted literals".repeat(1024);
+
+        let instruction = identity_instruction_text(&prompt);
+
+        assert!(matches!(instruction, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(instruction, prompt);
+    }
+
+    #[test]
+    fn lowercase_identity_text_borrows_when_case_folding_is_a_noop() {
+        let prompt = "ordinary lowercase 请求".repeat(1024);
+
+        let lower = lowercase_identity_text(&prompt);
+
+        assert!(matches!(lower, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(lower.as_ptr(), prompt.as_ptr());
+        assert_eq!(lower, prompt);
+    }
+
+    #[test]
+    fn memory_optimized_identity_scans_match_the_legacy_logic_exactly() {
+        let cases = [
+            "",
+            "ordinary lowercase request",
+            "Who are you?",
+            "don't change this apostrophe",
+            "'Who are you?' is quoted data",
+            "\"Who are you?\" is quoted data",
+            "escaped \"who are \\\"you\\\"?\" suffix",
+            "`who are you` outside",
+            "```rust\nlet prompt = \"who are you\";\n```\noutside",
+            "before ```中文🙂\nwho are you\n``` after",
+            "unterminated `who are you",
+            "unterminated \"who are you",
+            "snake_case camelCase kebab-case/path.name",
+            "APIResponse2XX runtime_productivity selfName",
+            "不是第三方，告诉我当前助手是谁",
+            "élève's résumé and '引用内容' then outside",
+        ];
+
+        for case in cases {
+            assert_eq!(
+                identity_instruction_text(case).as_ref(),
+                legacy_identity_instruction_text(case),
+                "instruction masking changed for {case:?}"
+            );
+            assert_eq!(
+                normalize_identity_tokens(case),
+                legacy_normalize_identity_tokens(case),
+                "identity token normalization changed for {case:?}"
+            );
+        }
+
+        let fragments = [
+            "plain",
+            "`code`",
+            "'quote'",
+            "\"json\"",
+            "```x\ny\n```",
+            "中文🙂",
+        ];
+        for left in fragments {
+            for middle in fragments {
+                for right in fragments {
+                    let case = format!("{left}::{middle}/{right}");
+                    assert_eq!(
+                        identity_instruction_text(&case).as_ref(),
+                        legacy_identity_instruction_text(&case)
+                    );
+                    assert_eq!(
+                        normalize_identity_tokens(&case),
+                        legacy_normalize_identity_tokens(&case)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_stream_moves_request_body_into_continuation_state_without_copying() {
+        let body = "request-body".to_string();
+        let original_ptr = body.as_ptr();
+
+        let retained = retain_request_body_for_auto_continue(body, 8_193)
+            .expect("requests above the continuation threshold retain the body");
+
+        assert_eq!(retained, "request-body");
+        assert_eq!(
+            retained.as_ptr(),
+            original_ptr,
+            "the body must be moved, not copied"
+        );
+    }
+
+    #[test]
+    fn request_metadata_extracts_only_supported_stop_sequences() {
+        let raw = Bytes::from_static(
+            br#"{
+                "model":"claude-opus-5",
+                "messages":[{"role":"user","content":"large body is ignored here"}],
+                "stop_sequences":["END","","STOP","THIRD","FOURTH","IGNORED"]
+            }"#,
+        );
+
+        let metadata = RequestBodyMetadata::parse(&raw).expect("valid metadata");
+
+        assert_eq!(metadata.stop_sequences, ["END", "STOP", "THIRD", "FOURTH"]);
+    }
+
+    #[test]
+    fn request_metadata_ignores_non_string_stop_sequences_without_losing_valid_ones() {
+        let raw = Bytes::from_static(
+            br#"{
+                "model":"claude-opus-5",
+                "messages":[{"role":"user","content":"hi"}],
+                "stop_sequences":["END",null,17,{"invalid":true},"STOP"]
+            }"#,
+        );
+
+        let metadata = RequestBodyMetadata::parse(&raw).expect("valid request metadata");
+
+        assert_eq!(metadata.stop_sequences, ["END", "STOP"]);
+    }
+
     fn parse(model: &str, extra: serde_json::Value) -> MessagesRequest {
         let mut body = serde_json::json!({
             "model": model,
@@ -6506,6 +6965,25 @@ mod tests {
             }
         }
         serde_json::from_value(body).expect("valid request body")
+    }
+
+    #[test]
+    fn plain_latest_user_identity_text_borrows_message_content() {
+        let request = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "messages": [{"role": "user", "content": "ordinary lowercase request"}]
+            }),
+        );
+        let original = request.messages[0]
+            .content
+            .as_str()
+            .expect("plain string content");
+
+        let identity_text = latest_user_identity_text(&request);
+
+        assert!(matches!(identity_text, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(identity_text.as_ptr(), original.as_ptr());
     }
 
     #[tokio::test]
@@ -11611,6 +12089,26 @@ mod tests {
             &request_body,
             "正文\nKRS_REALISTIC_DOC_END but extra text"
         ));
+    }
+
+    #[test]
+    fn compact_continuation_target_keeps_original_request_semantics() {
+        let request_body = serde_json::json!({
+            "conversationState": {
+                "currentMessage": {
+                    "userInputMessage": {
+                        "content": "请严格按行输出从 1 到 7000，最后输出 KRS_REALISTIC_DOC_END"
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let target = ContinuationCompletionTarget::from_request_body(&request_body);
+
+        assert!(target.completed("6999\n7000"));
+        assert!(target.completed("正文\nKRS_REALISTIC_DOC_END"));
+        assert!(!target.completed("6999\n7"));
     }
 
     #[test]

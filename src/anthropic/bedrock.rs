@@ -141,13 +141,25 @@ pub fn context_input_without_current_generation(
     reasoning_text: &str,
     tool_input: &str,
 ) -> Option<i32> {
+    context_input_without_current_generation_token_counts(
+        context_tokens,
+        super::claude_tok::count_claude(assistant_text),
+        super::claude_tok::count_claude(reasoning_text),
+        super::claude_tok::count_claude(tool_input),
+    )
+}
+
+pub fn context_input_without_current_generation_token_counts(
+    context_tokens: Option<i32>,
+    assistant_tokens: i32,
+    reasoning_tokens: i32,
+    tool_input_tokens: i32,
+) -> Option<i32> {
     let context_tokens = context_tokens?.max(1);
-    let generated_tokens = [assistant_text, reasoning_text, tool_input]
-        .into_iter()
-        .filter(|text| !text.is_empty())
-        .fold(0i32, |total, text| {
-            total.saturating_add(super::claude_tok::count_claude(text))
-        });
+    let generated_tokens = assistant_tokens
+        .max(0)
+        .saturating_add(reasoning_tokens.max(0))
+        .saturating_add(tool_input_tokens.max(0));
     Some(context_tokens.saturating_sub(generated_tokens).max(1))
 }
 
@@ -169,23 +181,16 @@ impl InputContextCalibration {
             )
         });
 
-        let mut truncated = payload.clone();
-        let mut descriptionless = payload.clone();
-        let mut has_truncated_tool_descriptions = false;
-        if let Some(truncated_tools) = truncated.tools.as_mut() {
-            for tool in truncated_tools {
-                if tool.description.chars().count() > KIRO_TOOL_DESCRIPTION_LIMIT_CHARS {
-                    has_truncated_tool_descriptions = true;
-                    tool.description =
-                        truncate_chars(&tool.description, KIRO_TOOL_DESCRIPTION_LIMIT_CHARS);
-                }
-            }
-        }
-        if let Some(descriptionless_tools) = descriptionless.tools.as_mut() {
-            for tool in descriptionless_tools {
-                tool.description.clear();
-            }
-        }
+        let has_truncated_tool_descriptions = tools
+            .iter()
+            .any(|tool| tool.description.chars().count() > KIRO_TOOL_DESCRIPTION_LIMIT_CHARS);
+        let truncated_tool_input_tokens =
+            super::compat::estimate_input_tokens_with_tool_description_limit(
+                payload,
+                KIRO_TOOL_DESCRIPTION_LIMIT_CHARS,
+            );
+        let descriptionless_tool_input_tokens =
+            super::compat::estimate_input_tokens_with_tool_description_limit(payload, 0);
         let direct_catalog_ordinary_usage =
             direct_catalog_ordinary_usage(payload, serialized_tool_bytes);
 
@@ -194,10 +199,8 @@ impl InputContextCalibration {
             has_tools: true,
             tool_count: tools.len().min(i32::MAX as usize) as i32,
             serialized_tool_bytes,
-            truncated_tool_input_tokens: super::compat::estimate_input_tokens(&truncated),
-            descriptionless_tool_input_tokens: super::compat::estimate_input_tokens(
-                &descriptionless,
-            ),
+            truncated_tool_input_tokens,
+            descriptionless_tool_input_tokens,
             has_truncated_tool_descriptions,
             local_direct_catalog: local_direct_catalog_profile(payload, serialized_tool_bytes),
             direct_catalog_ordinary_input_tokens: direct_catalog_ordinary_usage
@@ -716,9 +719,7 @@ pub fn calibrated_input_tokens(payload: &MessagesRequest, base_tokens: i32) -> i
             .as_ref()
             .is_some_and(|tools| !tools.is_empty())
         {
-            let mut without_tools = payload.clone();
-            without_tools.tools = None;
-            super::compat::estimate_input_tokens(&without_tools)
+            super::compat::estimate_input_tokens_without_tools(payload)
         } else {
             base_tokens
         };
@@ -2286,6 +2287,44 @@ mod tests {
     fn calibrated_payload(payload: &MessagesRequest) -> i32 {
         let base = super::super::compat::estimate_input_tokens(payload);
         calibrated_input_tokens(payload, base)
+    }
+
+    #[test]
+    fn borrowed_tool_description_variants_match_the_existing_token_contract() {
+        let payload = request(json!({
+            "model": "claude-opus-4-8",
+            "messages": [{"role": "user", "content": "large history ".repeat(32 * 1024)}],
+            "tools": [{
+                "name": "lookup",
+                "description": "description ".repeat(400),
+                "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}}
+            }]
+        }));
+
+        let mut truncated = payload.clone();
+        truncated.tools.as_mut().unwrap()[0].description =
+            truncate_chars(&truncated.tools.as_ref().unwrap()[0].description, 1024);
+        let mut descriptionless = payload.clone();
+        descriptionless.tools.as_mut().unwrap()[0]
+            .description
+            .clear();
+
+        assert_eq!(
+            super::super::compat::estimate_input_tokens_with_tool_description_limit(&payload, 1024),
+            super::super::compat::estimate_input_tokens(&truncated)
+        );
+        assert_eq!(
+            super::super::compat::estimate_input_tokens_with_tool_description_limit(&payload, 0),
+            super::super::compat::estimate_input_tokens(&descriptionless)
+        );
+        assert_eq!(
+            super::super::compat::estimate_input_tokens_without_tools(&payload),
+            {
+                let mut without_tools = payload.clone();
+                without_tools.tools = None;
+                super::super::compat::estimate_input_tokens(&without_tools)
+            }
+        );
     }
 
     #[test]

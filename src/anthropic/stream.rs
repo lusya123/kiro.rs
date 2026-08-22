@@ -842,6 +842,11 @@ pub struct StreamContext {
     output_text_acc: String,
     /// 已发给客户端的 thinking 文本,流结束时用 ctoc 算一次。
     thinking_text_acc: String,
+    /// 已完成的原生 reasoning 块只保留精确 token 数，避免为最终 usage
+    /// 再长期保存一整份 thinking 文本。
+    completed_native_thinking_tokens: i32,
+    /// 当前上游轮次的原生 reasoning 是否已在块结束时计入累计值。
+    native_reasoning_usage_accounted: bool,
     /// 客户请求的输出 token 上限
     output_token_limit: Option<i32>,
     /// 是否已经因为输出 token 上限停止向客户端发送文本
@@ -854,12 +859,11 @@ pub struct StreamContext {
     stop_sequence_reached: bool,
     /// 已收到的上游助手原始文本，用于 max_tokens 截断后的续写上下文
     pub assistant_raw_content: String,
-    /// Native reasoning generated during the current upstream invocation.
-    /// Kept independently from the client-visible thinking buffer so hidden
-    /// reasoning can still be removed from end-of-turn context occupancy.
-    upstream_reasoning_current_round: String,
-    /// Raw tool argument bytes generated during the current invocation.
-    upstream_tool_input_current_round: String,
+    /// Native reasoning generated during the current invocation, represented by
+    /// a bounded streaming token counter instead of another full-text copy.
+    upstream_reasoning_current_round: super::claude_tok::StreamingClaudeTokenCounter,
+    /// Tool arguments generated during the current invocation, likewise bounded.
+    upstream_tool_input_current_round: super::claude_tok::StreamingClaudeTokenCounter,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 后端 tool_use_id(`toolu_bdrk_…`)→ 对客户端暴露的 Anthropic 形态 id(`toolu_01…`)。
@@ -1046,14 +1050,18 @@ impl StreamContext {
             thinking_tokens: 0,
             output_text_acc: String::new(),
             thinking_text_acc: String::new(),
+            completed_native_thinking_tokens: 0,
+            native_reasoning_usage_accounted: false,
             output_token_limit: None,
             output_token_limit_reached: false,
             stop_sequences: Vec::new(),
             stop_sequence_pending: String::new(),
             stop_sequence_reached: false,
             assistant_raw_content: String::new(),
-            upstream_reasoning_current_round: String::new(),
-            upstream_tool_input_current_round: String::new(),
+            upstream_reasoning_current_round:
+                super::claude_tok::StreamingClaudeTokenCounter::default(),
+            upstream_tool_input_current_round:
+                super::claude_tok::StreamingClaudeTokenCounter::default(),
             tool_block_indices: HashMap::new(),
             tool_output_ids: HashMap::new(),
             tool_json_pending: HashMap::new(),
@@ -1784,7 +1792,6 @@ impl StreamContext {
                 if !delta.is_empty() {
                     self.upstream_reasoning_current_round.push_str(&delta);
                     self.thinking_tokens += estimate_tokens(&delta);
-                    self.thinking_text_acc.push_str(&delta);
                 }
             }
             return Vec::new();
@@ -1909,7 +1916,10 @@ impl StreamContext {
             let raw = std::mem::take(&mut self.thinking_pending_raw);
             if !raw.is_empty() {
                 self.thinking_tokens += estimate_tokens(&raw);
-                self.thinking_text_acc.push_str(&raw);
+                self.completed_native_thinking_tokens = self
+                    .completed_native_thinking_tokens
+                    .saturating_add(super::claude_tok::count_claude(&raw));
+                self.native_reasoning_usage_accounted = true;
             }
             self.native_reasoning_last_chunk.clear();
             self.native_reasoning_chunk_lengths.clear();
@@ -1946,6 +1956,10 @@ impl StreamContext {
         let raw = std::mem::take(&mut self.thinking_pending_raw);
         if !self.expose_thinking_text {
             self.thinking_tokens += estimate_tokens(&raw);
+            self.completed_native_thinking_tokens = self
+                .completed_native_thinking_tokens
+                .saturating_add(super::claude_tok::count_claude(&raw));
+            self.native_reasoning_usage_accounted = true;
             return Vec::new();
         }
         let sanitized = match self.thinking_sanitize_options {
@@ -1953,10 +1967,15 @@ impl StreamContext {
             None => raw,
         };
 
+        self.completed_native_thinking_tokens = self
+            .completed_native_thinking_tokens
+            .saturating_add(super::claude_tok::count_claude(&sanitized));
+        self.native_reasoning_usage_accounted = true;
+
         split_text_by_char_lengths(&sanitized, &self.native_reasoning_chunk_lengths)
             .into_iter()
             .filter(|chunk| !chunk.is_empty())
-            .map(|chunk| self.create_thinking_delta_event(index, &chunk))
+            .map(|chunk| self.create_native_thinking_delta_event(index, &chunk))
             .collect()
     }
 
@@ -2324,6 +2343,16 @@ impl StreamContext {
             self.outbound_native_thinking_block.push_str(thinking);
             self.thinking_tokens += estimate_tokens(thinking);
             self.thinking_text_acc.push_str(thinking); // ctoc 流结束时计数
+        }
+        Self::thinking_delta_event(index, thinking)
+    }
+
+    /// 原生 reasoning 在块结束时已经基于完整文本完成精确计数；这里仅维护
+    /// 客户端实际收到的文本以登记 opaque signature，不再复制到 usage 累积区。
+    fn create_native_thinking_delta_event(&mut self, index: i32, thinking: &str) -> SseEvent {
+        if !thinking.is_empty() {
+            self.outbound_native_thinking_block.push_str(thinking);
+            self.thinking_tokens += estimate_tokens(thinking);
         }
         Self::thinking_delta_event(index, thinking)
     }
@@ -2780,12 +2809,13 @@ impl StreamContext {
     }
 
     fn context_authoritative_input_tokens(&self) -> Option<i32> {
-        let context_input_tokens = super::bedrock::context_input_without_current_generation(
-            self.context_input_tokens,
-            &self.assistant_raw_content,
-            &self.upstream_reasoning_current_round,
-            &self.upstream_tool_input_current_round,
-        )?;
+        let context_input_tokens =
+            super::bedrock::context_input_without_current_generation_token_counts(
+                self.context_input_tokens,
+                super::claude_tok::count_claude(&self.assistant_raw_content),
+                self.upstream_reasoning_current_round.count(),
+                self.upstream_tool_input_current_round.count(),
+            )?;
         Some(if self.aws_b40_compat {
             self.input_context_calibration.calibrate(
                 &self.model,
@@ -3133,8 +3163,17 @@ impl StreamContext {
     }
 
     fn compat_thinking_usage_tokens(&self) -> i32 {
-        // 思考 token 也用 ctoc 对累积的完整 thinking 文本算一次。
-        let ctoc_thinking = super::claude_tok::count_claude(&self.thinking_text_acc);
+        // 标签式/synthetic thinking 仍在 thinking_text_acc；原生 reasoning 在块结束时
+        // 已折叠为数字。隐藏 reasoning 没有可见块结束回调，最后从当前轮原文计数。
+        let unaccounted_native = if self.native_reasoning_usage_accounted {
+            0
+        } else {
+            self.upstream_reasoning_current_round.count()
+        };
+        let ctoc_thinking = self
+            .completed_native_thinking_tokens
+            .saturating_add(super::claude_tok::count_claude(&self.thinking_text_acc))
+            .saturating_add(unaccounted_native);
         if ctoc_thinking > 0 {
             ctoc_thinking + 6
         } else {
@@ -3195,8 +3234,14 @@ impl StreamContext {
         self.exact_current_input_tokens = None;
         self.metered_current_input_tokens = None;
         self.exact_current_output_tokens = None;
-        self.upstream_reasoning_current_round.clear();
-        self.upstream_tool_input_current_round.clear();
+        if !self.native_reasoning_usage_accounted {
+            self.completed_native_thinking_tokens = self
+                .completed_native_thinking_tokens
+                .saturating_add(self.upstream_reasoning_current_round.count());
+        }
+        self.upstream_reasoning_current_round.reset();
+        self.native_reasoning_usage_accounted = false;
+        self.upstream_tool_input_current_round.reset();
         self.native_stop_reason_received = false;
     }
 
@@ -4243,7 +4288,14 @@ mod tests {
             reasoning_events.is_empty(),
             "private GPT reasoning must never be emitted"
         );
-        assert_eq!(ctx.thinking_text_acc, "Plan carefully");
+        assert_eq!(
+            ctx.upstream_reasoning_current_round.count(),
+            super::super::claude_tok::count_claude("Plan carefully")
+        );
+        assert!(
+            ctx.thinking_text_acc.is_empty(),
+            "hidden reasoning must not be duplicated solely for usage accounting"
+        );
 
         let final_events = ctx.generate_final_events();
         let delta = final_events
@@ -4343,6 +4395,43 @@ mod tests {
             ))
         );
         assert!(ctx.take_native_signature_registration().is_none());
+    }
+
+    #[test]
+    fn completed_native_reasoning_keeps_at_most_one_full_text_copy() {
+        use crate::kiro::model::events::ReasoningContentEvent;
+
+        let reasoning = "reason carefully ".repeat(64 * 1024);
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 1, true, true, HashMap::new());
+        ctx.enable_aws_b40_compat();
+        ctx.set_thinking_text_visible(true);
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            text: reasoning.clone(),
+            ..Default::default()
+        }));
+        let _ = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            signature: "upstream-opaque-signature".to_string(),
+            ..Default::default()
+        }));
+
+        let registration_bytes = ctx
+            .pending_native_signature_registration
+            .as_ref()
+            .map(|(thinking, _)| thinking.len())
+            .unwrap_or(0);
+        let retained_reasoning_bytes = ctx.thinking_text_acc.len()
+            + ctx.thinking_pending_raw.len()
+            + ctx.native_reasoning_last_chunk.len()
+            + ctx.outbound_native_thinking_block.len()
+            + registration_bytes;
+
+        assert!(
+            retained_reasoning_bytes <= reasoning.len(),
+            "completed reasoning retained {retained_reasoning_bytes} bytes for {} bytes of text",
+            reasoning.len()
+        );
     }
 
     #[test]

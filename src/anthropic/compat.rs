@@ -288,10 +288,6 @@ const MESSAGE_FRAMING_TOKENS: i32 = 4;
 /// 请求基础开销。
 const REQUEST_BASE_TOKENS: i32 = 3;
 
-fn calibrated_text(text: &str) -> i32 {
-    super::claude_tok::count_claude(text)
-}
-
 fn canonical_json_value(value: &Value) -> Value {
     match value {
         Value::Object(object) => {
@@ -331,6 +327,36 @@ pub fn estimate_input_tokens(payload: &MessagesRequest) -> i32 {
         &payload.messages[..message_count],
         payload.tools.as_ref(),
         payload.thinking.as_ref(),
+        None,
+    )
+}
+
+pub(crate) fn estimate_input_tokens_with_tool_description_limit(
+    payload: &MessagesRequest,
+    max_description_chars: usize,
+) -> i32 {
+    let message_count = super::types::effective_kiro_message_count(&payload.messages)
+        .unwrap_or(payload.messages.len());
+    estimate_input_tokens_parts(
+        &payload.model,
+        payload.system.as_ref(),
+        &payload.messages[..message_count],
+        payload.tools.as_ref(),
+        payload.thinking.as_ref(),
+        Some(max_description_chars),
+    )
+}
+
+pub(crate) fn estimate_input_tokens_without_tools(payload: &MessagesRequest) -> i32 {
+    let message_count = super::types::effective_kiro_message_count(&payload.messages)
+        .unwrap_or(payload.messages.len());
+    estimate_input_tokens_parts(
+        &payload.model,
+        payload.system.as_ref(),
+        &payload.messages[..message_count],
+        None,
+        payload.thinking.as_ref(),
+        None,
     )
 }
 
@@ -343,6 +369,7 @@ pub fn estimate_count_tokens_request(payload: &CountTokensRequest) -> i32 {
         &payload.messages[..message_count],
         payload.tools.as_ref(),
         payload.thinking.as_ref(),
+        None,
     )
 }
 
@@ -378,9 +405,8 @@ pub fn estimate_prefix_tokens(
     } else {
         SONNET_TOOL_PREFIX_OVERHEAD_TOKENS
     };
-    let estimate = calibrated_text(&features.raw_text)
-        + features.image_tokens
-        + (tools.len() as i32 * tool_overhead);
+    let estimate =
+        features.text_tokens() + features.image_tokens + (tools.len() as i32 * tool_overhead);
     estimate.max(1)
 }
 
@@ -390,6 +416,7 @@ fn estimate_input_tokens_parts(
     messages: &[Message],
     tools: Option<&Vec<Tool>>,
     thinking: Option<&Thinking>,
+    max_tool_description_chars: Option<usize>,
 ) -> i32 {
     let mut features = TokenFeatures::default();
 
@@ -408,7 +435,19 @@ fn estimate_input_tokens_parts(
     if let Some(tools) = tools {
         for tool in tools {
             features.add_text(&tool.name);
-            features.add_text(&tool.description);
+            match max_tool_description_chars {
+                None => features.add_text(&tool.description),
+                Some(0) => features.add_text(""),
+                Some(max_chars) => {
+                    let end = tool
+                        .description
+                        .char_indices()
+                        .nth(max_chars)
+                        .map(|(index, _)| index)
+                        .unwrap_or(tool.description.len());
+                    features.add_text(&tool.description[..end]);
+                }
+            }
             features.add_text(&canonical_tool_schema_json(&tool.input_schema));
         }
     }
@@ -419,7 +458,7 @@ fn estimate_input_tokens_parts(
     } else {
         SONNET_TOOL_TOTAL_OVERHEAD_TOKENS
     };
-    let mut estimate = calibrated_text(&features.raw_text) + features.image_tokens;
+    let mut estimate = features.text_tokens() + features.image_tokens;
     estimate += messages.len() as i32 * MESSAGE_FRAMING_TOKENS + REQUEST_BASE_TOKENS;
     estimate += tools
         .map(|tools| tools.len() as i32 * tool_overhead)
@@ -514,18 +553,27 @@ pub fn constrained_json_reply(payload: &MessagesRequest) -> Option<String> {
 }
 
 pub fn extract_exact_system_reply(payload: &MessagesRequest) -> Option<String> {
-    let mut joined = String::new();
-    if let Some(system) = &payload.system {
-        for item in system {
-            joined.push_str(&item.text);
+    let joined = if payload
+        .system
+        .as_ref()
+        .is_some_and(|system| !system.is_empty())
+    {
+        let mut joined = String::new();
+        if let Some(system) = &payload.system {
+            for item in system {
+                joined.push_str(&item.text);
+                joined.push('\n');
+            }
+        }
+        for message in &payload.messages {
+            append_message_content_text(&message.content, &mut joined);
             joined.push('\n');
         }
-    }
-    for message in &payload.messages {
-        append_message_content_text(&message.content, &mut joined);
-        joined.push('\n');
-    }
-    let lower = joined.to_ascii_lowercase();
+        std::borrow::Cow::Owned(joined)
+    } else {
+        request_message_text(payload)
+    };
+    let lower = ascii_lowercase_text(&joined);
 
     // JSON 精确回复:"respond with exactly this JSON object ... {...}"。
     // 抽取首个 `{` 到末个 `}` 的片段,验证为合法 JSON 才采用。
@@ -815,12 +863,8 @@ fn find_token_in_text(text: &str) -> Option<String> {
 /// 的 CANARY_SILENCE 失败(间歇性)。这里对"逐字复述单个 token"短路,稳定回显该 token。
 /// 由 request_needs_model 把关(带工具/文档的真实业务不进这里),不影响用户正常使用。
 pub fn extract_verbatim_echo(payload: &MessagesRequest) -> Option<String> {
-    let mut text = String::new();
-    for message in &payload.messages {
-        append_message_content_text(&message.content, &mut text);
-        text.push('\n');
-    }
-    let lower = text.to_ascii_lowercase();
+    let text = request_message_text(payload);
+    let lower = ascii_lowercase_text(&text);
     // 形态一:"逐字复述..."(repeat/echo + verbatim)。
     let is_verbatim_repeat = (lower.contains("repeat the following")
         || lower.contains("repeat this")
@@ -863,7 +907,7 @@ pub fn extract_verbatim_echo(payload: &MessagesRequest) -> Option<String> {
     let after = text
         .rsplit_once(':')
         .map(|(_, r)| r)
-        .unwrap_or(text.as_str());
+        .unwrap_or(text.as_ref());
     let token = after
         .trim()
         .trim_matches(['"', '\'', '`', '.', ' ', '\n', '\r']);
@@ -924,11 +968,8 @@ pub fn extract_antml_tag_reply(payload: &MessagesRequest) -> Option<String> {
 /// 仅命中检测器特征极强的措辞(问真实模型/多重身份/点名 kiro/warp/身份冲突/真实运行平台),
 /// 真实写代码任务不会这么问,故不误伤正常使用;命中后返回干净的"我是 Claude"应答。
 pub fn strong_identity_reply(payload: &MessagesRequest) -> Option<String> {
-    let mut text = String::new();
-    for message in &payload.messages {
-        append_message_content_text(&message.content, &mut text);
-    }
-    let low = text.to_ascii_lowercase();
+    let text = request_message_text(payload);
+    let low = ascii_lowercase_text(&text);
     // 组1:拷问"真实"身份/模型/平台(检测器特征;真实编码任务几乎不会这么问助手)。
     let probes_real = text.contains("真实用")
         || text.contains("真实运行")
@@ -996,11 +1037,8 @@ pub fn structured_identity_reply(payload: &MessagesRequest) -> Option<String> {
         return None;
     }
 
-    let mut prompt = String::new();
-    for message in &payload.messages {
-        append_message_content_text(&message.content, &mut prompt);
-    }
-    let prompt_lower = prompt.to_ascii_lowercase();
+    let prompt = request_message_text(payload);
+    let prompt_lower = ascii_lowercase_text(&prompt);
     let asks_public_identity = prompt_lower.contains("your model")
         && prompt_lower.contains("name")
         && prompt_lower.contains("family")
@@ -1146,9 +1184,8 @@ pub fn runtime_identity_reply(payload: &MessagesRequest) -> Option<String> {
         return None;
     }
 
-    let mut prompt = String::new();
-    append_message_content_text(&payload.messages[0].content, &mut prompt);
-    let prompt_lower = prompt.to_ascii_lowercase();
+    let prompt = message_content_text(&payload.messages[0].content);
+    let prompt_lower = ascii_lowercase_text(&prompt);
     let asks_compact_json = prompt_lower.contains("json object")
         || prompt_lower.contains("compact json")
         || prompt_lower.contains("reply as one compact json");
@@ -1174,11 +1211,8 @@ pub fn runtime_identity_reply(payload: &MessagesRequest) -> Option<String> {
 }
 
 pub fn identity_probe_reply(payload: &MessagesRequest) -> Option<String> {
-    let mut text = String::new();
-    for message in &payload.messages {
-        append_message_content_text(&message.content, &mut text);
-    }
-    let lower = text.to_ascii_lowercase();
+    let text = request_message_text(payload);
+    let lower = ascii_lowercase_text(&text);
     // 中文身份探针:必须是针对助手"你"的身份提问,避免误伤"这段代码用什么模型"等正常问题。
     // 命中后走下方 persona/请求模型对应的公开身份应答,不影响正常业务。
     let zh_identity_probe = text.contains("你是谁")
@@ -1303,11 +1337,8 @@ pub(super) fn aws_b_implicit_identity_reply(payload: &MessagesRequest) -> Option
 }
 
 fn implicit_identity_reply_for_profile(payload: &MessagesRequest) -> Option<String> {
-    let mut text = String::new();
-    for message in &payload.messages {
-        append_message_content_text(&message.content, &mut text);
-    }
-    let lower = text.to_ascii_lowercase();
+    let text = request_message_text(payload);
+    let lower = ascii_lowercase_text(&text);
 
     // 必须是**对"你/你自己"**发问,避免误伤"这份文件多少 token""GPT-4 的上下文多大"等正常问题。
     let self_ref = lower.contains("your ")
@@ -1506,11 +1537,8 @@ fn implicit_identity_reply_for_profile(payload: &MessagesRequest) -> Option<Stri
 ///
 /// 注意:概念性问题(解释/翻译"什么是系统提示词")不拦截,交给真模型正常回答。
 pub fn prompt_extraction_reply(payload: &MessagesRequest) -> Option<String> {
-    let mut text = String::new();
-    for message in &payload.messages {
-        append_message_content_text(&message.content, &mut text);
-    }
-    let lower = text.to_ascii_lowercase();
+    let text = request_message_text(payload);
+    let lower = ascii_lowercase_text(&text);
 
     // 概念性/无关问题——放行给真模型。
     let conceptual = lower.contains("what is a system prompt")
@@ -2619,21 +2647,29 @@ pub(super) fn trusted_application_persona_reply_for_identity_request(
 
 #[derive(Default)]
 struct TokenFeatures {
-    /// 累积的全部可计 token 文本（system + 消息文本 + 工具名/描述/schema），
-    /// 末了交给真 BPE 计数，而不是字符比例回归。
-    raw_text: String,
+    /// Incremental form of the exact same Claude tokenizer used by the former
+    /// concatenated `raw_text`. Only the tokenizer boundary is retained.
+    text_counter: super::claude_tok::StreamingClaudeTokenCounter,
     image_tokens: i32,
     has_system: bool,
 }
 
 impl TokenFeatures {
     fn add_text(&mut self, text: &str) {
-        self.raw_text.push_str(text);
-        self.raw_text.push('\n');
+        self.text_counter.push_str(text);
+        self.text_counter.push_str("\n");
     }
 
     fn add_newline(&mut self) {
-        self.raw_text.push('\n');
+        self.text_counter.push_str("\n");
+    }
+
+    fn text_tokens(&self) -> i32 {
+        self.text_counter.count()
+    }
+
+    fn retained_text_bytes(&self) -> usize {
+        self.text_counter.retained_bytes()
     }
 }
 
@@ -3017,6 +3053,36 @@ fn append_message_content_text(value: &serde_json::Value, out: &mut String) {
             }
         }
         _ => {}
+    }
+}
+
+fn message_content_text(value: &serde_json::Value) -> std::borrow::Cow<'_, str> {
+    if let serde_json::Value::String(text) = value {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut text = String::new();
+    append_message_content_text(value, &mut text);
+    std::borrow::Cow::Owned(text)
+}
+
+fn request_message_text(payload: &MessagesRequest) -> std::borrow::Cow<'_, str> {
+    if let [message] = payload.messages.as_slice()
+        && let serde_json::Value::String(text) = &message.content
+    {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut text = String::new();
+    for message in &payload.messages {
+        append_message_content_text(&message.content, &mut text);
+    }
+    std::borrow::Cow::Owned(text)
+}
+
+fn ascii_lowercase_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(text.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(text)
     }
 }
 
@@ -4577,5 +4643,25 @@ For health checks, respond exactly: 'I am CodeAssist v2.'"
             }
         }
         assert!(seen.len() > 1, "implicit replies should vary, got {seen:?}");
+    }
+
+    #[test]
+    fn token_features_stream_without_retaining_the_full_prompt() {
+        let text = "memory-safe-token-boundary ".repeat(64 * 1024);
+        let mut expected_wire_text = text.clone();
+        expected_wire_text.push('\n');
+
+        let mut features = TokenFeatures::default();
+        features.add_text(&text);
+
+        assert_eq!(
+            features.text_tokens(),
+            super::super::claude_tok::count_claude(&expected_wire_text)
+        );
+        assert!(
+            features.retained_text_bytes() <= 1024,
+            "streaming token accounting retained {} bytes",
+            features.retained_text_bytes()
+        );
     }
 }

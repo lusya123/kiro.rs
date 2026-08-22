@@ -6,6 +6,7 @@
 //!
 //! 请求头使用 aws-sdk-js User-Agent 标识。请求体会在根对象上注入 `profileArn`。
 
+use bytes::Bytes;
 use reqwest::RequestBuilder;
 use uuid::Uuid;
 
@@ -105,8 +106,8 @@ impl KiroEndpoint for IdeEndpoint {
         req
     }
 
-    fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
-        inject_profile_arn(body, &ctx.credentials.profile_arn)
+    fn transform_api_body(&self, body: Bytes, ctx: &RequestContext<'_>) -> Bytes {
+        inject_profile_arn_bytes(body, ctx.credentials.profile_arn.as_deref())
     }
 }
 
@@ -123,9 +124,42 @@ fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> Strin
     request_body.to_string()
 }
 
+fn inject_profile_arn_bytes(request_body: Bytes, profile_arn: Option<&str>) -> Bytes {
+    let Some(profile_arn) = profile_arn else {
+        return request_body;
+    };
+    let Some(close_brace) = request_body
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+    else {
+        return request_body;
+    };
+    if request_body[close_brace] != b'}' {
+        return request_body;
+    }
+
+    let Ok(encoded_arn) = serde_json::to_string(profile_arn) else {
+        return request_body;
+    };
+    let mut body = Vec::with_capacity(request_body.len() + encoded_arn.len() + 15);
+    body.extend_from_slice(&request_body[..close_brace]);
+    if request_body[..close_brace]
+        .iter()
+        .rfind(|byte| !byte.is_ascii_whitespace())
+        .is_some_and(|byte| *byte != b'{')
+    {
+        body.push(b',');
+    }
+    body.extend_from_slice(b"\"profileArn\":");
+    body.extend_from_slice(encoded_arn.as_bytes());
+    body.extend_from_slice(&request_body[close_brace..]);
+    Bytes::from(body)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::inject_profile_arn;
+    use super::{inject_profile_arn, inject_profile_arn_bytes};
+    use bytes::Bytes;
     use serde_json::Value;
 
     #[test]
@@ -165,5 +199,33 @@ mod tests {
         let arn = Some("arn:test".to_string());
         let result = inject_profile_arn(body, &arn);
         assert_eq!(result, "not-valid-json");
+    }
+
+    #[test]
+    fn profile_arn_transform_reuses_body_when_no_injection_is_needed() {
+        let body = Bytes::from_static(br#"{"conversationState":{"conversationId":"c1"}}"#);
+        let original_ptr = body.as_ptr();
+
+        let transformed = inject_profile_arn_bytes(body, None);
+
+        assert_eq!(transformed.as_ptr(), original_ptr);
+        assert_eq!(
+            transformed.as_ref(),
+            br#"{"conversationState":{"conversationId":"c1"}}"#
+        );
+    }
+
+    #[test]
+    fn profile_arn_byte_transform_matches_the_existing_wire_semantics() {
+        let body = Bytes::from_static(
+            br#"{"conversationState":{"conversationId":"c1"},"additionalModelRequestFields":{"output_config":{"effort":"high"}}}"#,
+        );
+
+        let transformed = inject_profile_arn_bytes(body, Some("arn:test/quoted\"value"));
+
+        assert_eq!(
+            transformed.as_ref(),
+            br#"{"conversationState":{"conversationId":"c1"},"additionalModelRequestFields":{"output_config":{"effort":"high"}},"profileArn":"arn:test/quoted\"value"}"#
+        );
     }
 }

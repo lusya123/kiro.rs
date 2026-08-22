@@ -645,6 +645,13 @@ fn process_message_content(
     ),
     ConversionError,
 > {
+    // A plain string is already the exact Kiro content. Returning its single
+    // owned copy directly avoids constructing a one-element Vec<String> and
+    // then allocating the same large string again in join("\n").
+    if let serde_json::Value::String(text) = content {
+        return Ok((text.clone(), Vec::new(), Vec::new(), Vec::new()));
+    }
+
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
     let mut documents = Vec::new();
@@ -652,9 +659,6 @@ fn process_message_content(
     let mut media_fidelity_notes = Vec::new();
 
     match content {
-        serde_json::Value::String(s) => {
-            text_parts.push(s.clone());
-        }
         serde_json::Value::Array(arr) => {
             for item in arr {
                 if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {

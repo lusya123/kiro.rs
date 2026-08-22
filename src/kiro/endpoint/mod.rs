@@ -6,6 +6,7 @@
 //! [`KiroEndpoint`] 抽象了请求侧的差异点；`KiroProvider` 持有一个 endpoint 注册表，
 //! 按凭据的 `endpoint` 字段选择对应实现。
 
+use bytes::Bytes;
 use reqwest::RequestBuilder;
 
 use crate::kiro::model::credentials::KiroCredentials;
@@ -39,7 +40,7 @@ pub trait KiroEndpoint: Send + Sync {
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder;
 
     /// 对已序列化的 API 请求体做端点特有加工（如注入 profileArn）
-    fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String;
+    fn transform_api_body(&self, body: Bytes, ctx: &RequestContext<'_>) -> Bytes;
 
     /// 对已序列化的 MCP 请求体做端点特有加工（默认不变）
     fn transform_mcp_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {

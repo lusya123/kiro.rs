@@ -5,6 +5,7 @@
 //! 支持多凭据故障转移和重试
 //! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
+use bytes::Bytes;
 use reqwest::{Client, StatusCode};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -37,6 +38,17 @@ pub(crate) struct UpstreamHttpError {
     status: StatusCode,
     body: String,
     api_type: &'static str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KiroProvider;
+
+    #[test]
+    fn explicit_model_hint_does_not_require_reparsing_the_request_body() {
+        let model = KiroProvider::model_for_request(Some("claude-opus-4.8"), b"not-json");
+        assert_eq!(model.as_deref(), Some("claude-opus-4.8"));
+    }
 }
 
 impl UpstreamHttpError {
@@ -90,6 +102,14 @@ pub struct KiroProvider {
 }
 
 impl KiroProvider {
+    fn model_for_request(model_hint: Option<&str>, request_body: &[u8]) -> Option<String> {
+        model_hint.map(str::to_owned).or_else(|| {
+            std::str::from_utf8(request_body)
+                .ok()
+                .and_then(Self::extract_model_from_request)
+        })
+    }
+
     /// 创建带代理配置和端点注册表的 KiroProvider 实例
     ///
     /// # Arguments
@@ -153,12 +173,32 @@ impl KiroProvider {
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
     pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, false).await
+        self.call_api_with_retry(Bytes::copy_from_slice(request_body.as_bytes()), false, None)
+            .await
     }
 
     /// 发送流式 API 请求
     pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, true).await
+        self.call_api_with_retry(Bytes::copy_from_slice(request_body.as_bytes()), true, None)
+            .await
+    }
+
+    pub async fn call_api_for_model(
+        &self,
+        request_body: Bytes,
+        model: &str,
+    ) -> anyhow::Result<reqwest::Response> {
+        self.call_api_with_retry(request_body, false, Some(model))
+            .await
+    }
+
+    pub async fn call_api_stream_for_model(
+        &self,
+        request_body: Bytes,
+        model: &str,
+    ) -> anyhow::Result<reqwest::Response> {
+        self.call_api_with_retry(request_body, true, Some(model))
+            .await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -324,8 +364,9 @@ impl KiroProvider {
     /// - 硬上限 9 次，避免无限重试
     async fn call_api_with_retry(
         &self,
-        request_body: &str,
+        request_body: Bytes,
         is_stream: bool,
+        model_hint: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
@@ -335,7 +376,7 @@ impl KiroProvider {
         let call_started = Instant::now();
 
         // 尝试从请求体中提取模型信息
-        let model = Self::extract_model_from_request(request_body);
+        let model = Self::model_for_request(model_hint, &request_body);
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
@@ -367,7 +408,7 @@ impl KiroProvider {
             };
 
             let url = endpoint.api_url(&rctx);
-            let body = endpoint.transform_api_body(request_body, &rctx);
+            let body = endpoint.transform_api_body(request_body.clone(), &rctx);
 
             let client = self.client_for(&ctx.credentials)?;
             let base = tls_sidecar::post(&client, &url)

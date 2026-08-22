@@ -20,6 +20,7 @@ struct Vocab {
     tokens: HashSet<Box<[u8]>>,
     /// 每个首字节对应的"最长 token 字节数",用于收紧贪心匹配的尝试范围。
     max_len_by_first: [usize; 256],
+    max_token_len: usize,
 }
 
 fn vocab() -> &'static Vocab {
@@ -46,6 +47,7 @@ fn vocab() -> &'static Vocab {
         Vocab {
             tokens,
             max_len_by_first,
+            max_token_len: max_len_by_first.iter().copied().max().unwrap_or(1),
         }
     })
 }
@@ -68,16 +70,15 @@ fn is_cjk(c: char) -> bool {
 /// 输入/输出/思考/缓存的 token 计数都应走本函数,保证口径统一。
 pub fn count_claude(text: &str) -> i32 {
     let raw = count_tokens(text);
+    let (cjk, total) = text.chars().fold((0usize, 0usize), |(cjk, total), ch| {
+        (cjk + usize::from(is_cjk(ch)), total + 1)
+    });
+    calibrate_cjk_count(raw, cjk, total)
+}
+
+fn calibrate_cjk_count(raw: i32, cjk: usize, total: usize) -> i32 {
     if raw <= 0 {
         return 0;
-    }
-    let mut cjk = 0usize;
-    let mut total = 0usize;
-    for c in text.chars() {
-        total += 1;
-        if is_cjk(c) {
-            cjk += 1;
-        }
     }
     if cjk == 0 {
         return raw; // 纯 ASCII:ctoc 已准
@@ -85,6 +86,60 @@ pub fn count_claude(text: &str) -> i32 {
     let frac = cjk as f64 / total as f64;
     let factor = 1.0 + (0.92 - 1.0) * frac;
     ((raw as f64) * factor).round().max(1.0) as i32
+}
+
+/// 与 `count_claude` 完全相同的流式计数器。只保留不超过词表最长 token
+/// 的边界尾巴，因此上游流越长也不会线性占用内存。
+#[derive(Clone, Debug, Default)]
+pub struct StreamingClaudeTokenCounter {
+    stable_raw_tokens: i32,
+    pending: Vec<u8>,
+    cjk_chars: usize,
+    total_chars: usize,
+}
+
+impl StreamingClaudeTokenCounter {
+    pub fn push_str(&mut self, text: &str) {
+        for ch in text.chars() {
+            self.total_chars += 1;
+            if is_cjk(ch) {
+                self.cjk_chars += 1;
+            }
+        }
+        let vocab = vocab();
+        // Feed bounded chunks so a one-shot multi-megabyte prompt cannot make
+        // the boundary Vec retain the prompt's former capacity forever.
+        for chunk in text.as_bytes().chunks(512) {
+            self.pending.extend_from_slice(chunk);
+            let mut consumed = 0usize;
+            while self.pending.len().saturating_sub(consumed) > vocab.max_token_len {
+                let token_len = greedy_token_len(&self.pending, consumed, vocab);
+                consumed += token_len;
+                self.stable_raw_tokens = self.stable_raw_tokens.saturating_add(1);
+            }
+            if consumed > 0 {
+                self.pending.drain(..consumed);
+            }
+        }
+    }
+
+    pub fn count(&self) -> i32 {
+        let raw = self
+            .stable_raw_tokens
+            .saturating_add(count_token_bytes(&self.pending));
+        calibrate_cjk_count(raw, self.cjk_chars, self.total_chars)
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.pending.capacity()
+    }
+
+    pub fn reset(&mut self) {
+        self.stable_raw_tokens = 0;
+        self.pending.clear();
+        self.cjk_chars = 0;
+        self.total_chars = 0;
+    }
 }
 
 /// Truncate text without exceeding a Claude token budget.
@@ -133,7 +188,10 @@ fn greedy_token_len(bytes: &[u8], pos: usize, vocab: &Vocab) -> usize {
 
 /// 贪心字节级最长匹配的 token 数(与 ctoc.cc 一致:未命中的字节按 1 token 兜底)。
 pub fn count_tokens(text: &str) -> i32 {
-    let bytes = text.as_bytes();
+    count_token_bytes(text.as_bytes())
+}
+
+fn count_token_bytes(bytes: &[u8]) -> i32 {
     if bytes.is_empty() {
         return 0;
     }
@@ -179,5 +237,49 @@ mod tests {
         // 重复空格等会被合并成更长的 token,token 数应远小于字节数。
         let spaces = " ".repeat(64);
         assert!(count_tokens(&spaces) < 20, "runs should merge");
+    }
+
+    #[test]
+    fn streaming_counter_matches_full_counter_at_every_character_boundary() {
+        let text = "Plan carefully：先检查 JSON，再输出 tool_result ✅ with  multiple   spaces.";
+        let expected = count_claude(text);
+        let boundaries = text
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain(std::iter::once(text.len()))
+            .collect::<Vec<_>>();
+
+        for &split in &boundaries {
+            let mut counter = StreamingClaudeTokenCounter::default();
+            counter.push_str(&text[..split]);
+            counter.push_str(&text[split..]);
+            assert_eq!(counter.count(), expected, "split at byte {split}");
+        }
+    }
+
+    #[test]
+    fn streaming_counter_can_be_reset_between_upstream_rounds() {
+        let mut counter = StreamingClaudeTokenCounter::default();
+        counter.push_str("first round reasoning");
+        assert_eq!(counter.count(), count_claude("first round reasoning"));
+
+        counter.reset();
+        counter.push_str("第二轮");
+
+        assert_eq!(counter.count(), count_claude("第二轮"));
+    }
+
+    #[test]
+    fn streaming_counter_retains_only_a_bounded_token_boundary() {
+        let text = "reasoning-token ".repeat(16 * 1024);
+        let mut counter = StreamingClaudeTokenCounter::default();
+
+        counter.push_str(&text);
+
+        assert_eq!(counter.count(), count_claude(&text));
+        assert!(
+            counter.pending.len() <= vocab().max_token_len,
+            "streaming token accounting must not retain output-sized text"
+        );
     }
 }
