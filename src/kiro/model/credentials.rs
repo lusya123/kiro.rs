@@ -10,6 +10,11 @@ use std::path::Path;
 use crate::http_client::ProxyConfig;
 use crate::model::config::Config;
 
+pub const BUILDER_ID_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
+pub const SOCIAL_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
+
 /// Kiro OAuth 凭证
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -272,6 +277,43 @@ impl KiroCredentials {
                 .map(|m| m.eq_ignore_ascii_case("api_key") || m.eq_ignore_ascii_case("apikey"))
                 .unwrap_or(false)
     }
+
+    fn is_social_login(&self) -> bool {
+        self.auth_method
+            .as_deref()
+            .is_some_and(|method| method.eq_ignore_ascii_case("social"))
+    }
+
+    fn default_profile_arn(&self) -> &'static str {
+        if self.is_social_login() {
+            SOCIAL_PROFILE_ARN
+        } else {
+            BUILDER_ID_PROFILE_ARN
+        }
+    }
+
+    /// 返回可用于用量类接口的真实 ARN，过滤 Builder ID 占位值。
+    pub fn effective_profile_arn(&self) -> Option<&str> {
+        self.profile_arn
+            .as_deref()
+            .filter(|arn| !is_placeholder_profile_arn(arn))
+    }
+
+    /// 返回流式端点所需 ARN。OAuth 缺失时使用官方占位值，API Key 不发送。
+    pub fn streaming_profile_arn(&self) -> Option<String> {
+        if self.is_api_key_credential() {
+            return None;
+        }
+        Some(
+            self.profile_arn
+                .clone()
+                .unwrap_or_else(|| self.default_profile_arn().to_string()),
+        )
+    }
+}
+
+pub fn is_placeholder_profile_arn(arn: &str) -> bool {
+    arn == BUILDER_ID_PROFILE_ARN
 }
 
 #[cfg(test)]
@@ -366,6 +408,36 @@ mod tests {
         let json = r#"{"refreshToken": "test"}"#;
         let creds = KiroCredentials::from_json(json).unwrap();
         assert_eq!(creds.priority, 0);
+    }
+
+    #[test]
+    fn usage_requests_only_expose_real_profile_arns() {
+        let mut credentials = KiroCredentials::default();
+        credentials.profile_arn = Some(BUILDER_ID_PROFILE_ARN.to_string());
+        assert_eq!(credentials.effective_profile_arn(), None);
+
+        let real = "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123";
+        credentials.profile_arn = Some(real.to_string());
+        assert_eq!(credentials.effective_profile_arn(), Some(real));
+    }
+
+    #[test]
+    fn streaming_requests_keep_a_profile_for_oauth_but_not_api_keys() {
+        let oauth = KiroCredentials {
+            refresh_token: Some("refresh".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            oauth.streaming_profile_arn().as_deref(),
+            Some(BUILDER_ID_PROFILE_ARN)
+        );
+
+        let api_key = KiroCredentials {
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some("ksk_test".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(api_key.streaming_profile_arn(), None);
     }
 
     #[test]

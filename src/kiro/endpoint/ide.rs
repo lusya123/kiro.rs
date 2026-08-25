@@ -97,7 +97,7 @@ impl KiroEndpoint for IdeEndpoint {
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        if let Some(ref arn) = ctx.credentials.profile_arn {
+        if let Some(arn) = ctx.credentials.effective_profile_arn() {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
         if ctx.credentials.is_api_key_credential() {
@@ -107,7 +107,8 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn transform_api_body(&self, body: Bytes, ctx: &RequestContext<'_>) -> Bytes {
-        inject_profile_arn_bytes(body, ctx.credentials.profile_arn.as_deref())
+        let profile_arn = ctx.credentials.streaming_profile_arn();
+        inject_profile_arn_bytes(body, profile_arn.as_deref())
     }
 }
 

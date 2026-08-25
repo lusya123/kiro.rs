@@ -18,6 +18,7 @@ use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
+use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
@@ -318,6 +319,42 @@ async fn refresh_idc_token(
     Ok(new_credentials)
 }
 
+fn rest_api_region_candidates(region: &str) -> [&'static str; 2] {
+    if region.eq_ignore_ascii_case("eu-central-1") || region.to_ascii_lowercase().starts_with("eu-")
+    {
+        ["eu-central-1", "us-east-1"]
+    } else {
+        ["us-east-1", "eu-central-1"]
+    }
+}
+
+fn profile_arn_query(profile_arn: Option<&str>) -> String {
+    profile_arn
+        .map(|arn| format!("&profileArn={}", urlencoding::encode(arn)))
+        .unwrap_or_default()
+}
+
+fn usage_api_attempts<'a>(
+    credentials: &'a KiroCredentials,
+    candidates: &[&'static str],
+) -> Vec<(&'static str, Option<&'a str>)> {
+    let mut attempts = Vec::with_capacity(candidates.len() * 2);
+    for region in candidates {
+        if let Some(arn) = credentials.effective_profile_arn() {
+            attempts.push((*region, Some(arn)));
+        }
+        attempts.push((*region, None));
+    }
+    attempts
+}
+
+fn usage_limits_url(host: &str, profile_arn: Option<&str>) -> String {
+    format!(
+        "https://{host}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true{}",
+        profile_arn_query(profile_arn)
+    )
+}
+
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
@@ -327,24 +364,11 @@ pub(crate) async fn get_usage_limits(
 ) -> anyhow::Result<UsageLimitsResponse> {
     tracing::debug!("正在获取使用额度信息...");
 
-    // 优先级：凭据.api_region > config.api_region > config.region
-    let region = credentials.effective_api_region(config);
-    let host = format!("q.{}.amazonaws.com", region);
+    let regions = rest_api_region_candidates(credentials.effective_auth_region(config));
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = &config.kiro_version;
     let os_name = &config.system_version;
     let node_version = &config.node_version;
-
-    // 构建 URL
-    let mut url = format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
-        host
-    );
-
-    // profileArn 是可选的
-    if let Some(profile_arn) = &credentials.profile_arn {
-        url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
-    }
 
     // 构建 User-Agent headers
     let user_agent = format!(
@@ -355,24 +379,37 @@ pub(crate) async fn get_usage_limits(
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
-    let mut request = tls_sidecar::get(&client, &url)
-        .header("x-amz-user-agent", &amz_user_agent)
-        .header("user-agent", &user_agent)
-        .header("host", &host)
-        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-        .header("amz-sdk-request", "attempt=1; max=1")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Connection", "close");
+    let attempts = usage_api_attempts(credentials, &regions);
+    let mut last_error = None;
 
-    if credentials.is_api_key_credential() {
-        request = request.header("tokentype", "API_KEY");
-    }
+    for (index, (region, profile_arn)) in attempts.iter().enumerate() {
+        let host = format!("q.{region}.amazonaws.com");
+        let url = usage_limits_url(&host, *profile_arn);
+        let mut request = tls_sidecar::get(&client, &url)
+            .header("x-amz-user-agent", &amz_user_agent)
+            .header("user-agent", &user_agent)
+            .header("host", &host)
+            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=1")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Connection", "close");
 
-    let response = request.send().await?;
+        if credentials.is_api_key_credential() {
+            request = request.header("tokentype", "API_KEY");
+        }
 
-    let status = response.status();
-    if !status.is_success() {
+        let response = request.send().await?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response.json().await?);
+        }
+
         let body_text = response.text().await.unwrap_or_default();
+        if status.as_u16() == 403 && index + 1 < attempts.len() {
+            last_error = Some(format!("{} {}", status, body_text));
+            continue;
+        }
+
         let error_msg = match status.as_u16() {
             401 => "认证失败，Token 无效或已过期",
             403 => "权限不足，无法获取使用额度",
@@ -383,8 +420,77 @@ pub(crate) async fn get_usage_limits(
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
-    let data: UsageLimitsResponse = response.json().await?;
-    Ok(data)
+    bail!(
+        "权限不足，无法获取使用额度: {}",
+        last_error.unwrap_or_else(|| "无可用端点".to_string())
+    )
+}
+
+pub(crate) async fn list_available_profiles(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<ListAvailableProfilesResponse> {
+    let regions = rest_api_region_candidates(credentials.effective_auth_region(config));
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        config.system_version, config.node_version, config.kiro_version, machine_id
+    );
+    let amz_user_agent = format!(
+        "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
+        config.kiro_version, machine_id
+    );
+    let client = build_client(proxy, 60, config.tls_backend)?;
+    let mut last_error = None;
+    let mut empty_seen = false;
+
+    for region in regions {
+        let host = format!("q.{region}.amazonaws.com");
+        let url = format!("https://{host}/");
+        let mut request = tls_sidecar::post(&client, &url)
+            .header("content-type", "application/x-amz-json-1.0")
+            .header(
+                "x-amz-target",
+                "AmazonCodeWhispererService.ListAvailableProfiles",
+            )
+            .header("x-amz-user-agent", &amz_user_agent)
+            .header("user-agent", &user_agent)
+            .header("host", &host)
+            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=1")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Connection", "close")
+            .body(r#"{"maxResults":10}"#);
+
+        if credentials.is_api_key_credential() {
+            request = request.header("tokentype", "API_KEY");
+        }
+
+        let response = request.send().await?;
+        let status = response.status();
+        if status.is_success() {
+            let profiles: ListAvailableProfilesResponse = response.json().await?;
+            if profiles.first_arn().is_some() {
+                return Ok(profiles);
+            }
+            empty_seen = true;
+            continue;
+        }
+
+        let body = response.text().await.unwrap_or_default();
+        last_error = Some(format!("{} {}", status, body));
+    }
+
+    if empty_seen {
+        return Ok(ListAvailableProfilesResponse::default());
+    }
+
+    bail!(
+        "获取可用 profile 失败: {}",
+        last_error.unwrap_or_else(|| "无可用端点".to_string())
+    )
 }
 
 // ============================================================================
@@ -1533,6 +1639,49 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 解析并持久化与当前 OAuth Token 绑定的真实 profileArn。
+    pub async fn resolve_profile_arn_for(
+        &self,
+        id: u64,
+        token: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| entry.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        if credentials.is_api_key_credential() {
+            return Ok(None);
+        }
+        if let Some(arn) = credentials.effective_profile_arn() {
+            return Ok(Some(arn.to_string()));
+        }
+
+        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let profiles =
+            list_available_profiles(&credentials, &self.config, token, effective_proxy.as_ref())
+                .await?;
+        let Some(arn) = profiles.first_arn().map(str::to_string) else {
+            return Ok(None);
+        };
+
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                entry.credentials.profile_arn = Some(arn.clone());
+            }
+        }
+        if let Err(error) = self.persist_credentials() {
+            tracing::warn!("profileArn 回填后持久化失败（不影响本次请求）: {}", error);
+        }
+        tracing::info!("凭据 #{} 已解析并回填真实 profileArn: {}", id, arn);
+        Ok(Some(arn))
+    }
+
     /// 获取指定凭据的使用额度（Admin API）
     pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
         let credentials = {
@@ -1596,7 +1745,7 @@ impl MultiTokenManager {
             }
         };
 
-        let credentials = {
+        let mut credentials = {
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -1604,6 +1753,14 @@ impl MultiTokenManager {
                 .map(|e| e.credentials.clone())
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
+
+        match self.resolve_profile_arn_for(id, &token).await {
+            Ok(Some(arn)) => credentials.profile_arn = Some(arn),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!("凭据 #{} 查询用量前解析 profileArn 失败: {}", id, error)
+            }
+        }
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
         let usage_limits =
@@ -1937,6 +2094,58 @@ impl Drop for MultiTokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN;
+
+    #[test]
+    fn usage_requests_try_real_profile_before_legacy_fallback() {
+        let real = "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123";
+        let credentials = KiroCredentials {
+            profile_arn: Some(real.to_string()),
+            ..Default::default()
+        };
+        let encoded = "arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123456789012%3Aprofile%2FREAL123";
+
+        assert_eq!(
+            usage_limits_url("q.us-east-1.amazonaws.com", Some(real)),
+            format!(
+                "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true&profileArn={encoded}"
+            )
+        );
+        assert_eq!(
+            usage_api_attempts(&credentials, &["us-east-1", "eu-central-1"]),
+            vec![
+                ("us-east-1", Some(real)),
+                ("us-east-1", None),
+                ("eu-central-1", Some(real)),
+                ("eu-central-1", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn usage_requests_route_all_eu_sso_regions_to_the_eu_rest_endpoint_first() {
+        assert_eq!(
+            rest_api_region_candidates("eu-west-1"),
+            ["eu-central-1", "us-east-1"]
+        );
+        assert_eq!(
+            rest_api_region_candidates("us-west-2"),
+            ["us-east-1", "eu-central-1"]
+        );
+    }
+
+    #[test]
+    fn usage_requests_never_send_builder_id_placeholder() {
+        let credentials = KiroCredentials {
+            profile_arn: Some(BUILDER_ID_PROFILE_ARN.to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            usage_api_attempts(&credentials, &["us-east-1", "eu-central-1"]),
+            vec![("us-east-1", None), ("eu-central-1", None)]
+        );
+    }
 
     #[test]
     fn test_is_token_expired_with_expired_token() {

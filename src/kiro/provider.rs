@@ -99,6 +99,8 @@ pub struct KiroProvider {
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
     default_endpoint: String,
+    /// 已完成 profileArn 探测的凭据，避免 Builder ID 每次请求都重复查询。
+    profile_resolution_attempted: Mutex<HashSet<u64>>,
 }
 
 impl KiroProvider {
@@ -142,6 +144,7 @@ impl KiroProvider {
             tls_backend,
             endpoints,
             default_endpoint,
+            profile_resolution_attempted: Mutex::new(HashSet::new()),
         }
     }
 
@@ -167,6 +170,43 @@ impl KiroProvider {
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
+    }
+
+    async fn ensure_profile_arn(&self, ctx: &mut crate::kiro::token_manager::CallContext) {
+        use crate::kiro::model::credentials::is_placeholder_profile_arn;
+
+        if ctx.credentials.is_api_key_credential() {
+            return;
+        }
+        let needs_resolution = ctx
+            .credentials
+            .profile_arn
+            .as_deref()
+            .is_none_or(is_placeholder_profile_arn);
+        if !needs_resolution || self.profile_resolution_attempted.lock().contains(&ctx.id) {
+            return;
+        }
+
+        match self
+            .token_manager
+            .resolve_profile_arn_for(ctx.id, &ctx.token)
+            .await
+        {
+            Ok(Some(arn)) => {
+                ctx.credentials.profile_arn = Some(arn);
+                self.profile_resolution_attempted.lock().insert(ctx.id);
+            }
+            Ok(None) => {
+                self.profile_resolution_attempted.lock().insert(ctx.id);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "凭据 #{} 解析真实 profileArn 失败（本次使用兼容值）: {}",
+                    ctx.id,
+                    error
+                );
+            }
+        }
     }
 
     /// 发送非流式 API 请求
@@ -215,13 +255,15 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
+            let mut ctx = match self.token_manager.acquire_context(None).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
                     continue;
                 }
             };
+
+            self.ensure_profile_arn(&mut ctx).await;
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -380,13 +422,15 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let mut ctx = match self.token_manager.acquire_context(model.as_deref()).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
                     continue;
                 }
             };
+
+            self.ensure_profile_arn(&mut ctx).await;
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
