@@ -3571,7 +3571,6 @@ async fn handle_non_stream_request(
         let mut round_reasoning_previous = String::new();
         let mut round_has_completed_tool_use = false;
         let mut round_has_terminal_evidence = false;
-        let mut round_has_native_stop_reason = false;
         let mut round_refused = false;
         stop_reason = "end_turn".to_string();
 
@@ -3716,7 +3715,6 @@ async fn handle_non_stream_request(
                                 .and_then(crate::kiro::model::events::anthropic_stop_reason);
                             if let Some(reason) = mapped_stop_reason {
                                 stop_reason = reason.to_string();
-                                round_has_native_stop_reason = true;
                                 round_refused |= reason == "refusal";
                             } else if metadata
                                 .stop_reason
@@ -3802,9 +3800,11 @@ async fn handle_non_stream_request(
             }
         }
 
-        if has_tool_use && stop_reason == "end_turn" && !round_has_native_stop_reason {
-            stop_reason = "tool_use".to_string();
-        }
+        stop_reason = super::stream::normalize_stop_reason_for_completed_tool_use(
+            &stop_reason,
+            round_has_completed_tool_use,
+        )
+        .to_string();
 
         if let Some(output_tokens) = round_exact_output_tokens {
             exact_output_tokens = exact_output_tokens.saturating_add(output_tokens.max(0));
