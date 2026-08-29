@@ -8,6 +8,7 @@ on:
       - codex/high-cache-container
       - aws-p
       - aws-b
+      - AWS杠B可外接版本
     tags:
       - 'v*'
   workflow_dispatch:
@@ -71,6 +72,7 @@ jobs:
           HIGH_CACHE_BRANCH="codex/high-cache-container"
           AWS_P_BRANCH="aws-p"
           AWS_B_BRANCH="aws-b"
+          AWS_B_EXTERNAL_BRANCH="AWS杠B可外接版本"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             if [ "${{ github.ref_name }}" = "${HIGH_CACHE_BRANCH}" ]; then
               echo "version=high-cache-${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
@@ -81,6 +83,9 @@ jobs:
             elif [ "${{ github.ref_name }}" = "${AWS_B_BRANCH}" ]; then
               echo "version=aws-b-${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
               echo "alias_tag=aws-b" >> $GITHUB_OUTPUT
+            elif [ "${{ github.ref_name }}" = "${AWS_B_EXTERNAL_BRANCH}" ]; then
+              echo "version=aws-b-external-${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+              echo "alias_tag=aws-b-external" >> $GITHUB_OUTPUT
             else
               echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
               echo "alias_tag=latest" >> $GITHUB_OUTPUT
@@ -101,6 +106,9 @@ jobs:
             elif [ "${{ github.ref_name }}" = "${AWS_B_BRANCH}" ]; then
               echo "version=aws-b-beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
               echo "alias_tag=aws-b" >> $GITHUB_OUTPUT
+            elif [ "${{ github.ref_name }}" = "${AWS_B_EXTERNAL_BRANCH}" ]; then
+              echo "version=aws-b-external-beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
+              echo "alias_tag=aws-b-external" >> $GITHUB_OUTPUT
             else
               echo "version=beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
               echo "alias_tag=beta" >> $GITHUB_OUTPUT
@@ -154,7 +162,7 @@ jobs:
             ${IMAGE}:${VERSION}-arm64
           docker manifest push ${IMAGE}:${VERSION}
 
-          # Create manifest for latest/beta/high-cache alias tag
+          # Create manifest for the branch-specific alias tag
           ALIAS_TAG="${{ needs.build.outputs.alias_tag }}"
           docker manifest create ${IMAGE}:${ALIAS_TAG} \
             ${IMAGE}:${VERSION}-amd64 \
