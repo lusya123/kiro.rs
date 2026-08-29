@@ -17,6 +17,17 @@ const AUTO_CONTINUE_COMPLETE_SENTINEL: &str = "__KRS_CONTINUATION_COMPLETE__";
 const AWS_B_TEXT_DELTA_TARGET_CHARS: usize = 8;
 const AWS_B_TEXT_DELTA_MAX_PARTS: usize = 256;
 
+pub(crate) fn normalize_stop_reason_for_completed_tool_use<'a>(
+    stop_reason: &'a str,
+    has_completed_tool_use: bool,
+) -> &'a str {
+    if has_completed_tool_use && stop_reason == "end_turn" {
+        "tool_use"
+    } else {
+        stop_reason
+    }
+}
+
 pub fn merge_continuation_text(previous: &str, incoming: &str) -> String {
     if previous.is_empty() || incoming.is_empty() {
         return incoming.to_string();
@@ -3035,6 +3046,15 @@ impl StreamContext {
         events.extend(self.flush_pending_identity_tool_arguments());
         events.extend(self.flush_pending_bedrock_tool_arguments());
 
+        let current_stop_reason = self.state_manager.get_stop_reason();
+        let normalized_stop_reason = normalize_stop_reason_for_completed_tool_use(
+            &current_stop_reason,
+            self.first_round_completed_tool_use,
+        );
+        if normalized_stop_reason != current_stop_reason {
+            self.state_manager.set_stop_reason(normalized_stop_reason);
+        }
+
         // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
         // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
         // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
@@ -3739,6 +3759,32 @@ mod tests {
             assert_eq!(delta.data["delta"]["stop_reason"], expected, "{native}");
             assert!(delta.data["delta"]["stop_details"].is_null());
         }
+    }
+
+    #[test]
+    fn completed_tool_use_overrides_native_end_turn_in_stream_delta() {
+        let mut ctx =
+            StreamContext::new_with_thinking("gpt-5.6-sol", 100, false, false, HashMap::new());
+        let _ = ctx.process_kiro_event(&Event::ToolUse(crate::kiro::model::events::ToolUseEvent {
+            name: "Read".to_string(),
+            tool_use_id: "call_file_read".to_string(),
+            input: r#"{"file_path":"README.md"}"#.to_string(),
+            stop: true,
+        }));
+        let _ = ctx.process_kiro_event(&Event::Metadata(
+            crate::kiro::model::events::MetadataEvent {
+                stop_reason: Some("END_TURN".to_string()),
+                token_usage: Default::default(),
+            },
+        ));
+
+        let events = ctx.generate_final_events();
+        let delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+
+        assert_eq!(delta.data["delta"]["stop_reason"], "tool_use");
     }
 
     #[test]

@@ -337,6 +337,13 @@ struct ForwardedImage {
 }
 
 pub(crate) const TOOL_RESULT_IMAGE_MARKER: &str = "[Image attached to this tool result]";
+pub(crate) const TOOL_RESULT_DOCUMENT_MARKER: &str = "[Document attached to this tool result]";
+
+#[derive(Debug)]
+struct ForwardedDocument {
+    document: KiroDocument,
+    tool_result_index: Option<usize>,
+}
 
 impl ForwardedImage {
     fn direct(image: KiroImage) -> Self {
@@ -349,6 +356,22 @@ impl ForwardedImage {
     fn from_tool_result(tool_result_index: usize, image: KiroImage) -> Self {
         Self {
             image,
+            tool_result_index: Some(tool_result_index),
+        }
+    }
+}
+
+impl ForwardedDocument {
+    fn direct(document: KiroDocument) -> Self {
+        Self {
+            document,
+            tool_result_index: None,
+        }
+    }
+
+    fn from_tool_result(tool_result_index: usize, document: KiroDocument) -> Self {
+        Self {
+            document,
             tool_result_index: Some(tool_result_index),
         }
     }
@@ -504,7 +527,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
     let last_message = messages.last().unwrap();
-    let (text_content, forwarded_images, documents, tool_results) =
+    let (text_content, forwarded_images, forwarded_documents, tool_results) =
         process_message_content(&last_message.content, model_id.starts_with("gpt-"))?;
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
@@ -533,6 +556,15 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
                 .is_none_or(|index| validated_tool_result_indices.contains(&index))
         })
         .map(|forwarded| forwarded.image)
+        .collect::<Vec<_>>();
+    let documents = forwarded_documents
+        .into_iter()
+        .filter(|forwarded| {
+            forwarded
+                .tool_result_index
+                .is_none_or(|index| validated_tool_result_indices.contains(&index))
+        })
+        .map(|forwarded| forwarded.document)
         .collect::<Vec<_>>();
 
     // 9. 从历史中移除孤立的 tool_use（Kiro API 要求 tool_use 必须有对应的 tool_result）
@@ -640,7 +672,7 @@ fn process_message_content(
     (
         String,
         Vec<ForwardedImage>,
-        Vec<KiroDocument>,
+        Vec<ForwardedDocument>,
         Vec<ToolResult>,
     ),
     ConversionError,
@@ -714,11 +746,14 @@ Ignore only that frame; the complete original source is the centered \
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
-                                let (result_content, result_images) =
+                                let (result_content, result_images, result_documents) =
                                     extract_tool_result_content(&block.content);
                                 let tool_result_index = tool_results.len();
                                 images.extend(result_images.into_iter().map(|image| {
                                     ForwardedImage::from_tool_result(tool_result_index, image)
+                                }));
+                                documents.extend(result_documents.into_iter().map(|document| {
+                                    ForwardedDocument::from_tool_result(tool_result_index, document)
                                 }));
                                 let is_error = block.is_error.unwrap_or(false);
 
@@ -741,10 +776,12 @@ Ignore only that frame; the complete original source is the centered \
                                         (source.media_type.as_deref(), source.data)
                                     {
                                         if let Some(format) = get_document_format(media_type) {
-                                            documents.push(KiroDocument::from_base64(
-                                                format,
-                                                document_name,
-                                                data,
+                                            documents.push(ForwardedDocument::direct(
+                                                KiroDocument::from_base64(
+                                                    format,
+                                                    document_name,
+                                                    data,
+                                                ),
                                             ));
                                         }
                                     }
@@ -1169,43 +1206,60 @@ fn get_image_format(media_type: &str) -> Option<String> {
 /// Kiro 的 ToolResultContentBlock 仅支持 text/json，图片必须放在同一条 user
 /// message 的 images 字段。这里保留原始文本，并返回需要提升的图片；关联标记使
 /// image-only 结果保持非空，也让模型知道这些 message-level 图片属于该工具结果。
-fn extract_tool_result_content(content: &Option<serde_json::Value>) -> (String, Vec<KiroImage>) {
+fn extract_tool_result_content(
+    content: &Option<serde_json::Value>,
+) -> (String, Vec<KiroImage>, Vec<KiroDocument>) {
     match content {
-        Some(serde_json::Value::String(s)) => (s.clone(), Vec::new()),
+        Some(serde_json::Value::String(s)) => (s.clone(), Vec::new(), Vec::new()),
         Some(serde_json::Value::Array(arr)) => {
             let mut parts = Vec::new();
             let mut images = Vec::new();
+            let mut documents = Vec::new();
             for item in arr {
                 if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                     parts.push(text.to_string());
                 }
-                if item.get("type").and_then(|v| v.as_str()) != Some("image") {
+                let Some(media_type) = item.get("type").and_then(|v| v.as_str()) else {
                     continue;
-                }
+                };
                 let Some(source) = item.get("source") else {
                     continue;
                 };
                 if source.get("type").and_then(|v| v.as_str()) != Some("base64") {
                     continue;
                 }
-                let (Some(media_type), Some(data)) = (
+                let (Some(source_media_type), Some(data)) = (
                     source.get("media_type").and_then(|v| v.as_str()),
                     source.get("data").and_then(|v| v.as_str()),
                 ) else {
                     continue;
                 };
-                if let Some(format) = get_image_format(media_type) {
-                    images.push(KiroImage::from_base64(format, data));
-                    // Keep one marker at the original media position. Repeating
-                    // the marker for multiple images preserves attachment order
-                    // after Kiro flattens them into message-level `images[]`.
-                    parts.push(TOOL_RESULT_IMAGE_MARKER.to_string());
+                match media_type {
+                    "image" => {
+                        if let Some(format) = get_image_format(source_media_type) {
+                            images.push(KiroImage::from_base64(format, data));
+                            // Keep one marker at the original media position. Repeating
+                            // the marker for multiple images preserves attachment order
+                            // after Kiro flattens them into message-level `images[]`.
+                            parts.push(TOOL_RESULT_IMAGE_MARKER.to_string());
+                        }
+                    }
+                    "document" => {
+                        if let Some(format) = get_document_format(source_media_type) {
+                            let document_name = bedrock_document_name(
+                                item.get("name").and_then(|name| name.as_str()),
+                            );
+                            documents.push(KiroDocument::from_base64(format, document_name, data));
+                            parts.push(TOOL_RESULT_DOCUMENT_MARKER.to_string());
+                        }
+                    }
+                    _ => {}
                 }
             }
-            (parts.join("\n"), images)
+            (parts.join("\n"), images, documents)
         }
-        Some(v) => (v.to_string(), Vec::new()),
-        None => (String::new(), Vec::new()),
+        Some(v) => (v.to_string(), Vec::new(), Vec::new()),
+        None => (String::new(), Vec::new(), Vec::new()),
     }
 }
 
@@ -1897,11 +1951,11 @@ fn merge_user_messages(
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut forwarded_images = Vec::new();
-    let mut all_documents = Vec::new();
+    let mut forwarded_documents = Vec::new();
     let mut all_tool_results = Vec::new();
 
     for msg in messages {
-        let (text, mut images, documents, tool_results) =
+        let (text, mut images, mut documents, tool_results) =
             process_message_content(&msg.content, model_id.starts_with("gpt-"))?;
         if !text.is_empty() {
             content_parts.push(text);
@@ -1912,8 +1966,13 @@ fn merge_user_messages(
                 *index = index.saturating_add(tool_result_index_offset);
             }
         }
+        for document in &mut documents {
+            if let Some(index) = &mut document.tool_result_index {
+                *index = index.saturating_add(tool_result_index_offset);
+            }
+        }
         forwarded_images.extend(images);
-        all_documents.extend(documents);
+        forwarded_documents.extend(documents);
         all_tool_results.extend(tool_results);
     }
 
@@ -1930,6 +1989,15 @@ fn merge_user_messages(
                 .is_none_or(|index| validated_tool_result_indices.contains(&index))
         })
         .map(|forwarded| forwarded.image)
+        .collect::<Vec<_>>();
+    let all_documents = forwarded_documents
+        .into_iter()
+        .filter(|forwarded| {
+            forwarded
+                .tool_result_index
+                .is_none_or(|index| validated_tool_result_indices.contains(&index))
+        })
+        .map(|forwarded| forwarded.document)
         .collect::<Vec<_>>();
 
     let joined = content_parts.join("\n");
@@ -2382,6 +2450,86 @@ mod tests {
                 "each image payload must occur exactly once on the Kiro wire"
             );
         }
+    }
+
+    #[test]
+    fn tool_result_documents_are_promoted_once_and_preserve_text_pairing() {
+        let pdf_document = "cGRmLXRvb2wtcmVzdWx0";
+        let docx_document = "ZG9jeC10b29sLXJlc3VsdA==";
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": GPT_56_SOL_MODEL_ID,
+            "messages": [
+                {"role": "user", "content": "Read both documents"},
+                {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_documents",
+                    "name": "read_documents",
+                    "input": {}
+                }]},
+                {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_documents",
+                    "content": [
+                        {"type": "text", "text": "two documents attached"},
+                        {
+                            "type": "document",
+                            "name": "report.pdf",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": pdf_document
+                            }
+                        },
+                        {
+                            "type": "document",
+                            "name": "notes.docx",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                "data": docx_document
+                            }
+                        }
+                    ]
+                }]}
+            ],
+            "tools": [{
+                "name": "read_documents",
+                "description": "Read documents",
+                "input_schema": {"type": "object", "properties": {}}
+            }]
+        }))
+        .expect("request");
+
+        let converted = convert_request(&request).expect("conversion");
+        let current = &converted
+            .conversation_state
+            .current_message
+            .user_input_message;
+        assert_eq!(current.documents.len(), 2);
+        assert_eq!(current.documents[0].format, "pdf");
+        assert_eq!(current.documents[0].name, "report pdf");
+        assert_eq!(current.documents[0].source.bytes, pdf_document);
+        assert_eq!(current.documents[1].format, "docx");
+        assert_eq!(current.documents[1].name, "notes docx");
+        assert_eq!(current.documents[1].source.bytes, docx_document);
+
+        let result = &current.user_input_message_context.tool_results[0];
+        let result_text = result.content[0]["text"].as_str().expect("result text");
+        assert!(result_text.contains("two documents attached"));
+        assert_eq!(
+            result_text
+                .matches("[Document attached to this tool result]")
+                .count(),
+            2
+        );
+
+        let result_wire = serde_json::to_string(result).expect("tool result wire");
+        assert!(!result_wire.contains(pdf_document));
+        assert!(!result_wire.contains(docx_document));
+        let request_wire =
+            serde_json::to_string(&converted.conversation_state).expect("request wire");
+        assert_eq!(request_wire.matches(pdf_document).count(), 1);
+        assert_eq!(request_wire.matches(docx_document).count(), 1);
     }
 
     #[test]
