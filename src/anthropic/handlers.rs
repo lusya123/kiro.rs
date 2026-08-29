@@ -2801,9 +2801,12 @@ pub async fn post_messages(
     let gpt_passthrough = is_gpt_model(&payload.model);
     let aws_b40_initial_thinking_requested = aws_b40_compat
         && (payload.thinking.is_some() || payload.model.to_ascii_lowercase().contains("thinking"));
-    if let Some(response) = reject_invalid_thinking_signatures(&payload, aws_b40_compat).await {
-        return response;
-    }
+    // AWS-B 可外接版本：暂时停用入站 thinking signature 拒绝。
+    // 外部网关可能回放本实例注册表中不存在、但属于原会话的 provider signature；
+    // 在这里拒绝会导致请求尚未到达上游就返回 400。校验实现保留，便于以后恢复。
+    // if let Some(response) = reject_invalid_thinking_signatures(&payload, aws_b40_compat).await {
+    //     return response;
+    // }
     if aws_b40_compat {
         normalize_aws_b40_thinking(&mut payload);
         normalize_aws_b40_tool_choice(&mut payload);
@@ -6068,9 +6071,11 @@ pub async fn post_messages_cc(
     let gpt_passthrough = is_gpt_model(&payload.model);
     let aws_b40_initial_thinking_requested = aws_b40_compat
         && (payload.thinking.is_some() || payload.model.to_ascii_lowercase().contains("thinking"));
-    if let Some(response) = reject_invalid_thinking_signatures(&payload, aws_b40_compat).await {
-        return response;
-    }
+    // AWS-B 可外接版本：与 /v1/messages 保持一致，停用入站 thinking signature 拒绝。
+    // 校验实现仍完整保留，仅注释入口调用，避免外部会话回放在本地提前返回 400。
+    // if let Some(response) = reject_invalid_thinking_signatures(&payload, aws_b40_compat).await {
+    //     return response;
+    // }
     if aws_b40_compat {
         normalize_aws_b40_thinking(&mut payload);
         normalize_aws_b40_tool_choice(&mut payload);
@@ -7699,7 +7704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn message_entrypoints_use_upstream_signature_error_contract() {
+    async fn message_entrypoints_bypass_unknown_thinking_signatures_before_provider_selection() {
         let request = parse(
             "claude-opus-5",
             serde_json::json!({
@@ -7723,16 +7728,10 @@ mod tests {
             RawApiJson(request.clone(), Bytes::new()),
         )
         .await;
-        assert_eq!(v1.status(), StatusCode::BAD_REQUEST);
-        let v1_body = axum::body::to_bytes(v1.into_body(), usize::MAX)
-            .await
-            .expect("/v1/messages error body");
-        let v1_body: serde_json::Value =
-            serde_json::from_slice(&v1_body).expect("/v1/messages error JSON");
         assert_eq!(
-            v1_body["error"]["message"],
-            "messages.0.content.0: Invalid `signature` in `thinking` block",
-            "/v1/messages must mirror the upstream signature error contract"
+            v1.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "/v1/messages must pass the unknown signature and reach provider selection"
         );
 
         let cc = post_messages_cc(
@@ -7741,16 +7740,10 @@ mod tests {
             RawApiJson(request, Bytes::new()),
         )
         .await;
-        assert_eq!(cc.status(), StatusCode::BAD_REQUEST);
-        let cc_body = axum::body::to_bytes(cc.into_body(), usize::MAX)
-            .await
-            .expect("/cc/v1/messages error body");
-        let cc_body: serde_json::Value =
-            serde_json::from_slice(&cc_body).expect("/cc/v1/messages error JSON");
         assert_eq!(
-            cc_body["error"]["message"],
-            "messages.0.content.0: Invalid `signature` in `thinking` block",
-            "/cc/v1/messages must mirror the upstream signature error contract"
+            cc.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "/cc/v1/messages must pass the unknown signature and reach provider selection"
         );
     }
 
