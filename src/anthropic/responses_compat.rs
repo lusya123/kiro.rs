@@ -2551,6 +2551,135 @@ async fn responses_stream_from_upstream(
     }
 }
 
+async fn responses_nonstream_from_upstream(
+    mut upstream: Pin<Box<dyn Future<Output = Response> + Send>>,
+    grace_period: Duration,
+) -> Response {
+    match tokio::time::timeout(grace_period, &mut upstream).await {
+        Ok(response) => response,
+        Err(_) => {
+            let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(8);
+            tokio::spawn(async move {
+                let whitespace = Bytes::from_static(b"\n");
+                if sender.send(whitespace.clone()).await.is_err() {
+                    return;
+                }
+
+                let mut heartbeat = tokio::time::interval_at(
+                    tokio::time::Instant::now() + RESPONSES_KEEP_ALIVE_INTERVAL,
+                    RESPONSES_KEEP_ALIVE_INTERVAL,
+                );
+                let response = loop {
+                    tokio::select! {
+                        response = &mut upstream => break response,
+                        _ = heartbeat.tick() => {
+                            if sender.send(whitespace.clone()).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                };
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Bytes::from_static(
+                            br#"{"error":{"message":"The request could not be completed due to an internal server error.","type":"server_error","param":null,"code":null}}"#,
+                        )
+                    });
+                let _ = sender.send(body).await;
+            });
+
+            let output = stream::unfold(receiver, |mut receiver| async move {
+                receiver
+                    .recv()
+                    .await
+                    .map(|chunk| (Ok::<Bytes, Infallible>(chunk), receiver))
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CACHE_CONTROL, "no-cache")
+                .body(Body::from_stream(output))
+                .expect("Deferred Responses JSON response")
+        }
+    }
+}
+
+async fn responses_nonstream_response(
+    response: Response,
+    mut meta: ResponseMeta,
+    mut stored_messages: Option<Vec<Message>>,
+    model: String,
+    session_id: String,
+    response_store: Arc<ResponseStore>,
+) -> Response {
+    let status = response.status();
+    let body = match axum::body::to_bytes(response.into_body(), usize::MAX).await {
+        Ok(body) => body,
+        Err(_) => {
+            return response_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                default_error_message(StatusCode::INTERNAL_SERVER_ERROR),
+                true,
+            );
+        }
+    };
+    if !status.is_success() {
+        return response_error(status, default_error_message(status), true);
+    }
+    let anthropic: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return response_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                default_error_message(StatusCode::INTERNAL_SERVER_ERROR),
+                true,
+            );
+        }
+    };
+    let mut mapped = match anthropic_to_response(&anthropic, &meta) {
+        Ok(response) => response,
+        Err(_) => {
+            return response_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                default_error_message(StatusCode::INTERNAL_SERVER_ERROR),
+                true,
+            );
+        }
+    };
+    if let Some(messages) = stored_messages.as_mut() {
+        if let Some(assistant) = mapped.assistant_message.take() {
+            messages.push(assistant);
+        }
+        let stored = StoredConversation {
+            model,
+            session_id,
+            messages: std::mem::take(messages),
+        };
+        if let Err(StoreError::EntryTooLarge { max_bytes }) =
+            response_store.insert(meta.id.clone(), stored)
+        {
+            if meta.store.disable_if_implicit() {
+                tracing::warn!(
+                    response_id = %meta.id,
+                    max_bytes,
+                    "implicit Responses storage disabled because completed visible state exceeds the retention limit"
+                );
+                mapped.response["store"] = Value::Bool(false);
+            } else {
+                return response_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!(
+                        "The completed response exceeds the {max_bytes}-byte retention limit required by `store: true`"
+                    ),
+                    true,
+                );
+            }
+        }
+    }
+    mark_gpt_openai_response((StatusCode::OK, Json(mapped.response)).into_response())
+}
+
 fn translated_request_for_profile(
     request: &Value,
     model: &str,
@@ -2758,73 +2887,21 @@ pub async fn post_responses(
         );
     }
 
-    let response = upstream.await;
-    let status = response.status();
-
-    let body = match axum::body::to_bytes(response.into_body(), usize::MAX).await {
-        Ok(body) => body,
-        Err(_) => {
-            return response_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                default_error_message(StatusCode::INTERNAL_SERVER_ERROR),
-                true,
-            );
-        }
-    };
-    if !status.is_success() {
-        return response_error(status, default_error_message(status), true);
-    }
-    let anthropic: Value = match serde_json::from_slice(&body) {
-        Ok(value) => value,
-        Err(_) => {
-            return response_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                default_error_message(StatusCode::INTERNAL_SERVER_ERROR),
-                true,
-            );
-        }
-    };
-    let mut mapped = match anthropic_to_response(&anthropic, &meta) {
-        Ok(response) => response,
-        Err(_) => {
-            return response_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                default_error_message(StatusCode::INTERNAL_SERVER_ERROR),
-                true,
-            );
-        }
-    };
-    if let Some(messages) = stored_messages.as_mut() {
-        if let Some(assistant) = mapped.assistant_message.take() {
-            messages.push(assistant);
-        }
-        let stored = StoredConversation {
-            model: model.clone(),
+    let response_store = state.response_store.clone();
+    let final_response: Pin<Box<dyn Future<Output = Response> + Send>> = Box::pin(async move {
+        responses_nonstream_response(
+            upstream.await,
+            meta,
+            stored_messages,
+            model,
             session_id,
-            messages: std::mem::take(messages),
-        };
-        if let Err(StoreError::EntryTooLarge { max_bytes }) =
-            state.response_store.insert(meta.id.clone(), stored)
-        {
-            if meta.store.disable_if_implicit() {
-                tracing::warn!(
-                    response_id = %meta.id,
-                    max_bytes,
-                    "implicit Responses storage disabled because completed visible state exceeds the retention limit"
-                );
-                mapped.response["store"] = Value::Bool(false);
-            } else {
-                return response_error(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    format!(
-                        "The completed response exceeds the {max_bytes}-byte retention limit required by `store: true`"
-                    ),
-                    true,
-                );
-            }
-        }
-    }
-    mark_gpt_openai_response((StatusCode::OK, Json(mapped.response)).into_response())
+            response_store,
+        )
+        .await
+    });
+    mark_gpt_openai_response(
+        responses_nonstream_from_upstream(final_response, RESPONSES_KEEP_ALIVE_INTERVAL).await,
+    )
 }
 
 #[cfg(test)]
@@ -4222,6 +4299,39 @@ other product, model, or company.";
             .expect("stream must remain open")
             .expect("keep-alive chunk must be readable");
         assert_eq!(first, RESPONSES_KEEP_ALIVE);
+    }
+
+    #[tokio::test]
+    async fn delayed_nonstream_emits_json_whitespace_before_final_response() {
+        let (release, delayed) = tokio::sync::oneshot::channel::<Response>();
+        let upstream = Box::pin(async move {
+            delayed
+                .await
+                .expect("test releases the delayed JSON response")
+        });
+        let response = responses_nonstream_from_upstream(upstream, Duration::from_millis(10)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+
+        let mut body = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(Duration::from_millis(100), body.next())
+            .await
+            .expect("JSON whitespace must arrive before the public gateway timeout")
+            .expect("JSON stream must remain open")
+            .expect("JSON whitespace chunk must be readable");
+        assert_eq!(first, Bytes::from_static(b"\n"));
+
+        release
+            .send((StatusCode::OK, Json(json!({"ok": true}))).into_response())
+            .expect("release delayed JSON response");
+        let mut rest = BytesMut::new();
+        while let Some(chunk) = body.next().await {
+            rest.extend_from_slice(&chunk.expect("final JSON chunk must be readable"));
+        }
+        assert_eq!(
+            serde_json::from_slice::<Value>(&rest).unwrap(),
+            json!({"ok": true})
+        );
     }
 
     #[test]
