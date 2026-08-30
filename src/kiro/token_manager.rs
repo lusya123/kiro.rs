@@ -790,13 +790,18 @@ impl MultiTokenManager {
     /// 检查凭据是否支持请求的模型。
     ///
     /// 所有凭据选择路径（包括 priority 模式的 current_id 快路径）都必须复用
-    /// 这个条件，避免对 Opus 的订阅等级约束出现分支漂移。
+    /// 这个条件，避免付费模型的订阅等级约束出现分支漂移。
     fn credential_supports_model(credentials: &KiroCredentials, model: Option<&str>) -> bool {
-        let is_opus = model
-            .map(|model| model.to_ascii_lowercase().contains("opus"))
+        let requires_paid_subscription = model
+            .map(|model| {
+                let model = model.to_ascii_lowercase();
+                model.contains("opus")
+                    || model.starts_with("gpt-5.6")
+                    || model.starts_with("gpt 5.6")
+            })
             .unwrap_or(false);
 
-        !is_opus || credentials.supports_opus()
+        !requires_paid_subscription || credentials.supports_opus()
     }
 
     /// 根据负载均衡模式选择下一个凭据
@@ -805,7 +810,7 @@ impl MultiTokenManager {
     /// - balanced 模式：均衡选择可用凭据
     ///
     /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 Opus/GPT-5.6 需要付费订阅）
     fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
 
@@ -854,7 +859,7 @@ impl MultiTokenManager {
     /// Token 刷新失败会累计到当前凭据，达到阈值后禁用并切换
     ///
     /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 Opus/GPT-5.6 需要付费订阅）
     pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
@@ -2686,6 +2691,45 @@ mod tests {
         assert_eq!(opus_context.id, 2);
         assert_eq!(opus_context.token, "opus-token");
         assert_eq!(manager.snapshot().current_id, 2);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_failover_does_not_select_free_credential_for_gpt56() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority".to_string();
+
+        let expires_at = (Utc::now() + Duration::hours(1)).to_rfc3339();
+
+        let mut pro_credential = KiroCredentials::default();
+        pro_credential.priority = 0;
+        pro_credential.access_token = Some("pro-token".to_string());
+        pro_credential.expires_at = Some(expires_at.clone());
+        pro_credential.subscription_title = Some("KIRO PRO+".to_string());
+
+        let mut free_credential = KiroCredentials::default();
+        free_credential.priority = 1;
+        free_credential.access_token = Some("free-token".to_string());
+        free_credential.expires_at = Some(expires_at);
+        free_credential.subscription_title = Some("KIRO FREE".to_string());
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![pro_credential, free_credential],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let first = manager.acquire_context(Some("gpt-5.6-sol")).await.unwrap();
+        assert_eq!(first.id, 1);
+
+        let retry = manager
+            .acquire_context_avoiding(Some("gpt-5.6-sol"), first.id)
+            .await
+            .unwrap();
+        assert_eq!(retry.id, 1, "KIRO FREE must not receive GPT-5.6 retries");
+        assert_eq!(manager.available_count(), 2);
     }
 
     #[tokio::test]
