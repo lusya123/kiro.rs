@@ -8,7 +8,10 @@
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
+    future::Future,
+    pin::Pin,
     sync::Arc,
+    time::Duration,
 };
 
 use axum::{
@@ -34,6 +37,8 @@ use super::{
 const GPT56_MODELS: &[&str] = &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 const GPT56_DEFAULT_MODEL: &str = "gpt-5.6-sol";
 const RESPONSES_BODY_LIMIT: usize = 50 * 1024 * 1024;
+const RESPONSES_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(4);
+const RESPONSES_KEEP_ALIVE: Bytes = Bytes::from_static(b": keep-alive\n\n");
 const IMAGE_MEDIA_TYPES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
 const DOCUMENT_MEDIA_TYPES: &[&str] = &[
     "application/pdf",
@@ -2467,6 +2472,85 @@ fn responses_stream_response(
         .expect("Responses stream response")
 }
 
+fn responses_stream_response_from_upstream(
+    mut upstream: Pin<Box<dyn Future<Output = Response> + Send>>,
+    meta: ResponseMeta,
+    store: Option<StreamStoreContext>,
+) -> Response {
+    let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(8);
+    tokio::spawn(async move {
+        if sender.send(RESPONSES_KEEP_ALIVE).await.is_err() {
+            return;
+        }
+
+        let mut heartbeat = tokio::time::interval_at(
+            tokio::time::Instant::now() + RESPONSES_KEEP_ALIVE_INTERVAL,
+            RESPONSES_KEEP_ALIVE_INTERVAL,
+        );
+        let response = loop {
+            tokio::select! {
+                response = &mut upstream => break response,
+                _ = heartbeat.tick() => {
+                    if sender.send(RESPONSES_KEEP_ALIVE).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        };
+
+        if !response.status().is_success() {
+            let error = ResponsesStreamState::with_store(meta, store).clean_stream_error();
+            let _ = sender.send(Bytes::from(error)).await;
+            return;
+        }
+
+        let transformed = responses_stream_response(response.into_body(), meta, store);
+        let mut body = transformed.into_body().into_data_stream();
+        while let Some(chunk) = body.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    if sender.send(chunk).await.is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    let output = stream::unfold(receiver, |mut receiver| async move {
+        receiver
+            .recv()
+            .await
+            .map(|chunk| (Ok::<Bytes, Infallible>(chunk), receiver))
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "keep-alive")
+        .body(Body::from_stream(output))
+        .expect("Deferred Responses stream response")
+}
+
+async fn responses_stream_from_upstream(
+    mut upstream: Pin<Box<dyn Future<Output = Response> + Send>>,
+    meta: ResponseMeta,
+    store: Option<StreamStoreContext>,
+    grace_period: Duration,
+) -> Response {
+    match tokio::time::timeout(grace_period, &mut upstream).await {
+        Ok(response) if response.status().is_success() => {
+            responses_stream_response(response.into_body(), meta, store)
+        }
+        Ok(response) => {
+            let status = response.status();
+            response_error(status, default_error_message(status), true)
+        }
+        Err(_) => responses_stream_response_from_upstream(upstream, meta, store),
+    }
+}
+
 fn translated_request_for_profile(
     request: &Value,
     model: &str,
@@ -2650,27 +2734,32 @@ pub async fn post_responses(
     let raw = Bytes::from(
         serde_json::to_vec(&translated).expect("translated Responses request must serialize"),
     );
-    let response = post_messages(
+    let upstream: Pin<Box<dyn Future<Output = Response> + Send>> = Box::pin(post_messages(
         State(state.clone()),
         HeaderMap::new(),
         RawApiJson(translated, raw),
-    )
-    .await;
-    let status = response.status();
+    ));
 
-    if stream_requested && status.is_success() {
+    if stream_requested {
         let stream_store = stored_messages.take().map(|messages| StreamStoreContext {
             store: state.response_store.clone(),
             model: model.clone(),
             session_id,
             messages,
         });
-        return mark_gpt_openai_response(responses_stream_response(
-            response.into_body(),
-            meta,
-            stream_store,
-        ));
+        return mark_gpt_openai_response(
+            responses_stream_from_upstream(
+                upstream,
+                meta,
+                stream_store,
+                RESPONSES_KEEP_ALIVE_INTERVAL,
+            )
+            .await,
+        );
     }
+
+    let response = upstream.await;
+    let status = response.status();
 
     let body = match axum::body::to_bytes(response.into_body(), usize::MAX).await {
         Ok(body) => body,
@@ -4085,6 +4174,54 @@ other product, model, or company.";
             assert_eq!(event["type"], *event_name, "{event}");
             assert_eq!(event["sequence_number"], sequence, "{event}");
         }
+    }
+
+    #[tokio::test]
+    async fn delayed_upstream_emits_sse_keep_alive_before_headers_arrive() {
+        let (release, delayed) = tokio::sync::oneshot::channel::<Response>();
+        let upstream = Box::pin(async move {
+            delayed
+                .await
+                .expect("test releases the delayed upstream response")
+        });
+        let response =
+            responses_stream_response_from_upstream(upstream, base_meta("gpt-5.6-sol"), None);
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut body = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(std::time::Duration::from_millis(100), body.next())
+            .await
+            .expect("keep-alive must be emitted without waiting for upstream headers")
+            .expect("stream must remain open")
+            .expect("keep-alive chunk must be readable");
+        assert_eq!(first, Bytes::from_static(b": keep-alive\n\n"));
+
+        drop(release);
+    }
+
+    #[tokio::test]
+    async fn stream_switches_to_keep_alive_when_upstream_misses_grace_period() {
+        let (_release, delayed) = tokio::sync::oneshot::channel::<Response>();
+        let upstream = Box::pin(async move {
+            delayed
+                .await
+                .expect("test keeps the upstream pending past the grace period")
+        });
+        let response = responses_stream_from_upstream(
+            upstream,
+            base_meta("gpt-5.6-sol"),
+            None,
+            Duration::from_millis(10),
+        )
+        .await;
+
+        let mut body = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(Duration::from_millis(100), body.next())
+            .await
+            .expect("keep-alive must arrive before the public gateway timeout")
+            .expect("stream must remain open")
+            .expect("keep-alive chunk must be readable");
+        assert_eq!(first, RESPONSES_KEEP_ALIVE);
     }
 
     #[test]
