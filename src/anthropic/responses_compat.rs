@@ -253,51 +253,100 @@ fn validate_top_level_fields(request: &Value) -> Result<(), String> {
         None | Some(Value::Null | Value::Object(_)) => {}
         Some(_) => return Err("`stream_options` must be an object".to_string()),
     }
-    match object.get("text") {
-        None | Some(Value::Null) => {}
-        Some(Value::Object(text)) => {
-            for key in text.keys() {
-                if !matches!(key.as_str(), "format" | "verbosity") {
-                    return Err(format!("`text.{key}` is not supported"));
-                }
-            }
-            match text.get("verbosity") {
-                None | Some(Value::Null) => {}
-                Some(Value::String(value))
-                    if matches!(value.as_str(), "low" | "medium" | "high") => {}
-                Some(Value::String(_)) => {
-                    return Err("`text.verbosity` must be one of: low, medium, high".to_string());
-                }
-                Some(_) => return Err("`text.verbosity` must be a string".to_string()),
-            }
-            if let Some(format) = text.get("format") {
-                if !format.is_null() {
-                    let format = format
-                        .as_object()
-                        .ok_or_else(|| "`text.format` must be an object".to_string())?;
-                    for key in format.keys() {
-                        if !matches!(key.as_str(), "type" | "strict") {
-                            return Err(format!("`text.format.{key}` is not supported"));
-                        }
-                    }
-                    match format.get("strict") {
-                        None | Some(Value::Null | Value::Bool(_)) => {}
-                        Some(_) => {
-                            return Err("`text.format.strict` must be a boolean".to_string());
-                        }
-                    }
-                    if format.get("type").and_then(Value::as_str) != Some("text") {
-                        return Err(
-                            "only `text.format.type: \"text\"` is supported by this endpoint"
-                                .to_string(),
-                        );
-                    }
-                }
-            }
-        }
-        Some(_) => return Err("`text` must be an object".to_string()),
-    }
     Ok(())
+}
+
+fn responses_text_format_instruction(text: Option<&Value>) -> Result<Option<String>, String> {
+    let text = match text {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(text)) => text,
+        Some(_) => return Err("`text` must be an object".to_string()),
+    };
+    for key in text.keys() {
+        if !matches!(key.as_str(), "format" | "verbosity") {
+            return Err(format!("`text.{key}` is not supported"));
+        }
+    }
+    match text.get("verbosity") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(value)) if matches!(value.as_str(), "low" | "medium" | "high") => {}
+        Some(Value::String(_)) => {
+            return Err("`text.verbosity` must be one of: low, medium, high".to_string());
+        }
+        Some(_) => return Err("`text.verbosity` must be a string".to_string()),
+    }
+
+    let format = match text.get("format") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(format)) => format,
+        Some(_) => return Err("`text.format` must be an object".to_string()),
+    };
+    let format_type = format
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "`text.format.type` must be a string".to_string())?;
+    match format_type {
+        "text" => {
+            for key in format.keys() {
+                if !matches!(key.as_str(), "type" | "strict") {
+                    return Err(format!("`text.format.{key}` is not supported"));
+                }
+            }
+            match format.get("strict") {
+                None | Some(Value::Null | Value::Bool(_)) => {}
+                Some(_) => return Err("`text.format.strict` must be a boolean".to_string()),
+            }
+            Ok(None)
+        }
+        "json_schema" => {
+            for key in format.keys() {
+                if !matches!(
+                    key.as_str(),
+                    "type" | "name" | "description" | "schema" | "strict"
+                ) {
+                    return Err(format!("`text.format.{key}` is not supported"));
+                }
+            }
+            let name = format
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| "`text.format.name` must be a non-empty string".to_string())?;
+            let description = match format.get("description") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(description)) => Some(description.as_str()),
+                Some(_) => return Err("`text.format.description` must be a string".to_string()),
+            };
+            match format.get("strict") {
+                None | Some(Value::Null | Value::Bool(_)) => {}
+                Some(_) => return Err("`text.format.strict` must be a boolean".to_string()),
+            }
+            let schema = format
+                .get("schema")
+                .filter(|schema| schema.is_object())
+                .ok_or_else(|| "`text.format.schema` must be an object".to_string())?;
+            if schema.get("type").and_then(Value::as_str) == Some("object")
+                && schema.get("additionalProperties") != Some(&Value::Bool(false))
+            {
+                return Err(
+                    "`text.format.schema` object must explicitly set `additionalProperties` to false"
+                        .to_string(),
+                );
+            }
+
+            let mut instruction = format!("Structured output format `{name}`.");
+            if let Some(description) = description {
+                instruction.push(' ');
+                instruction.push_str(description);
+            }
+            instruction.push_str("\n\n");
+            instruction.push_str(&super::bedrock::structured_output_instruction(schema));
+            Ok(Some(instruction))
+        }
+        _ => Err(format!(
+            "`text.format.type` value `{format_type}` is not supported by this endpoint"
+        )),
+    }
 }
 
 fn optional_string(value: Option<&Value>, path: &str) -> Result<Option<String>, String> {
@@ -1363,15 +1412,15 @@ fn append_input_item(
                 .and_then(Value::as_str)
                 .ok_or_else(|| "custom tool call input requires string `input`".to_string())?;
             let public_key = PublicToolKey::custom(namespace, name);
-            let kiro_name = catalog.kiro_name(&public_key).ok_or_else(|| {
-                if let Some(namespace) = namespace {
-                    format!(
+            let kiro_name = match (namespace, catalog.kiro_name(&public_key)) {
+                (_, Some(name)) => name,
+                (None, None) => name,
+                (Some(namespace), None) => {
+                    return Err(format!(
                         "custom tool call references undeclared namespace tool `{namespace}.{name}`"
-                    )
-                } else {
-                    format!("custom tool call references undeclared tool `{name}`")
+                    ));
                 }
-            })?;
+            };
             messages.push(Message {
                 role: "assistant".to_string(),
                 content: json!([{
@@ -2369,6 +2418,7 @@ fn translated_request_for_profile(
     accept_strict_hint: bool,
 ) -> Result<(MessagesRequest, ResponseMeta), String> {
     validate_top_level_fields(request)?;
+    let text_format_instruction = responses_text_format_instruction(request.get("text"))?;
     let instructions = optional_string(request.get("instructions"), "instructions")?;
     let max_tokens = max_output_tokens(request)?;
     let stream = stream_requested(request)?;
@@ -2388,6 +2438,12 @@ fn translated_request_for_profile(
         system.get_or_insert_with(Vec::new).push(SystemMessage {
             text: "Tool-use constraint: Call at most one tool in this assistant response. If more work is needed, wait for the tool result before selecting another tool."
                 .to_string(),
+            cache_control: None,
+        });
+    }
+    if let Some(instruction) = text_format_instruction {
+        system.get_or_insert_with(Vec::new).push(SystemMessage {
+            text: instruction,
             cache_control: None,
         });
     }
@@ -2872,6 +2928,42 @@ mod tests {
     }
 
     #[test]
+    fn replays_undeclared_custom_tool_call_as_history_without_reactivating_it() {
+        let request = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"type": "message", "role": "user", "content": "Read the workspace."},
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_exec",
+                    "name": "exec",
+                    "input": "rg --files",
+                    "status": "completed"
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_exec",
+                    "output": "README.md",
+                    "status": "completed"
+                }
+            ],
+            "tools": [],
+            "store": false
+        });
+
+        let (translated, _) = translated_request(&request, "gpt-5.6-sol")
+            .expect("a completed custom call is historical context, not an active declaration");
+        assert!(translated.tools.is_none());
+        assert_eq!(translated.messages[1].role, "assistant");
+        assert_eq!(translated.messages[1].content[0]["type"], "tool_use");
+        assert_eq!(translated.messages[1].content[0]["name"], "exec");
+        assert_eq!(translated.messages[2].role, "user");
+        assert_eq!(translated.messages[2].content[0]["type"], "tool_result");
+        super::super::converter::convert_request(&translated)
+            .expect("the replayed custom call must reach the Kiro wire converter");
+    }
+
+    #[test]
     fn accepts_codex_cached_web_search_declaration_without_forwarding_or_losing_the_echo() {
         let mut request = realistic_codex_request();
         request["tools"] = json!([
@@ -3093,6 +3185,40 @@ mod tests {
         let mut invalid_strict = request;
         invalid_strict["text"]["format"]["strict"] = json!("yes");
         assert!(translated_request(&invalid_strict, "gpt-5.6-sol").is_err());
+    }
+
+    #[test]
+    fn translates_responses_json_schema_to_kiro_system_instruction() {
+        let mut request = base_request("gpt-5.6-sol");
+        request["text"] = json!({
+            "format": {
+                "type": "json_schema",
+                "name": "workspace_summary",
+                "description": "A concise workspace summary",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "summary": {"type": "string"}
+                    },
+                    "required": ["summary"],
+                    "additionalProperties": false
+                },
+                "strict": true
+            }
+        });
+
+        let (translated, meta) = translated_request(&request, "gpt-5.6-sol")
+            .expect("Responses JSON Schema output format");
+        assert!(translated.output_config.is_none());
+        let system = translated.system.as_ref().expect("schema instruction");
+        assert!(system.iter().any(|message| {
+            message.text.contains("JSON Schema:")
+                && message.text.contains("workspace_summary")
+                && message.text.contains("additionalProperties")
+        }));
+        assert_eq!(meta.text, request["text"]);
+        super::super::converter::convert_request(&translated)
+            .expect("the structured-output request must reach the Kiro wire converter");
     }
 
     #[test]
