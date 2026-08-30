@@ -414,6 +414,7 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut avoid_credential_id: Option<u64> = None;
         let api_type = if is_stream { "流式" } else { "非流式" };
         let call_started = Instant::now();
 
@@ -422,7 +423,14 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let mut ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let context = if let Some(avoided_id) = avoid_credential_id.take() {
+                self.token_manager
+                    .acquire_context_avoiding(model.as_deref(), avoided_id)
+                    .await
+            } else {
+                self.token_manager.acquire_context(model.as_deref()).await
+            };
+            let mut ctx = match context {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -638,8 +646,9 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
-            // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
+            // 429/408/5xx - 瞬态上游错误：重试但不禁用凭据。
+            // 429 通常是凭据级限流，因此下一次尝试优先避开当前凭据；408/5xx
+            // 仍保持原凭据，避免网络或全局上游故障引发无意义切换。
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
                 tracing::warn!(
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
@@ -654,6 +663,9 @@ impl KiroProvider {
                     status,
                     body
                 ));
+                if status == StatusCode::TOO_MANY_REQUESTS {
+                    avoid_credential_id = Some(ctx.id);
+                }
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
