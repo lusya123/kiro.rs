@@ -43,11 +43,24 @@ pub(crate) struct UpstreamHttpError {
 #[cfg(test)]
 mod tests {
     use super::KiroProvider;
+    use reqwest::StatusCode;
 
     #[test]
     fn explicit_model_hint_does_not_require_reparsing_the_request_body() {
         let model = KiroProvider::model_for_request(Some("claude-opus-4.8"), b"not-json");
         assert_eq!(model.as_deref(), Some("claude-opus-4.8"));
+    }
+
+    #[test]
+    fn rate_limits_expand_the_retry_window_to_the_hard_cap() {
+        assert_eq!(
+            KiroProvider::expanded_retry_limit(6, StatusCode::TOO_MANY_REQUESTS),
+            super::MAX_TOTAL_RETRIES
+        );
+        assert_eq!(
+            KiroProvider::expanded_retry_limit(6, StatusCode::INTERNAL_SERVER_ERROR),
+            6
+        );
     }
 }
 
@@ -403,6 +416,7 @@ impl KiroProvider {
     /// 重试策略：
     /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
     /// - 总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
+    /// - 一旦遇到 429，将当前请求的窗口扩展到硬上限，吸收短期限流
     /// - 硬上限 9 次，避免无限重试
     async fn call_api_with_retry(
         &self,
@@ -411,7 +425,8 @@ impl KiroProvider {
         model_hint: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let mut max_retries =
+            (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let mut avoid_credential_id: Option<u64> = None;
@@ -421,7 +436,10 @@ impl KiroProvider {
         // 尝试从请求体中提取模型信息
         let model = Self::model_for_request(model_hint, &request_body);
 
-        for attempt in 0..max_retries {
+        for attempt in 0..MAX_TOTAL_RETRIES {
+            if attempt >= max_retries {
+                break;
+            }
             // 获取调用上下文（绑定 index、credentials、token）
             let context = if let Some(avoided_id) = avoid_credential_id.take() {
                 self.token_manager
@@ -650,6 +668,7 @@ impl KiroProvider {
             // 429 通常是凭据级限流，因此下一次尝试优先避开当前凭据；408/5xx
             // 仍保持原凭据，避免网络或全局上游故障引发无意义切换。
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+                max_retries = Self::expanded_retry_limit(max_retries, status);
                 tracing::warn!(
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -731,5 +750,13 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+
+    fn expanded_retry_limit(current_limit: usize, status: StatusCode) -> usize {
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            MAX_TOTAL_RETRIES
+        } else {
+            current_limit
+        }
     }
 }
