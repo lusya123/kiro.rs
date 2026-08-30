@@ -955,6 +955,68 @@ impl MultiTokenManager {
         }
     }
 
+    /// 获取一个不同于 `avoided_id` 的可用调用上下文。
+    ///
+    /// 这用于请求内的瞬态限流故障转移：不会累计失败或禁用原凭据；如果没有
+    /// 其他支持该模型的凭据，则回退到普通选择逻辑。
+    pub async fn acquire_context_avoiding(
+        &self,
+        model: Option<&str>,
+        avoided_id: u64,
+    ) -> anyhow::Result<CallContext> {
+        let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+        let mut candidates = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .filter(|entry| {
+                    entry.id != avoided_id
+                        && !entry.disabled
+                        && Self::credential_supports_model(&entry.credentials, model)
+                })
+                .map(|entry| {
+                    (
+                        entry.id,
+                        entry.credentials.clone(),
+                        entry.success_count,
+                        entry.credentials.priority,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        if is_balanced {
+            candidates.sort_by_key(|(_, _, success_count, priority)| (*success_count, *priority));
+        } else {
+            candidates.sort_by_key(|(_, _, _, priority)| *priority);
+        }
+
+        for (id, credentials, _, _) in candidates {
+            match self.try_ensure_token(id, &credentials).await {
+                Ok(ctx) => {
+                    *self.current_id.lock() = id;
+                    return Ok(ctx);
+                }
+                Err(error) => {
+                    let has_available =
+                        if error.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+                            self.report_refresh_token_invalid(id)
+                        } else {
+                            self.report_refresh_failure(id)
+                        };
+                    tracing::warn!(
+                        "备用凭据 #{} 获取 Token 失败（仍有可用凭据: {}）: {}",
+                        id,
+                        has_available,
+                        error
+                    );
+                }
+            }
+        }
+
+        self.acquire_context(model).await
+    }
+
     /// 选择优先级最高的未禁用凭据作为当前凭据（内部方法）
     ///
     /// 纯粹按优先级选择，不排除当前凭据，用于优先级变更后立即生效
@@ -2437,6 +2499,33 @@ mod tests {
         let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
         assert_eq!(manager.total_count(), 1);
         assert_eq!(manager.available_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_avoiding_uses_another_available_credential() {
+        let config = Config::default();
+        let mut cred1 = KiroCredentials::default();
+        cred1.auth_method = Some("api_key".to_string());
+        cred1.kiro_api_key = Some("ksk_first".to_string());
+        cred1.priority = 0;
+
+        let mut cred2 = KiroCredentials::default();
+        cred2.auth_method = Some("api_key".to_string());
+        cred2.kiro_api_key = Some("ksk_second".to_string());
+        cred2.priority = 1;
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        let first = manager.acquire_context(None).await.unwrap();
+        let alternate = manager
+            .acquire_context_avoiding(None, first.id)
+            .await
+            .unwrap();
+
+        assert_ne!(alternate.id, first.id);
+        assert_eq!(alternate.token, "ksk_second");
+        assert_eq!(manager.available_count(), 2);
     }
 
     #[test]
