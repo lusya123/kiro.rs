@@ -1293,6 +1293,20 @@ impl StreamContext {
                 _ if self.aws_b40_thinking_requested => 3,
                 _ => 1,
             };
+            let mut usage = json!({
+                "input_tokens": breakdown.input_tokens,
+                "cache_creation_input_tokens": breakdown.cache_creation_input_tokens,
+                "cache_read_input_tokens": breakdown.cache_read_input_tokens,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": breakdown.cache_creation_5m_input_tokens,
+                    "ephemeral_1h_input_tokens": breakdown.cache_creation_1h_input_tokens
+                },
+                "output_tokens": initial_output_tokens
+            });
+            super::compat::apply_service_tier(
+                &self.model,
+                usage.as_object_mut().expect("usage object"),
+            );
             return json!({
                 "type": "message_start",
                 "message": {
@@ -1304,17 +1318,7 @@ impl StreamContext {
                     "stop_reason": null,
                     "stop_sequence": null,
                     "stop_details": null,
-                    "usage": {
-                        "input_tokens": breakdown.input_tokens,
-                        "cache_creation_input_tokens": breakdown.cache_creation_input_tokens,
-                        "cache_read_input_tokens": breakdown.cache_read_input_tokens,
-                        "cache_creation": {
-                            "ephemeral_5m_input_tokens": breakdown.cache_creation_5m_input_tokens,
-                            "ephemeral_1h_input_tokens": breakdown.cache_creation_1h_input_tokens
-                        },
-                        "output_tokens": initial_output_tokens,
-                        "service_tier": "standard"
-                    }
+                    "usage": usage
                 }
             });
         }
@@ -4945,7 +4949,7 @@ mod tests {
     }
 
     #[test]
-    fn aws_b_message_start_uses_same_local_usage_as_final_delta() {
+    fn aws_b_message_start_matches_current_pomo_id_and_service_tier_shape() {
         let usage = super::super::cache::UsageBreakdown {
             input_tokens: 100,
             cache_read_input_tokens: 40,
@@ -4954,7 +4958,7 @@ mod tests {
             cache_creation_1h_input_tokens: 20,
         };
         let mut ctx = StreamContext::new_with_thinking(
-            "claude-sonnet-4-5-thinking",
+            "claude-sonnet-4-6",
             170,
             false,
             usage,
@@ -4965,11 +4969,11 @@ mod tests {
         let event = ctx.create_message_start_event();
         let message = &event["message"];
         let response_usage = &message["usage"];
-        assert_eq!(message["model"], "claude-sonnet-4-5-20250929");
+        assert_eq!(message["model"], "claude-sonnet-4-6");
         assert!(
             message["id"]
                 .as_str()
-                .is_some_and(|id| id.starts_with("msg_bdrk_") && id.len() == 61)
+                .is_some_and(|id| id.starts_with("msg_01") && id.len() == 28)
         );
         assert_eq!(response_usage["input_tokens"], 100);
         assert_eq!(response_usage["cache_read_input_tokens"], 40);
@@ -4986,6 +4990,22 @@ mod tests {
         assert_eq!(response_usage["service_tier"], "standard");
         ctx.context_input_tokens = Some(170);
         assert_eq!(ctx.final_usage_breakdown(), usage);
+
+        for model in [
+            "claude-sonnet-5",
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+        ] {
+            let mut ctx =
+                StreamContext::new_with_thinking(model, 170, false, usage, HashMap::new());
+            ctx.enable_aws_b40_compat();
+            let event = ctx.create_message_start_event();
+            assert!(
+                event["message"]["usage"].get("service_tier").is_none(),
+                "{model}"
+            );
+        }
     }
 
     #[test]
@@ -5607,10 +5627,7 @@ mod tests {
 
         assert_eq!(delta.data["delta"]["stop_reason"], "max_tokens");
         assert_eq!(delta.data["usage"]["output_tokens"], 1);
-        assert_eq!(
-            delta.data["usage"]["output_tokens_details"]["thinking_tokens"],
-            0
-        );
+        assert!(delta.data["usage"].get("output_tokens_details").is_none());
     }
 
     #[test]

@@ -489,7 +489,7 @@ fn generate_websearch_events(
     } else {
         model.to_string()
     };
-    let start_usage = if aws_b40_compat {
+    let mut start_usage = if aws_b40_compat {
         json!({
             "input_tokens": input_usage.input_tokens,
             "output_tokens": 16,
@@ -498,8 +498,7 @@ fn generate_websearch_events(
             "cache_creation": {
                 "ephemeral_5m_input_tokens": 0,
                 "ephemeral_1h_input_tokens": 0
-            },
-            "service_tier": "standard"
+            }
         })
     } else {
         json!({
@@ -509,6 +508,9 @@ fn generate_websearch_events(
             "cache_read_input_tokens": 0
         })
     };
+    if let Some(usage) = start_usage.as_object_mut() {
+        super::compat::apply_service_tier(model, usage);
+    }
 
     // 1. message_start
     events.push(SseEvent::new(
@@ -927,10 +929,12 @@ fn build_websearch_json(
             "ephemeral_5m_input_tokens": 0,
             "ephemeral_1h_input_tokens": 0
         });
-        usage["service_tier"] = json!("standard");
         if model.to_ascii_lowercase().contains("opus") {
             usage["output_tokens_details"] = json!({ "thinking_tokens": 0 });
         }
+    }
+    if let Some(usage) = usage.as_object_mut() {
+        super::compat::apply_service_tier(model, usage);
     }
     json!({
         "id": message_id,
@@ -1351,7 +1355,12 @@ mod tests {
         assert!(
             message_start.data["message"]["id"]
                 .as_str()
-                .is_some_and(|id| id.starts_with("msg_bdrk_") && id.len() == 61)
+                .is_some_and(|id| id.starts_with("msg_01") && id.len() == 28)
+        );
+        assert!(
+            message_start.data["message"]["usage"]
+                .get("service_tier")
+                .is_none()
         );
 
         let result_start = events
@@ -1408,7 +1417,7 @@ mod tests {
             .data["usage"];
         assert_eq!(final_usage["input_tokens"], 556);
         assert_eq!(final_usage["server_tool_use"]["web_search_requests"], 1);
-        assert_eq!(final_usage["output_tokens_details"]["thinking_tokens"], 0);
+        assert!(final_usage.get("output_tokens_details").is_none());
 
         let metrics = &events
             .iter()

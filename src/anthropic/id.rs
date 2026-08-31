@@ -2,17 +2,10 @@
 
 const BASE62: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 const NON_HEX_BASE62: &[u8] = b"GHIJKLMNOPQRSTUVWXYZghijklmnopqrstuvwxyz";
-const LOWER_ALPHANUMERIC: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 
 fn random_base62(len: usize) -> String {
     (0..len)
         .map(|_| BASE62[fastrand::usize(..BASE62.len())] as char)
-        .collect()
-}
-
-fn random_lower_alphanumeric(len: usize) -> String {
-    (0..len)
-        .map(|_| LOWER_ALPHANUMERIC[fastrand::usize(..LOWER_ALPHANUMERIC.len())] as char)
         .collect()
 }
 
@@ -36,33 +29,10 @@ pub fn message_id() -> String {
     anthropic_id("msg")
 }
 
-fn anthropic_compatible_bedrock_message_id() -> String {
-    // Keep the Bedrock marker while staying inside Anthropic's public
-    // `msg_<18-40 alphanumeric chars>` compatibility contract.
-    format!("msg_01bdrk{}", random_base62(18))
-}
-
-fn native_bedrock_message_id() -> String {
-    // The current native Bedrock route sampled through the reference gateway
-    // exposes a 52-character lowercase alphanumeric suffix after `msg_bdrk_`.
-    format!("msg_bdrk_{}", random_lower_alphanumeric(52))
-}
-
-pub fn bedrock_message_id_for_model(model: &str) -> String {
-    let mapped_model = super::converter::map_model(model);
-    if mapped_model
-        .as_deref()
-        .is_some_and(|model_id| model_id.starts_with("gpt-"))
-    {
-        message_id()
-    } else if mapped_model
-        .as_deref()
-        .is_some_and(|model_id| model_id.starts_with("claude-"))
-    {
-        native_bedrock_message_id()
-    } else {
-        anthropic_compatible_bedrock_message_id()
-    }
+pub fn bedrock_message_id_for_model(_model: &str) -> String {
+    // The public Anthropic-compatible envelope uses the same msg_01 Base62
+    // shape regardless of the internal transport selected for the model.
+    message_id()
 }
 
 pub fn server_tool_use_id() -> String {
@@ -78,10 +48,7 @@ pub fn tool_use_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        LOWER_ALPHANUMERIC, anthropic_compatible_bedrock_message_id, bedrock_message_id_for_model,
-        message_id, native_bedrock_message_id, server_tool_use_id,
-    };
+    use super::{bedrock_message_id_for_model, message_id, server_tool_use_id};
 
     fn assert_anthropic_id(id: &str, prefix: &str) {
         let expected_prefix = format!("{prefix}_");
@@ -102,30 +69,20 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_message_ids_keep_marker_and_match_anthropic_shape() {
-        let id = anthropic_compatible_bedrock_message_id();
-        assert_anthropic_id(&id, "msg");
-        assert!(id.starts_with("msg_01bdrk"));
-        assert_eq!(id.len(), 28);
-    }
-
-    #[test]
-    fn native_bedrock_message_ids_match_observed_gateway_shape() {
+    fn claude_bedrock_message_ids_match_current_pomo_shape() {
         for id in [
-            native_bedrock_message_id(),
             bedrock_message_id_for_model("claude-opus-5"),
             bedrock_message_id_for_model("claude-sonnet-5"),
+            bedrock_message_id_for_model("claude-opus-4-8"),
+            bedrock_message_id_for_model("claude-opus-4-7"),
+            bedrock_message_id_for_model("claude-sonnet-4-6"),
             bedrock_message_id_for_model("Opus 5"),
             bedrock_message_id_for_model("Sonnet 5"),
             bedrock_message_id_for_model("haiku"),
         ] {
-            assert!(id.starts_with("msg_bdrk_"));
-            assert_eq!(id.len(), 61);
-            assert!(
-                id["msg_bdrk_".len()..]
-                    .bytes()
-                    .all(|byte| LOWER_ALPHANUMERIC.contains(&byte))
-            );
+            assert_anthropic_id(&id, "msg");
+            assert!(id.starts_with("msg_01"), "{id}");
+            assert!(!id.to_ascii_lowercase().contains("bdrk"), "{id}");
         }
     }
 
@@ -139,11 +96,12 @@ mod tests {
     }
 
     #[test]
-    fn native_bedrock_ids_are_limited_to_claude_models() {
+    fn non_claude_message_ids_do_not_expose_transport_markers() {
         for model in ["glm-5", "minimax-m2.5", "deepseek-3.2", "qwen3-coder-next"] {
             let id = bedrock_message_id_for_model(model);
             assert_anthropic_id(&id, "msg");
-            assert!(id.starts_with("msg_01bdrk"), "{model}: {id}");
+            assert!(id.starts_with("msg_01"), "{model}: {id}");
+            assert!(!id.to_ascii_lowercase().contains("bdrk"), "{model}: {id}");
             assert_eq!(id.len(), 28);
         }
     }

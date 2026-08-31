@@ -5549,7 +5549,7 @@ fn compat_direct_stream_response(
     } else {
         payload.model.clone()
     };
-    let start_usage = if aws_b40_compat {
+    let mut start_usage = if aws_b40_compat {
         json!({
             "input_tokens": usage_breakdown.input_tokens,
             "cache_creation_input_tokens": usage_breakdown.cache_creation_input_tokens,
@@ -5566,8 +5566,7 @@ fn compat_direct_stream_response(
                 9
             } else {
                 1
-            },
-            "service_tier": "standard"
+            }
         })
     } else {
         super::compat::stream_start_usage(
@@ -5580,6 +5579,9 @@ fn compat_direct_stream_response(
             usage_breakdown.cache_read_input_tokens,
         )
     };
+    if let Some(usage) = start_usage.as_object_mut() {
+        super::compat::apply_service_tier(&payload.model, usage);
+    }
     let mut events = Vec::new();
     events.push(SseEvent::new(
         "message_start",
@@ -8690,7 +8692,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aws_b_exact_reply_keeps_bedrock_envelope() {
+    async fn aws_b_exact_reply_matches_current_pomo_envelope() {
         let req = parse(
             "claude-opus-4-8",
             serde_json::json!({
@@ -8712,9 +8714,9 @@ mod tests {
         assert!(
             body["id"]
                 .as_str()
-                .is_some_and(|id| id.starts_with("msg_bdrk_") && id.len() == 61)
+                .is_some_and(|id| id.starts_with("msg_01") && id.len() == 28)
         );
-        assert_eq!(body["usage"]["service_tier"], "standard");
+        assert!(body["usage"].get("service_tier").is_none());
         assert_eq!(body["usage"]["input_tokens"], 15);
         assert_eq!(body["usage"]["output_tokens"], 4);
     }

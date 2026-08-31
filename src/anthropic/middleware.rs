@@ -165,15 +165,7 @@ pub async fn aws_b40_headers_middleware(
     let path = request.uri().path().to_string();
 
     if state.aws_b40_compat && request.method() == Method::OPTIONS {
-        let request_id = aws_b40_oneapi_request_id();
-        let mut response =
-            (StatusCode::NOT_FOUND, Json(json!({ "error": "Not Found" }))).into_response();
-        apply_aws_b40_headers_with_version(
-            response.headers_mut(),
-            &request_id,
-            AWS_B40_GATEWAY_VERSION,
-        );
-        return response;
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "Not Found" }))).into_response();
     }
 
     let mut response = next.run(request).await;
@@ -183,7 +175,7 @@ pub async fn aws_b40_headers_middleware(
 
 fn apply_response_compat_headers(
     state: &AppState,
-    method: &Method,
+    _method: &Method,
     path: &str,
     response: &mut Response,
 ) {
@@ -197,26 +189,11 @@ fn apply_response_compat_headers(
     }
 
     if state.aws_b40_compat {
-        let messages_success = is_gateway_completion_path(path) && response.status().is_success();
-        let messages_stream_success = messages_success && is_stream_response(response);
-        let request_id = response
-            .headers()
-            .get("x-oneapi-request-id")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                if messages_success && !messages_stream_success {
-                    aws_b40_messages_success_request_id()
-                } else {
-                    aws_b40_oneapi_request_id()
-                }
-            });
-        let version = aws_b40_version_for_response(method, path, response);
-        apply_aws_b40_headers_with_version(response.headers_mut(), &request_id, version);
-
-        if messages_success && !messages_stream_success {
-            apply_aws_b40_non_stream_success_headers(response.headers_mut());
-        }
+        // AWSB is an upstream channel behind the customer's own New API.
+        // New-API build IDs, request IDs and WAF identity belong to that outer
+        // gateway. Forwarding locally forged values would mix two gateway
+        // identities and can also be copied by New API onto the public response.
+        strip_non_openai_gateway_headers(response.headers_mut());
     } else {
         let include_official_headers = path.ends_with("/messages");
         let is_stream = is_stream_response(response);
@@ -234,6 +211,9 @@ fn strip_non_openai_gateway_headers(headers: &mut header::HeaderMap) {
     for name in [
         "x-new-api-version",
         "x-oneapi-request-id",
+        "x-request-id",
+        "x-app-revision",
+        "x-group-used",
         "x-accel-buffering",
         "strict-transport-security",
         "server",
@@ -300,7 +280,6 @@ pub(crate) fn apply_aws_b40_headers_with_version(
 }
 
 fn apply_aws_b40_non_stream_success_headers(headers: &mut header::HeaderMap) {
-    headers.insert(header::VIA, HeaderValue::from_static("1.1 Caddy"));
     headers.insert(
         header::ALT_SVC,
         HeaderValue::from_static("h3=\":443\"; ma=2592000"),
@@ -427,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn aws_b_non_stream_success_id_and_headers_match_gateway_shape() {
+    fn aws_b_non_stream_success_headers_do_not_expose_caddy_via() {
         let request_id = aws_b40_messages_success_request_id();
         assert_eq!(request_id.len(), 39);
         assert!(
@@ -444,7 +423,7 @@ mod tests {
 
         let mut headers = header::HeaderMap::new();
         apply_aws_b40_non_stream_success_headers(&mut headers);
-        assert_eq!(headers["via"], "1.1 Caddy");
+        assert!(headers.get("via").is_none());
         assert!(headers.get("vary").is_none());
         assert_eq!(headers["alt-svc"], "h3=\":443\"; ma=2592000");
         assert_eq!(
@@ -587,19 +566,49 @@ mod tests {
     }
 
     #[test]
-    fn unmarked_claude_openai_and_messages_keep_gateway_headers() {
+    fn pomo_upstream_responses_do_not_emit_outer_new_api_or_waf_headers() {
         let state = AppState::new("test-key", true, true);
-        for path in ["/v1/chat/completions", "/v1/messages"] {
-            let mut response = response(StatusCode::OK, "application/json");
+        for (path, content_type) in [
+            ("/v1/chat/completions", "application/json"),
+            ("/v1/messages", "application/json"),
+            ("/v1/messages", "text/event-stream"),
+        ] {
+            let mut response = response(StatusCode::OK, content_type);
+            apply_aws_b40_headers(response.headers_mut(), "should-be-stripped");
+            apply_aws_b40_non_stream_success_headers(response.headers_mut());
+            response.headers_mut().insert(
+                "x-request-id",
+                HeaderValue::from_static("stale-upstream-request-id"),
+            );
+            response
+                .headers_mut()
+                .insert("x-app-revision", HeaderValue::from_static("stale-revision"));
+            response
+                .headers_mut()
+                .insert("x-group-used", HeaderValue::from_static("stale-group"));
             apply_response_compat_headers(&state, &Method::POST, path, &mut response);
 
-            assert_eq!(
-                response.headers()["x-new-api-version"],
-                AWS_B40_NON_STREAM_VERSION
-            );
-            assert_eq!(response.headers()["server"], "lyywafcdn");
-            assert_eq!(response.headers()["via"], "1.1 Caddy");
-            assert!(response.headers().get("x-oneapi-request-id").is_some());
+            assert_eq!(response.headers()[header::CONTENT_TYPE], content_type);
+            for outer_header in [
+                "x-new-api-version",
+                "x-oneapi-request-id",
+                "x-request-id",
+                "x-app-revision",
+                "x-group-used",
+                "x-accel-buffering",
+                "strict-transport-security",
+                "server",
+                "via",
+                "alt-svc",
+                "referrer-policy",
+                "x-content-type-options",
+                "x-frame-options",
+            ] {
+                assert!(
+                    response.headers().get(outer_header).is_none(),
+                    "AWSB leaked outer header {outer_header} for {path} {content_type}"
+                );
+            }
         }
     }
 }

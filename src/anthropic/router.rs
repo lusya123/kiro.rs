@@ -162,8 +162,9 @@ mod tests {
             .await
             .expect("AWS-B models request");
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()["server"], "lyywafcdn");
-        assert_eq!(response.headers()["x-new-api-version"], "d47d4a8b");
+        assert!(response.headers().get("server").is_none());
+        assert!(response.headers().get("x-new-api-version").is_none());
+        assert!(response.headers().get("x-oneapi-request-id").is_none());
         assert!(
             response
                 .headers()
@@ -200,7 +201,7 @@ mod tests {
             .await
             .expect("AWS-B HEAD models request");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert_eq!(response.headers()["x-new-api-version"], "d47d4a8b");
+        assert!(response.headers().get("x-new-api-version").is_none());
         assert!(response.bytes().await.expect("HEAD body").is_empty());
 
         let response = client
@@ -215,7 +216,7 @@ mod tests {
                 .get("access-control-allow-origin")
                 .is_none()
         );
-        assert_eq!(response.headers()["x-new-api-version"], "d47d4a8b");
+        assert!(response.headers().get("x-new-api-version").is_none());
 
         let response = client
             .post(format!("{base}/v1/messages"))
@@ -228,7 +229,7 @@ mod tests {
             .await
             .expect("AWS-B unauthenticated request");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(response.headers()["x-new-api-version"], "d47d4a8b");
+        assert!(response.headers().get("x-new-api-version").is_none());
         assert!(
             response
                 .text()
@@ -298,7 +299,7 @@ mod tests {
             .await
             .expect("AWS-B malformed JSON request");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(response.headers()["x-new-api-version"], "d47d4a8b");
+        assert!(response.headers().get("x-new-api-version").is_none());
         let body: Value = response.json().await.expect("AWS-B malformed JSON body");
         assert!(
             body["error"]
@@ -734,7 +735,7 @@ mod tests {
             .await
             .expect("AWS-B public count_tokens");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert_eq!(response.headers()["x-new-api-version"], "d47d4a8b");
+        assert!(response.headers().get("x-new-api-version").is_none());
         let body: Value = response
             .json()
             .await
@@ -901,7 +902,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["x-amzn-requestid"], "native-request-id");
         assert_eq!(response.headers()["x-native-rate-limit"], "preserved");
-        assert_eq!(response.headers()[header::CONNECTION], "keep-alive");
+        assert!(response.headers().get(header::CONNECTION).is_none());
         assert_eq!(response.text().await.expect("native body"), NATIVE_SSE);
 
         let (headers, body) = captured

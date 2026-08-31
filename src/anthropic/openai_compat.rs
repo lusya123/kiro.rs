@@ -1932,9 +1932,12 @@ mod tests {
             .await
             .expect("Claude OpenAI control response");
         assert!(!claude.status().is_success());
-        assert_eq!(claude.headers()["x-new-api-version"], "d47d4a8b");
-        assert_eq!(claude.headers()["server"], "lyywafcdn");
-        assert!(claude.headers().get("x-oneapi-request-id").is_some());
+        for outer_header in ["x-new-api-version", "x-oneapi-request-id", "server", "via"] {
+            assert!(
+                claude.headers().get(outer_header).is_none(),
+                "AWSB leaked outer header {outer_header} on Claude control"
+            );
+        }
 
         server.abort();
     }

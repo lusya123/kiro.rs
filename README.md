@@ -191,7 +191,7 @@ docker-compose up
 | `adminApiKey` | string | - | Admin API 密钥（须为非空可见 ASCII），配置后启用凭据管理 API 和 Web 管理界面 |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
-| `awsB40Compat` | boolean | `true` | 保留 AWS-B/Bedrock 的模型目录、响应头、错误、ID、签名和 SSE 外形；设为 `false` 时使用 AWS-P 外观 |
+| `awsB40Compat` | boolean | `true` | 使用 POMO 上游兼容的模型目录、正文、错误、ID、签名和 SSE 外形；不伪造外层 New API/WAF 响应头。设为 `false` 时使用 AWS-P 外观 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
 
 完整配置示例：
@@ -224,6 +224,12 @@ docker-compose up
 
 AWS-B 与 AWS-P 共用 tokenizer、计费、缓存、身份清洗、流式处理和工具链。`awsB40Compat`
 只控制对外协议外观，不切换上游模型或内部质量引擎。
+
+当 AWS-B 作为 New API 的上游渠道时，`Server`、`X-Oneapi-Request-Id`、
+`X-New-Api-Version`、`X-Request-Id` 等站点或网关身份应由外层 New API、反向代理和
+WAF 生成。AWS-B 的 POMO 兼容模式会移除这些本地伪造头，避免外层 New API 复制到
+最终客户响应后出现两套网关指纹；`Content-Type`、上游 Bedrock 限流信息等业务头不受
+影响。
 
 ### credentials.json
 
@@ -379,12 +385,9 @@ RUST_LOG=debug ./target/release/kiro-rs
 `KIRO_CLUSTER_CACHE_ADDR=host1:46379,host2:46379` 配置共享候选地址，或设为
 `off`、`local`、`disabled` 关闭集群共享并退回进程内缓存。
 
-AWS-B 会根据模型自动生成公开消息 ID，不需要额外的容器启动参数。Claude
-（Opus、Sonnet、Haiku）响应使用当前参考网关原生 Bedrock 路由实测到的
-`msg_bdrk_` + 52 位小写字母数字 ID。GPT 保持 Anthropic 兼容的 `msg_01…`
-形态；其他兼容模型保持现有 ID 形态，Mantle 原生代理继续透传上游 ID。该自动
-选择只改变公开消息 ID，不改变模型路由、对话内容、Thinking、Token 统计或
-工具调用。
+AWS-B 的公共 Anthropic 兼容响应统一使用 `msg_01…` Base62 消息 ID，不暴露
+内部使用的 Bedrock 或其他传输方式。该规则只改变公开消息 ID，不改变模型路由、
+对话内容、Thinking、Token 统计或工具调用。
 
 ## API 端点
 

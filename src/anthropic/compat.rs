@@ -151,7 +151,7 @@ pub fn usage(
         );
     }
 
-    usage.insert("service_tier".to_string(), json!("standard"));
+    apply_service_tier(model, &mut usage);
     usage.insert("inference_geo".to_string(), json!(inference_geo_for(model)));
     Value::Object(usage)
 }
@@ -188,9 +188,20 @@ pub fn stream_start_usage(
         }),
     );
     usage.insert("output_tokens".to_string(), json!(output_tokens));
-    usage.insert("service_tier".to_string(), json!("standard"));
+    apply_service_tier(model, &mut usage);
     usage.insert("inference_geo".to_string(), json!(inference_geo_for(model)));
     Value::Object(usage)
+}
+
+pub fn should_include_service_tier(model: &str) -> bool {
+    super::converter::map_model(model).as_deref() == Some("claude-sonnet-4.6")
+}
+
+pub fn apply_service_tier(model: &str, usage: &mut serde_json::Map<String, Value>) {
+    usage.remove("service_tier");
+    if should_include_service_tier(model) {
+        usage.insert("service_tier".to_string(), json!("standard"));
+    }
 }
 
 /// `message_delta` 事件的 usage。真 Anthropic 的 delta 是**精简版**：
@@ -229,8 +240,10 @@ pub fn stream_delta_usage(
     Value::Object(usage)
 }
 
-pub fn should_include_thinking_details(model: &str, thinking_tokens: i32) -> bool {
-    thinking_tokens != 0 || model.to_ascii_lowercase().contains("opus")
+pub fn should_include_thinking_details(_model: &str, thinking_tokens: i32) -> bool {
+    // POMO omits this object for ordinary, non-thinking Opus responses.  The
+    // model family alone is not evidence that reasoning tokens were emitted.
+    thinking_tokens > 0
 }
 
 pub fn is_opus_4_8(model: &str) -> bool {
@@ -3339,7 +3352,48 @@ mod tests {
         let obj = u.as_object().unwrap();
         assert!(!obj.contains_key("output_tokens_details"));
         assert!(obj.contains_key("cache_creation"));
-        assert!(obj.contains_key("service_tier"));
+        assert!(!obj.contains_key("service_tier"));
+
+        let sonnet = stream_start_usage("claude-sonnet-4-6", 10, 1, 0, 0, 0, 0);
+        assert_eq!(sonnet["service_tier"], "standard");
+    }
+
+    #[test]
+    fn final_usage_matches_current_pomo_service_tier_by_model() {
+        for (model, expected) in [
+            ("claude-sonnet-4-6", Some("standard")),
+            ("claude-sonnet-5", None),
+            ("claude-opus-5", None),
+            ("claude-opus-4-8", None),
+            ("claude-opus-4-7", None),
+        ] {
+            let usage = usage(model, 10, 2, 0, 0, 0, 0);
+            assert_eq!(
+                usage.get("service_tier").and_then(Value::as_str),
+                expected,
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn nonthinking_opus_usage_omits_thinking_details_like_current_pomo() {
+        for model in ["claude-opus-5", "claude-opus-4-8", "claude-opus-4-7"] {
+            let usage = usage(model, 10, 2, 0, 0, 0, 0);
+            assert!(
+                usage.get("output_tokens_details").is_none(),
+                "{model}: {usage}"
+            );
+
+            let delta = stream_delta_usage(model, 10, 2, 0, 0, 0, 0);
+            assert!(
+                delta.get("output_tokens_details").is_none(),
+                "{model}: {delta}"
+            );
+        }
+
+        let thinking = usage("claude-opus-5", 10, 2, 7, 0, 0, 0);
+        assert_eq!(thinking["output_tokens_details"]["thinking_tokens"], 7);
     }
 
     #[test]
@@ -3348,8 +3402,8 @@ mod tests {
         let obj = u.as_object().unwrap();
         assert!(!obj.contains_key("cache_creation"));
         assert!(!obj.contains_key("service_tier"));
-        // opus 仍带 output_tokens_details
-        assert!(obj.contains_key("output_tokens_details"));
+        // 未实际产出 thinking 时，POMO 的 opus 也不带 details。
+        assert!(!obj.contains_key("output_tokens_details"));
         // sonnet（无 thinking）不带
         let s = stream_delta_usage("claude-sonnet-4-6", 10, 9, 0, 0, 0, 0);
         assert!(!s.as_object().unwrap().contains_key("output_tokens_details"));
