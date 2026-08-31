@@ -406,6 +406,7 @@ mod tests {
                     "{path}: {model}"
                 );
                 let body: Value = response.json().await.expect("validation error JSON");
+                assert_eq!(body["type"], "error", "{path}: {model}");
                 assert_eq!(
                     body["error"]["type"], "invalid_request_error",
                     "{path}: {model}"
@@ -454,6 +455,56 @@ mod tests {
                     "{path}: {model}"
                 );
                 let body: Value = response.json().await.expect("validation error JSON");
+                assert_eq!(body["type"], "error", "{path}: {model}");
+                assert_eq!(
+                    body["error"]["type"], "invalid_request_error",
+                    "{path}: {model}"
+                );
+            }
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn aws_b_message_entrypoints_reject_unknown_message_roles() {
+        let (base, server) = spawn_router(true).await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test HTTP client");
+
+        for path in ["/v1/messages", "/cc/v1/messages"] {
+            for model in [
+                "claude-opus-4-6",
+                "claude-opus-4-7",
+                "claude-opus-4-8",
+                "claude-opus-5",
+                "claude-sonnet-4-6",
+                "claude-sonnet-5",
+            ] {
+                let response = client
+                    .post(format!("{base}{path}"))
+                    .header("x-api-key", "test-key")
+                    .json(&json!({
+                        "model": model,
+                        "max_tokens": 64,
+                        "messages": [
+                            {"role": "developer", "content": "This role is not valid here."},
+                            {"role": "user", "content": "hello"}
+                        ]
+                    }))
+                    .send()
+                    .await
+                    .expect("unknown role request");
+
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "{path}: {model}"
+                );
+                let body: Value = response.json().await.expect("validation error JSON");
+                assert_eq!(body["type"], "error", "{path}: {model}");
                 assert_eq!(
                     body["error"]["type"], "invalid_request_error",
                     "{path}: {model}"
