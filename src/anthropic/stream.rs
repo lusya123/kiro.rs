@@ -932,6 +932,9 @@ pub struct StreamContext {
     /// Whether the current invocation supplied a known native stop reason.
     /// End-of-stream shape heuristics must not replace authoritative metadata.
     native_stop_reason_received: bool,
+    /// An unknown native stop reason must fail closed even when Opus 5 has
+    /// already emitted non-empty assistant text before a clean transport EOF.
+    first_round_unknown_native_stop_reason: bool,
     /// A fully closed tool call is meaningful terminal model output even when
     /// no assistant text is visible to the client.
     first_round_completed_tool_use: bool,
@@ -1097,6 +1100,7 @@ impl StreamContext {
             first_round_terminal_evidence: false,
             first_round_refused: false,
             native_stop_reason_received: false,
+            first_round_unknown_native_stop_reason: false,
             first_round_completed_tool_use: false,
             exact_current_input_tokens: None,
             metered_current_input_tokens: None,
@@ -1515,6 +1519,9 @@ impl StreamContext {
                     .as_deref()
                     .is_some_and(|reason| !reason.trim().is_empty())
                 {
+                    if !self.continuation_started {
+                        self.first_round_unknown_native_stop_reason = true;
+                    }
                     tracing::warn!(
                         native_stop_reason = %metadata.stop_reason.as_deref().unwrap_or_default(),
                         "忽略未知 Kiro stopReason，保留安全的本地终止推断"
@@ -3288,8 +3295,17 @@ impl StreamContext {
             return false;
         }
 
-        let has_completion_evidence =
-            self.first_round_completed_tool_use || self.first_round_terminal_evidence;
+        // Both streaming handlers call this predicate only after the upstream
+        // body reached EOF and the EventStream decoder has no pending frame.
+        // Opus 5 sometimes completes with only an assistantResponseEvent, so
+        // non-empty visible output is sufficient in that clean-EOF shape.
+        let has_clean_opus_5_assistant_response = stream_model_is_opus_5(&self.model)
+            && !self.output_text_acc.trim().is_empty()
+            && !self.output_token_limit_reached
+            && !self.first_round_unknown_native_stop_reason;
+        let has_completion_evidence = self.first_round_completed_tool_use
+            || self.first_round_terminal_evidence
+            || has_clean_opus_5_assistant_response;
         if !has_completion_evidence {
             return false;
         }
@@ -3325,6 +3341,11 @@ impl StreamContext {
         self.state_manager.set_stop_reason("max_tokens");
         Some(limited)
     }
+}
+
+fn stream_model_is_opus_5(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.contains("opus-5") || lower.contains("opus-5.0") || lower.contains("opus 5")
 }
 
 pub(crate) fn cumulative_event_delta(current: &str, previous: &str) -> String {
@@ -3790,7 +3811,8 @@ mod tests {
     #[test]
     fn unknown_native_stop_reason_fails_closed_without_cache_evidence() {
         let mut ctx =
-            StreamContext::new_with_thinking("test-model", 100, false, false, HashMap::new());
+            StreamContext::new_with_thinking("claude-opus-5", 100, false, false, HashMap::new());
+        let _ = ctx.process_assistant_response("complete-looking output");
         let _ = ctx.process_kiro_event(&Event::Metadata(
             crate::kiro::model::events::MetadataEvent {
                 stop_reason: Some("FUTURE_PROVIDER_REASON".to_string()),
