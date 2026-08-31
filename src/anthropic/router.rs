@@ -516,6 +516,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn external_message_entrypoints_reject_malformed_thinking_signatures() {
+        let (base, server) = spawn_router(true).await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test HTTP client");
+
+        for path in ["/v1/messages", "/cc/v1/messages"] {
+            let response = client
+                .post(format!("{base}{path}"))
+                .header("x-api-key", "test-key")
+                .json(&json!({
+                    "model": "claude-opus-4-8",
+                    "max_tokens": 64,
+                    "messages": [
+                        {"role": "user", "content": "first"},
+                        {"role": "assistant", "content": [
+                            {"type": "thinking", "thinking": "test", "signature": "not-base64!!"},
+                            {"type": "text", "text": "answer"}
+                        ]},
+                        {"role": "user", "content": "continue"}
+                    ]
+                }))
+                .send()
+                .await
+                .expect("malformed signature request");
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            let body: Value = response.json().await.expect("validation error JSON");
+            assert_eq!(body["type"], "error", "{path}");
+            assert_eq!(body["error"]["type"], "<nil>", "{path}");
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn aws_b_message_entrypoints_reject_temperature_above_one_for_all_claude_models() {
         let (base, server) = spawn_router(true).await;
         let client = reqwest::Client::builder()

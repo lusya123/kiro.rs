@@ -2819,12 +2819,13 @@ pub async fn post_messages(
     let gpt_passthrough = is_gpt_model(&payload.model);
     let aws_b40_initial_thinking_requested = aws_b40_compat
         && (payload.thinking.is_some() || payload.model.to_ascii_lowercase().contains("thinking"));
-    // AWS-B 可外接版本：暂时停用入站 thinking signature 拒绝。
-    // 外部网关可能回放本实例注册表中不存在、但属于原会话的 provider signature；
-    // 在这里拒绝会导致请求尚未到达上游就返回 400。校验实现保留，便于以后恢复。
-    // if let Some(response) = reject_invalid_thinking_signatures(&payload, aws_b40_compat).await {
-    //     return response;
-    // }
+    // 外部网关允许回放未登记但结构合法的 provider signature；仍须在入口拒绝
+    // 非 base64、长度异常等畸形签名，避免把确定无效的请求送往上游。
+    if let Some(response) =
+        reject_invalid_thinking_signatures_with_import_policy(&payload, true, true).await
+    {
+        return response;
+    }
     if aws_b40_compat {
         normalize_aws_b40_thinking(&mut payload);
         normalize_aws_b40_tool_choice(&mut payload);
@@ -6316,11 +6317,12 @@ pub async fn post_messages_cc(
     let gpt_passthrough = is_gpt_model(&payload.model);
     let aws_b40_initial_thinking_requested = aws_b40_compat
         && (payload.thinking.is_some() || payload.model.to_ascii_lowercase().contains("thinking"));
-    // AWS-B 可外接版本：与 /v1/messages 保持一致，停用入站 thinking signature 拒绝。
-    // 校验实现仍完整保留，仅注释入口调用，避免外部会话回放在本地提前返回 400。
-    // if let Some(response) = reject_invalid_thinking_signatures(&payload, aws_b40_compat).await {
-    //     return response;
-    // }
+    // 与公共入口保持一致：接受结构合法的外部 provider signature，拒绝畸形值。
+    if let Some(response) =
+        reject_invalid_thinking_signatures_with_import_policy(&payload, true, true).await
+    {
+        return response;
+    }
     if aws_b40_compat {
         normalize_aws_b40_thinking(&mut payload);
         normalize_aws_b40_tool_choice(&mut payload);
@@ -6959,6 +6961,7 @@ fn create_buffered_sse_stream(
 mod tests {
     use super::*;
     use crate::anthropic::types::MessagesRequest;
+    use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 
     struct TestKiroEndpoint {
         url: String,
@@ -8270,6 +8273,12 @@ mod tests {
 
     #[tokio::test]
     async fn message_entrypoints_bypass_unknown_thinking_signatures_before_provider_selection() {
+        let signature = super::super::signature::generate_model_signature("claude-opus-5")
+            .expect("provider-shaped signature");
+        let mut raw_signature = BASE64.decode(signature).expect("signature base64");
+        let mac_index = raw_signature.len() - 34;
+        raw_signature[mac_index] ^= 1;
+        let unknown_provider_signature = BASE64.encode(raw_signature);
         let request = parse(
             "claude-opus-5",
             serde_json::json!({
@@ -8279,7 +8288,7 @@ mod tests {
                         "content": [{
                             "type": "thinking",
                             "thinking": "provider-issued history",
-                            "signature": "unknown-opaque-signature"
+                            "signature": unknown_provider_signature
                         }]
                     },
                     {"role": "user", "content": "continue the analysis"}
