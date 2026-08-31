@@ -369,6 +369,299 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aws_b_message_entrypoints_reject_a_leading_system_role() {
+        let (base, server) = spawn_router(true).await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test HTTP client");
+
+        for path in ["/v1/messages", "/cc/v1/messages"] {
+            for model in [
+                "claude-opus-4-6",
+                "claude-opus-4-7",
+                "claude-opus-4-8",
+                "claude-opus-5",
+                "claude-sonnet-4-6",
+                "claude-sonnet-5",
+            ] {
+                let response = client
+                    .post(format!("{base}{path}"))
+                    .header("x-api-key", "test-key")
+                    .json(&json!({
+                        "model": model,
+                        "max_tokens": 200,
+                        "messages": [
+                            {"role": "system", "content": "This system message is in the wrong location."},
+                            {"role": "user", "content": "Reply in one sentence."}
+                        ]
+                    }))
+                    .send()
+                    .await
+                    .expect("leading system role request");
+
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "{path}: {model}"
+                );
+                let body: Value = response.json().await.expect("validation error JSON");
+                assert_eq!(
+                    body["error"]["type"], "invalid_request_error",
+                    "{path}: {model}"
+                );
+            }
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn aws_b_message_entrypoints_reject_modern_claude_assistant_prefill() {
+        let (base, server) = spawn_router(true).await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test HTTP client");
+
+        for path in ["/v1/messages", "/cc/v1/messages"] {
+            for model in [
+                "claude-opus-4-6",
+                "claude-opus-4-7",
+                "claude-opus-4-8",
+                "claude-opus-5",
+                "claude-sonnet-4-6",
+                "claude-sonnet-5",
+            ] {
+                let response = client
+                    .post(format!("{base}{path}"))
+                    .header("x-api-key", "test-key")
+                    .json(&json!({
+                        "model": model,
+                        "max_tokens": 200,
+                        "messages": [
+                            {"role": "user", "content": "Return a JSON object containing only an ok field."},
+                            {"role": "assistant", "content": "{"}
+                        ]
+                    }))
+                    .send()
+                    .await
+                    .expect("assistant prefill request");
+
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "{path}: {model}"
+                );
+                let body: Value = response.json().await.expect("validation error JSON");
+                assert_eq!(
+                    body["error"]["type"], "invalid_request_error",
+                    "{path}: {model}"
+                );
+            }
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn aws_b_message_entrypoints_reject_temperature_above_one_for_all_claude_models() {
+        let (base, server) = spawn_router(true).await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test HTTP client");
+
+        for path in ["/v1/messages", "/cc/v1/messages"] {
+            for model in [
+                "claude-opus-4-6",
+                "claude-opus-4-7",
+                "claude-opus-4-8",
+                "claude-opus-5",
+                "claude-sonnet-4-6",
+                "claude-sonnet-5",
+            ] {
+                let response = client
+                    .post(format!("{base}{path}"))
+                    .header("x-api-key", "test-key")
+                    .json(&json!({
+                        "model": model,
+                        "max_tokens": 64,
+                        "temperature": 1.01,
+                        "messages": [{"role": "user", "content": "hello"}]
+                    }))
+                    .send()
+                    .await
+                    .expect("out-of-range temperature request");
+
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "{path}: {model}"
+                );
+                let body: Value = response.json().await.expect("validation error JSON");
+                assert_eq!(
+                    body["error"]["type"], "invalid_request_error",
+                    "{path}: {model}: {body}"
+                );
+            }
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn aws_b_public_messages_rejects_unavailable_server_side_features() {
+        let (base, server) = spawn_router(true).await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test HTTP client");
+
+        let cases = [
+            (
+                "server-side fallback",
+                json!({
+                    "model": "claude-opus-5",
+                    "max_tokens": 64,
+                    "fallbacks": "default",
+                    "messages": [{"role": "user", "content": "hello"}]
+                }),
+            ),
+            (
+                "web search server tool",
+                json!({
+                    "model": "claude-opus-4-8",
+                    "max_tokens": 64,
+                    "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                    "messages": [{"role": "user", "content": "search the web"}]
+                }),
+            ),
+            (
+                "advisor server tool",
+                json!({
+                    "model": "claude-sonnet-5",
+                    "max_tokens": 64,
+                    "tools": [{"type": "advisor_20260301", "name": "advisor", "model": "claude-opus-5"}],
+                    "messages": [{"role": "user", "content": "design a worker pool"}]
+                }),
+            ),
+            (
+                "code execution server tool",
+                json!({
+                    "model": "claude-opus-4-8",
+                    "max_tokens": 64,
+                    "tools": [{"type": "code_execution_20260521", "name": "code_execution"}],
+                    "messages": [{"role": "user", "content": "Use code execution to calculate 17+25."}]
+                }),
+            ),
+            (
+                "structured output",
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 64,
+                    "output_config": {"format": {"type": "json_schema", "schema": {
+                        "type": "object",
+                        "properties": {"ok": {"type": "boolean"}},
+                        "required": ["ok"],
+                        "additionalProperties": false
+                    }}},
+                    "messages": [{"role": "user", "content": "Return an ok field."}]
+                }),
+            ),
+            (
+                "manual enabled thinking",
+                json!({
+                    "model": "claude-opus-5",
+                    "max_tokens": 2048,
+                    "thinking": {"type": "enabled", "budget_tokens": 1024},
+                    "messages": [{"role": "user", "content": "Calculate 17+25."}]
+                }),
+            ),
+            (
+                "URL image source",
+                json!({
+                    "model": "claude-opus-5",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": [
+                        {"type": "image", "source": {"type": "url", "url": "https://example.com/image.png"}},
+                        {"type": "text", "text": "Describe this image."}
+                    ]}]
+                }),
+            ),
+        ];
+
+        for (case, body) in cases {
+            let response = client
+                .post(format!("{base}/v1/messages"))
+                .header("x-api-key", "test-key")
+                .header("anthropic-beta", "server-side-fallback-2026-07-01")
+                .json(&body)
+                .send()
+                .await
+                .expect("unsupported public feature request");
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{case}: {body}");
+            let error: Value = response.json().await.expect("validation error JSON");
+            assert_eq!(
+                error["error"]["type"], "invalid_request_error",
+                "{case}: {error}"
+            );
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn aws_b_public_messages_keeps_normal_questions_and_client_tools_available() {
+        let (base, server) = spawn_router(true).await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test HTTP client");
+
+        for (case, body) in [
+            (
+                "ordinary coding question",
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "Write a Rust function that adds two integers."}]
+                }),
+            ),
+            (
+                "client-defined code tool",
+                json!({
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 64,
+                    "tools": [{
+                        "name": "run_tests",
+                        "description": "Run the project's tests",
+                        "input_schema": {"type": "object", "properties": {}, "additionalProperties": false}
+                    }],
+                    "messages": [{"role": "user", "content": "Use the client tool if tests are needed."}]
+                }),
+            ),
+        ] {
+            let response = client
+                .post(format!("{base}/v1/messages"))
+                .header("x-api-key", "test-key")
+                .json(&body)
+                .send()
+                .await
+                .expect("normal public request");
+
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{case}: request must pass validation and reach the absent provider"
+            );
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn profiles_share_token_engine_but_keep_distinct_model_catalogs() {
         let (aws_b_base, aws_b_server) = spawn_router(true).await;
         let (aws_p_base, aws_p_server) = spawn_router(false).await;

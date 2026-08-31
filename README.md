@@ -407,6 +407,8 @@ AWS-B 会根据模型自动生成公开消息 ID，不需要额外的容器启�
 > **`/cc/v1/messages` 与 `/v1/messages` 的区别**：
 > - `/v1/messages`：实时流式返回；`message_start` 与最终 `message_delta` 使用同一份请求侧本地输入 usage
 > - `/cc/v1/messages`：缓冲模式；仅延迟发送事件，不会用上游 `metadataEvent`、`meteringEvent` 或 `contextUsageEvent` 改写输入 usage
+> - 启用 `awsB40Compat` 且未配置原生 Bedrock Mantle 混合路由时，公共 `/v1/messages` 按 Amazon Bedrock 能力边界校验：拒绝 `fallbacks`、服务端 `web_search` / `advisor` / `code_execution`、`output_config.format`、现代 Claude 的手动 `thinking.type=enabled` 和 URL 图片；普通问答、代码生成、base64 图片及客户端自定义工具保持可用
+> - `/cc/v1/messages` 保留上述 Kiro 兼容扩展，供明确需要扩展能力的 Claude Code 客户端使用；两个入口都会拒绝首条 `system` role，以及现代 Claude 的末尾 assistant prefill
 > - 输入总量与缓存拆分在请求发往上游前完成；自动续写和本轮输出不会增加客户端请求的 `input_tokens`
 > - 普通文本和缓存前缀统一使用本地 Claude BPE 加固定协议框架；不存在 1024 字符分界，也不会叠加字符数比例补偿
 > - 等待期间会每 25 秒发送 `ping` 事件保活
@@ -581,7 +583,7 @@ Codex 建议直接配置官方目录中的 `gpt-5.6-sol`、`gpt-5.6-terra` 或
 
 1. **凭证安全**: 请妥善保管 `credentials.json` 文件，不要提交到版本控制
 2. **Token 刷新**: 服务会自动刷新过期的 Token，无需手动干预
-3. **Anthropic WebSearch 工具**: Messages 请求中仅包含一个 `web_search_20250305` 工具时，会走内置 WebSearch 转换逻辑；OpenAI Responses 的 hosted `web_search` 目前仅接受 `external_web_access: false` 的禁用态声明
+3. **Anthropic WebSearch 工具**: AWS-B 公共 `/v1/messages` 会按 Bedrock 能力边界拒绝服务端 WebSearch；需要 Kiro WebSearch 兼容扩展时使用 `/cc/v1/messages`。OpenAI Responses 的 hosted `web_search` 目前仅接受 `external_web_access: false` 的禁用态声明
 
 ## 项目结构
 
