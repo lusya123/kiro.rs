@@ -8,6 +8,8 @@ use std::collections::HashMap;
 /// API 错误响应
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
+    #[serde(rename = "type")]
+    pub response_type: &'static str,
     pub error: ErrorDetail,
 }
 
@@ -25,6 +27,7 @@ impl ErrorResponse {
     /// 创建新的错误响应
     pub fn new(error_type: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
+            response_type: "error",
             error: ErrorDetail {
                 error_type: error_type.into(),
                 message: message.into(),
@@ -39,6 +42,7 @@ impl ErrorResponse {
         code: impl Into<String>,
     ) -> Self {
         Self {
+            response_type: "error",
             error: ErrorDetail {
                 error_type: error_type.into(),
                 message: message.into(),

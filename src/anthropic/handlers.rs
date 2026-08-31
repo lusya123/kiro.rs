@@ -5996,6 +5996,19 @@ fn reject_invalid_message_sequence(payload: &MessagesRequest) -> Option<Response
             "A system message cannot be the first entry in `messages`; use the top-level `system` field instead."
                 .to_string(),
         )
+    } else if let Some((index, role)) =
+        payload
+            .messages
+            .iter()
+            .enumerate()
+            .find_map(|(index, message)| {
+                (!matches!(message.role.as_str(), "user" | "assistant"))
+                    .then_some((index, message.role.as_str()))
+            })
+    {
+        Some(format!(
+            "messages.{index}.role: `{role}` is not supported; expected `user` or `assistant`"
+        ))
     } else {
         let rejects_assistant_prefill = modern_claude_rejects_assistant_prefill(&payload.model);
         (rejects_assistant_prefill
