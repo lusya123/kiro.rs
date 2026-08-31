@@ -192,7 +192,7 @@ fn build_events(
     let tool_use_id = id::server_tool_use_id();
     let blocks = execution_blocks(execution_protocol(payload), &tool_use_id, execution);
     let output_tokens = output_tokens(&blocks.input, &blocks.result, &blocks.summary);
-    let start_usage = json!({
+    let mut start_usage = json!({
         "input_tokens": usage.input_tokens,
         "cache_creation_input_tokens": usage.cache_creation_input_tokens,
         "cache_read_input_tokens": usage.cache_read_input_tokens,
@@ -200,9 +200,12 @@ fn build_events(
             "ephemeral_5m_input_tokens": usage.cache_creation_5m_input_tokens,
             "ephemeral_1h_input_tokens": usage.cache_creation_1h_input_tokens
         },
-        "output_tokens": 4,
-        "service_tier": "standard"
+        "output_tokens": 4
     });
+    super::compat::apply_service_tier(
+        &payload.model,
+        start_usage.as_object_mut().expect("usage object"),
+    );
 
     let mut events = vec![SseEvent::new(
         "message_start",
@@ -312,6 +315,22 @@ fn non_stream_response(
     let tool_use_id = id::server_tool_use_id();
     let blocks = execution_blocks(execution_protocol(payload), &tool_use_id, execution);
     let output_tokens = output_tokens(&blocks.input, &blocks.result, &blocks.summary);
+    let mut response_usage = json!({
+        "input_tokens": usage.input_tokens,
+        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+        "cache_read_input_tokens": usage.cache_read_input_tokens,
+        "cache_creation": {
+            "ephemeral_5m_input_tokens": usage.cache_creation_5m_input_tokens,
+            "ephemeral_1h_input_tokens": usage.cache_creation_1h_input_tokens
+        },
+        "output_tokens": output_tokens,
+        "output_tokens_details": {"thinking_tokens": 0},
+        "server_tool_use": {"code_execution_requests": 1}
+    });
+    super::compat::apply_service_tier(
+        &payload.model,
+        response_usage.as_object_mut().expect("usage object"),
+    );
     let body = json!({
         "id": super::bedrock::response_id(&payload.model),
         "type": "message",
@@ -330,19 +349,7 @@ fn non_stream_response(
         "stop_reason": "end_turn",
         "stop_sequence": null,
         "stop_details": null,
-        "usage": {
-            "input_tokens": usage.input_tokens,
-            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-            "cache_read_input_tokens": usage.cache_read_input_tokens,
-            "cache_creation": {
-                "ephemeral_5m_input_tokens": usage.cache_creation_5m_input_tokens,
-                "ephemeral_1h_input_tokens": usage.cache_creation_1h_input_tokens
-            },
-            "output_tokens": output_tokens,
-            "output_tokens_details": {"thinking_tokens": 0},
-            "server_tool_use": {"code_execution_requests": 1},
-            "service_tier": "standard"
-        }
+        "usage": response_usage
     });
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -818,7 +825,12 @@ mod tests {
         assert!(
             events[0].data["message"]["id"]
                 .as_str()
-                .is_some_and(|id| id.starts_with("msg_bdrk_") && id.len() == 61)
+                .is_some_and(|id| id.starts_with("msg_01") && id.len() == 28)
+        );
+        assert!(
+            events[0].data["message"]["usage"]
+                .get("service_tier")
+                .is_none()
         );
         let starts = events
             .iter()
@@ -939,8 +951,9 @@ mod tests {
         assert!(
             body["id"]
                 .as_str()
-                .is_some_and(|id| id.starts_with("msg_bdrk_") && id.len() == 61)
+                .is_some_and(|id| id.starts_with("msg_01") && id.len() == 28)
         );
+        assert!(body["usage"].get("service_tier").is_none());
         assert_eq!(body["usage"]["input_tokens"], 1);
         assert_eq!(body["usage"]["cache_creation_input_tokens"], 0);
         assert_eq!(body["usage"]["cache_read_input_tokens"], 0);
