@@ -1659,6 +1659,19 @@ impl ResponseMeta {
             "usage": usage
         })
     }
+
+    fn uses_json_schema(&self) -> bool {
+        self.text.pointer("/format/type").and_then(Value::as_str) == Some("json_schema")
+    }
+}
+
+fn canonical_json_prefix(text: &str) -> Result<String, ()> {
+    serde_json::Deserializer::from_str(text)
+        .into_iter::<Value>()
+        .next()
+        .ok_or(())?
+        .map(|value| value.to_string())
+        .map_err(|_| ())
 }
 
 fn responses_usage(usage: &Value) -> Value {
@@ -1757,14 +1770,23 @@ fn anthropic_to_response(
     let mut output = Vec::new();
     let mut assistant_blocks = Vec::new();
     let mut tool_calls_seen = 0_usize;
+    let structured_completion = meta.uses_json_schema()
+        && !matches!(
+            anthropic.get("stop_reason").and_then(Value::as_str),
+            Some("tool_use" | "max_tokens")
+        );
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
             Some("text") => {
-                let value = block
+                let mut value = block
                     .get("text")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
+                if structured_completion {
+                    value = canonical_json_prefix(&value)
+                        .map_err(|()| "model response did not contain a complete JSON value")?;
+                }
                 output.push(new_message_output(vec![value.clone()]));
                 assistant_blocks.push(json!({"type": "text", "text": value}));
             }
@@ -2022,6 +2044,7 @@ impl ResponsesStreamState {
         let Some(delta) = event.get("delta") else {
             return String::new();
         };
+        let buffer_structured_text = self.meta.uses_json_schema();
         let Some(active) = self.active.get_mut(&block_index) else {
             return String::new();
         };
@@ -2038,6 +2061,9 @@ impl ResponsesStreamState {
                     .unwrap_or_default()
                     .to_string();
                 text.push_str(&value);
+                if buffer_structured_text {
+                    return String::new();
+                }
                 let item_id = item["id"].as_str().unwrap_or_default().to_string();
                 let output_index = *output_index;
                 let content_index = *content_index;
@@ -2093,8 +2119,25 @@ impl ResponsesStreamState {
                 output_index,
                 mut item,
                 content_index,
-                text,
+                mut text,
             } => {
+                let structured_text = self.meta.uses_json_schema();
+                if structured_text {
+                    text = match canonical_json_prefix(&text) {
+                        Ok(text) => text,
+                        Err(()) => {
+                            self.done = true;
+                            return self.event(
+                                "error",
+                                json!({
+                                    "code": "invalid_structured_output",
+                                    "message": "The model did not return a complete JSON value for the requested structured output.",
+                                    "param": "text.format"
+                                }),
+                            );
+                        }
+                    };
+                }
                 let item_id = item["id"].as_str().unwrap_or_default().to_string();
                 let part = json!({
                     "type": "output_text",
@@ -2108,7 +2151,19 @@ impl ResponsesStreamState {
                 self.assistant_blocks
                     .push(json!({"type": "text", "text": text.clone()}));
                 format!(
-                    "{}{}{}",
+                    "{}{}{}{}",
+                    structured_text
+                        .then(|| self.event(
+                            "response.output_text.delta",
+                            json!({
+                                "item_id": item_id,
+                                "output_index": output_index,
+                                "content_index": content_index,
+                                "delta": text,
+                                "logprobs": []
+                            })
+                        ))
+                        .unwrap_or_default(),
                     self.event(
                         "response.output_text.done",
                         json!({
@@ -3793,6 +3848,46 @@ other product, model, or company.";
     }
 
     #[test]
+    fn structured_nonstream_never_returns_text_after_first_json_value() {
+        let mut request = base_request("gpt-5.6-sol");
+        request["text"] = json!({
+            "format": {
+                "type": "json_schema",
+                "name": "workspace_summary",
+                "schema": {
+                    "type": "object",
+                    "properties": {"safe": {"type": "boolean"}},
+                    "required": ["safe"],
+                    "additionalProperties": false
+                },
+                "strict": true
+            }
+        });
+        let (_, meta) = translated_request(&request, "gpt-5.6-sol").unwrap();
+        let mapped = anthropic_to_response(
+            &json!({
+                "content": [
+                    {"type": "text", "text": "{\"safe\":true} 助手：ChatGPT。"}
+                ],
+                "stop_reason": "end_turn",
+                "usage": {}
+            }),
+            &meta,
+        )
+        .expect("valid JSON prefix must be preserved");
+
+        assert_eq!(
+            mapped.response["output"][0]["content"][0]["text"],
+            r#"{"safe":true}"#
+        );
+        assert_eq!(
+            mapped.assistant_message.unwrap().content[0]["text"],
+            r#"{"safe":true}"#
+        );
+        assert!(!mapped.response.to_string().contains("ChatGPT"));
+    }
+
+    #[test]
     fn nonstream_preserves_mixed_text_and_tool_output_order() {
         let meta = base_meta("gpt-5.6-sol");
         let mapped = anthropic_to_response(
@@ -3990,6 +4085,69 @@ other product, model, or company.";
             assert_eq!(event["type"], *event_name, "{event}");
             assert_eq!(event["sequence_number"], sequence, "{event}");
         }
+    }
+
+    #[test]
+    fn structured_stream_never_forwards_text_after_first_json_value() {
+        let mut request = base_request("gpt-5.6-sol");
+        request["text"] = json!({
+            "format": {
+                "type": "json_schema",
+                "name": "workspace_summary",
+                "schema": {
+                    "type": "object",
+                    "properties": {"safe": {"type": "boolean"}},
+                    "required": ["safe"],
+                    "additionalProperties": false
+                },
+                "strict": true
+            }
+        });
+        let (_, meta) = translated_request(&request, "gpt-5.6-sol").unwrap();
+        let mut state = ResponsesStreamState::new(meta);
+        let events = [
+            (
+                "message_start",
+                json!({"message": {"usage": {"input_tokens": 4, "output_tokens": 0}}}),
+            ),
+            (
+                "content_block_start",
+                json!({"index": 0, "content_block": {"type": "text", "text": ""}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index": 0, "delta": {"type": "text_delta", "text": "{\"safe\":true}"}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index": 0, "delta": {"type": "text_delta", "text": " 助手：ChatGPT。"}}),
+            ),
+            ("content_block_stop", json!({"index": 0})),
+            (
+                "message_delta",
+                json!({"usage": {"output_tokens": 4}, "delta": {"stop_reason": "end_turn"}}),
+            ),
+            ("message_stop", json!({"type": "message_stop"})),
+        ];
+        let output = events
+            .iter()
+            .map(|(name, event)| state.transform(name, event))
+            .collect::<String>();
+        let parsed = parsed_events(&output);
+        let deltas = parsed
+            .iter()
+            .filter(|(name, _)| name == "response.output_text.delta")
+            .filter_map(|(_, event)| event.get("delta").and_then(Value::as_str))
+            .collect::<String>();
+        let done = parsed
+            .iter()
+            .find(|(name, _)| name == "response.output_text.done")
+            .and_then(|(_, event)| event.get("text").and_then(Value::as_str));
+
+        assert_eq!(deltas, r#"{"safe":true}"#);
+        assert_eq!(done, Some(r#"{"safe":true}"#));
+        assert!(!output.contains("ChatGPT"), "{output}");
+        assert!(output.contains("event: response.completed"), "{output}");
     }
 
     #[test]
