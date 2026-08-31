@@ -3811,8 +3811,19 @@ async fn handle_non_stream_request(
             upstream_fatal_error = Some("truncated upstream event stream");
         }
 
-        let round_has_completion_evidence =
-            round_has_completed_tool_use || round_has_terminal_evidence;
+        // Opus 5 can return a complete buffered response containing only an
+        // assistantResponseEvent. Because the entire non-streaming body has
+        // already been read and decoded here, clean EOF plus non-empty model
+        // output is sufficient completion evidence for this compatibility
+        // fallback. Fatal events, refusals, and partial frames are still
+        // rejected by the guards below. Keep the streaming path strict: it
+        // cannot infer clean completion until its live response is finished.
+        let round_has_clean_opus_5_assistant_response = model_is_opus_5(model)
+            && round_has_assistant_content
+            && !chunk_text_content.trim().is_empty();
+        let round_has_completion_evidence = round_has_completed_tool_use
+            || round_has_terminal_evidence
+            || round_has_clean_opus_5_assistant_response;
         if continuation_round == 0
             && upstream_fatal_error.is_none()
             && round_has_completion_evidence
@@ -6936,6 +6947,143 @@ mod tests {
     use super::*;
     use crate::anthropic::types::MessagesRequest;
 
+    struct TestKiroEndpoint {
+        url: String,
+    }
+
+    impl crate::kiro::endpoint::KiroEndpoint for TestKiroEndpoint {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+
+        fn api_url(&self, _ctx: &crate::kiro::endpoint::RequestContext<'_>) -> String {
+            self.url.clone()
+        }
+
+        fn mcp_url(&self, _ctx: &crate::kiro::endpoint::RequestContext<'_>) -> String {
+            self.url.clone()
+        }
+
+        fn decorate_api(
+            &self,
+            req: reqwest::RequestBuilder,
+            _ctx: &crate::kiro::endpoint::RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            req
+        }
+
+        fn decorate_mcp(
+            &self,
+            req: reqwest::RequestBuilder,
+            _ctx: &crate::kiro::endpoint::RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            req
+        }
+
+        fn transform_api_body(
+            &self,
+            body: Bytes,
+            _ctx: &crate::kiro::endpoint::RequestContext<'_>,
+        ) -> Bytes {
+            body
+        }
+    }
+
+    fn eventstream_string_header(name: &str, value: &str, output: &mut Vec<u8>) {
+        output.push(name.len() as u8);
+        output.extend_from_slice(name.as_bytes());
+        output.push(7);
+        output.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        output.extend_from_slice(value.as_bytes());
+    }
+
+    fn eventstream_event(event_type: &str, payload: serde_json::Value) -> Vec<u8> {
+        let mut headers = Vec::new();
+        eventstream_string_header(":message-type", "event", &mut headers);
+        eventstream_string_header(":event-type", event_type, &mut headers);
+        eventstream_string_header(":content-type", "application/json", &mut headers);
+        let payload = serde_json::to_vec(&payload).expect("event payload JSON");
+
+        let total_len = 12 + headers.len() + payload.len() + 4;
+        let mut frame = Vec::with_capacity(total_len);
+        frame.extend_from_slice(&(total_len as u32).to_be_bytes());
+        frame.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        let prelude_crc = crate::kiro::parser::crc::crc32(&frame);
+        frame.extend_from_slice(&prelude_crc.to_be_bytes());
+        frame.extend_from_slice(&headers);
+        frame.extend_from_slice(&payload);
+        let message_crc = crate::kiro::parser::crc::crc32(&frame);
+        frame.extend_from_slice(&message_crc.to_be_bytes());
+        frame
+    }
+
+    async fn provider_serving_eventstream(
+        response_body: Vec<u8>,
+    ) -> (
+        std::sync::Arc<crate::kiro::provider::KiroProvider>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move || {
+                let response_body = response_body.clone();
+                async move {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/vnd.amazon.eventstream")
+                        .body(Body::from(response_body))
+                        .expect("test upstream response")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test upstream");
+        let address = listener.local_addr().expect("test upstream address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve test upstream");
+        });
+
+        let mut config = crate::model::config::Config::default();
+        config.default_endpoint = "test".to_string();
+        config.tls_sidecar_enabled = false;
+        let credentials = crate::kiro::model::credentials::KiroCredentials {
+            id: Some(1),
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some("ksk_test_cache_commit".to_string()),
+            machine_id: Some("00000000-0000-4000-8000-000000000001".to_string()),
+            endpoint: Some("test".to_string()),
+            ..Default::default()
+        };
+        let token_manager = crate::kiro::token_manager::MultiTokenManager::new(
+            config,
+            vec![credentials],
+            None,
+            None,
+            true,
+        )
+        .expect("test token manager");
+        let mut endpoints: std::collections::HashMap<
+            String,
+            std::sync::Arc<dyn crate::kiro::endpoint::KiroEndpoint>,
+        > = std::collections::HashMap::new();
+        endpoints.insert(
+            "test".to_string(),
+            std::sync::Arc::new(TestKiroEndpoint {
+                url: format!("http://{address}/"),
+            }),
+        );
+        let provider = crate::kiro::provider::KiroProvider::with_proxy(
+            std::sync::Arc::new(token_manager),
+            None,
+            endpoints,
+            "test".to_string(),
+        );
+        (std::sync::Arc::new(provider), server)
+    }
+
     fn legacy_identity_instruction_text(text: &str) -> String {
         let chars: Vec<char> = text.chars().collect();
         let mut result = String::with_capacity(text.len());
@@ -7738,6 +7886,184 @@ mod tests {
             .await;
             assert_eq!(second.cache_creation_input_tokens, 0, "{model}: no rewrite");
             assert!(second.cache_read_input_tokens > 0, "{model}: warm read");
+        }
+    }
+
+    #[tokio::test]
+    async fn opus_5_clean_assistant_only_nonstream_response_warms_next_prefix_match() {
+        let model = "claude-opus-5";
+        let unique_prefix = format!("opus-5-assistant-only-{} ", Uuid::new_v4());
+        let payload = parse(
+            model,
+            serde_json::json!({
+                "max_tokens": 150,
+                "system": [{
+                    "type": "text",
+                    "text": unique_prefix.repeat(2_000),
+                    "cache_control": {"type": "ephemeral"}
+                }],
+                "messages": [{
+                    "role": "user",
+                    "content": "Reply with exactly: CACHE_REGISTRY_WARM"
+                }]
+            }),
+        );
+        let total = 5_600;
+        let first = super::super::cache::compute_request_usage_breakdown_with_profile(
+            total, &payload, true,
+        )
+        .await;
+        assert!(
+            first.cache_creation_input_tokens > 0,
+            "first request is cold"
+        );
+        assert_eq!(
+            first.cache_read_input_tokens, 0,
+            "first request has no read"
+        );
+
+        let response_body = eventstream_event(
+            "assistantResponseEvent",
+            serde_json::json!({
+                "content": "CACHE_REGISTRY_WARM",
+                "messageStatus": "COMPLETED"
+            }),
+        );
+        let (provider, server) = provider_serving_eventstream(response_body).await;
+        let commit = super::super::cache::prepare_cache_commit(total, &payload, true);
+        let response = handle_non_stream_request(
+            provider,
+            "{}".to_string(),
+            model,
+            model,
+            total,
+            first,
+            super::super::bedrock::InputContextCalibration::default(),
+            false,
+            false,
+            false,
+            false,
+            std::collections::HashMap::new(),
+            150,
+            Vec::new(),
+            false,
+            request_identity_sanitization_context(&payload),
+            None,
+            false,
+            true,
+            commit,
+        )
+        .await;
+        server.abort();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let second = super::super::cache::compute_request_usage_breakdown_with_profile(
+            total, &payload, true,
+        )
+        .await;
+        assert_eq!(
+            second.cache_creation_input_tokens, 0,
+            "clean assistant-only completion must not be reported as another write"
+        );
+        assert!(
+            second.cache_read_input_tokens > 0,
+            "clean assistant-only completion must warm the next matching request"
+        );
+    }
+
+    #[tokio::test]
+    async fn opus_5_nonstream_fallback_rejects_empty_refused_fatal_and_truncated_responses() {
+        let assistant = || {
+            eventstream_event(
+                "assistantResponseEvent",
+                serde_json::json!({"content": "PARTIAL_OUTPUT"}),
+            )
+        };
+        let mut refused = assistant();
+        refused.extend(eventstream_event(
+            "metadataEvent",
+            serde_json::json!({"stopReason": "REFUSAL"}),
+        ));
+        let mut fatal = assistant();
+        fatal.extend(eventstream_event(
+            "invalidStateEvent",
+            serde_json::json!({"reason": "INVALID_STATE", "message": "rejected"}),
+        ));
+        let mut truncated = assistant();
+        truncated.truncate(truncated.len() - 1);
+
+        for (label, response_body) in [
+            (
+                "empty",
+                eventstream_event("assistantResponseEvent", serde_json::json!({"content": ""})),
+            ),
+            ("refused", refused),
+            ("fatal", fatal),
+            ("truncated", truncated),
+        ] {
+            let model = "claude-opus-5";
+            let unique_prefix = format!("opus-5-negative-{label}-{} ", Uuid::new_v4());
+            let payload = parse(
+                model,
+                serde_json::json!({
+                    "max_tokens": 150,
+                    "system": [{
+                        "type": "text",
+                        "text": unique_prefix.repeat(2_000),
+                        "cache_control": {"type": "ephemeral"}
+                    }],
+                    "messages": [{"role": "user", "content": "Reply briefly"}]
+                }),
+            );
+            let total = 5_600;
+            let first = super::super::cache::compute_request_usage_breakdown_with_profile(
+                total, &payload, true,
+            )
+            .await;
+            assert!(
+                first.cache_creation_input_tokens > 0,
+                "{label}: initially cold"
+            );
+
+            let (provider, server) = provider_serving_eventstream(response_body).await;
+            let commit = super::super::cache::prepare_cache_commit(total, &payload, true);
+            let _response = handle_non_stream_request(
+                provider,
+                "{}".to_string(),
+                model,
+                model,
+                total,
+                first,
+                super::super::bedrock::InputContextCalibration::default(),
+                false,
+                false,
+                false,
+                false,
+                std::collections::HashMap::new(),
+                150,
+                Vec::new(),
+                false,
+                request_identity_sanitization_context(&payload),
+                None,
+                false,
+                true,
+                commit,
+            )
+            .await;
+            server.abort();
+
+            let second = super::super::cache::compute_request_usage_breakdown_with_profile(
+                total, &payload, true,
+            )
+            .await;
+            assert!(
+                second.cache_creation_input_tokens > 0,
+                "{label}: unsafe response must remain cold"
+            );
+            assert_eq!(
+                second.cache_read_input_tokens, 0,
+                "{label}: unsafe response must not create a cache read"
+            );
         }
     }
 
