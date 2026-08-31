@@ -3592,6 +3592,7 @@ async fn handle_non_stream_request(
         let mut round_has_completed_tool_use = false;
         let mut round_has_terminal_evidence = false;
         let mut round_refused = false;
+        let mut round_unknown_native_stop_reason = false;
         stop_reason = "end_turn".to_string();
 
         for result in decoder.decode_iter() {
@@ -3741,6 +3742,7 @@ async fn handle_non_stream_request(
                                 .as_deref()
                                 .is_some_and(|reason| !reason.trim().is_empty())
                             {
+                                round_unknown_native_stop_reason = true;
                                 tracing::warn!(
                                     native_stop_reason = %metadata.stop_reason.as_deref().unwrap_or_default(),
                                     "忽略未知 Kiro stopReason，保留安全的本地终止推断"
@@ -3813,11 +3815,12 @@ async fn handle_non_stream_request(
         // already been read and decoded here, clean EOF plus non-empty model
         // output is sufficient completion evidence for this compatibility
         // fallback. Fatal events, refusals, and partial frames are still
-        // rejected by the guards below. Keep the streaming path strict: it
-        // cannot infer clean completion until its live response is finished.
+        // rejected by the guards below. The streaming paths apply the same
+        // fallback only after their live upstream response reaches clean EOF.
         let round_has_clean_opus_5_assistant_response = model_is_opus_5(model)
             && round_has_assistant_content
-            && !chunk_text_content.trim().is_empty();
+            && !chunk_text_content.trim().is_empty()
+            && !round_unknown_native_stop_reason;
         let round_has_completion_evidence = round_has_completed_tool_use
             || round_has_terminal_evidence
             || round_has_clean_opus_5_assistant_response;
@@ -7979,6 +7982,133 @@ mod tests {
         );
     }
 
+    async fn assert_opus_5_clean_assistant_only_stream_warms_next_prefix_match(buffered: bool) {
+        let model = "claude-opus-5";
+        let mode = if buffered { "buffered" } else { "live" };
+        let unique_prefix = format!("opus-5-{mode}-assistant-only-{} ", Uuid::new_v4());
+        let payload = parse(
+            model,
+            serde_json::json!({
+                "max_tokens": 150,
+                "stream": true,
+                "system": [{
+                    "type": "text",
+                    "text": unique_prefix.repeat(2_000),
+                    "cache_control": {"type": "ephemeral"}
+                }],
+                "messages": [{
+                    "role": "user",
+                    "content": "Reply with exactly: CACHE_REGISTRY_WARM"
+                }]
+            }),
+        );
+        let total = 5_600;
+        let first = super::super::cache::compute_request_usage_breakdown_with_profile(
+            total, &payload, true,
+        )
+        .await;
+        assert!(
+            first.cache_creation_input_tokens > 0,
+            "{mode}: first request is cold"
+        );
+        assert_eq!(
+            first.cache_read_input_tokens, 0,
+            "{mode}: first request has no read"
+        );
+
+        let response_body = eventstream_event(
+            "assistantResponseEvent",
+            serde_json::json!({
+                "content": "CACHE_REGISTRY_WARM",
+                "messageStatus": "COMPLETED"
+            }),
+        );
+        let (provider, server) = provider_serving_eventstream(response_body).await;
+        let commit = super::super::cache::prepare_cache_commit(total, &payload, true);
+        let response = if buffered {
+            handle_stream_request_buffered(
+                provider,
+                "{}".to_string(),
+                model.to_string(),
+                model.to_string(),
+                total,
+                first,
+                super::super::bedrock::InputContextCalibration::default(),
+                false,
+                false,
+                false,
+                std::collections::HashMap::new(),
+                150,
+                Vec::new(),
+                false,
+                request_identity_sanitization_context(&payload),
+                None,
+                false,
+                true,
+                false,
+                commit,
+            )
+            .await
+        } else {
+            handle_stream_request(
+                provider,
+                "{}".to_string(),
+                model.to_string(),
+                model.to_string(),
+                total,
+                first,
+                super::super::bedrock::InputContextCalibration::default(),
+                false,
+                false,
+                false,
+                std::collections::HashMap::new(),
+                150,
+                Vec::new(),
+                false,
+                request_identity_sanitization_context(&payload),
+                None,
+                false,
+                true,
+                false,
+                commit,
+            )
+            .await
+        };
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("stream response body");
+        server.abort();
+        assert_eq!(status, StatusCode::OK, "{mode}: response status");
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("message_stop"),
+            "{mode}: completed SSE response"
+        );
+
+        let second = super::super::cache::compute_request_usage_breakdown_with_profile(
+            total, &payload, true,
+        )
+        .await;
+        assert_eq!(
+            second.cache_creation_input_tokens, 0,
+            "{mode}: clean assistant-only completion must not be reported as another write"
+        );
+        assert!(
+            second.cache_read_input_tokens > 0,
+            "{mode}: clean assistant-only completion must warm the next matching request"
+        );
+    }
+
+    #[tokio::test]
+    async fn opus_5_clean_assistant_only_live_stream_warms_next_prefix_match() {
+        assert_opus_5_clean_assistant_only_stream_warms_next_prefix_match(false).await;
+    }
+
+    #[tokio::test]
+    async fn opus_5_clean_assistant_only_buffered_stream_warms_next_prefix_match() {
+        assert_opus_5_clean_assistant_only_stream_warms_next_prefix_match(true).await;
+    }
+
     #[tokio::test]
     async fn opus_5_nonstream_fallback_rejects_empty_refused_fatal_and_truncated_responses() {
         let assistant = || {
@@ -7999,6 +8129,11 @@ mod tests {
         ));
         let mut truncated = assistant();
         truncated.truncate(truncated.len() - 1);
+        let mut unknown_stop = assistant();
+        unknown_stop.extend(eventstream_event(
+            "metadataEvent",
+            serde_json::json!({"stopReason": "FUTURE_PROVIDER_REASON"}),
+        ));
 
         for (label, response_body) in [
             (
@@ -8008,6 +8143,7 @@ mod tests {
             ("refused", refused),
             ("fatal", fatal),
             ("truncated", truncated),
+            ("unknown-stop", unknown_stop),
         ] {
             let model = "claude-opus-5";
             let unique_prefix = format!("opus-5-negative-{label}-{} ", Uuid::new_v4());
