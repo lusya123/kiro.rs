@@ -63,6 +63,8 @@ pub(super) struct RawApiJson<T>(pub T, pub Bytes);
 struct RequestBodyMetadata {
     #[serde(default)]
     stop_sequences: Vec<serde_json::Value>,
+    #[serde(default)]
+    fallbacks: Option<serde_json::Value>,
 }
 
 impl RequestBodyMetadata {
@@ -76,6 +78,7 @@ impl RequestBodyMetadata {
                 .filter(|sequence| !sequence.is_empty())
                 .take(4)
                 .collect(),
+            fallbacks_requested: metadata.fallbacks.is_some(),
         })
     }
 }
@@ -83,6 +86,7 @@ impl RequestBodyMetadata {
 #[derive(Debug, Default)]
 struct ParsedRequestBodyMetadata {
     stop_sequences: Vec<String>,
+    fallbacks_requested: bool,
 }
 
 fn api_json_rejection_response(
@@ -2774,9 +2778,8 @@ pub async fn post_messages(
         message_count = %payload.messages.len(),
         "Received POST /v1/messages request"
     );
-    let stop_sequences = RequestBodyMetadata::parse(&raw_body)
-        .unwrap_or_default()
-        .stop_sequences;
+    let request_metadata = RequestBodyMetadata::parse(&raw_body).unwrap_or_default();
+    let stop_sequences = request_metadata.stop_sequences;
 
     let aws_b40_compat = state.aws_b40_compat;
     if let Some(response) = reject_unsupported_gpt_model(&payload.model, aws_b40_compat) {
@@ -2788,13 +2791,28 @@ pub async fn post_messages(
     if let Some(response) = reject_invalid_modern_sampling(&payload, aws_b40_compat) {
         return response;
     }
-
+    if let Some(response) = reject_invalid_message_sequence(&payload) {
+        return response;
+    }
     if let Some(provider) = state
         .bedrock_mantle_provider
         .as_ref()
         .filter(|provider| provider.should_route_messages(&payload))
     {
         return provider.proxy_messages(&headers, raw_body).await;
+    }
+    // Hybrid native-Bedrock deployments intentionally retain the existing
+    // Kiro fallback route for payloads the native provider cannot accept.
+    // The strict AWS-B probe contract applies to the standalone Kiro-backed
+    // public endpoint used by this distribution.
+    if state.bedrock_mantle_provider.is_none() {
+        if let Some(response) = reject_unavailable_aws_b_public_features(
+            &payload,
+            request_metadata.fallbacks_requested,
+            aws_b40_compat,
+        ) {
+            return response;
+        }
     }
     drop(raw_body);
 
@@ -2995,7 +3013,12 @@ pub async fn post_messages(
     // before choosing the response path so a successful in-process reply can
     // warm the same Redis prefix as a successful provider-backed reply.
     let cache_commit = super::cache::prepare_cache_commit(input_tokens, &payload, aws_b40_compat);
-    let compat_response = compat_direct_response(&payload, initial_usage_breakdown, aws_b40_compat);
+    let compat_response = compat_direct_response_with_constraints(
+        &payload,
+        initial_usage_breakdown,
+        aws_b40_compat,
+        &stop_sequences,
+    );
 
     // 检查是否启用了 thinking，以及是否向客户端暴露 thinking 块。
     let thinking_enabled = payload
@@ -5125,6 +5148,15 @@ fn compat_direct_response(
     usage_breakdown: super::cache::UsageBreakdown,
     aws_b40_compat: bool,
 ) -> Option<Response> {
+    compat_direct_response_with_constraints(payload, usage_breakdown, aws_b40_compat, &[])
+}
+
+fn compat_direct_response_with_constraints(
+    payload: &MessagesRequest,
+    usage_breakdown: super::cache::UsageBreakdown,
+    aws_b40_compat: bool,
+    stop_sequences: &[String],
+) -> Option<Response> {
     // GPT models must always reach the selected Kiro upstream model. The
     // compatibility replies below are Claude-specific local responses.
     if is_gpt_model(&payload.model) {
@@ -5278,7 +5310,30 @@ fn compat_direct_response(
             output_tokens = profile_direct_text_output_tokens(&text, aws_b40_compat);
         }
     }
+    let matched_stop_sequence = stop_sequences
+        .iter()
+        .filter(|sequence| !sequence.is_empty())
+        .filter_map(|sequence| text.find(sequence).map(|index| (index, sequence.clone())))
+        .min_by_key(|(index, _)| *index)
+        .map(|(index, sequence)| {
+            text.truncate(index);
+            sequence
+        });
+    let output_truncated = super::claude_tok::count_claude(&text) > payload.max_tokens.max(1);
+    if output_truncated {
+        text = truncate_to_claude_token_limit(&text, payload.max_tokens.max(1));
+    }
+    if matched_stop_sequence.is_some() || output_truncated {
+        output_tokens = profile_direct_text_output_tokens(&text, aws_b40_compat);
+    }
     let output_tokens = output_tokens.min(payload.max_tokens.max(1));
+    let stop_reason = if output_truncated {
+        "max_tokens"
+    } else if matched_stop_sequence.is_some() {
+        "stop_sequence"
+    } else {
+        "end_turn"
+    };
     let usage_breakdown = if aws_b40_compat {
         super::cache::finalize_request_usage(usage_breakdown, &payload.model)
     } else {
@@ -5329,16 +5384,19 @@ fn compat_direct_response(
             output_tokens,
             thinking_tokens,
             aws_b40_compat,
+            stop_reason,
+            matched_stop_sequence.as_deref(),
         ));
     }
 
     let total_output_tokens =
         output_tokens + thinking_tokens + if thinking_tokens > 0 { 2 } else { 0 };
     if aws_b40_compat {
-        return Some(super::bedrock::non_stream_response(
+        return Some(super::bedrock::non_stream_response_with_stop_sequence(
             &payload.model,
             &content,
-            "end_turn",
+            stop_reason,
+            matched_stop_sequence.as_deref(),
             usage_breakdown,
             total_output_tokens,
             thinking_tokens,
@@ -5351,8 +5409,8 @@ fn compat_direct_response(
         "type": "message",
         "role": "assistant",
         "content": content,
-        "stop_reason": "end_turn",
-        "stop_sequence": null,
+        "stop_reason": stop_reason,
+        "stop_sequence": matched_stop_sequence,
         "stop_details": null,
         "usage": super::compat::usage(
             &payload.model,
@@ -5467,6 +5525,8 @@ fn compat_direct_stream_response(
     output_tokens: i32,
     thinking_tokens: i32,
     aws_b40_compat: bool,
+    stop_reason: &str,
+    matched_stop_sequence: Option<&str>,
 ) -> Response {
     let message_id = if aws_b40_compat {
         super::bedrock::response_id(&payload.model)
@@ -5638,8 +5698,8 @@ fn compat_direct_stream_response(
         json!({
             "type": "message_delta",
             "delta": {
-                "stop_reason": "end_turn",
-                "stop_sequence": null,
+                "stop_reason": stop_reason,
+                "stop_sequence": matched_stop_sequence,
                 "stop_details": null
             },
             "usage": delta_usage
@@ -5767,6 +5827,26 @@ fn reject_invalid_modern_sampling(
     payload: &MessagesRequest,
     aws_b40_compat: bool,
 ) -> Option<Response> {
+    if !aws_b40_compat {
+        return None;
+    }
+
+    if payload
+        .temperature
+        .is_some_and(|temperature| !(0.0..=1.0).contains(&temperature))
+    {
+        return Some(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    "`temperature` must be between 0 and 1",
+                )),
+            )
+                .into_response(),
+        );
+    }
+
     let model = super::converter::map_model(&payload.model);
     let rejects_sampling = model.as_deref().is_some_and(|model| {
         matches!(
@@ -5774,7 +5854,7 @@ fn reject_invalid_modern_sampling(
             "claude-opus-5" | "claude-opus-4.8" | "claude-opus-4.7" | "claude-sonnet-5"
         )
     });
-    if !aws_b40_compat || !rejects_sampling {
+    if !rejects_sampling {
         return None;
     }
     let model_name = payload.model.as_str();
@@ -5806,6 +5886,144 @@ fn reject_invalid_modern_sampling(
         )
             .into_response(),
     )
+}
+
+/// AWS-B exposes Amazon Bedrock's public capability boundary on `/v1/messages`.
+/// Compatibility extensions remain available on `/cc/v1/messages`, but the
+/// public endpoint must fail closed instead of silently emulating unsupported
+/// Anthropic server-side features.
+fn reject_unavailable_aws_b_public_features(
+    payload: &MessagesRequest,
+    fallbacks_requested: bool,
+    aws_b40_compat: bool,
+) -> Option<Response> {
+    if !aws_b40_compat {
+        return None;
+    }
+
+    let message = if fallbacks_requested {
+        Some("`fallbacks` is not supported on Amazon Bedrock".to_string())
+    } else if let Some((index, tool_type)) = payload.tools.as_ref().and_then(|tools| {
+        tools.iter().enumerate().find_map(|(index, tool)| {
+            let tool_type = tool.tool_type.as_deref()?;
+            (tool_type.starts_with("web_search_")
+                || tool_type.starts_with("advisor_")
+                || tool_type.starts_with("code_execution_"))
+            .then_some((index, tool_type))
+        })
+    }) {
+        Some(format!(
+            "tools.{index}.type: `{tool_type}` is not supported on this endpoint"
+        ))
+    } else if payload
+        .output_config
+        .as_ref()
+        .is_some_and(|output_config| output_config.format.is_some())
+    {
+        Some("`output_config.format` is not supported on this endpoint".to_string())
+    } else if payload
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.thinking_type == "enabled")
+        && modern_claude_rejects_assistant_prefill(&payload.model)
+    {
+        Some(
+            "`thinking.type.enabled` is not supported for this model. Use `thinking.type.adaptive` and `output_config.effort` instead."
+                .to_string(),
+        )
+    } else if payload
+        .messages
+        .iter()
+        .any(|message| content_contains_url_image(&message.content))
+    {
+        Some("URL image sources are not supported; use a base64 image source".to_string())
+    } else {
+        None
+    }?;
+
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invalid_request_error", message)),
+        )
+            .into_response(),
+    )
+}
+
+fn content_contains_url_image(content: &serde_json::Value) -> bool {
+    content.as_array().into_iter().flatten().any(|block| {
+        match block.get("type").and_then(serde_json::Value::as_str) {
+            Some("image") => image_block_uses_url_source(block),
+            Some("tool_result") => block
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|result_block| {
+                    result_block.get("type").and_then(serde_json::Value::as_str) == Some("image")
+                        && image_block_uses_url_source(result_block)
+                }),
+            _ => false,
+        }
+    })
+}
+
+fn image_block_uses_url_source(block: &serde_json::Value) -> bool {
+    block
+        .get("source")
+        .and_then(|source| source.get("type"))
+        .and_then(serde_json::Value::as_str)
+        == Some("url")
+}
+
+/// Validate message ordering before any upstream routing or compatibility
+/// conversion can silently discard an unsupported message.
+fn reject_invalid_message_sequence(payload: &MessagesRequest) -> Option<Response> {
+    let message = if payload
+        .messages
+        .first()
+        .is_some_and(|message| message.role == "system")
+    {
+        Some(
+            "A system message cannot be the first entry in `messages`; use the top-level `system` field instead."
+                .to_string(),
+        )
+    } else {
+        let rejects_assistant_prefill = modern_claude_rejects_assistant_prefill(&payload.model);
+        (rejects_assistant_prefill
+            && payload
+                .messages
+                .last()
+                .is_some_and(|message| message.role == "assistant"))
+        .then(|| {
+            "This model does not support assistant message prefill. The conversation must end with a user message."
+                .to_string()
+        })
+    }?;
+
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invalid_request_error", message)),
+        )
+            .into_response(),
+    )
+}
+
+fn modern_claude_rejects_assistant_prefill(model: &str) -> bool {
+    super::converter::map_model(model)
+        .as_deref()
+        .is_some_and(|model| {
+            matches!(
+                model,
+                "claude-sonnet-4.6"
+                    | "claude-sonnet-5"
+                    | "claude-opus-4.6"
+                    | "claude-opus-4.7"
+                    | "claude-opus-4.8"
+                    | "claude-opus-5"
+            )
+        })
 }
 
 /// 规整 thinking / output_config，使请求与 Kiro 上游标准一致
@@ -6058,6 +6276,9 @@ pub async fn post_messages_cc(
     if let Some(response) = reject_invalid_modern_sampling(&payload, aws_b40_compat) {
         return response;
     }
+    if let Some(response) = reject_invalid_message_sequence(&payload) {
+        return response;
+    }
 
     if let Some(provider) = state
         .bedrock_mantle_provider
@@ -6253,7 +6474,12 @@ pub async fn post_messages_cc(
     };
 
     let cache_commit = super::cache::prepare_cache_commit(input_tokens, &payload, aws_b40_compat);
-    let compat_response = compat_direct_response(&payload, initial_usage_breakdown, aws_b40_compat);
+    let compat_response = compat_direct_response_with_constraints(
+        &payload,
+        initial_usage_breakdown,
+        aws_b40_compat,
+        &stop_sequences,
+    );
 
     // 检查是否启用了 thinking，以及是否向客户端暴露 thinking 块。
     let thinking_enabled = payload
@@ -8009,6 +8235,55 @@ mod tests {
         assert_eq!(body["usage"]["service_tier"], "standard");
         assert_eq!(body["usage"]["input_tokens"], 15);
         assert_eq!(body["usage"]["output_tokens"], 4);
+    }
+
+    #[tokio::test]
+    async fn aws_b_direct_reply_honors_max_tokens_in_text_and_stop_reason() {
+        let req = parse(
+            "claude-sonnet-4-6",
+            serde_json::json!({
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "Reply exactly MODEL_OK"}]
+            }),
+        );
+        let response =
+            compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(15), true)
+                .expect("AWS-B literal reply should remain deterministic");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON response");
+        let text = body["content"][0]["text"].as_str().expect("text response");
+
+        assert_eq!(body["stop_reason"], "max_tokens");
+        assert!(super::super::claude_tok::count_claude(text) <= 1, "{text}");
+        assert_eq!(body["usage"]["output_tokens"], 1);
+    }
+
+    #[tokio::test]
+    async fn aws_b_direct_reply_honors_stop_sequences() {
+        let req = parse(
+            "claude-sonnet-4-6",
+            serde_json::json!({
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "Reply exactly: ALPHA<STOP>BETA"}]
+            }),
+        );
+        let response = compat_direct_response_with_constraints(
+            &req,
+            super::super::cache::UsageBreakdown::flat(15),
+            true,
+            &["<STOP>".to_string()],
+        )
+        .expect("AWS-B literal reply should remain deterministic");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON response");
+
+        assert_eq!(body["content"][0]["text"], "ALPHA");
+        assert_eq!(body["stop_reason"], "stop_sequence");
+        assert_eq!(body["stop_sequence"], "<STOP>");
     }
 
     #[tokio::test]
