@@ -1572,32 +1572,78 @@ fn forced_tool_choice_instruction(
 ) -> Option<String> {
     let tool_choice = req.tool_choice.as_ref()?;
     match tool_choice.get("type").and_then(serde_json::Value::as_str) {
-        Some("any") if req.tools.as_ref().is_some_and(|tools| !tools.is_empty()) => Some(
-            "Tool-use requirement: Call one of the provided tools. Populate every field listed in the selected tool's required schema from the user's request; do not send an empty input object when required fields exist. Return the tool call only, with no explanatory text before or after it."
-                .to_string(),
-        ),
+        Some("any") => {
+            let tools = req.tools.as_ref()?;
+            if tools.is_empty() {
+                return None;
+            }
+
+            let selected = if tools.len() == 1 {
+                tools.first()
+            } else {
+                let latest_user = req
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == "user");
+                let mut user_text = String::new();
+                if let Some(message) = latest_user {
+                    append_text_content(&message.content, &mut user_text);
+                }
+                tools
+                    .iter()
+                    .find(|tool| explicitly_requests_named_tool(&user_text, &tool.name))
+            };
+
+            selected
+                .and_then(|tool| forced_named_tool_instruction(tool, tool_name_map))
+                .or_else(|| {
+                    Some(
+                        "Tool-use requirement: Call one of the provided tools. Populate every field listed in the selected tool's required schema from the user's request; do not send an empty input object when required fields exist. Return the tool call only, with no explanatory text before or after it."
+                            .to_string(),
+                    )
+                })
+        }
         Some("tool") => {
             let requested_name = tool_choice
                 .get("name")
                 .and_then(serde_json::Value::as_str)?;
-            let tool_exists = req
+            let tool = req
                 .tools
-                .as_ref()
-                .is_some_and(|tools| tools.iter().any(|tool| tool.name == requested_name));
-            if !tool_exists {
-                return None;
-            }
-            let upstream_name = tool_name_map
+                .as_ref()?
                 .iter()
-                .find_map(|(short, original)| (original == requested_name).then_some(short.as_str()))
-                .unwrap_or(requested_name);
-            let quoted_name = serde_json::to_string(upstream_name).ok()?;
-            Some(format!(
-                "Tool-use requirement: You must call the provided tool named {quoted_name}. Populate every field listed in that tool's required schema from the user's request; do not send an empty input object when required fields exist. Return that tool call only, with no explanatory text before or after it."
-            ))
+                .find(|tool| tool.name == requested_name)?;
+            forced_named_tool_instruction(tool, tool_name_map)
         }
         _ => None,
     }
+}
+
+fn forced_named_tool_instruction(
+    tool: &super::types::Tool,
+    tool_name_map: &HashMap<String, String>,
+) -> Option<String> {
+    let upstream_name = tool_name_map
+        .iter()
+        .find_map(|(short, original)| (original == &tool.name).then_some(short.as_str()))
+        .unwrap_or(&tool.name);
+    let required = tool
+        .input_schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let quoted_name = serde_json::to_string(upstream_name).ok()?;
+    let quoted_required = serde_json::to_string(&required).ok()?;
+    let quoted_schema = serde_json::to_string(&tool.input_schema).ok()?;
+    Some(format!(
+        "Tool-use requirement: You must call the provided tool named {quoted_name}. Its JSON input must match this exact schema: {quoted_schema}. Required field names are {quoted_required}. Populate every field listed in that schema from the user's request and copy explicitly requested values exactly, including enum literals. Never send an empty JSON input object when required fields exist; do not send an empty input object. Return that tool call only, with no explanatory text before or after it."
+    ))
 }
 
 fn normalize_tool_request_tokens(text: &str) -> String {
@@ -3422,6 +3468,76 @@ mod tests {
                 .content
                 .contains("Tool-use requirement")
         );
+    }
+
+    #[test]
+    fn captured_ztest_any_tool_gets_the_exact_schema_contract() {
+        use super::super::types::{
+            Message as AnthropicMessage, SystemMessage, Tool as AnthropicTool,
+        };
+
+        let tool = AnthropicTool {
+            name: "get_weather".to_string(),
+            description: "Get the current weather for a given city.".to_string(),
+            input_schema: HashMap::from([
+                ("type".to_string(), serde_json::json!("object")),
+                (
+                    "properties".to_string(),
+                    serde_json::json!({
+                        "city": {
+                            "description": "The city name.",
+                            "type": "string"
+                        },
+                        "unit": {
+                            "description": "Temperature unit.",
+                            "enum": ["celsius", "fahrenheit"],
+                            "type": "string"
+                        }
+                    }),
+                ),
+                ("required".to_string(), serde_json::json!(["city", "unit"])),
+            ]),
+            tool_type: None,
+            strict: None,
+            max_uses: None,
+            cache_control: None,
+        };
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 256,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([{
+                    "text": "You MUST call the get_weather tool to look up the current weather in Exampleville-0d07955a. Use unit=celsius. Do NOT reply in plain text - only a tool call counts as a valid answer.",
+                    "type": "text"
+                }]),
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
+                cache_control: None,
+            }]),
+            tools: Some(vec![tool]),
+            tool_choice: Some(serde_json::json!({"type": "any"})),
+            thinking: None,
+            output_config: None,
+            reasoning: None,
+            cache_control: None,
+            metadata: None,
+        };
+
+        let converted = convert_request(&req).expect("captured ZTest request converts");
+        let Some(Message::User(system)) = converted.conversation_state.history.first() else {
+            panic!("forced tool contract should be injected");
+        };
+        let system_text = &system.user_input_message.content;
+        assert!(system_text.contains("provided tool named \"get_weather\""));
+        assert!(system_text.contains("Required field names are [\"city\",\"unit\"]"));
+        assert!(system_text.contains("\"enum\":[\"celsius\",\"fahrenheit\"]"));
+        assert!(system_text.contains("Never send an empty JSON input object"));
     }
 
     #[test]
