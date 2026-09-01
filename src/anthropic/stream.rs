@@ -2630,6 +2630,7 @@ impl StreamContext {
         // block, before any argument bytes arrive.
         if self.aws_b40_compat
             && new_tool_block
+            && !self.suppress_text_blocks
             && let Some(delta_event) = self.state_manager.handle_content_block_delta(
                 block_index,
                 json!({
@@ -5764,6 +5765,10 @@ mod tests {
                 .iter()
                 .any(|event| event.data["delta"]["type"] == "signature_delta")
         );
+        assert!(events.iter().all(|event| {
+            event.data["delta"]["type"] != "input_json_delta"
+                || event.data["delta"]["partial_json"] != ""
+        }));
     }
 
     #[test]
