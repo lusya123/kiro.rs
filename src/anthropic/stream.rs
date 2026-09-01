@@ -1676,7 +1676,9 @@ impl StreamContext {
         // Opus 通常不返回 thinking，因此可能准备了合成块。但上游仍可能在特定提示下
         // 返回真实 <thinking>。真实块必须优先走专用严格清洗，不能在合成块之后被当成正文。
         if self.pending_synthetic_thinking.is_some() {
-            if find_real_thinking_start_tag(&self.thinking_buffer).is_some() {
+            if self.suppress_text_blocks {
+                self.pending_synthetic_thinking = None;
+            } else if find_real_thinking_start_tag(&self.thinking_buffer).is_some() {
                 self.pending_synthetic_thinking = None;
             } else if could_still_start_with_thinking_tag(&self.thinking_buffer) {
                 return events;
@@ -3093,7 +3095,9 @@ impl StreamContext {
         }
 
         if let Some(synth) = self.pending_synthetic_thinking.take() {
-            events.extend(self.emit_synthetic_thinking_block(&synth));
+            if !self.suppress_text_blocks {
+                events.extend(self.emit_synthetic_thinking_block(&synth));
+            }
         }
 
         // Flush thinking_buffer 中的剩余内容。
@@ -5728,12 +5732,15 @@ mod tests {
         ctx.set_synthetic_thinking(Some("synthetic fallback".to_string()));
         ctx.set_suppress_text_blocks(true);
 
-        let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
-            name: "get_weather".to_string(),
-            tool_use_id: "toolu_bdrk_forced_index_zero".to_string(),
-            input: "{\"city\":\"Exampleville\"}".to_string(),
-            stop: true,
-        });
+        let mut events = ctx.process_assistant_response("I'll call the tool now.");
+        events.extend(
+            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "get_weather".to_string(),
+                tool_use_id: "toolu_bdrk_forced_index_zero".to_string(),
+                input: "{\"city\":\"Exampleville\"}".to_string(),
+                stop: true,
+            }),
+        );
         let block_starts = events
             .iter()
             .filter(|event| event.event == "content_block_start")
