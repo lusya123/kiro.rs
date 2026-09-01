@@ -3043,6 +3043,7 @@ pub async fn post_messages(
     let stream_requested = payload.stream;
     let requested_max_tokens = payload.max_tokens;
     let force_tool_only = tool_choice_forces_tool(&payload);
+    log_forced_tool_request_diagnostic(&payload, forced_tool_input_repair.is_some());
     let requested_model = std::mem::take(&mut payload.model);
     drop(payload);
 
@@ -5108,6 +5109,30 @@ fn forced_tool_input_repair(
     })
 }
 
+fn log_forced_tool_request_diagnostic(payload: &MessagesRequest, repair_context_present: bool) {
+    if !tool_choice_forces_tool(payload) {
+        return;
+    }
+    let choice_kind = match payload
+        .tool_choice
+        .as_ref()
+        .and_then(|choice| choice.get("type"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("tool") => "tool",
+        Some("any") => "any",
+        _ => "unknown",
+    };
+    tracing::info!(
+        diagnostic = "forced_tool_request_shape",
+        stream = payload.stream,
+        choice_kind,
+        tools_count = payload.tools.as_ref().map_or(0, Vec::len),
+        repair_context_present,
+        "Forced tool request shape diagnostic"
+    );
+}
+
 fn extract_forced_tool_string_value(text: &str, field: &str, tool_name: &str) -> Option<String> {
     extract_named_assignment(text, field).or_else(|| {
         let field = field.to_ascii_lowercase();
@@ -6671,6 +6696,7 @@ pub async fn post_messages_cc(
     let stream_requested = payload.stream;
     let requested_max_tokens = payload.max_tokens;
     let force_tool_only = tool_choice_forces_tool(&payload);
+    log_forced_tool_request_diagnostic(&payload, forced_tool_input_repair.is_some());
     let requested_model = std::mem::take(&mut payload.model);
     drop(payload);
 
