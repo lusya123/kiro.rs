@@ -1054,6 +1054,22 @@ pub(super) fn select_first_round_reconciled_input(
     .then_some(resolved_aggregate_input.max(1))
 }
 
+fn forced_tool_input_json_kind(input: &str) -> &'static str {
+    if input.trim().is_empty() {
+        return "empty";
+    }
+    match serde_json::from_str::<serde_json::Value>(input) {
+        Ok(serde_json::Value::Object(object)) if object.is_empty() => "object_empty",
+        Ok(serde_json::Value::Object(_)) => "object_nonempty",
+        Ok(serde_json::Value::Array(_)) => "array",
+        Ok(serde_json::Value::String(_)) => "string",
+        Ok(serde_json::Value::Number(_)) => "number",
+        Ok(serde_json::Value::Bool(_)) => "bool",
+        Ok(serde_json::Value::Null) => "null",
+        Err(_) => "invalid",
+    }
+}
+
 impl StreamContext {
     /// 创建启用thinking的StreamContext
     pub fn new_with_thinking(
@@ -2632,20 +2648,39 @@ impl StreamContext {
                 .tool_input_acc
                 .remove(&tool_use.tool_use_id)
                 .unwrap_or_default();
+            let repair_context_present = self.forced_tool_input_repair.is_some();
+            let repair_tool_name_match =
+                self.forced_tool_input_repair
+                    .as_ref()
+                    .is_some_and(|repair| {
+                        repair.tool_name == tool_use.name || repair.tool_name == original_name
+                    });
+            let input_json_kind = forced_tool_input_json_kind(&complete_input);
             let repair_input = self
                 .forced_tool_input_repair
                 .as_ref()
-                .filter(|repair| {
+                .filter(|_| {
                     self.suppress_text_blocks
-                        && (repair.tool_name == tool_use.name || repair.tool_name == original_name)
-                        && (complete_input.trim().is_empty()
-                            || matches!(
-                                serde_json::from_str::<serde_json::Value>(&complete_input),
-                                Ok(serde_json::Value::Object(ref object)) if object.is_empty()
-                            ))
+                        && repair_tool_name_match
+                        && matches!(input_json_kind, "empty" | "object_empty")
                 })
                 .and_then(|repair| serde_json::to_string(&repair.input).ok());
             repaired_complete_input = repair_input.is_some();
+            if self.suppress_text_blocks {
+                tracing::info!(
+                    diagnostic = "forced_tool_input_shape",
+                    path = "stop_frame",
+                    stop = true,
+                    repair_context_present,
+                    suppress_text_blocks = self.suppress_text_blocks,
+                    tool_name_match = repair_tool_name_match,
+                    input_bytes = complete_input.len(),
+                    trimmed_empty = complete_input.trim().is_empty(),
+                    json_kind = input_json_kind,
+                    repair_applied = repaired_complete_input,
+                    "Forced tool input shape diagnostic"
+                );
+            }
             let effective_input = repair_input.as_deref().unwrap_or(&complete_input);
             let mut parsed_input = serde_json::from_str::<serde_json::Value>(effective_input).ok();
             if let (Some(options), Some(value)) = (tool_identity_options, parsed_input.as_mut()) {
@@ -2793,22 +2828,41 @@ impl StreamContext {
                 .tool_input_acc
                 .remove(&id)
                 .unwrap_or_else(|| input.clone());
-            let repair_input = self
-                .forced_tool_input_repair
-                .as_ref()
-                .filter(|repair| {
-                    self.suppress_text_blocks
-                        && self.tool_names_by_id.get(&id).is_some_and(|name| {
+            let repair_context_present = self.forced_tool_input_repair.is_some();
+            let repair_tool_name_match =
+                self.forced_tool_input_repair
+                    .as_ref()
+                    .is_some_and(|repair| {
+                        self.tool_names_by_id.get(&id).is_some_and(|name| {
                             repair.tool_name == *name
                                 || self.tool_name_map.get(name) == Some(&repair.tool_name)
                         })
-                        && (complete_input.trim().is_empty()
-                            || matches!(
-                                serde_json::from_str::<serde_json::Value>(&complete_input),
-                                Ok(serde_json::Value::Object(ref object)) if object.is_empty()
-                            ))
+                    });
+            let input_json_kind = forced_tool_input_json_kind(&complete_input);
+            let repair_input = self
+                .forced_tool_input_repair
+                .as_ref()
+                .filter(|_| {
+                    self.suppress_text_blocks
+                        && repair_tool_name_match
+                        && matches!(input_json_kind, "empty" | "object_empty")
                 })
                 .and_then(|repair| serde_json::to_string(&repair.input).ok());
+            if self.suppress_text_blocks {
+                tracing::info!(
+                    diagnostic = "forced_tool_input_shape",
+                    path = "end_of_stream",
+                    stop = false,
+                    repair_context_present,
+                    suppress_text_blocks = self.suppress_text_blocks,
+                    tool_name_match = repair_tool_name_match,
+                    input_bytes = complete_input.len(),
+                    trimmed_empty = complete_input.trim().is_empty(),
+                    json_kind = input_json_kind,
+                    repair_applied = repair_input.is_some(),
+                    "Forced tool input shape diagnostic"
+                );
+            }
             let effective_input = repair_input.as_deref().unwrap_or(&input);
             if let Some(repair_input) = repair_input.as_ref() {
                 if let Some(start) = self.output_text_acc.rfind(&complete_input) {
