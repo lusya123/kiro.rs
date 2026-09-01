@@ -2487,10 +2487,15 @@ impl StreamContext {
         }
 
         // A tool-only upstream response has no assistant text event to trigger
-        // the pending synthetic thinking block. Emit it before opening the tool
-        // block so content ordering remains valid.
+        // the pending synthetic thinking block. Emit it before an ordinary
+        // auto-selected tool. A forced-tool response must remain a single
+        // index-0 tool block: some Anthropic clients bind JSON deltas to the
+        // first content block even though they still recognize a later tool
+        // start, which otherwise turns a valid input into an observed `{}`.
         if let Some(synth) = self.pending_synthetic_thinking.take() {
-            events.extend(self.emit_synthetic_thinking_block(&synth));
+            if !self.suppress_text_blocks {
+                events.extend(self.emit_synthetic_thinking_block(&synth));
+            }
         }
 
         // tool_use 必须发生在 thinking 结束之后。
@@ -5713,6 +5718,39 @@ mod tests {
             })
             .expect("tool block");
         assert!(signature_position < tool_position);
+    }
+
+    #[test]
+    fn forced_tool_response_keeps_tool_at_index_zero_without_synthetic_thinking() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 1, true, true, HashMap::new());
+        ctx.enable_aws_b40_compat();
+        ctx.set_synthetic_thinking(Some("synthetic fallback".to_string()));
+        ctx.set_suppress_text_blocks(true);
+
+        let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "get_weather".to_string(),
+            tool_use_id: "toolu_bdrk_forced_index_zero".to_string(),
+            input: "{\"city\":\"Exampleville\"}".to_string(),
+            stop: true,
+        });
+        let block_starts = events
+            .iter()
+            .filter(|event| event.event == "content_block_start")
+            .map(|event| {
+                (
+                    event.data["index"].as_i64(),
+                    event.data["content_block"]["type"].as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(block_starts, vec![(Some(0), Some("tool_use"))]);
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.data["delta"]["type"] == "signature_delta")
+        );
     }
 
     #[test]
