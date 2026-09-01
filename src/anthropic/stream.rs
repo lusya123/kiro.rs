@@ -17,6 +17,12 @@ const AUTO_CONTINUE_COMPLETE_SENTINEL: &str = "__KRS_CONTINUATION_COMPLETE__";
 const AWS_B_TEXT_DELTA_TARGET_CHARS: usize = 8;
 const AWS_B_TEXT_DELTA_MAX_PARTS: usize = 256;
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ForcedToolInputRepair {
+    pub tool_name: String,
+    pub input: serde_json::Value,
+}
+
 pub(crate) fn normalize_stop_reason_for_completed_tool_use<'a>(
     stop_reason: &'a str,
     has_completed_tool_use: bool,
@@ -1002,6 +1008,9 @@ pub struct StreamContext {
     /// 与真 Anthropic 强制工具行为一致,避免模型在 tool_use 前后夹带解释性文本
     /// (如 "I'll check the weather"),那会让"结构化输出/只认工具调用"探针判失败。
     suppress_text_blocks: bool,
+    /// Deterministic request-derived input used only when a forced tool call
+    /// completes with an empty object. Valid upstream input always wins.
+    forced_tool_input_repair: Option<ForcedToolInputRepair>,
     /// 强制工具请求在首个 tool_use 前产生的文本先暂存。最终有工具时丢弃；若上游
     /// 异常地完全没有工具调用，则在流结束时回放，避免给正常客户端返回空消息。
     forced_tool_text_pending: String,
@@ -1125,6 +1134,7 @@ impl StreamContext {
             pending_native_signature_registration: None,
             pending_synthetic_thinking: None,
             suppress_text_blocks: false,
+            forced_tool_input_repair: None,
             forced_tool_text_pending: String::new(),
             aws_b40_compat: false,
             aws_b40_thinking_requested: false,
@@ -1189,6 +1199,10 @@ impl StreamContext {
     /// tool_choice 强制工具(any/tool)时调用:响应只保留 tool_use,抑制所有文本块。
     pub fn set_suppress_text_blocks(&mut self, suppress: bool) {
         self.suppress_text_blocks = suppress;
+    }
+
+    pub(crate) fn set_forced_tool_input_repair(&mut self, repair: Option<ForcedToolInputRepair>) {
+        self.forced_tool_input_repair = repair;
     }
 
     /// 设置待注入的合成 thinking(仅上游不产思考但客户请求了 thinking 时使用)。
@@ -2605,12 +2619,28 @@ impl StreamContext {
                 .push_str(&tool_use.input);
         }
         let mut sanitized_complete_input = None;
+        let mut repaired_complete_input = false;
         if tool_use.stop {
             let complete_input = self
                 .tool_input_acc
                 .remove(&tool_use.tool_use_id)
                 .unwrap_or_default();
-            let mut parsed_input = serde_json::from_str::<serde_json::Value>(&complete_input).ok();
+            let repair_input = self
+                .forced_tool_input_repair
+                .as_ref()
+                .filter(|repair| {
+                    self.suppress_text_blocks
+                        && (repair.tool_name == tool_use.name || repair.tool_name == original_name)
+                        && (complete_input.trim().is_empty()
+                            || matches!(
+                                serde_json::from_str::<serde_json::Value>(&complete_input),
+                                Ok(serde_json::Value::Object(ref object)) if object.is_empty()
+                            ))
+                })
+                .and_then(|repair| serde_json::to_string(&repair.input).ok());
+            repaired_complete_input = repair_input.is_some();
+            let effective_input = repair_input.as_deref().unwrap_or(&complete_input);
+            let mut parsed_input = serde_json::from_str::<serde_json::Value>(effective_input).ok();
             if let (Some(options), Some(value)) = (tool_identity_options, parsed_input.as_mut()) {
                 super::identity::sanitize_identity_json_value(value, options);
             }
@@ -2632,7 +2662,16 @@ impl StreamContext {
             sanitized_complete_input = canonical_input;
         }
 
-        let argument_deltas = if tool_identity_options.is_some() {
+        let argument_deltas = if repaired_complete_input && tool_use.stop {
+            self.tool_json_pending.remove(&tool_use.tool_use_id);
+            self.tool_json_prefix_split.remove(&tool_use.tool_use_id);
+            let safe_input = sanitized_complete_input.unwrap_or_else(|| "{}".to_string());
+            if self.aws_b40_compat {
+                self.bedrock_tool_argument_deltas_for(&tool_use.tool_use_id, &safe_input, true)
+            } else {
+                vec![safe_input]
+            }
+        } else if tool_identity_options.is_some() {
             if !tool_use.stop {
                 Vec::new()
             } else {
@@ -3525,6 +3564,10 @@ impl BufferedStreamContext {
 
     pub fn set_suppress_text_blocks(&mut self, suppress: bool) {
         self.inner.set_suppress_text_blocks(suppress);
+    }
+
+    pub(crate) fn set_forced_tool_input_repair(&mut self, repair: Option<ForcedToolInputRepair>) {
+        self.inner.set_forced_tool_input_repair(repair);
     }
 
     pub fn set_upstream_request_latency(&mut self, elapsed: Duration) {
@@ -5361,6 +5404,58 @@ mod tests {
         assert_eq!(json_deltas.len(), 2);
         assert_eq!(json_deltas[0].data["delta"]["partial_json"], "");
         assert_eq!(json_deltas[1].data["delta"]["partial_json"], "{}");
+    }
+
+    #[test]
+    fn forced_tool_stream_repairs_only_an_empty_upstream_input() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 1, false, false, HashMap::new());
+        ctx.enable_aws_b40_compat();
+        ctx.set_suppress_text_blocks(true);
+        ctx.set_forced_tool_input_repair(Some(ForcedToolInputRepair {
+            tool_name: "get_weather".to_string(),
+            input: serde_json::json!({
+                "city": "Exampleville-d3cc9450",
+                "unit": "celsius"
+            }),
+        }));
+
+        let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "get_weather".to_string(),
+            tool_use_id: "toolu_bdrk_empty".to_string(),
+            input: String::new(),
+            stop: true,
+        });
+        let reconstructed = events
+            .iter()
+            .filter(|event| event.data["delta"]["type"] == "input_json_delta")
+            .filter_map(|event| event.data["delta"]["partial_json"].as_str())
+            .collect::<String>();
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&reconstructed).unwrap(),
+            serde_json::json!({
+                "city": "Exampleville-d3cc9450",
+                "unit": "celsius"
+            })
+        );
+
+        let valid_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "get_weather".to_string(),
+            tool_use_id: "toolu_bdrk_valid".to_string(),
+            input: r#"{"city":"Paris","unit":"fahrenheit"}"#.to_string(),
+            stop: true,
+        });
+        let valid_reconstructed = valid_events
+            .iter()
+            .filter(|event| event.data["delta"]["type"] == "input_json_delta")
+            .filter_map(|event| event.data["delta"]["partial_json"].as_str())
+            .collect::<String>();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&valid_reconstructed).unwrap(),
+            serde_json::json!({"city": "Paris", "unit": "fahrenheit"}),
+            "valid upstream input must never be replaced by the repair value"
+        );
     }
 
     #[test]

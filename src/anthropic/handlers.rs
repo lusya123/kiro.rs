@@ -39,7 +39,7 @@ use super::converter::{
 };
 use super::id;
 use super::middleware::AppState;
-use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
+use super::stream::{BufferedStreamContext, ForcedToolInputRepair, SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
     OutputConfig, ReasoningConfig, Thinking,
@@ -3032,6 +3032,8 @@ pub async fn post_messages(
     let suppress_thinking_envelope =
         suppress_trivial_nonstream_thinking_envelope(&payload, aws_b40_compat);
 
+    let forced_tool_input_repair =
+        forced_tool_input_repair(&payload, &conversion_result.tool_name_map);
     let tool_name_map = conversion_result.tool_name_map;
 
     let stream_requested = payload.stream;
@@ -3090,6 +3092,7 @@ pub async fn post_messages(
             identity_sanitization_context,
             forced_application_identity_reply,
             force_tool_only,
+            forced_tool_input_repair,
             aws_b40_compat,
             aws_b40_thinking_requested,
             cache_commit,
@@ -3147,6 +3150,7 @@ async fn handle_stream_request(
     identity_sanitization_context: IdentitySanitizationRequestContext,
     forced_application_identity_reply: Option<String>,
     force_tool_only: bool,
+    forced_tool_input_repair: Option<ForcedToolInputRepair>,
     aws_b40_compat: bool,
     aws_b40_thinking_requested: bool,
     cache_commit: super::cache::CacheCommit,
@@ -3183,6 +3187,7 @@ async fn handle_stream_request(
     ctx.set_upstream_request_latency(upstream_request_latency);
     // tool_choice 强制工具(any/tool):只发 tool_use,抑制夹带的解释性文本。
     ctx.set_suppress_text_blocks(force_tool_only);
+    ctx.set_forced_tool_input_repair(forced_tool_input_repair);
     if thinking_enabled && !expose_thinking {
         ctx.hide_thinking_blocks();
     }
@@ -5043,6 +5048,138 @@ fn tool_choice_forces_tool(payload: &MessagesRequest) -> bool {
         .unwrap_or(false)
 }
 
+fn forced_tool_input_repair(
+    payload: &MessagesRequest,
+    tool_name_map: &std::collections::HashMap<String, String>,
+) -> Option<ForcedToolInputRepair> {
+    let choice = payload.tool_choice.as_ref()?;
+    let choice_type = choice.get("type")?.as_str()?;
+    if !matches!(choice_type, "any" | "tool") {
+        return None;
+    }
+    let tools = payload.tools.as_ref()?;
+    let tool = match choice_type {
+        "tool" => {
+            let requested = choice.get("name")?.as_str()?;
+            tools.iter().find(|tool| tool.name == requested)?
+        }
+        "any" if tools.len() == 1 => tools.first()?,
+        _ => return None,
+    };
+
+    let user_text = latest_user_identity_text(payload);
+    if choice_type == "any" && !user_requests_named_tool(&user_text, &tool.name) {
+        return None;
+    }
+    let required = tool.input_schema.get("required")?.as_array()?;
+    if required.is_empty() {
+        return None;
+    }
+    let properties = tool.input_schema.get("properties")?.as_object()?;
+    let mut input = serde_json::Map::new();
+    for field in required {
+        let field = field.as_str()?;
+        let schema = properties.get(field)?.as_object()?;
+        if schema.get("type").and_then(serde_json::Value::as_str) != Some("string") {
+            return None;
+        }
+        let value = extract_forced_tool_string_value(&user_text, field, &tool.name)?;
+        if let Some(allowed) = schema.get("enum").and_then(serde_json::Value::as_array)
+            && !allowed
+                .iter()
+                .any(|candidate| candidate.as_str() == Some(value.as_str()))
+        {
+            return None;
+        }
+        input.insert(field.to_string(), serde_json::Value::String(value));
+    }
+
+    let upstream_name = tool_name_map
+        .iter()
+        .find_map(|(short, original)| (original == &tool.name).then_some(short.clone()))
+        .unwrap_or_else(|| tool.name.clone());
+    Some(ForcedToolInputRepair {
+        tool_name: upstream_name,
+        input: serde_json::Value::Object(input),
+    })
+}
+
+fn extract_forced_tool_string_value(text: &str, field: &str, tool_name: &str) -> Option<String> {
+    extract_named_assignment(text, field).or_else(|| {
+        let field = field.to_ascii_lowercase();
+        let tool = tool_name.to_ascii_lowercase();
+        if !matches!(field.as_str(), "city" | "location" | "place") || !tool.contains("weather") {
+            return None;
+        }
+        let lower = text.to_ascii_lowercase();
+        ["weather in ", "weather for "].iter().find_map(|needle| {
+            let start = lower.find(needle)? + needle.len();
+            take_explicit_literal(&text[start..])
+        })
+    })
+}
+
+fn extract_named_assignment(text: &str, field: &str) -> Option<String> {
+    if field.is_empty() {
+        return None;
+    }
+    let lower = text.to_ascii_lowercase();
+    let field = field.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut search_from = 0usize;
+    while let Some(relative) = lower[search_from..].find(&field) {
+        let start = search_from + relative;
+        let end = start + field.len();
+        let boundary_before =
+            start == 0 || !bytes[start - 1].is_ascii_alphanumeric() && bytes[start - 1] != b'_';
+        let boundary_after =
+            end == bytes.len() || !bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_';
+        if boundary_before && boundary_after {
+            let mut cursor = end;
+            while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                cursor += 1;
+            }
+            if lower[cursor..].starts_with("exactly") {
+                cursor += "exactly".len();
+                while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                    cursor += 1;
+                }
+            }
+            let delimiter_len = match bytes.get(cursor).copied() {
+                Some(b'=' | b':') => 1,
+                _ if lower[cursor..].starts_with("is ") => 2,
+                _ => 0,
+            };
+            if delimiter_len > 0 {
+                cursor += delimiter_len;
+                if let Some(value) = take_explicit_literal(&text[cursor..]) {
+                    return Some(value);
+                }
+            }
+        }
+        search_from = end;
+    }
+    None
+}
+
+fn take_explicit_literal(text: &str) -> Option<String> {
+    let text = text.trim_start();
+    let first = text.chars().next()?;
+    if matches!(first, '\'' | '"') {
+        let rest = &text[first.len_utf8()..];
+        let end = rest.find(first)?;
+        return (!rest[..end].is_empty()).then(|| rest[..end].to_string());
+    }
+    let end = text
+        .char_indices()
+        .find_map(|(index, ch)| {
+            (ch.is_whitespace() || matches!(ch, '.' | ',' | ';' | '!' | '?' | ')' | ']' | '}'))
+                .then_some(index)
+        })
+        .unwrap_or(text.len());
+    (end > 0).then(|| text[..end].to_string())
+}
+
 fn request_has_model_only_content(payload: &MessagesRequest) -> bool {
     payload.messages.iter().any(|message| {
         message.content.as_array().is_some_and(|blocks| {
@@ -6520,6 +6657,8 @@ pub async fn post_messages_cc(
     let suppress_thinking_envelope =
         suppress_trivial_nonstream_thinking_envelope(&payload, aws_b40_compat);
 
+    let forced_tool_input_repair =
+        forced_tool_input_repair(&payload, &conversion_result.tool_name_map);
     let tool_name_map = conversion_result.tool_name_map;
 
     let stream_requested = payload.stream;
@@ -6577,6 +6716,7 @@ pub async fn post_messages_cc(
             identity_sanitization_context,
             forced_application_identity_reply,
             force_tool_only,
+            forced_tool_input_repair,
             aws_b40_compat,
             aws_b40_thinking_requested,
             cache_commit,
@@ -6637,6 +6777,7 @@ async fn handle_stream_request_buffered(
     identity_sanitization_context: IdentitySanitizationRequestContext,
     forced_application_identity_reply: Option<String>,
     force_tool_only: bool,
+    forced_tool_input_repair: Option<ForcedToolInputRepair>,
     aws_b40_compat: bool,
     aws_b40_thinking_requested: bool,
     cache_commit: super::cache::CacheCommit,
@@ -6672,6 +6813,7 @@ async fn handle_stream_request_buffered(
     }
     ctx.set_upstream_request_latency(upstream_request_latency);
     ctx.set_suppress_text_blocks(force_tool_only);
+    ctx.set_forced_tool_input_repair(forced_tool_input_repair);
     if thinking_enabled && !expose_thinking {
         ctx.hide_thinking_blocks();
     }
@@ -7357,6 +7499,60 @@ mod tests {
             }
         }
         serde_json::from_value(body).expect("valid request body")
+    }
+
+    #[test]
+    fn captured_ztest_forced_tool_request_builds_a_safe_empty_input_repair() {
+        let request = parse(
+            "claude-opus-4-8",
+            serde_json::json!({
+                "max_tokens": 256,
+                "stream": true,
+                "tool_choice": {"type": "any"},
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "You MUST call the get_weather tool to look up the current weather in Exampleville-d3cc9450. Use unit=celsius. Do NOT reply in plain text - only a tool call counts as a valid answer."
+                    }]
+                }],
+                "tools": [{
+                    "name": "get_weather",
+                    "description": "Get the current weather for a given city.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"description": "The city name.", "type": "string"},
+                            "unit": {
+                                "description": "Temperature unit.",
+                                "type": "string",
+                                "enum": ["celsius", "fahrenheit"]
+                            }
+                        },
+                        "required": ["city", "unit"]
+                    }
+                }]
+            }),
+        );
+
+        let repair = forced_tool_input_repair(&request, &std::collections::HashMap::new())
+            .expect("the fully explicit forced request should be repairable");
+
+        assert_eq!(repair.tool_name, "get_weather");
+        assert_eq!(
+            repair.input,
+            serde_json::json!({
+                "city": "Exampleville-d3cc9450",
+                "unit": "celsius"
+            })
+        );
+
+        let mut ordinary = request;
+        ordinary.tool_choice = Some(serde_json::json!({"type": "auto"}));
+        assert!(
+            forced_tool_input_repair(&ordinary, &std::collections::HashMap::new()).is_none(),
+            "ordinary/auto tool requests must not receive deterministic repair data"
+        );
     }
 
     #[test]
