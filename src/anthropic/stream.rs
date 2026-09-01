@@ -893,6 +893,9 @@ pub struct StreamContext {
     /// Complete argument JSON per tool, retained only until the final frame so
     /// Bedrock output usage can account for additional argument fields.
     tool_input_acc: HashMap<String, String>,
+    /// Upstream tool name per tool id. Retained so end-of-stream recovery can
+    /// apply the same name guard when the provider omits its final stop frame.
+    tool_names_by_id: HashMap<String, String>,
     tool_argument_fields: usize,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
     pub tool_name_map: HashMap<String, String>,
@@ -1090,6 +1093,7 @@ impl StreamContext {
             tool_json_pending: HashMap::new(),
             tool_json_prefix_split: HashSet::new(),
             tool_input_acc: HashMap::new(),
+            tool_names_by_id: HashMap::new(),
             tool_argument_fields: 0,
             tool_name_map,
             thinking_enabled,
@@ -2568,6 +2572,9 @@ impl StreamContext {
             .get(&tool_use.name)
             .cloned()
             .unwrap_or_else(|| tool_use.name.clone());
+        self.tool_names_by_id
+            .entry(tool_use.tool_use_id.clone())
+            .or_insert_with(|| tool_use.name.clone());
 
         // 发送 content_block_start(带 caller,对齐真 Anthropic / 参考渠道的 tool_use 块)
         let mut content_block = json!({
@@ -2782,7 +2789,41 @@ impl StreamContext {
                 self.tool_json_prefix_split.remove(&id);
                 continue;
             };
-            for partial_json in self.bedrock_tool_argument_deltas_for(&id, &input, true) {
+            let complete_input = self
+                .tool_input_acc
+                .remove(&id)
+                .unwrap_or_else(|| input.clone());
+            let repair_input = self
+                .forced_tool_input_repair
+                .as_ref()
+                .filter(|repair| {
+                    self.suppress_text_blocks
+                        && self.tool_names_by_id.get(&id).is_some_and(|name| {
+                            repair.tool_name == *name
+                                || self.tool_name_map.get(name) == Some(&repair.tool_name)
+                        })
+                        && (complete_input.trim().is_empty()
+                            || matches!(
+                                serde_json::from_str::<serde_json::Value>(&complete_input),
+                                Ok(serde_json::Value::Object(ref object)) if object.is_empty()
+                            ))
+                })
+                .and_then(|repair| serde_json::to_string(&repair.input).ok());
+            let effective_input = repair_input.as_deref().unwrap_or(&input);
+            if let Some(repair_input) = repair_input.as_ref() {
+                if let Some(start) = self.output_text_acc.rfind(&complete_input) {
+                    self.output_text_acc.replace_range(
+                        start..start + complete_input.len(),
+                        &format!("{repair_input}\n"),
+                    );
+                }
+                self.tool_argument_fields +=
+                    serde_json::from_str::<serde_json::Value>(repair_input)
+                        .ok()
+                        .and_then(|value| value.as_object().map(serde_json::Map::len))
+                        .unwrap_or(0);
+            }
+            for partial_json in self.bedrock_tool_argument_deltas_for(&id, effective_input, true) {
                 if let Some(delta_event) = self.state_manager.handle_content_block_delta(
                     block_index,
                     json!({
@@ -5455,6 +5496,71 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&valid_reconstructed).unwrap(),
             serde_json::json!({"city": "Paris", "unit": "fahrenheit"}),
             "valid upstream input must never be replaced by the repair value"
+        );
+    }
+
+    #[test]
+    fn forced_tool_stream_repairs_empty_input_when_upstream_omits_final_stop_frame() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 1, false, false, HashMap::new());
+        ctx.enable_aws_b40_compat();
+        ctx.set_suppress_text_blocks(true);
+        ctx.set_forced_tool_input_repair(Some(ForcedToolInputRepair {
+            tool_name: "get_weather".to_string(),
+            input: serde_json::json!({
+                "city": "Exampleville-be9902e9",
+                "unit": "celsius"
+            }),
+        }));
+
+        let mut events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "get_weather".to_string(),
+            tool_use_id: "toolu_bdrk_missing_stop".to_string(),
+            input: "{}".to_string(),
+            stop: false,
+        });
+        events.extend(ctx.generate_final_events());
+
+        let reconstructed = events
+            .iter()
+            .filter(|event| event.data["delta"]["type"] == "input_json_delta")
+            .filter_map(|event| event.data["delta"]["partial_json"].as_str())
+            .collect::<String>();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&reconstructed).unwrap(),
+            serde_json::json!({
+                "city": "Exampleville-be9902e9",
+                "unit": "celsius"
+            })
+        );
+
+        let mut valid =
+            StreamContext::new_with_thinking("claude-opus-4-8", 1, false, false, HashMap::new());
+        valid.enable_aws_b40_compat();
+        valid.set_suppress_text_blocks(true);
+        valid.set_forced_tool_input_repair(Some(ForcedToolInputRepair {
+            tool_name: "get_weather".to_string(),
+            input: serde_json::json!({
+                "city": "Exampleville-be9902e9",
+                "unit": "celsius"
+            }),
+        }));
+        let mut valid_events = valid.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "get_weather".to_string(),
+            tool_use_id: "toolu_bdrk_valid_missing_stop".to_string(),
+            input: r#"{"city":"Paris","unit":"fahrenheit"}"#.to_string(),
+            stop: false,
+        });
+        valid_events.extend(valid.generate_final_events());
+        let valid_reconstructed = valid_events
+            .iter()
+            .filter(|event| event.data["delta"]["type"] == "input_json_delta")
+            .filter_map(|event| event.data["delta"]["partial_json"].as_str())
+            .collect::<String>();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&valid_reconstructed).unwrap(),
+            serde_json::json!({"city": "Paris", "unit": "fahrenheit"}),
+            "valid unterminated upstream input must never be replaced"
         );
     }
 
