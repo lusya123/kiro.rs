@@ -1842,7 +1842,10 @@ impl StreamContext {
         // A real upstream event always wins over the compatibility fallback.
         // Requests that did not enable thinking keep the reasoning private.
         self.pending_synthetic_thinking = None;
-        if !self.thinking_enabled || self.forced_application_identity_reply.is_some() {
+        if !self.thinking_enabled
+            || self.forced_application_identity_reply.is_some()
+            || self.suppress_text_blocks
+        {
             if !reasoning.text.is_empty() {
                 let delta =
                     cumulative_event_delta(&reasoning.text, &self.native_reasoning_last_chunk);
@@ -1917,7 +1920,10 @@ impl StreamContext {
             "收到 thinkingMetadataEvent"
         );
 
-        if !self.thinking_enabled || self.forced_application_identity_reply.is_some() {
+        if !self.thinking_enabled
+            || self.forced_application_identity_reply.is_some()
+            || self.suppress_text_blocks
+        {
             return Vec::new();
         }
 
@@ -5737,6 +5743,52 @@ mod tests {
             ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
                 name: "get_weather".to_string(),
                 tool_use_id: "toolu_bdrk_forced_index_zero".to_string(),
+                input: "{\"city\":\"Exampleville\"}".to_string(),
+                stop: true,
+            }),
+        );
+        let block_starts = events
+            .iter()
+            .filter(|event| event.event == "content_block_start")
+            .map(|event| {
+                (
+                    event.data["index"].as_i64(),
+                    event.data["content_block"]["type"].as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(block_starts, vec![(Some(0), Some("tool_use"))]);
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.data["delta"]["type"] == "signature_delta")
+        );
+    }
+
+    #[test]
+    fn forced_tool_response_keeps_tool_at_index_zero_after_native_reasoning() {
+        use crate::kiro::model::events::{ReasoningContentEvent, ThinkingMetadataEvent};
+
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 1, true, true, HashMap::new());
+        ctx.enable_aws_b40_compat();
+        ctx.set_suppress_text_blocks(true);
+
+        let mut events = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+            text: "I should call the requested tool.".to_string(),
+            ..Default::default()
+        }));
+        events.extend(
+            ctx.process_kiro_event(&Event::ThinkingMetadata(ThinkingMetadataEvent {
+                signature: "upstream-opaque-signature".to_string(),
+                ..Default::default()
+            })),
+        );
+        events.extend(
+            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "get_weather".to_string(),
+                tool_use_id: "toolu_bdrk_forced_native_index_zero".to_string(),
                 input: "{\"city\":\"Exampleville\"}".to_string(),
                 stop: true,
             }),
