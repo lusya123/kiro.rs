@@ -1600,6 +1600,107 @@ fn forced_tool_choice_instruction(
     }
 }
 
+fn normalize_tool_request_tokens(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut separator_pending = false;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if separator_pending && !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            normalized.push(ch.to_ascii_lowercase());
+            separator_pending = false;
+        } else if ch.is_ascii() {
+            separator_pending = true;
+        } else {
+            if separator_pending && !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            normalized.push(ch);
+            separator_pending = false;
+        }
+    }
+    normalized
+}
+
+fn explicitly_requests_named_tool(user_text: &str, tool_name: &str) -> bool {
+    let user = normalize_tool_request_tokens(user_text);
+    let name = normalize_tool_request_tokens(tool_name);
+    if name.is_empty() || !user.contains(&name) {
+        return false;
+    }
+
+    if [
+        format!("do not use {name}"),
+        format!("do not call {name}"),
+        format!("don t use {name}"),
+        format!("don t call {name}"),
+        format!("never use {name}"),
+        format!("never call {name}"),
+        format!("不要使用 {name}"),
+        format!("不要调用 {name}"),
+        format!("不要使用{name}"),
+        format!("不要调用{name}"),
+    ]
+    .iter()
+    .any(|negative| user.contains(negative))
+    {
+        return false;
+    }
+
+    [
+        "call", "use", "invoke", "run", "execute", "调用", "使用", "执行",
+    ]
+    .iter()
+    .any(|verb| user.contains(verb))
+}
+
+fn named_auto_tool_schema_instruction(
+    req: &MessagesRequest,
+    messages: &[super::types::Message],
+    tool_name_map: &HashMap<String, String>,
+) -> Option<String> {
+    let choice_type = req
+        .tool_choice
+        .as_ref()
+        .and_then(|choice| choice.get("type"))
+        .and_then(serde_json::Value::as_str);
+    if !matches!(choice_type, None | Some("auto")) {
+        return None;
+    }
+
+    let latest_user = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")?;
+    let mut user_text = String::new();
+    append_text_content(&latest_user.content, &mut user_text);
+    let tools = req.tools.as_ref()?;
+    let tool = tools
+        .iter()
+        .find(|tool| explicitly_requests_named_tool(&user_text, &tool.name))?;
+    let required = tool
+        .input_schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    if required.is_empty() {
+        return None;
+    }
+
+    let upstream_name = tool_name_map
+        .iter()
+        .find_map(|(short, original)| (original == &tool.name).then_some(short.as_str()))
+        .unwrap_or(&tool.name);
+    let quoted_name = serde_json::to_string(upstream_name).ok()?;
+    let quoted_required = serde_json::to_string(&required).ok()?;
+    Some(format!(
+        "Tool-use schema reminder: The user explicitly requested the provided tool named {quoted_name}. When calling it, populate every required field listed in {quoted_required} from the user's request; do not send an empty input object when required fields exist."
+    ))
+}
+
 fn append_text_content(value: &serde_json::Value, out: &mut String) {
     match value {
         serde_json::Value::String(text) => {
@@ -1868,6 +1969,10 @@ fn build_history(
         system_parts.push(non_gpt_identity_override(model_id));
     }
     if let Some(tool_instruction) = forced_tool_choice_instruction(req, tool_name_map) {
+        system_parts.push(tool_instruction);
+    } else if let Some(tool_instruction) =
+        named_auto_tool_schema_instruction(req, messages, tool_name_map)
+    {
         system_parts.push(tool_instruction);
     }
     let system_content = system_parts.join("\n");
@@ -3317,6 +3422,84 @@ mod tests {
                 .content
                 .contains("Tool-use requirement")
         );
+    }
+
+    #[test]
+    fn explicitly_named_auto_tool_gets_a_required_schema_reminder() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        let tool = AnthropicTool {
+            name: "get_weather".to_string(),
+            description: "Return the weather for a city".to_string(),
+            input_schema: HashMap::from([
+                ("type".to_string(), serde_json::json!("object")),
+                (
+                    "properties".to_string(),
+                    serde_json::json!({"city": {"type": "string"}}),
+                ),
+                ("required".to_string(), serde_json::json!(["city"])),
+            ]),
+            tool_type: None,
+            strict: None,
+            max_uses: None,
+            cache_control: None,
+        };
+        let mut req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 256,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Call get_weather with city exactly TestCity-8bd92e56."),
+            }],
+            stream: false,
+            system: None,
+            tools: Some(vec![tool]),
+            tool_choice: Some(serde_json::json!({"type": "auto"})),
+            thinking: None,
+            output_config: None,
+            reasoning: None,
+            cache_control: None,
+            metadata: None,
+        };
+
+        let converted = convert_request(&req).expect("named auto tool request converts");
+        let Some(Message::User(system)) = converted.conversation_state.history.first() else {
+            panic!("schema reminder should be injected");
+        };
+        let system_text = &system.user_input_message.content;
+        assert!(system_text.contains("Tool-use schema reminder"));
+        assert!(system_text.contains("get_weather"));
+        assert!(system_text.contains("city"));
+        assert!(system_text.contains("do not send an empty input object"));
+
+        req.messages[0].content = serde_json::json!("What is the weather in TestCity?");
+        let unnamed = convert_request(&req).expect("unnamed auto tool request converts");
+        let unnamed_system = match unnamed.conversation_state.history.first() {
+            Some(Message::User(system)) => system.user_input_message.content.as_str(),
+            _ => "",
+        };
+        assert!(!unnamed_system.contains("Tool-use schema reminder"));
+
+        req.messages[0].content =
+            serde_json::json!("Do not call get_weather; answer with plain text.");
+        let negated = convert_request(&req).expect("negated auto tool request converts");
+        let negated_system = match negated.conversation_state.history.first() {
+            Some(Message::User(system)) => system.user_input_message.content.as_str(),
+            _ => "",
+        };
+        assert!(!negated_system.contains("Tool-use schema reminder"));
+
+        req.messages[0].content = serde_json::json!("不要调用get_weather，请直接回答。");
+        let chinese_negated =
+            convert_request(&req).expect("Chinese-negated auto tool request converts");
+        let chinese_negated_system = match chinese_negated.conversation_state.history.first() {
+            Some(Message::User(system)) => system.user_input_message.content.as_str(),
+            _ => "",
+        };
+        assert!(!chinese_negated_system.contains("Tool-use schema reminder"));
     }
 
     #[test]
