@@ -825,7 +825,7 @@ mod tests {
         assert!(
             events[0].data["message"]["id"]
                 .as_str()
-                .is_some_and(|id| id.starts_with("msg_01") && id.len() == 28)
+                .is_some_and(|id| id.starts_with("msg_bdrk_011C") && id.len() == 33)
         );
         assert!(
             events[0].data["message"]["usage"]
@@ -951,7 +951,7 @@ mod tests {
         assert!(
             body["id"]
                 .as_str()
-                .is_some_and(|id| id.starts_with("msg_01") && id.len() == 28)
+                .is_some_and(|id| id.starts_with("msg_bdrk_011C") && id.len() == 33)
         );
         assert!(body["usage"].get("service_tier").is_none());
         assert_eq!(body["usage"]["input_tokens"], 1);

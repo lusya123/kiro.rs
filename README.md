@@ -385,9 +385,10 @@ RUST_LOG=debug ./target/release/kiro-rs
 `KIRO_CLUSTER_CACHE_ADDR=host1:46379,host2:46379` 配置共享候选地址，或设为
 `off`、`local`、`disabled` 关闭集群共享并退回进程内缓存。
 
-AWS-B 的公共 Anthropic 兼容响应统一使用 `msg_01…` Base62 消息 ID，不暴露
-内部使用的 Bedrock 或其他传输方式。该规则只改变公开消息 ID，不改变模型路由、
-对话内容、Thinking、Token 统计或工具调用。
+AWS-B 的 Claude 公共 Anthropic 兼容响应使用当前 POMO 实测形态：
+`msg_bdrk_011C…`（固定 `011C`，其后 20 位 Base62；总长度 33）。GPT 和其他兼容模型仍使用
+`msg_01…`。该规则只改变公开消息 ID，不改变模型路由、对话内容、Thinking、
+Token 统计或工具调用。
 
 ## API 端点
 

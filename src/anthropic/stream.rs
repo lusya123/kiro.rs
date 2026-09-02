@@ -5127,7 +5127,7 @@ mod tests {
         assert!(
             message["id"]
                 .as_str()
-                .is_some_and(|id| id.starts_with("msg_01") && id.len() == 28)
+                .is_some_and(|id| id.starts_with("msg_bdrk_011C") && id.len() == 33)
         );
         assert_eq!(response_usage["input_tokens"], 100);
         assert_eq!(response_usage["cache_read_input_tokens"], 40);

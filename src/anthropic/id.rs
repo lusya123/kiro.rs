@@ -25,14 +25,27 @@ fn anthropic_id(prefix: &str) -> String {
     format!("{prefix}_{suffix}")
 }
 
+fn pomo_bedrock_message_id() -> String {
+    // POMO exposes the Bedrock route as a lowercase `msg_bdrk_` prefix plus
+    // the same versioned Anthropic identifier shape used by `request-id`:
+    // uppercase `011C`, followed by exactly 20 Base62 characters.
+    format!("msg_bdrk_011C{}", random_base62(20))
+}
+
 pub fn message_id() -> String {
     anthropic_id("msg")
 }
 
-pub fn bedrock_message_id_for_model(_model: &str) -> String {
-    // The public Anthropic-compatible envelope uses the same msg_01 Base62
-    // shape regardless of the internal transport selected for the model.
-    message_id()
+pub fn bedrock_message_id_for_model(model: &str) -> String {
+    let mapped_model = super::converter::map_model(model);
+    if mapped_model
+        .as_deref()
+        .is_some_and(|model_id| model_id.starts_with("claude-"))
+    {
+        pomo_bedrock_message_id()
+    } else {
+        message_id()
+    }
 }
 
 pub fn server_tool_use_id() -> String {
@@ -40,8 +53,8 @@ pub fn server_tool_use_id() -> String {
 }
 
 /// 客户端可见的 tool_use ID(Anthropic 形态 `toolu_01…`)。
-/// 后端返回的是 `toolu_bdrk_…`(Bedrock),会与我们已重写的 `msg_01…` 冲突暴露异源;
-/// 统一重写成本函数生成的形态,与真 Anthropic / 参考渠道一致。
+/// 工具 ID 继续沿用独立的 Anthropic 兼容规则；消息 ID 是否带 `msg_bdrk_`
+/// 不改变工具调用 ID 的协议约定。
 pub fn tool_use_id() -> String {
     anthropic_id("toolu")
 }
@@ -80,9 +93,12 @@ mod tests {
             bedrock_message_id_for_model("Sonnet 5"),
             bedrock_message_id_for_model("haiku"),
         ] {
-            assert_anthropic_id(&id, "msg");
-            assert!(id.starts_with("msg_01"), "{id}");
-            assert!(!id.to_ascii_lowercase().contains("bdrk"), "{id}");
+            assert!(id.starts_with("msg_bdrk_011C"), "{id}");
+            assert_eq!(id.len(), 33, "{id}");
+            let suffix = &id["msg_bdrk_".len()..];
+            assert_eq!(&suffix[..4], "011C", "{id}");
+            assert_eq!(suffix[4..].len(), 20, "{id}");
+            assert!(suffix.chars().all(|c| c.is_ascii_alphanumeric()), "{id}");
         }
     }
 
