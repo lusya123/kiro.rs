@@ -20,11 +20,11 @@ Starting commit and live Q2 source: `68dd35c1e5c15bcf1e6328495f2858cc9e2f6c17`.
 1. [done] Create isolated branch/worktree.
 2. [done] Run unchanged local test suite and validate POMO credential/model catalog.
 3. [done] Establish POMO website baseline and exact-probe direct response references.
-4. [running] Extend Q2 baseline to all seven models and inspect specific differences.
+4. [done] Extend Q2 baseline to all seven models and inspect specific differences.
 5. [done] Select evidence-backed compatibility fixes within frozen protocol/signature constraints; add regression tests, then implement.
 6. [done] Local full validation and unchanged request-shape/general coding checks.
-7. [pending] Build immutable test-only image, deploy Q2 with rollback, repeat full matrix.
-8. [pending] Compare scores and POMO parity; retain improvements only when compatibility and normal workload gates pass.
+7. [done] Build immutable test-only image, deploy Q2 with rollback, repeat full matrix.
+8. [done] Compare scores and POMO parity; compatibility and normal workload gates pass. Retain and disclose lower detector scores and unresolved attribution rather than claiming universal improvement.
 
 ## Artifacts
 
@@ -52,4 +52,23 @@ The complete Q2 capture contains 673 complete HTTP exchanges with no TCP gaps. A
 
 The public-feature guard incorrectly reused the assistant-prefill capability to decide whether explicit thinking was supported, despite the existing model capability table allowing enabled thinking on both 4.6 models. The guard now consults that existing table before rejecting. It does not modify the request, request normalization, upstream headers, parameters, ID generation or signature code. Unsupported enabled-thinking protocols on newer models still fail closed.
 
-The new seven-model boundary regression failed on the original guard and passes after the fix. Full local validation: **977 passed, 0 failed, 3 ignored**; formatting and diff checks pass. Deploy the combined verified changes as one Q2 candidate, then compare the full website matrix with the captured original Q2 and POMO rounds. The first image build is retained as an intermediate artifact and is not promoted to the domain.
+The new seven-model boundary regression failed on the original guard and passes after the fix. Full local validation: **977 passed, 0 failed, 3 ignored**; formatting and diff checks pass. The combined verified changes were deployed as one Q2 candidate and compared with the original Q2 and POMO full matrices. The first image build remains an intermediate artifact and was not promoted to the domain.
+
+## Deployment and final observations
+
+Deployed source: `0391a916e6d6c850de66ba1524c9029f74a8f05d`.
+Image: `ghcr.io/lusya123/kiro-rs:q2-test-0391a916e6d6c850de66ba1524c9029f74a8f05d`.
+Digest: `sha256:e9b8212db6a63248a6c7519a3ebf57cc9fcb4b651628cfd312bcdb29e79cf8ba`.
+CI: https://github.com/lusya123/kiro.rs/actions/runs/33972380334
+
+The active container is `kiro-rs-q2-test-0391a91`, bound to `127.0.0.1:19006` on `43.156.115.199`. Its isolated config is `/home/ubuntu/services/q2-rollouts/20260905-0391a91-compat/config`. Nginx for `q2.quietfox.sbs` changed only its upstream port from 19005 to 19006 after config validation. The prior container `kiro-rs-q2-aws-b-68dd35c-proxy` remains available, with the Nginx rollback file at `/home/ubuntu/services/q2-rollouts/20260905-0391a91-compat/nginx.before.conf`. Final inspection found other container fingerprints unchanged.
+
+Public-domain regression: 28 requests across all seven models passed arithmetic, generated code, exact context data, and stream stop checks. All request bodies matched the baseline byte for byte, all 28 response IDs retained `msg_bdrk_`, and seven generated Python functions passed three execution examples each. This is sampled evidence, not a guarantee for every future answer.
+
+Each of POMO, Q2 before, and Q2 after has 28 registered model/site cells: 20 combinations with actual site controls were exercised, and 8 were explicitly recorded as unavailable. 9coding and API Dance used Bedrock standards; Ranking and CheckHub used their available Claude checks. No model substitution was used.
+
+9coding changes: Opus 4.8 87.3→88.6, Opus 4.6 70.9→73.4, Sonnet 4.6 76.6→79.1; Opus 4.7 82.3→81.0, with a second run also 81.0. Other headline scores held. API Dance Sonnet 4.6 moved from HTTP 400/unscorable to 6/8. Ranking's displayed 100% differs from internal scores: Opus 5 76→84, Sonnet 5 84→83, Sonnet 4.6 84→83. These observations do not establish causation for every score difference.
+
+For Opus 4.7, comparison of 42 identical request hashes identified an exact-copy punctuation difference (curly Chinese quotes became ASCII quotes). Both old and new local sanitizer versions preserved the original punctuation in ordinary/strict and five stream chunk configurations. Diagnostic tests were temporary and source was restored byte for byte; no punctuation-specific replacement was added. The upstream text and individual site grading details were unavailable, so attribution remains unresolved.
+
+The artifact directory contains the complete report, three matrices, visible per-site details, actual downloaded JSON files, direct POMO/Q2 workload records, and 1,427 complete redacted HTTP exchanges (673 before, 754 after; no TCP gaps). Both temporary server captures were removed after local integrity validation. POMO's internal upstream server capture was not available; its original evidence is limited to site-visible material and direct reference requests. Final documentation commits do not change the deployed runtime source above.
