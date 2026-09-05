@@ -7237,14 +7237,33 @@ mod tests {
         std::sync::Arc<crate::kiro::provider::KiroProvider>,
         tokio::task::JoinHandle<()>,
     ) {
+        let (provider, server, _) =
+            provider_serving_eventstream_sequence(vec![response_body]).await;
+        (provider, server)
+    }
+
+    async fn provider_serving_eventstream_sequence(
+        response_bodies: Vec<Vec<u8>>,
+    ) -> (
+        std::sync::Arc<crate::kiro::provider::KiroProvider>,
+        tokio::task::JoinHandle<()>,
+        std::sync::Arc<parking_lot::Mutex<Vec<Bytes>>>,
+    ) {
+        let received = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let request_log = received.clone();
         let app = axum::Router::new().route(
             "/",
-            axum::routing::post(move || {
-                let response_body = response_body.clone();
+            axum::routing::post(move |body: Bytes| {
+                let mut requests = request_log.lock();
+                let index = requests.len().min(response_bodies.len() - 1);
+                requests.push(body);
+                let response_body = response_bodies[index].clone();
                 async move {
                     Response::builder()
                         .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "application/vnd.amazon.eventstream")
+                        // The real Kiro endpoint labels its EventStream as JSON.
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header("x-test-upstream", "preserve-response-headers")
                         .body(Body::from(response_body))
                         .expect("test upstream response")
                 }
@@ -7295,9 +7314,136 @@ mod tests {
             endpoints,
             "test".to_string(),
         );
-        (std::sync::Arc::new(provider), server)
+        (std::sync::Arc::new(provider), server, received)
     }
 
+    #[tokio::test]
+    async fn context_only_upstream_retries_identical_request_before_returning_content() {
+        let context_only = eventstream_event(
+            "contextUsageEvent",
+            json!({"contextUsagePercentage": 15.326799392700195}),
+        );
+        let mut complete = eventstream_event(
+            "reasoningContentEvent",
+            json!({"text": "原始思考", "signature": "opaque-signature-unchanged"}),
+        );
+        complete.extend(eventstream_event(
+            "assistantResponseEvent",
+            json!({"content": "An actual model answer.", "messageStatus": "COMPLETED"}),
+        ));
+        for streaming in [false, true] {
+            let (provider, server, requests) =
+                provider_serving_eventstream_sequence(vec![context_only.clone(), complete.clone()])
+                    .await;
+            let body = "{ \"conversationState\": { \"history\": [] }, \"marker\": \"unchanged\" }";
+            let response = if streaming {
+                provider.call_api_stream(body).await
+            } else {
+                provider
+                    .call_api_for_model(Bytes::copy_from_slice(body.as_bytes()), "claude-opus-5")
+                    .await
+            }
+            .expect("one empty response should recover");
+            assert_eq!(
+                response.headers()["x-test-upstream"],
+                "preserve-response-headers"
+            );
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+            let bytes = response.bytes().await.expect("response bytes");
+            server.abort();
+            assert_eq!(
+                bytes.as_ref(),
+                complete.as_slice(),
+                "must return the real complete response, preserving reasoning/signature bytes"
+            );
+            assert_eq!(
+                requests.lock().as_slice(),
+                [
+                    Bytes::copy_from_slice(body.as_bytes()),
+                    Bytes::copy_from_slice(body.as_bytes())
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn context_only_upstream_stops_after_one_retry_without_empty_success() {
+        let context_only =
+            eventstream_event("contextUsageEvent", json!({"contextUsagePercentage": 15.3}));
+        for streaming in [false, true] {
+            let (provider, server, requests) =
+                provider_serving_eventstream_sequence(vec![context_only.clone()]).await;
+            let response = if streaming {
+                provider.call_api_stream("{}").await
+            } else {
+                provider
+                    .call_api_for_model(Bytes::from_static(b"{}"), "claude-opus-5")
+                    .await
+            };
+            server.abort();
+            assert!(
+                response.is_err(),
+                "repeated context-only EOF must not become HTTP 200 with an empty answer"
+            );
+            assert_eq!(
+                requests.lock().len(),
+                2,
+                "empty response recovery must be bounded to one retry"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn context_only_guard_preserves_all_other_upstream_event_shapes() {
+        let context =
+            eventstream_event("contextUsageEvent", json!({"contextUsagePercentage": 15.3}));
+        let mut bad_crc = context.clone();
+        *bad_crc.last_mut().unwrap() ^= 1;
+        let partial = context[..context.len() - 1].to_vec();
+        let mut context_then_answer = context;
+        context_then_answer.extend(eventstream_event(
+            "assistantResponseEvent",
+            json!({"content":"answer"}),
+        ));
+        for bytes in [
+            context_then_answer,
+            eventstream_event(
+                "assistantResponseEvent",
+                json!({"content":" ","messageStatus":"COMPLETED"}),
+            ),
+            eventstream_event(
+                "reasoningContentEvent",
+                json!({"text":"reasoning","signature":"keep-opaque"}),
+            ),
+            eventstream_event("thinkingMetadataEvent", json!({"signature":"keep-opaque"})),
+            eventstream_event(
+                "toolUseEvent",
+                json!({"name":"write_file","toolUseId":"tool-1","input":"{}","stop":true}),
+            ),
+            eventstream_event("metadataEvent", json!({"stopReason":"REFUSAL"})),
+            eventstream_event("meteringEvent", json!({"outputTokens":1})),
+            eventstream_event("invalidStateEvent", json!({"reason":"INVALID_STATE"})),
+            eventstream_event("futureEvent", json!({"future":true})),
+            eventstream_event("contextUsageEvent", json!({"contextUsagePercentage":100.0})),
+            partial,
+            bad_crc,
+        ] {
+            let (provider, server, requests) =
+                provider_serving_eventstream_sequence(vec![bytes.clone()]).await;
+            let response = provider
+                .call_api_for_model(Bytes::from_static(b"{}"), "claude-opus-5")
+                .await
+                .expect("pass through");
+            let actual = response.bytes().await.expect("original bytes");
+            server.abort();
+            assert_eq!(actual.as_ref(), bytes.as_slice());
+            assert_eq!(
+                requests.lock().len(),
+                1,
+                "output, errors, unknown and partial events must never be replayed"
+            );
+        }
+    }
     fn legacy_identity_instruction_text(text: &str) -> String {
         let chars: Vec<char> = text.chars().collect();
         let mut result = String::with_capacity(text.len());

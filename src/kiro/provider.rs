@@ -6,7 +6,8 @@
 //! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
 use bytes::Bytes;
-use reqwest::{Client, StatusCode};
+use futures::{StreamExt, stream};
+use reqwest::{Client, ResponseBuilderExt, StatusCode};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -17,6 +18,8 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::events::Event;
+use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 use crate::tls_sidecar;
@@ -27,6 +30,68 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
+
+/// Inspect only the beginning of a successful model stream. Kiro sometimes
+/// closes a CRC-valid contextUsageEvent without producing any model event.
+/// Such a response is not a successful generation, even though HTTP says 200.
+/// Any model/terminal/error/unknown event is passed through unchanged. The
+/// lookahead is bounded so normal streaming never waits for the full answer.
+async fn inspect_initial_model_response(
+    mut response: reqwest::Response,
+) -> anyhow::Result<Option<reqwest::Response>> {
+    const MAX_LOOKAHEAD_BYTES: usize = 16 * 1024;
+    const MAX_LOOKAHEAD_TIME: Duration = Duration::from_secs(1);
+    let deadline = tokio::time::Instant::now() + MAX_LOOKAHEAD_TIME;
+    let mut prefix = Vec::new();
+    let mut prefix_bytes = 0usize;
+    let mut decoder = EventStreamDecoder::new();
+
+    'inspect: loop {
+        let chunk = match tokio::time::timeout_at(deadline, response.chunk()).await {
+            Ok(result) => result?,
+            Err(_) => break,
+        };
+        let Some(chunk) = chunk else {
+            if !decoder.has_pending_data() {
+                return Ok(None);
+            }
+            break;
+        };
+        prefix_bytes = prefix_bytes.saturating_add(chunk.len());
+        prefix.push(chunk.clone());
+        if prefix_bytes > MAX_LOOKAHEAD_BYTES || decoder.feed(&chunk).is_err() {
+            break;
+        }
+        for frame in decoder.decode_iter() {
+            match frame.and_then(Event::from_frame) {
+                Ok(Event::ContextUsage(usage))
+                    if (0.0..100.0).contains(&usage.context_usage_percentage) => {}
+                // Do not retry output (including whitespace), reasoning,
+                // signatures, tools, refusals, full context or invalid frames.
+                _ => break 'inspect,
+            }
+        }
+    }
+
+    if prefix.is_empty() {
+        return Ok(Some(response));
+    }
+    let mut builder = http::Response::builder()
+        .status(response.status())
+        .version(response.version())
+        .url(response.url().clone());
+    *builder.headers_mut().expect("response headers") = response.headers().clone();
+    builder
+        .extensions_mut()
+        .expect("response extensions")
+        .extend(std::mem::take(response.extensions_mut()));
+    let body = stream::iter(prefix.into_iter().map(Ok::<_, reqwest::Error>))
+        .chain(response.bytes_stream());
+    let rebuilt = builder
+        .body(reqwest::Body::wrap_stream(body))
+        .expect("existing upstream response metadata");
+    Ok(Some(reqwest::Response::from(rebuilt)))
+}
 
 /// A non-retryable HTTP rejection returned by the Kiro upstream.
 ///
@@ -44,6 +109,124 @@ pub(crate) struct UpstreamHttpError {
 mod tests {
     use super::KiroProvider;
     use reqwest::StatusCode;
+
+    fn test_event_frame(event: &str) -> bytes::Bytes {
+        let mut headers = Vec::new();
+        for (name, value) in [(":message-type", "event"), (":event-type", event)] {
+            headers.push(name.len() as u8);
+            headers.extend_from_slice(name.as_bytes());
+            headers.push(7);
+            headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            headers.extend_from_slice(value.as_bytes());
+        }
+        let payload = if event == "contextUsageEvent" {
+            b"{\"contextUsagePercentage\":15.3}".as_slice()
+        } else {
+            b"{\"content\":\"streamed answer\"}".as_slice()
+        };
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&((16 + headers.len() + payload.len()) as u32).to_be_bytes());
+        frame.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&crate::kiro::parser::crc::crc32(&frame).to_be_bytes());
+        frame.extend_from_slice(&headers);
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(&crate::kiro::parser::crc::crc32(&frame).to_be_bytes());
+        frame.into()
+    }
+
+    #[tokio::test]
+    async fn initial_response_probe_preserves_streaming_before_eof() {
+        use futures::{StreamExt, stream};
+        use reqwest::ResponseBuilderExt;
+        let first = test_event_frame("assistantResponseEvent");
+        let last = test_event_frame("contextUsageEvent");
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let delayed = last.clone();
+        let body = stream::iter(vec![Ok::<_, std::io::Error>(first.clone())]).chain(stream::once(
+            async move {
+                rx.await.unwrap();
+                Ok(delayed)
+            },
+        ));
+        let response = http::Response::builder()
+            .status(200)
+            .version(http::Version::HTTP_2)
+            .header("content-type", "application/json")
+            .url("https://upstream.example/generate".parse().unwrap())
+            .body(reqwest::Body::wrap_stream(body))
+            .unwrap()
+            .into();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            super::inspect_initial_model_response(response),
+        )
+        .await
+        .expect("a model event must be forwarded before EOF")
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.url().as_str(), "https://upstream.example/generate");
+        assert_eq!(response.version(), http::Version::HTTP_2);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        tx.send(()).unwrap();
+        assert_eq!(
+            response.bytes().await.unwrap().as_ref(),
+            [first.as_ref(), last.as_ref()].concat()
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_response_probe_handles_fragmented_context_only_eof() {
+        use futures::stream;
+        let frame = test_event_frame("contextUsageEvent");
+        let chunks: Vec<_> = frame
+            .chunks(3)
+            .map(|b| Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(b)))
+            .collect();
+        let response = http::Response::builder()
+            .status(200)
+            .body(reqwest::Body::wrap_stream(stream::iter(chunks)))
+            .unwrap()
+            .into();
+        assert!(
+            super::inspect_initial_model_response(response)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_response_probe_does_not_hold_a_delayed_model_stream() {
+        use futures::{StreamExt, stream};
+        let first = test_event_frame("contextUsageEvent");
+        let last = test_event_frame("assistantResponseEvent");
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let delayed = last.clone();
+        let body = stream::iter(vec![Ok::<_, std::io::Error>(first.clone())]).chain(stream::once(
+            async move {
+                rx.await.unwrap();
+                Ok(delayed)
+            },
+        ));
+        let response = http::Response::builder()
+            .status(200)
+            .body(reqwest::Body::wrap_stream(body))
+            .unwrap()
+            .into();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::inspect_initial_model_response(response),
+        )
+        .await
+        .expect("lookahead must be bounded when model output has not arrived")
+        .unwrap()
+        .unwrap();
+        tx.send(()).unwrap();
+        assert_eq!(
+            response.bytes().await.unwrap().as_ref(),
+            [first.as_ref(), last.as_ref()].concat()
+        );
+    }
 
     #[test]
     fn explicit_model_hint_does_not_require_reparsing_the_request_body() {
@@ -430,6 +613,7 @@ impl KiroProvider {
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let mut avoid_credential_id: Option<u64> = None;
+        let mut retried_without_model_events = false;
         let api_type = if is_stream { "流式" } else { "非流式" };
         let call_started = Instant::now();
 
@@ -541,6 +725,24 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
+                let response = match inspect_initial_model_response(response).await? {
+                    Some(response) => response,
+                    None => {
+                        if retried_without_model_events || attempt + 1 >= max_retries {
+                            anyhow::bail!(
+                                "Upstream model returned no model events after an empty response retry"
+                            );
+                        }
+                        retried_without_model_events = true;
+                        tracing::warn!(
+                            upstream_model_id = model.as_deref().unwrap_or("unknown"),
+                            credential_id = ctx.id,
+                            attempt = attempt + 1,
+                            "Kiro stream ended without model events; retrying the unchanged request once"
+                        );
+                        continue;
+                    }
+                };
                 self.token_manager.report_success(ctx.id);
                 tracing::info!(
                     upstream_model_id = model.as_deref().unwrap_or("unknown"),
