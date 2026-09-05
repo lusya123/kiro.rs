@@ -1577,6 +1577,7 @@ struct ResponseMeta {
     tool_catalog: ToolCatalog,
     store: StoreMode,
     previous_response_id: Option<String>,
+    tool_continuation: bool,
 }
 
 impl ResponseMeta {
@@ -1624,6 +1625,7 @@ impl ResponseMeta {
             tool_catalog,
             store,
             previous_response_id,
+            tool_continuation: false,
         }
     }
 
@@ -1772,6 +1774,11 @@ fn anthropic_to_response(
         .get("content")
         .and_then(Value::as_array)
         .ok_or("model response did not contain a content array")?;
+    if meta.tool_continuation
+        && empty_tool_completion(blocks, anthropic.get("stop_reason").and_then(Value::as_str))
+    {
+        return Err("model returned an empty tool-result continuation");
+    }
     let mut output = Vec::new();
     let mut assistant_blocks = Vec::new();
     let mut tool_calls_seen = 0_usize;
@@ -2279,6 +2286,12 @@ impl ResponsesStreamState {
         if self.done {
             return String::new();
         }
+        if self.meta.tool_continuation
+            && empty_tool_completion(&self.assistant_blocks, stop_reason)
+            && self.tool_calls_started == 0
+        {
+            return self.clean_stream_error();
+        }
         if let Some(mut store) = self.store.take() {
             if !self.assistant_blocks.is_empty() {
                 store.messages.push(Message {
@@ -2340,6 +2353,9 @@ impl ResponsesStreamState {
     }
 
     fn transform(&mut self, event_name: &str, event: &Value) -> String {
+        if self.done {
+            return String::new();
+        }
         match event_name {
             "ping" => String::new(),
             "message_start" => {
@@ -2370,8 +2386,173 @@ impl ResponsesStreamState {
     }
 }
 
-fn parse_sse_block(block: &[u8]) -> Option<(String, Value)> {
-    let text = std::str::from_utf8(block).ok()?;
+// Retry only a completed, empty assistant turn immediately after tool results.
+// Once text or a tool call becomes visible, never replay the generation.
+fn last_message_has_tool_result(messages: &[Message]) -> bool {
+    messages.last().is_some_and(|message| {
+        message.role == "user"
+            && message.content.as_array().is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+            })
+    })
+}
+
+fn visible_assistant_block(block: &Value) -> bool {
+    match block.get("type").and_then(Value::as_str) {
+        Some("tool_use") => true,
+        Some("text") => block
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty()),
+        _ => false,
+    }
+}
+
+fn empty_tool_completion(blocks: &[Value], stop_reason: Option<&str>) -> bool {
+    matches!(stop_reason, None | Some("end_turn")) && !blocks.iter().any(visible_assistant_block)
+}
+
+async fn tool_continuation_response<F, Fut>(
+    mut request: F,
+    streaming: bool,
+    continuation: bool,
+) -> Response
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Response>,
+{
+    for attempt in 0..=1 {
+        let response = request().await;
+        if !continuation || !response.status().is_success() {
+            return response;
+        }
+        let response = if streaming {
+            inspect_tool_continuation_stream(response).await
+        } else {
+            let (parts, body) = response.into_parts();
+            match axum::body::to_bytes(body, RESPONSES_BODY_LIMIT).await {
+                Ok(bytes) => {
+                    let empty = serde_json::from_slice::<Value>(&bytes)
+                        .ok()
+                        .is_some_and(|value| {
+                            value
+                                .get("content")
+                                .and_then(Value::as_array)
+                                .is_some_and(|blocks| {
+                                    empty_tool_completion(
+                                        blocks,
+                                        value.get("stop_reason").and_then(Value::as_str),
+                                    )
+                                })
+                        });
+                    if empty {
+                        None
+                    } else {
+                        Some(Response::from_parts(parts, Body::from(bytes)))
+                    }
+                }
+                Err(_) => Some(response_error(
+                    StatusCode::BAD_GATEWAY,
+                    "Unable to read the upstream response",
+                    true,
+                )),
+            }
+        };
+        if let Some(response) = response {
+            return response;
+        }
+        if attempt == 0 {
+            tracing::warn!("retrying an empty GPT tool-result continuation once before delivery");
+        }
+    }
+    response_error(
+        StatusCode::BAD_GATEWAY,
+        "The model returned an empty response after tool results on both attempts",
+        true,
+    )
+}
+
+// Retain only the prelude before the first visible output. The ordinary adapter
+// still owns parsing failures, terminal events, and all subsequent streaming.
+async fn inspect_tool_continuation_stream(response: Response) -> Option<Response> {
+    const MAX_PRELUDE_BYTES: usize = 512 * 1024;
+    let (parts, body) = response.into_parts();
+    let mut input = body.into_data_stream();
+    let mut retained = Vec::new();
+    let mut buffer = BytesMut::new();
+    let mut bytes_seen = 0;
+    let mut stop_reason = None;
+    'inspect: while let Some(chunk) = input.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                return Some(response_error(
+                    StatusCode::BAD_GATEWAY,
+                    "The upstream response stream was interrupted",
+                    true,
+                ));
+            }
+        };
+        bytes_seen += chunk.len();
+        buffer.extend_from_slice(&chunk);
+        retained.push(chunk);
+        while let Some((position, separator_len)) = sse_boundary(&buffer) {
+            let mut block = buffer.split_to(position + separator_len);
+            block.truncate(position);
+            let (name, event) = match parse_sse_block(&block) {
+                Ok(Some(event)) => event,
+                Ok(None) => continue,
+                Err(()) => break 'inspect,
+            };
+            match name.as_str() {
+                "content_block_start"
+                    if event
+                        .get("content_block")
+                        .is_some_and(visible_assistant_block) =>
+                {
+                    break 'inspect;
+                }
+                "content_block_delta"
+                    if event
+                        .pointer("/delta/text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.trim().is_empty()) =>
+                {
+                    break 'inspect;
+                }
+                "message_delta" => {
+                    if let Some(reason) =
+                        event.pointer("/delta/stop_reason").and_then(Value::as_str)
+                    {
+                        stop_reason = Some(reason.to_string());
+                    }
+                }
+                "message_stop" => {
+                    if empty_tool_completion(&[], stop_reason.as_deref()) {
+                        return None;
+                    }
+                    break 'inspect;
+                }
+                "error" => break 'inspect,
+                _ => {}
+            }
+        }
+        if bytes_seen > MAX_PRELUDE_BYTES {
+            return Some(response_error(
+                StatusCode::BAD_GATEWAY,
+                "The upstream response prelude exceeded its limit",
+                true,
+            ));
+        }
+    }
+    let replay = stream::iter(retained.into_iter().map(Ok::<Bytes, axum::Error>)).chain(input);
+    Some(Response::from_parts(parts, Body::from_stream(replay)))
+}
+
+fn parse_sse_block(block: &[u8]) -> Result<Option<(String, Value)>, ()> {
+    let text = std::str::from_utf8(block).map_err(|_| ())?;
     let mut event_name = None;
     let mut data = String::new();
     for line in text.lines() {
@@ -2385,7 +2566,12 @@ fn parse_sse_block(block: &[u8]) -> Option<(String, Value)> {
             data.push_str(value.trim_start());
         }
     }
-    Some((event_name?, serde_json::from_str(&data).ok()?))
+    // Comments and data-less pings are valid heartbeats, not broken JSON.
+    if data.is_empty() && (event_name.is_none() || event_name.as_deref() == Some("ping")) {
+        return Ok(None);
+    }
+    let event = serde_json::from_str(&data).map_err(|_| ())?;
+    Ok(Some((event_name.ok_or(())?, event)))
 }
 
 fn sse_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
@@ -2406,11 +2592,16 @@ fn sse_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
 
 fn drain_sse(buffer: &mut BytesMut, state: &mut ResponsesStreamState) -> String {
     let mut output = String::new();
-    while let Some((position, separator_len)) = sse_boundary(buffer) {
+    while !state.done {
+        let Some((position, separator_len)) = sse_boundary(buffer) else {
+            break;
+        };
         let mut block = buffer.split_to(position + separator_len);
         block.truncate(position);
-        if let Some((event_name, event)) = parse_sse_block(&block) {
-            output.push_str(&state.transform(&event_name, &event));
+        match parse_sse_block(&block) {
+            Ok(Some((event_name, event))) => output.push_str(&state.transform(&event_name, &event)),
+            Ok(None) => {}
+            Err(()) => output.push_str(&state.clean_stream_error()),
         }
     }
     output
@@ -2430,7 +2621,7 @@ fn responses_stream_response(
             false,
         ),
         |(mut input, mut buffer, mut state, finished)| async move {
-            if finished {
+            if finished || state.done {
                 return None;
             }
             loop {
@@ -2489,6 +2680,7 @@ fn responses_stream_response_from_upstream(
         );
         let response = loop {
             tokio::select! {
+                _ = sender.closed() => return,
                 response = &mut upstream => break response,
                 _ = heartbeat.tick() => {
                     if sender.send(RESPONSES_KEEP_ALIVE).await.is_err() {
@@ -2506,7 +2698,16 @@ fn responses_stream_response_from_upstream(
 
         let transformed = responses_stream_response(response.into_body(), meta, store);
         let mut body = transformed.into_body().into_data_stream();
-        while let Some(chunk) = body.next().await {
+        loop {
+            let chunk = tokio::select! {
+                _ = sender.closed() => return,
+                _ = heartbeat.tick() => {
+                    if sender.send(RESPONSES_KEEP_ALIVE).await.is_err() { return; }
+                    continue;
+                }
+                chunk = body.next() => chunk,
+            };
+            let Some(chunk) = chunk else { break };
             match chunk {
                 Ok(chunk) => {
                     if sender.send(chunk).await.is_err() {
@@ -2715,7 +2916,7 @@ fn translated_request_for_profile(
             cache_control: None,
         });
     }
-    let meta = ResponseMeta::new(
+    let mut meta = ResponseMeta::new(
         request,
         model,
         max_tokens,
@@ -2724,6 +2925,7 @@ fn translated_request_for_profile(
         store,
         previous_response_id,
     );
+    meta.tool_continuation = last_message_has_tool_result(&messages);
     Ok((
         MessagesRequest {
             model: model.to_string(),
@@ -2828,6 +3030,7 @@ pub async fn post_responses(
     };
 
     let session_id = apply_conversation_state(&mut translated, prior);
+    meta.tool_continuation = last_message_has_tool_result(&translated.messages);
 
     let mut stored_messages = meta.store.enabled().then(|| translated.messages.clone());
     let retention_error = stored_messages.as_ref().and_then(|messages| {
@@ -2863,11 +3066,22 @@ pub async fn post_responses(
     let raw = Bytes::from(
         serde_json::to_vec(&translated).expect("translated Responses request must serialize"),
     );
-    let upstream: Pin<Box<dyn Future<Output = Response> + Send>> = Box::pin(post_messages(
-        State(state.clone()),
-        HeaderMap::new(),
-        RawApiJson(translated, raw),
-    ));
+    let request_state = state.clone();
+    let tool_continuation = meta.tool_continuation;
+    let upstream: Pin<Box<dyn Future<Output = Response> + Send>> = Box::pin(async move {
+        tool_continuation_response(
+            || {
+                post_messages(
+                    State(request_state.clone()),
+                    HeaderMap::new(),
+                    RawApiJson(translated.clone(), raw.clone()),
+                )
+            },
+            stream_requested,
+            tool_continuation,
+        )
+        .await
+    });
 
     if stream_requested {
         let stream_store = stored_messages.take().map(|messages| StreamStoreContext {
@@ -3048,7 +3262,7 @@ mod tests {
             .filter_map(|block| {
                 let block = block.trim();
                 (!block.is_empty())
-                    .then(|| parse_sse_block(block.as_bytes()))
+                    .then(|| parse_sse_block(block.as_bytes()).expect("valid test SSE"))
                     .flatten()
             })
             .collect()
@@ -4871,5 +5085,313 @@ other product, model, or company.";
         );
         assert_eq!(malformed_body["error"]["type"], "invalid_request_error");
         server.abort();
+    }
+
+    #[test]
+    fn empty_tool_continuation_must_not_complete() {
+        let mut failures = Vec::new();
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let request = json!({
+                "model": model,
+                "input": [
+                    {"role":"user", "content":"Read README.md and summarize it"},
+                    {"type":"function_call", "call_id":"call_read", "name":"read_file", "arguments":"{\"path\":\"README.md\"}"},
+                    {"type":"function_call_output", "call_id":"call_read", "output":"# Example project"}
+                ],
+                "tools":[], "store":false
+            });
+            let (_, meta) = translated_request(&request, model).unwrap();
+            let mut responses = ResponsesStreamState::new(meta);
+            let mut native = super::super::stream::StreamContext::new_with_thinking(
+                model,
+                10,
+                false,
+                false,
+                HashMap::new(),
+            );
+            let mut events = native.generate_initial_events();
+            events.extend(
+                native.process_kiro_event(&crate::kiro::model::events::Event::Metadata(
+                    crate::kiro::model::events::MetadataEvent {
+                        stop_reason: Some("END_TURN".to_string()),
+                        token_usage: Default::default(),
+                    },
+                )),
+            );
+            events.extend(native.generate_final_events());
+            let output = events
+                .iter()
+                .map(|e| responses.transform(&e.event, &e.data))
+                .collect::<String>();
+            if output.contains("event: response.completed") {
+                failures.push(model);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "empty tool-result continuations became successful completions for {failures:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_stop_must_close_without_transport_eof() {
+        let frames = concat!(
+            "event: message_start\ndata: {\"message\":{\"usage\":{}}}\n\n",
+            "event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Done\"}}\n\n",
+            "event: content_block_stop\ndata: {\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "event: message_stop\ndata: {}\n\n"
+        );
+        let input = stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from_static(
+            frames.as_bytes(),
+        ))])
+        .chain(stream::pending());
+        let response =
+            responses_stream_response(Body::from_stream(input), base_meta("gpt-5.6-sol"), None);
+        let mut body = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(Duration::from_millis(200), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("response.completed"));
+        let next = tokio::time::timeout(Duration::from_millis(200), body.next()).await;
+        assert!(
+            matches!(next, Ok(None)),
+            "public body still waits for transport EOF after message_stop"
+        );
+    }
+
+    #[test]
+    fn malformed_sse_must_not_be_silently_completed() {
+        let mut state = ResponsesStreamState::new(base_meta("gpt-5.6-sol"));
+        let mut input = BytesMut::from(
+            concat!(
+                "event: message_start\ndata: {\"message\":{\"usage\":{}}}\n\n",
+                "event: content_block_delta\ndata: {invalid-json}\n\n",
+                "event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+                "event: message_stop\ndata: {}\n\n"
+            )
+            .as_bytes(),
+        );
+        let output = drain_sse(&mut input, &mut state);
+        assert!(
+            !output.contains("event: response.completed"),
+            "malformed SSE was dropped and the response was marked complete: {output}"
+        );
+    }
+
+    fn upstream_test_stream(block: Option<Value>, reason: &str) -> String {
+        let mut events = vec![("message_start", json!({"message": {"usage": {}}}))];
+        if let Some(block) = block {
+            events.push((
+                "content_block_start",
+                json!({"index": 0, "content_block": block}),
+            ));
+            events.push(("content_block_stop", json!({"index": 0})));
+        }
+        events.push(("message_delta", json!({"delta": {"stop_reason": reason}})));
+        events.push(("message_stop", json!({})));
+        events
+            .into_iter()
+            .map(|(name, value)| format!("event: {name}\ndata: {value}\n\n"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn tool_result_retry_is_bounded_and_preserves_the_successful_attempt() {
+        for streaming in [false, true] {
+            for second_succeeds in [false, true] {
+                let mut attempts = 0;
+                let response = tool_continuation_response(
+                    || {
+                        attempts += 1;
+                        let blocks = if second_succeeds && attempts == 2 {
+                            vec![json!({"type":"text", "text":"verified file contents"})]
+                        } else {
+                            vec![json!({"type":"thinking", "thinking":"internal"})]
+                        };
+                        let response = if streaming {
+                            Response::new(Body::from(upstream_test_stream(
+                                blocks.first().cloned(),
+                                "end_turn",
+                            )))
+                        } else {
+                            Json(json!({"content": blocks, "stop_reason": "end_turn"}))
+                                .into_response()
+                        };
+                        async { response }
+                    },
+                    streaming,
+                    true,
+                )
+                .await;
+                assert_eq!(attempts, 2);
+                assert_eq!(
+                    response.status(),
+                    if second_succeeds {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    }
+                );
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    String::from_utf8_lossy(&body).contains("verified file contents"),
+                    second_succeeds
+                );
+                assert!(!String::from_utf8_lossy(&body).contains("internal"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_stops_visible_output_and_non_tool_turns_are_never_retried() {
+        for streaming in [false, true] {
+            for (block, reason, continuation) in [
+                (None, "end_turn", false),
+                (None, "max_tokens", true),
+                (None, "refusal", true),
+                (None, "stop_sequence", true),
+                (
+                    Some(json!({"type":"text", "text":"read complete"})),
+                    "end_turn",
+                    true,
+                ),
+                (
+                    Some(json!({"type":"tool_use", "id":"call_1", "name":"read_file", "input":{}})),
+                    "end_turn",
+                    true,
+                ),
+            ] {
+                let mut attempts = 0;
+                let response = tool_continuation_response(|| {
+                    attempts += 1;
+                    let response = if streaming {
+                        Response::new(Body::from(upstream_test_stream(block.clone(), reason)))
+                    } else {
+                        Json(json!({"content": block.clone().into_iter().collect::<Vec<_>>(), "stop_reason":reason})).into_response()
+                    };
+                    async { response }
+                }, streaming, continuation).await;
+                assert_eq!(attempts, 1, "{streaming} {reason}");
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_or_truncated_preludes_fail_without_retrying() {
+        for bytes in [
+            b"event: message_start\ndata: {broken}\n\n".as_slice(),
+            b"event: message_start\ndata: \xff\n\n".as_slice(),
+            b"event: message_start\ndata: {\"message\":{}}".as_slice(),
+        ] {
+            let mut attempts = 0;
+            let response = tool_continuation_response(
+                || {
+                    attempts += 1;
+                    async { Response::new(Body::from(bytes)) }
+                },
+                true,
+                true,
+            )
+            .await;
+            assert_eq!(attempts, 1);
+            let response =
+                responses_stream_response(response.into_body(), base_meta("gpt-5.6-sol"), None);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8_lossy(&body);
+            assert!(body.contains("event: error"));
+            assert!(!body.contains("response.completed"));
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_handles_fragmented_crlf_heartbeats_and_ignores_post_terminal_frames() {
+        let wire = format!(
+            ": keepalive\r\n\r\nevent: ping\r\n\r\n{}event: content_block_delta\r\ndata: broken\r\n\r\n",
+            upstream_test_stream(Some(json!({"type":"text", "text":"hello"})), "end_turn")
+                .replace('\n', "\r\n")
+        );
+        let chunks = wire
+            .into_bytes()
+            .into_iter()
+            .map(|byte| Ok::<_, Infallible>(Bytes::from(vec![byte])));
+        let response = responses_stream_response(
+            Body::from_stream(stream::iter(chunks)),
+            base_meta("gpt-5.6-sol"),
+            None,
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(body.matches("event: response.completed").count(), 1);
+        assert!(!body.contains("event: error"));
+    }
+
+    #[tokio::test]
+    async fn deferred_stream_disconnect_cancels_pending_upstream_body() {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let pending_body = stream::unfold(Some(sender), |guard| async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+            None::<(
+                Result<Bytes, Infallible>,
+                Option<tokio::sync::oneshot::Sender<()>>,
+            )>
+        });
+        // Keep the sender alive only while the upstream body is alive; dropping
+        // the body closes the receiver, even while no upstream chunk arrives.
+        let response = responses_stream_response_from_upstream(
+            Box::pin(async { Response::new(Body::from_stream(pending_body)) }),
+            base_meta("gpt-5.6-sol"),
+            None,
+        );
+        let mut body = response.into_body().into_data_stream();
+        assert!(body.next().await.is_some());
+        tokio::task::yield_now().await;
+        drop(body);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), receiver)
+                .await
+                .is_ok()
+        );
+    }
+    #[tokio::test]
+    async fn tool_call_prelude_is_released_before_terminal_event_or_eof() {
+        let wire = Bytes::from_static(b"event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"read_file\",\"input\":{}}}\n\n");
+        let body = Body::from_stream(
+            stream::iter([Ok::<_, Infallible>(wire.clone())]).chain(stream::pending()),
+        );
+        let response = tokio::time::timeout(
+            Duration::from_millis(200),
+            inspect_tool_continuation_stream(Response::new(body)),
+        )
+        .await
+        .expect("a tool call must not wait for the provider to finish")
+        .unwrap();
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(body.next().await.unwrap().unwrap(), wire);
+    }
+
+    #[tokio::test]
+    async fn tool_prelude_retention_is_bounded() {
+        let wire = format!(
+            "event: content_block_start\ndata: {}\n\n",
+            json!({
+                "index":0,"content_block":{"type":"thinking","thinking":"x".repeat(512 * 1024)}
+            })
+        );
+        let response = inspect_tool_continuation_stream(Response::new(Body::from(wire)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 }
