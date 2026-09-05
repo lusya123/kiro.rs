@@ -34,6 +34,11 @@ pub struct AssistantResponseEvent {
     #[serde(default)]
     pub content: String,
 
+    /// 上游消息生命周期状态。只有 `COMPLETED` 能作为无 metadata / metering
+    /// 响应的终止证据。
+    #[serde(default)]
+    pub message_status: Option<String>,
+
     /// 捕获其他未使用的字段，确保反序列化兼容性
     #[serde(flatten)]
     #[serde(skip_serializing)]
@@ -48,6 +53,11 @@ impl EventPayload for AssistantResponseEvent {
 }
 
 impl AssistantResponseEvent {
+    /// Whether the upstream explicitly marked this assistant message complete.
+    pub fn is_completed(&self) -> bool {
+        self.message_status.as_deref() == Some("COMPLETED")
+    }
+
     /// Return only extension field names for diagnostics; values may contain
     /// model output or upstream metadata and must not be written to logs.
     pub fn extra_field_names(&self) -> Vec<String> {
@@ -65,6 +75,7 @@ impl Default for AssistantResponseEvent {
     fn default() -> Self {
         Self {
             content: String::new(),
+            message_status: None,
             extra: serde_json::Value::Null,
         }
     }
@@ -102,14 +113,10 @@ mod tests {
         }"#;
         let event: AssistantResponseEvent = serde_json::from_str(json).unwrap();
         assert_eq!(event.content, "Done");
+        assert_eq!(event.message_status.as_deref(), Some("COMPLETED"));
         assert_eq!(
             event.extra_field_names(),
-            [
-                "conversationId",
-                "followupPrompt",
-                "messageId",
-                "messageStatus"
-            ]
+            ["conversationId", "followupPrompt", "messageId"]
         );
     }
 

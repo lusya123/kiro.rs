@@ -935,6 +935,9 @@ pub struct StreamContext {
     /// HTTP 200, partial text/reasoning and a clean transport EOF are not
     /// sufficient on their own.
     first_round_terminal_evidence: bool,
+    /// Whether an assistant response in the first invocation was explicitly
+    /// marked complete by the upstream message lifecycle.
+    first_round_completed_assistant_response: bool,
     /// A refusal is a valid client response, but is not by itself proof that a
     /// locally planned compatibility-cache prefix became warm.
     first_round_refused: bool,
@@ -1127,6 +1130,7 @@ impl StreamContext {
             exact_first_round_usage: None,
             exact_cache_ttl_plan: super::cache::ExactCacheTtlPlan::default(),
             first_round_terminal_evidence: false,
+            first_round_completed_assistant_response: false,
             first_round_refused: false,
             native_stop_reason_received: false,
             first_round_unknown_native_stop_reason: false,
@@ -1432,6 +1436,9 @@ impl StreamContext {
             Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
             Event::ThinkingMetadata(metadata) => self.process_thinking_metadata(metadata),
             Event::AssistantResponse(resp) => {
+                if !self.continuation_started && resp.is_completed() {
+                    self.first_round_completed_assistant_response = true;
+                }
                 if tracing::enabled!(tracing::Level::TRACE) {
                     let fields = resp.extra_field_names();
                     if !fields.is_empty() {
@@ -3452,8 +3459,10 @@ impl StreamContext {
         // Both streaming handlers call this predicate only after the upstream
         // body reached EOF and the EventStream decoder has no pending frame.
         // Opus 5 sometimes completes with only an assistantResponseEvent, so
-        // non-empty visible output is sufficient in that clean-EOF shape.
+        // non-empty visible output plus its explicit COMPLETED status is
+        // sufficient in that clean-EOF shape.
         let has_clean_opus_5_assistant_response = stream_model_is_opus_5(&self.model)
+            && self.first_round_completed_assistant_response
             && !self.output_text_acc.trim().is_empty()
             && !self.output_token_limit_reached
             && !self.first_round_unknown_native_stop_reason;
@@ -3970,7 +3979,12 @@ mod tests {
     fn unknown_native_stop_reason_fails_closed_without_cache_evidence() {
         let mut ctx =
             StreamContext::new_with_thinking("claude-opus-5", 100, false, false, HashMap::new());
-        let _ = ctx.process_assistant_response("complete-looking output");
+        let assistant = serde_json::from_value(serde_json::json!({
+            "content": "complete-looking output",
+            "messageStatus": "COMPLETED"
+        }))
+        .expect("completed assistant event");
+        let _ = ctx.process_kiro_event(&Event::AssistantResponse(assistant));
         let _ = ctx.process_kiro_event(&Event::Metadata(
             crate::kiro::model::events::MetadataEvent {
                 stop_reason: Some("FUTURE_PROVIDER_REASON".to_string()),
@@ -3979,6 +3993,7 @@ mod tests {
         ));
 
         assert_eq!(ctx.state_manager.get_stop_reason(), "end_turn");
+        assert!(ctx.first_round_completed_assistant_response);
         assert!(!ctx.first_round_terminal_evidence);
         assert!(!ctx.upstream_succeeded_for_cache());
     }

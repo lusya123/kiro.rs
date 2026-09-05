@@ -3598,6 +3598,7 @@ async fn handle_non_stream_request(
 
         let mut chunk_text_content = String::new();
         let mut round_has_assistant_content = false;
+        let mut round_has_completed_assistant_response = false;
         let mut round_reasoning_previous = String::new();
         let mut round_has_completed_tool_use = false;
         let mut round_has_terminal_evidence = false;
@@ -3644,6 +3645,7 @@ async fn handle_non_stream_request(
                             );
                         }
                         Event::AssistantResponse(resp) => {
+                            round_has_completed_assistant_response |= resp.is_completed();
                             let content = if continuation_round > 0 && !round_has_assistant_content
                             {
                                 super::stream::merge_continuation_text(&text_content, &resp.content)
@@ -3823,12 +3825,14 @@ async fn handle_non_stream_request(
         // Opus 5 can return a complete buffered response containing only an
         // assistantResponseEvent. Because the entire non-streaming body has
         // already been read and decoded here, clean EOF plus non-empty model
-        // output is sufficient completion evidence for this compatibility
-        // fallback. Fatal events, refusals, and partial frames are still
+        // output plus an explicit COMPLETED messageStatus is sufficient
+        // completion evidence for this compatibility fallback. Fatal events,
+        // refusals, partial frames, and incomplete/missing statuses are still
         // rejected by the guards below. The streaming paths apply the same
         // fallback only after their live upstream response reaches clean EOF.
         let round_has_clean_opus_5_assistant_response = model_is_opus_5(model)
             && round_has_assistant_content
+            && round_has_completed_assistant_response
             && !chunk_text_content.trim().is_empty()
             && !round_unknown_native_stop_reason;
         let round_has_completion_evidence = round_has_completed_tool_use
@@ -8214,10 +8218,18 @@ mod tests {
         );
     }
 
-    async fn assert_opus_5_clean_assistant_only_stream_warms_next_prefix_match(buffered: bool) {
+    async fn assert_opus_5_assistant_only_stream_cache_state(
+        buffered: bool,
+        message_status: Option<&str>,
+        expect_warm: bool,
+    ) {
         let model = "claude-opus-5";
         let mode = if buffered { "buffered" } else { "live" };
-        let unique_prefix = format!("opus-5-{mode}-assistant-only-{} ", Uuid::new_v4());
+        let status_label = message_status.unwrap_or("missing").to_ascii_lowercase();
+        let unique_prefix = format!(
+            "opus-5-{mode}-assistant-only-{status_label}-{} ",
+            Uuid::new_v4()
+        );
         let payload = parse(
             model,
             serde_json::json!({
@@ -8248,13 +8260,13 @@ mod tests {
             "{mode}: first request has no read"
         );
 
-        let response_body = eventstream_event(
-            "assistantResponseEvent",
-            serde_json::json!({
-                "content": "CACHE_REGISTRY_WARM",
-                "messageStatus": "COMPLETED"
-            }),
-        );
+        let mut assistant_payload = serde_json::json!({
+            "content": "CACHE_REGISTRY_WARM"
+        });
+        if let Some(message_status) = message_status {
+            assistant_payload["messageStatus"] = serde_json::json!(message_status);
+        }
+        let response_body = eventstream_event("assistantResponseEvent", assistant_payload);
         let (provider, server) = provider_serving_eventstream(response_body).await;
         let commit = super::super::cache::prepare_cache_commit(total, &payload, true);
         let response = if buffered {
@@ -8323,57 +8335,106 @@ mod tests {
             total, &payload, true,
         )
         .await;
-        assert_eq!(
-            second.cache_creation_input_tokens, 0,
-            "{mode}: clean assistant-only completion must not be reported as another write"
-        );
-        assert!(
-            second.cache_read_input_tokens > 0,
-            "{mode}: clean assistant-only completion must warm the next matching request"
-        );
+        if expect_warm {
+            assert_eq!(
+                second.cache_creation_input_tokens, 0,
+                "{mode}: completed assistant-only response must not be reported as another write"
+            );
+            assert!(
+                second.cache_read_input_tokens > 0,
+                "{mode}: completed assistant-only response must warm the next matching request"
+            );
+        } else {
+            assert!(
+                second.cache_creation_input_tokens > 0,
+                "{mode}/{status_label}: clean EOF without completed status must remain cold"
+            );
+            assert_eq!(
+                second.cache_read_input_tokens, 0,
+                "{mode}/{status_label}: incomplete response must not create a cache read"
+            );
+        }
     }
 
     #[tokio::test]
     async fn opus_5_clean_assistant_only_live_stream_warms_next_prefix_match() {
-        assert_opus_5_clean_assistant_only_stream_warms_next_prefix_match(false).await;
+        assert_opus_5_assistant_only_stream_cache_state(false, Some("COMPLETED"), true).await;
     }
 
     #[tokio::test]
     async fn opus_5_clean_assistant_only_buffered_stream_warms_next_prefix_match() {
-        assert_opus_5_clean_assistant_only_stream_warms_next_prefix_match(true).await;
+        assert_opus_5_assistant_only_stream_cache_state(true, Some("COMPLETED"), true).await;
     }
 
     #[tokio::test]
-    async fn opus_5_nonstream_fallback_rejects_empty_refused_fatal_and_truncated_responses() {
-        let assistant = || {
+    async fn opus_5_live_stream_clean_eof_requires_completed_assistant_status_to_warm() {
+        for status in [Some("IN_PROGRESS"), None] {
+            assert_opus_5_assistant_only_stream_cache_state(false, status, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn opus_5_buffered_stream_clean_eof_requires_completed_assistant_status_to_warm() {
+        for status in [Some("IN_PROGRESS"), None] {
+            assert_opus_5_assistant_only_stream_cache_state(true, status, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn opus_5_nonstream_fallback_requires_safe_completion_evidence() {
+        let completed_assistant = || {
             eventstream_event(
                 "assistantResponseEvent",
-                serde_json::json!({"content": "PARTIAL_OUTPUT"}),
+                serde_json::json!({
+                    "content": "PARTIAL_OUTPUT",
+                    "messageStatus": "COMPLETED"
+                }),
             )
         };
-        let mut refused = assistant();
+        let missing_status = eventstream_event(
+            "assistantResponseEvent",
+            serde_json::json!({"content": "PARTIAL_OUTPUT"}),
+        );
+        let mut refused = completed_assistant();
         refused.extend(eventstream_event(
             "metadataEvent",
             serde_json::json!({"stopReason": "REFUSAL"}),
         ));
-        let mut fatal = assistant();
+        let mut fatal = completed_assistant();
         fatal.extend(eventstream_event(
             "invalidStateEvent",
             serde_json::json!({"reason": "INVALID_STATE", "message": "rejected"}),
         ));
-        let mut truncated = assistant();
-        truncated.truncate(truncated.len() - 1);
-        let mut unknown_stop = assistant();
+        let mut truncated = completed_assistant();
+        let mut truncated_tail = eventstream_event(
+            "metadataEvent",
+            serde_json::json!({"stopReason": "END_TURN"}),
+        );
+        truncated_tail.truncate(truncated_tail.len() - 1);
+        truncated.extend(truncated_tail);
+        let mut unknown_stop = completed_assistant();
         unknown_stop.extend(eventstream_event(
             "metadataEvent",
             serde_json::json!({"stopReason": "FUTURE_PROVIDER_REASON"}),
         ));
+        let in_progress = eventstream_event(
+            "assistantResponseEvent",
+            serde_json::json!({
+                "content": "PARTIAL_OUTPUT",
+                "messageStatus": "IN_PROGRESS"
+            }),
+        );
 
         for (label, response_body) in [
             (
                 "empty",
-                eventstream_event("assistantResponseEvent", serde_json::json!({"content": ""})),
+                eventstream_event(
+                    "assistantResponseEvent",
+                    serde_json::json!({"content": "", "messageStatus": "COMPLETED"}),
+                ),
             ),
+            ("missing-status", missing_status),
+            ("in-progress", in_progress),
             ("refused", refused),
             ("fatal", fatal),
             ("truncated", truncated),
