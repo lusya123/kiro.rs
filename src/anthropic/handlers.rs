@@ -6105,6 +6105,9 @@ fn reject_unavailable_aws_b_public_features(
         .as_ref()
         .is_some_and(|thinking| thinking.thinking_type == "enabled")
         && modern_claude_rejects_assistant_prefill(&payload.model)
+        // Prefill and thinking are separate capabilities: Opus/Sonnet 4.6
+        // reject assistant prefill but still support an explicit budget.
+        && !aws_b40_model_supports_enabled_thinking(&payload.model)
     {
         Some(
             "`thinking.type.enabled` is not supported for this model. Use `thinking.type.adaptive` and `output_config.effort` instead."
@@ -7131,6 +7134,32 @@ fn create_buffered_sse_stream(
 mod tests {
     use super::*;
     use crate::anthropic::types::MessagesRequest;
+
+    #[test]
+    fn public_enabled_thinking_respects_each_models_supported_protocol() {
+        for (model, supported) in [
+            ("claude-sonnet-4-6", true),
+            ("claude-opus-4-6", true),
+            ("claude-haiku-4-5", true),
+            ("claude-opus-4-7", false),
+            ("claude-opus-4-8", false),
+            ("claude-opus-5", false),
+            ("claude-sonnet-5", false),
+        ] {
+            let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model": model,
+                "max_tokens": 2048,
+                "thinking": {"type": "enabled", "budget_tokens": 1024},
+                "messages": [{"role": "user", "content": "Solve 17 * 23."}]
+            }))
+            .unwrap();
+            assert_eq!(
+                reject_unavailable_aws_b_public_features(&request, false, true).is_none(),
+                supported,
+                "{model}: rejecting assistant prefill must not disable supported thinking"
+            );
+        }
+    }
 
     struct TestKiroEndpoint {
         url: String,

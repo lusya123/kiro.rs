@@ -45,3 +45,11 @@ The fix keeps objects/arrays and fenced code outside the ordinary-response fallb
 Validation: frontend build completed; `cargo test --locked --no-default-features -- --test-threads=4` reports **976 passed, 0 failed, 3 ignored**. The unchanged baseline was 974 passed, 3 ignored. Formatting and `git diff --check` pass. A dedicated workflow publishes only `q2-test-<full commit SHA>`, with no production aliases.
 
 POMO website baseline covers all 28 model/site cells: 20 supported runs and 8 explicitly unavailable selectors (Ranking and CheckHub). Failed connectivity attempts are retained separately. Current Q2 baseline and the deployed-image rerun are recorded as separate rounds; score changes must be measured rather than inferred from the fix.
+
+## Iteration 2: stop rejecting supported explicit thinking
+
+The complete Q2 capture contains 673 complete HTTP exchanges with no TCP gaps. API Dance's Sonnet 4.6 baseline was rejected locally with HTTP 400. Replaying the same captured enabled-thinking request against POMO returned HTTP 200 with thinking and signature for both Sonnet 4.6 and Opus 4.6.
+
+The public-feature guard incorrectly reused the assistant-prefill capability to decide whether explicit thinking was supported, despite the existing model capability table allowing enabled thinking on both 4.6 models. The guard now consults that existing table before rejecting. It does not modify the request, request normalization, upstream headers, parameters, ID generation or signature code. Unsupported enabled-thinking protocols on newer models still fail closed.
+
+The new seven-model boundary regression failed on the original guard and passes after the fix. Full local validation: **977 passed, 0 failed, 3 ignored**; formatting and diff checks pass. Deploy the combined verified changes as one Q2 candidate, then compare the full website matrix with the captured original Q2 and POMO rounds. The first image build is retained as an intermediate artifact and is not promoted to the domain.
