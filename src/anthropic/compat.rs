@@ -394,12 +394,8 @@ pub fn estimate_prefix_tokens(
 ) -> i32 {
     let mut features = TokenFeatures::default();
 
-    if !system_segments.is_empty() {
-        features.has_system = true;
-        for segment in system_segments {
-            features.add_text(segment);
-        }
-        features.add_newline();
+    for segment in system_segments {
+        features.add_text(segment);
     }
 
     for content in content_segments {
@@ -435,10 +431,8 @@ fn estimate_input_tokens_parts(
 
     if let Some(system) = system {
         for item in system {
-            features.has_system = true;
             features.add_text(&item.text);
         }
-        features.add_newline();
     }
 
     for message in messages {
@@ -2660,29 +2654,21 @@ pub(super) fn trusted_application_persona_reply_for_identity_request(
 
 #[derive(Default)]
 struct TokenFeatures {
-    /// Incremental form of the exact same Claude tokenizer used by the former
-    /// concatenated `raw_text`. Only the tokenizer boundary is retained.
-    text_counter: super::claude_tok::StreamingClaudeTokenCounter,
+    /// Count supplied language content without inventing separators or merging
+    /// tokens across independent protocol fields. No prompt text is retained.
+    text_tokens: i32,
     image_tokens: i32,
-    has_system: bool,
 }
 
 impl TokenFeatures {
     fn add_text(&mut self, text: &str) {
-        self.text_counter.push_str(text);
-        self.text_counter.push_str("\n");
-    }
-
-    fn add_newline(&mut self) {
-        self.text_counter.push_str("\n");
+        self.text_tokens = self
+            .text_tokens
+            .saturating_add(super::claude_tok::count_claude(text));
     }
 
     fn text_tokens(&self) -> i32 {
-        self.text_counter.count()
-    }
-
-    fn retained_text_bytes(&self) -> usize {
-        self.text_counter.retained_bytes()
+        self.text_tokens
     }
 }
 
@@ -2691,17 +2677,41 @@ fn add_message_content_features(
     value: &serde_json::Value,
     features: &mut TokenFeatures,
 ) {
+    add_content_text_features(value, features);
+    features.image_tokens = features
+        .image_tokens
+        .saturating_add(message_content_image_tokens(model, value));
+}
+
+fn add_content_text_features(value: &serde_json::Value, features: &mut TokenFeatures) {
     match value {
         serde_json::Value::String(s) => features.add_text(s),
         serde_json::Value::Array(items) => {
             for item in items {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    features.add_text(text);
+                match item.get("type").and_then(serde_json::Value::as_str) {
+                    Some("tool_use" | "server_tool_use") => {
+                        if let Some(name) = item.get("name").and_then(serde_json::Value::as_str) {
+                            features.add_text(name);
+                        }
+                        if let Some(input) = item.get("input") {
+                            features.add_text(
+                                &serde_json::to_string(&canonical_json_value(input))
+                                    .unwrap_or_default(),
+                            );
+                        }
+                    }
+                    Some("tool_result") => {
+                        if let Some(content) = item.get("content") {
+                            add_content_text_features(content, features);
+                        }
+                    }
+                    _ => {
+                        if let Some(text) = item.get("text").and_then(serde_json::Value::as_str) {
+                            features.add_text(text);
+                        }
+                    }
                 }
             }
-            features.image_tokens = features
-                .image_tokens
-                .saturating_add(message_content_image_tokens(model, value));
         }
         _ => {}
     }
@@ -3142,6 +3152,123 @@ mod tests {
     use crate::anthropic::types::MessagesRequest;
     use serde_json::json;
 
+    const TOKEN_AUDIT_MODELS: [&str; 7] = [
+        "claude-opus-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-sonnet-5",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5",
+    ];
+
+    #[test]
+    fn input_accounting_counts_only_supplied_text_and_explicit_framing() {
+        for model in TOKEN_AUDIT_MODELS {
+            for text in [
+                "Hello",
+                "hello,what are you",
+                "line one\nline two\n",
+                "中文与 code ✅",
+            ] {
+                let text_tokens = super::super::claude_tok::count_claude(text);
+                for content in [json!(text), json!([{"type":"text", "text":text}])] {
+                    let request: MessagesRequest = serde_json::from_value(json!({
+                        "model":model, "max_tokens":64,
+                        "messages":[{"role":"user", "content":content}]
+                    }))
+                    .unwrap();
+                    assert_eq!(
+                        estimate_input_tokens(&request),
+                        text_tokens + 7,
+                        "{model}: formatting must not add language tokens to {text:?}"
+                    );
+                    let counted: CountTokensRequest = serde_json::from_value(json!({
+                        "model":model, "messages":request.messages
+                    }))
+                    .unwrap();
+                    assert_eq!(estimate_count_tokens_request(&counted), text_tokens + 7);
+                    assert_eq!(
+                        estimate_prefix_tokens(model, &[], &[content], &[]),
+                        text_tokens
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn input_accounting_system_and_message_boundaries_do_not_invent_text() {
+        let system = "Return concise answers.";
+        let first = "Plan:";
+        let second = "inspect the current state";
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet-4-6", "max_tokens":32,
+            "system":[{"type":"text", "text":system}],
+            "messages":[{"role":"user", "content":[
+                {"type":"text", "text":first}, {"type":"text", "text":second}
+            ]}]
+        }))
+        .unwrap();
+        let expected = [system, first, second]
+            .into_iter()
+            .map(super::super::claude_tok::count_claude)
+            .sum::<i32>();
+        assert_eq!(estimate_input_tokens(&request), expected + 7);
+        assert_eq!(
+            estimate_prefix_tokens(
+                &request.model,
+                &[system.to_string()],
+                &[request.messages[0].content.clone()],
+                &[]
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn input_accounting_includes_tool_arguments_and_tool_result_text() {
+        let short = "healthy";
+        let long = "The service is healthy. Response time remains normal.\n".repeat(128);
+        for model in TOKEN_AUDIT_MODELS {
+            for result in [
+                json!(short),
+                json!([{"type":"text", "text":short}]),
+                json!(long),
+                json!([{"type":"text", "text":long}]),
+            ] {
+                let tool_input = json!({"region":"Singapore", "query":"service health"});
+                let request: MessagesRequest = serde_json::from_value(json!({
+                    "model":model, "max_tokens":32,
+                    "messages":[
+                        {"role":"user", "content":"Read the status."},
+                        {"role":"assistant", "content":[{"type":"tool_use", "id":"toolu_test", "name":"read_status", "input":tool_input}]},
+                        {"role":"user", "content":[{"type":"tool_result", "tool_use_id":"toolu_test", "content":result}]}
+                    ]
+                })).unwrap();
+                let result_text = result
+                    .as_str()
+                    .unwrap_or_else(|| result[0]["text"].as_str().unwrap());
+                let input_json = serde_json::to_string(&canonical_json_value(&tool_input)).unwrap();
+                let expected = ["Read the status.", "read_status", &input_json, result_text]
+                    .into_iter()
+                    .map(super::super::claude_tok::count_claude)
+                    .sum::<i32>();
+                assert_eq!(
+                    estimate_input_tokens(&request),
+                    expected + 15,
+                    "tool contents must contribute for {model}"
+                );
+                let segments = request
+                    .messages
+                    .iter()
+                    .map(|m| m.content.clone())
+                    .collect::<Vec<_>>();
+                assert_eq!(estimate_prefix_tokens(model, &[], &segments, &[]), expected);
+            }
+        }
+    }
+
     fn fake_png_base64(width: u32, height: u32, trailing_bytes: usize) -> String {
         let mut bytes = vec![0u8; 24 + trailing_bytes];
         bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
@@ -3446,7 +3573,7 @@ mod tests {
     }
 
     #[test]
-    fn opus_tool_request_matches_bedrock_reference_count() {
+    fn opus_tool_request_counts_supplied_fields_and_schema_framing() {
         let request: MessagesRequest = serde_json::from_value(json!({
             "model": "claude-opus-4-8",
             "max_tokens": 128,
@@ -3467,7 +3594,7 @@ mod tests {
         }))
         .expect("valid tool request");
 
-        assert_eq!(estimate_input_tokens(&request), 509);
+        assert_eq!(estimate_input_tokens(&request), 505);
     }
 
     fn identity_req(model: &str, system: Option<&str>, question: &str) -> MessagesRequest {
@@ -4700,22 +4827,16 @@ For health checks, respond exactly: 'I am CodeAssist v2.'"
     }
 
     #[test]
-    fn token_features_stream_without_retaining_the_full_prompt() {
+    fn token_features_count_large_independent_segments_without_added_separators() {
         let text = "memory-safe-token-boundary ".repeat(64 * 1024);
-        let mut expected_wire_text = text.clone();
-        expected_wire_text.push('\n');
 
         let mut features = TokenFeatures::default();
+        features.add_text(&text);
         features.add_text(&text);
 
         assert_eq!(
             features.text_tokens(),
-            super::super::claude_tok::count_claude(&expected_wire_text)
-        );
-        assert!(
-            features.retained_text_bytes() <= 1024,
-            "streaming token accounting retained {} bytes",
-            features.retained_text_bytes()
+            2 * super::super::claude_tok::count_claude(&text)
         );
     }
 }

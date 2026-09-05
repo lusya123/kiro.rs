@@ -4453,7 +4453,7 @@ mod tests {
         let total = super::super::bedrock::calibrated_input_tokens(&req, base);
         let usage = compute_request_usage_breakdown_with_profile(total, &req, true).await;
 
-        assert_eq!(total, 18_021);
+        assert_eq!(total, 18_019);
         assert_eq!(usage.cache_read_input_tokens, 0);
         assert!(usage.input_tokens > 0);
         assert!(usage.cache_creation_input_tokens > 0);
