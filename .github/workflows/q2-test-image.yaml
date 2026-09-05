@@ -1,0 +1,37 @@
+name: Build isolated Q2 test image
+
+on:
+  push:
+    branches:
+      - 'codex/q2-pomo-compat-*'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    if: startsWith(github.ref, 'refs/heads/codex/q2-pomo-compat-')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+      - name: Build immutable test tag without production aliases
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ghcr.io/${{ github.repository_owner }}/kiro-rs:q2-test-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=Isolated Q2 compatibility experiment
+          cache-from: type=gha,scope=q2-test
+          cache-to: type=gha,scope=q2-test,mode=max

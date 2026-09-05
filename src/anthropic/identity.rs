@@ -3001,6 +3001,29 @@ fn apply_short_response_safety_net(
         return text.to_string();
     }
 
+    if !options.strict_identity_context {
+        // A JSON field or a line inside a code fence is user data, not a
+        // standalone assistant-name label. Splitting the complete answer into
+        // lines first loses that boundary and rewrites values such as
+        // `"service": "kiro"` in otherwise ordinary replies.
+        if matches!(
+            serde_json::from_str::<serde_json::Value>(text),
+            Ok(serde_json::Value::Object(_) | serde_json::Value::Array(_))
+        ) {
+            return text.to_string();
+        }
+        return map_non_code_segments(text, |prose| {
+            apply_short_response_safety_net_to_prose(prose, options)
+        });
+    }
+
+    apply_short_response_safety_net_to_prose(text, options)
+}
+
+fn apply_short_response_safety_net_to_prose(
+    text: &str,
+    options: IdentitySanitizationOptions,
+) -> String {
     // 整段（最常见的 `**Kiro**` / `Kiro` 形态）
     if looks_like_label_only_brand_response(text) {
         return sanitize_identity_text_internal(
@@ -5789,6 +5812,36 @@ fn split_before_last_chars(text: &str, hold_chars: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_structured_output_keeps_user_supplied_service_names() {
+        let options = IdentitySanitizationOptions::strict(false);
+        for original in [
+            "```json\n{\n  \"service\": \"kiro\",\n  \"region\": \"Singapore\",\n  \"ticket\": 9173\n}\n```",
+            "{\n  \"service\": \"kiro\",\n  \"region\": \"Singapore\",\n  \"ticket\": 9173\n}",
+            "Result:\n```yaml\nservice: kiro\nregion: Singapore\nticket: 9173\n```\nDone.",
+        ] {
+            assert_eq!(
+                sanitize_identity_text_for_request_with_options(original, options),
+                original,
+                "ordinary structured data must not be treated as an assistant name"
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_structured_output_keeps_user_supplied_service_names() {
+        let original = "```json\n{\n  \"service\": \"kiro\",\n  \"region\": \"Singapore\",\n  \"ticket\": 9173\n}\n```";
+        for chunk_size in [1, 7, 32, 128] {
+            let mut sanitizer = IdentityOutputSanitizer::new_with_strict_mode(false);
+            let mut actual = String::new();
+            for chunk in original.as_bytes().chunks(chunk_size) {
+                actual.push_str(&sanitizer.push(std::str::from_utf8(chunk).unwrap()));
+            }
+            actual.push_str(&sanitizer.finish());
+            assert_eq!(actual, original, "SSE chunk size {chunk_size}");
+        }
+    }
 
     #[test]
     fn open_weight_models_have_distinct_public_identity_targets() {
