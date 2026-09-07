@@ -16,3 +16,37 @@ Reference: https://platform.claude.com/docs/en/build-with-claude/mid-conversatio
 The `sub2api的分组` branch is based on the external compatibility variant. It is released as `sub2api-compat-*`, independently of `aws-b` and `aws-b-external` aliases. The standard `aws-b` branch intentionally retains strict validation and must not receive this patch.
 
 Sub2API customer traffic must not mix the standard fleet with this compatibility fleet. A release must audit actual account base URLs against live cluster membership, persistently exclude standard accounts from customer scheduling (including automatic recovery), and preserve unrelated accounts, credentials, groups, databases, Redis and production/staging application identities.
+
+
+## Sub2API group cutover
+
+Run `scripts/sub2api_group_audit.py` read-only on the Docker host, then run
+`scripts/sub2api_group_policy.py AUDIT.json PLAN.json` locally. The audit resolves
+actual account destinations against live cache roles and external source labels;
+account names do not determine cluster identity. It includes standard source
+ports whose containers are currently missing but whose external twins exist.
+The plan contains bounded, explicit admin API requests and per-account rollback
+states, with no credentials or request content.
+
+For this customer-facing routing policy, standard accounts must be both
+`status=inactive` and `schedulable=false`. Leaving status active allows an
+ordinary successful health check to turn scheduling back on. Preserve standard
+containers and their strict validator. Keep their account records, credentials
+and group bindings for audit/rollback. Never let future credential import or
+route recovery enable these standard destinations in Sub2API. Credential parity
+between twins remains a separate invariant; it does not require both variants
+to receive customer traffic. Other gateways are outside this cutover scope.
+
+The planner refuses overlapping account IDs/ports or a customer group without
+an eligible external account. This is a routing precondition, not proof of live
+capacity: verify each affected model on the actual new image before applying.
+Re-audit immediately before mutation; abort if the target account identities,
+base URLs, status or group sets differ from the reviewed snapshot. Apply through
+`POST /api/v1/admin/accounts/bulk-update`; check every per-account result, since
+HTTP 200 alone does not imply the whole batch succeeded. On partial failure,
+stop and restore only the successfully changed accounts to their saved state,
+provided no subsequent administrator has changed them. Do not restart Sub2API.
+
+A release is complete only after external-image rollout, persistent routing
+isolation and successful gateway-level tests. Local tests and a pushed image
+alone do not establish resolution of the production incident.
