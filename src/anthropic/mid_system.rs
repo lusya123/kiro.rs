@@ -10,10 +10,10 @@ use super::types::Message;
 use serde_json::{Value, json};
 
 pub(super) fn supports_model(model: &str) -> bool {
-    matches!(
-        super::converter::map_model(model).as_deref(),
-        Some("claude-opus-4.8" | "claude-opus-5")
-    )
+    // This branch is a customer compatibility transport. Claude Code can send
+    // reminders while selecting Sonnet as well as Opus; the Kiro rendering is
+    // intentionally independent of the native API's model-specific support.
+    super::converter::map_model(model).is_some_and(|mapped| mapped.starts_with("claude-"))
 }
 
 pub(super) fn validate_placement(messages: &[Message]) -> Result<(), String> {

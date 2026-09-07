@@ -375,8 +375,16 @@ mod tests {
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         for path in ["/v1/messages", "/cc/v1/messages"] {
             for stream in [false, true] {
-                for model in ["claude-opus-4-8", "claude-opus-5"] {
-                    let response = client.post(format!("{base}{path}"))
+                for model in [
+                    "claude-opus-4-6",
+                    "claude-opus-4-7",
+                    "claude-opus-4-8",
+                    "claude-opus-5",
+                    "claude-sonnet-4-6",
+                    "claude-sonnet-5",
+                ] {
+                    let response = client
+                        .post(format!("{base}{path}"))
                         .header("x-api-key", "test-key")
                         .json(&json!({
                             "model": model, "max_tokens": 64, "stream": stream,
@@ -384,9 +392,15 @@ mod tests {
                                 {"role": "user", "content": "你好"},
                                 {"role": "system", "content": "Reply concisely."}
                             ]
-                        })).send().await.unwrap();
-                    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE,
-                        "{path} {model} stream={stream}: valid role must reach provider dispatch");
+                        }))
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "{path} {model} stream={stream}: valid role must reach provider dispatch"
+                    );
                 }
             }
         }

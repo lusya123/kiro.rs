@@ -9,6 +9,7 @@ on:
       - aws-p
       - aws-b
       - AWS杠B可外接版本
+      - sub2api的分组
     tags:
       - 'v*'
   workflow_dispatch:
@@ -73,6 +74,7 @@ jobs:
           AWS_P_BRANCH="aws-p"
           AWS_B_BRANCH="aws-b"
           AWS_B_EXTERNAL_BRANCH="AWS杠B可外接版本"
+          SUB2API_COMPAT_BRANCH="sub2api的分组"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             if [ "${{ github.ref_name }}" = "${HIGH_CACHE_BRANCH}" ]; then
               echo "version=high-cache-${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
@@ -86,6 +88,9 @@ jobs:
             elif [ "${{ github.ref_name }}" = "${AWS_B_EXTERNAL_BRANCH}" ]; then
               echo "version=aws-b-external-${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
               echo "alias_tag=aws-b-external" >> $GITHUB_OUTPUT
+            elif [ "${{ github.ref_name }}" = "${SUB2API_COMPAT_BRANCH}" ]; then
+              echo "version=sub2api-compat-${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+              echo "alias_tag=sub2api-compat" >> $GITHUB_OUTPUT
             else
               echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
               echo "alias_tag=latest" >> $GITHUB_OUTPUT
@@ -109,6 +114,9 @@ jobs:
             elif [ "${{ github.ref_name }}" = "${AWS_B_EXTERNAL_BRANCH}" ]; then
               echo "version=aws-b-external-beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
               echo "alias_tag=aws-b-external" >> $GITHUB_OUTPUT
+            elif [ "${{ github.ref_name }}" = "${SUB2API_COMPAT_BRANCH}" ]; then
+              echo "version=sub2api-compat-beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
+              echo "alias_tag=sub2api-compat" >> $GITHUB_OUTPUT
             else
               echo "version=beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
               echo "alias_tag=beta" >> $GITHUB_OUTPUT
@@ -137,6 +145,7 @@ jobs:
           provenance: false
           tags: ghcr.io/${{ github.repository_owner }}/kiro-rs:${{ steps.version.outputs.version }}-${{ matrix.arch }}
           labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=Kiro.rs Docker Image
 
