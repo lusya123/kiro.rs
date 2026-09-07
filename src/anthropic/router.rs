@@ -370,6 +370,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aws_b_message_entrypoints_accept_mid_conversation_system_role() {
+        let (base, server) = spawn_router(true).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for path in ["/v1/messages", "/cc/v1/messages"] {
+            for stream in [false, true] {
+                for model in ["claude-opus-4-8", "claude-opus-5"] {
+                    let response = client.post(format!("{base}{path}"))
+                        .header("x-api-key", "test-key")
+                        .json(&json!({
+                            "model": model, "max_tokens": 64, "stream": stream,
+                            "messages": [
+                                {"role": "user", "content": "你好"},
+                                {"role": "system", "content": "Reply concisely."}
+                            ]
+                        })).send().await.unwrap();
+                    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE,
+                        "{path} {model} stream={stream}: valid role must reach provider dispatch");
+                }
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn aws_b_message_entrypoints_reject_a_leading_system_role() {
         let (base, server) = spawn_router(true).await;
         let client = reqwest::Client::builder()
@@ -894,7 +918,10 @@ mod tests {
                 "stream": true,
                 "temperature": 1,
                 "custom_extension": {"keep": true},
-                "messages": [{"role": "user", "content": "hello"}]
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "system", "content": "A native reminder", "clear_at": "never"}
+                ]
             }))
             .send()
             .await
@@ -919,6 +946,9 @@ mod tests {
         assert_eq!(body["model"], "anthropic.claude-opus-4-8");
         assert_eq!(body["temperature"], 1);
         assert_eq!(body["custom_extension"]["keep"], true);
+        assert_eq!(body["messages"][1]["role"], "system");
+        assert_eq!(body["messages"][1]["content"], "A native reminder");
+        assert_eq!(body["messages"][1]["clear_at"], "never");
 
         let count_tokens: Value = client
             .post(format!("http://{app_addr}/v1/messages/count_tokens"))
