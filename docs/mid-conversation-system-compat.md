@@ -50,3 +50,35 @@ provided no subsequent administrator has changed them. Do not restart Sub2API.
 A release is complete only after external-image rollout, persistent routing
 isolation and successful gateway-level tests. Local tests and a pushed image
 alone do not establish resolution of the production incident.
+
+
+## Local live validation (2026-09-07)
+
+The release image at commit `1c31160b90e12a7b75d9279fa709ec85664290dd`
+was started locally and exercised with Claude Code 2.1.263 in print mode,
+using an isolated configuration. The old external image reproduced
+`400 messages.1.role: system is not supported`; the repaired image completed
+the same role pattern. Ordinary dialogue, injected system reminders, a real
+Read tool round trip and an Opus 5 request completed successfully.
+
+The ordinary bare client emitted only a user message on its first turn.
+The failing-role fixture was therefore added explicitly by a local observing
+proxy. This does not claim the user's VS Code extension/environment was tested.
+
+`scripts/test_mid_system_live.py` runs 16 real inference cases across Sonnet 5,
+Sonnet 4.6, Opus 5 and Opus 4.8, v1/cc, streaming/non-streaming. Provide the
+local endpoint and `ANTHROPIC_API_KEY` through the environment. It performs
+billable calls and stops on protocol/completion failure. All 16 returned HTTP
+200 with complete substantive responses in this run, and the upstream success
+logs confirmed actual Kiro calls for all four model families.
+
+Do not use an exact-echo prompt as proof of upstream inference: the existing
+compatibility responder can answer such probes locally. Use substantive tasks
+and inspect upstream success events in addition to client responses.
+
+Language precedence is advisory, separate from the HTTP completion assertion:
+14/16 cases obeyed the reminder's English instruction; Sonnet 4.6 on cc returned
+Chinese in both stream modes when the preceding user explicitly requested
+Chinese. Retain this observation as a limitation of Kiro text rendering; do not
+claim native system-role priority or silently discard this result. Production
+image rollout and Sub2API routing cutover remain separate, unexecuted steps.
