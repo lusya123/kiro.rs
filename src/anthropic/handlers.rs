@@ -2814,6 +2814,13 @@ pub async fn post_messages(
             return response;
         }
     }
+    if let Err(message) = super::mid_system::normalize_legacy(&mut payload.messages, &raw_body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invalid_request_error", message)),
+        )
+            .into_response();
+    }
     drop(raw_body);
 
     let gpt_passthrough = is_gpt_model(&payload.model);
@@ -6177,13 +6184,17 @@ fn reject_invalid_message_sequence(payload: &MessagesRequest) -> Option<Response
             .iter()
             .enumerate()
             .find_map(|(index, message)| {
-                (!matches!(message.role.as_str(), "user" | "assistant"))
-                    .then_some((index, message.role.as_str()))
+                let supported = matches!(message.role.as_str(), "user" | "assistant")
+                    || (message.role == "system"
+                        && super::mid_system::supports_model(&payload.model));
+                (!supported).then_some((index, message.role.as_str()))
             })
     {
         Some(format!(
             "messages.{index}.role: `{role}` is not supported; expected `user` or `assistant`"
         ))
+    } else if let Err(message) = super::mid_system::validate_placement(&payload.messages) {
+        Some(message)
     } else {
         let rejects_assistant_prefill = modern_claude_rejects_assistant_prefill(&payload.model);
         (rejects_assistant_prefill
@@ -6410,6 +6421,13 @@ async fn count_tokens_for_profile(
     {
         return provider.proxy_count_tokens(&headers, raw_body).await;
     }
+    if let Err(message) = super::mid_system::normalize_legacy(&mut payload.messages, &raw_body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invalid_request_error", message)),
+        )
+            .into_response();
+    }
     if let Some(thinking) = &payload.thinking {
         if thinking.thinking_type == "enabled" && thinking.budget_tokens < 1024 {
             let message = format!(
@@ -6482,6 +6500,13 @@ pub async fn post_messages_cc(
         .filter(|provider| provider.should_route_messages(&payload))
     {
         return provider.proxy_messages(&headers, raw_body).await;
+    }
+    if let Err(message) = super::mid_system::normalize_legacy(&mut payload.messages, &raw_body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invalid_request_error", message)),
+        )
+            .into_response();
     }
     drop(raw_body);
 
@@ -7275,6 +7300,50 @@ mod tests {
             "test".to_string(),
         );
         (std::sync::Arc::new(provider), server)
+    }
+
+    #[tokio::test]
+    async fn mid_system_requests_complete_through_both_kiro_handlers() {
+        for cc in [false, true] {
+            for stream in [false, true] {
+                let response_body = eventstream_event(
+                    "assistantResponseEvent",
+                    json!({"content": "MID_SYSTEM_OK", "messageStatus": "COMPLETED"}),
+                );
+                let (provider, server) = provider_serving_eventstream(response_body).await;
+                let mut state = AppState::new("test-key", true, true);
+                state.kiro_provider = Some(provider);
+                let raw = serde_json::to_vec(&json!({
+                    "model": "claude-opus-5", "max_tokens": 64, "stream": stream,
+                    "messages": [
+                        {"role":"user", "content":"Compute the sum of 137 and 281."},
+                        {"role":"system", "content":"Return only the result."}
+                    ]
+                })).unwrap();
+                let payload = serde_json::from_slice(&raw).unwrap();
+                let response = if cc {
+                    post_messages_cc(State(state), HeaderMap::new(), RawApiJson(payload, raw.into())).await
+                } else {
+                    post_messages(State(state), HeaderMap::new(), RawApiJson(payload, raw.into())).await
+                };
+                assert_eq!(response.status(), StatusCode::OK, "cc={cc} stream={stream}");
+                let body = to_bytes(response.into_body(), 1_000_000).await.unwrap();
+                let body = String::from_utf8(body.to_vec()).unwrap();
+                let text = if stream {
+                    assert!(body.contains("message_stop"));
+                    body.lines().filter_map(|line| line.strip_prefix("data: "))
+                        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+                        .filter_map(|event| event.pointer("/delta/text").and_then(|v| v.as_str()).map(str::to_owned))
+                        .collect::<String>()
+                } else {
+                    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    value["content"].as_array().unwrap().iter()
+                        .filter_map(|block| block["text"].as_str()).collect::<String>()
+                };
+                assert_eq!(text, "MID_SYSTEM_OK", "cc={cc} stream={stream}");
+                server.abort();
+            }
+        }
     }
 
     fn legacy_identity_instruction_text(text: &str) -> String {
