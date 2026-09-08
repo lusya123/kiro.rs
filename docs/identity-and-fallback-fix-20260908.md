@@ -1,5 +1,7 @@
 # JSON/代码身份过滤与 fallback 修复
 
+> 后续截图复测发现普通文字人设仍有遗漏，已继续修复；扩展测试中的 JSON 空回复仍未解决，见 [后续复测报告](screenshot-retest-persona-fix-20260908.md)。下文保留本轮历史结果。
+
 2026-09-08，在指定 Worktree 修改、构建并运行，主入口为 `/v1/messages`，目标模型为 Opus 5 和 Opus 4.8。
 
 ## 实际复现

@@ -910,14 +910,15 @@ pub(super) fn sanitize_code_identity_literal(text: &str, name: &str, label: bool
         return Some(text.replacen(trimmed, name, 1));
     }
     let prose = trimmed.trim_start_matches(['#', '/', '*', ' ']).to_ascii_lowercase();
-    let first_person = ["i am ", "i'm ", "my name is ", "my identity is ",
+    let first_person = ["i am ", "i'm ", "i’m ", "my name is ", "my identity is ",
         "my persona name is ", "my actual name is ", "my assistant name is ", "my application name is ",
         "我是", "我的名字是", "我的名称是", "我的身份是"]
         .iter().any(|phrase| prose.match_indices(phrase).any(|(start, _)|
             !phrase.is_ascii() || start == 0
                 || !prose[..start].chars().next_back().is_some_and(char::is_alphanumeric)));
     if !first_person { return None; }
-    let clean = sanitize_identity_text_for_request(text, true);
+    let clean = replace_phrase_ci(text, "kiro-powered", "AI-powered");
+    let clean = sanitize_identity_text_for_request(&clean, true);
     let clean = replace_identity_term_ci(&clean, "Claude", name);
     (clean != text).then_some(clean)
 }
@@ -949,6 +950,101 @@ pub(super) fn sanitize_identity_commentary(text: &str, name: &str) -> String {
         .filter(|line| !is_identity_only_commentary(line))
         .map(|line| sanitize_code_identity_literal(line, name, false).unwrap_or_else(|| line.to_owned()))
         .collect()
+}
+
+/// A trusted application persona preserves task output, but must still filter
+/// the model's own introductions. Scope the existing wording rules to each
+/// self-referential sentence; adjacent product descriptions, quotes and code
+/// are data, even when an introduction appears in the same response.
+pub(super) fn sanitize_application_persona_prose(text: &str, name: &str) -> String {
+    fn sentence(text: &str, name: &str) -> String {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return text.to_owned();
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        // Drop an identity-only refusal to adopt the application's persona,
+        // including its quoted name, without leaving sentence fragments.
+        let persona_refusal = lower.contains("kiro")
+            && lower.contains("persona")
+            && [
+                "i'll keep ",
+                "i will keep ",
+                "i’ll keep ",
+                "i will continue ",
+                "i'll continue ",
+            ]
+            .iter()
+            .any(|phrase| lower.contains(phrase));
+        if persona_refusal {
+            return String::new();
+        }
+        map_non_quoted_segments(text, |prose| {
+            let trimmed = prose.trim();
+            if trimmed.is_empty() {
+                return prose.to_owned();
+            }
+            let lower = trimmed.to_ascii_lowercase();
+            let reversed_self_claim = [
+                " is who i am",
+                " is who i actually am",
+                " is who i really am",
+            ]
+            .iter()
+            .any(|phrase| lower.contains(phrase));
+            let replacement = if reversed_self_claim {
+                Some(replace_identity_term_ci(trimmed, "Kiro", name))
+            } else {
+                sanitize_code_identity_literal(trimmed, name, false)
+            };
+            let Some(replacement) = replacement else {
+                return prose.to_owned();
+            };
+            let start = prose.len() - prose.trim_start().len();
+            format!(
+                "{}{}{}",
+                &prose[..start],
+                replacement,
+                &prose[start + trimmed.len()..]
+            )
+        })
+    }
+    map_non_code_segments(text, |prose| {
+        let mut out = String::with_capacity(prose.len());
+        let mut start = 0;
+        let mut closing_quote = None;
+        let mut escaped = false;
+        for (index, ch) in prose.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' && closing_quote == Some('"') {
+                escaped = true;
+                continue;
+            }
+            if let Some(expected) = closing_quote {
+                if ch == expected {
+                    closing_quote = None;
+                }
+                continue;
+            }
+            closing_quote = match ch {
+                '"' => Some('"'),
+                '“' => Some('”'),
+                '「' => Some('」'),
+                '『' => Some('』'),
+                _ => None,
+            };
+            if closing_quote.is_none() && is_sentence_boundary_at(prose, index, ch) {
+                let end = index + ch.len_utf8();
+                out.push_str(&sentence(&prose[start..end], name));
+                start = end;
+            }
+        }
+        out.push_str(&sentence(&prose[start..], name));
+        out
+    })
 }
 
 /// Apply the existing identity field rules to a JSON identity answer. Only

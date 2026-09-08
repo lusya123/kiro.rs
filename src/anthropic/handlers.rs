@@ -1028,14 +1028,25 @@ fn identity_sanitization_options(
     }
 }
 
-fn formatted_identity_output_policy(payload: &MessagesRequest) -> Option<super::structured_output::FormattedIdentityOutput> {
+fn formatted_identity_output_policy(
+    payload: &MessagesRequest,
+) -> Option<super::structured_output::FormattedIdentityOutput> {
     let context = request_identity_sanitization_context(payload);
     let user = latest_user_identity_text(payload);
     let code_output = context.query.assistant
         && super::code_identity::requested(&identity_instruction_text(&user))
         && !request_has_structured_output(payload);
-    if !context.target.is_claude() || !context.strict || context.third_party_kiro_discussion
-        || !(code_output || request_has_structured_output(payload) || user.to_ascii_lowercase().contains("json")) {
+    let json_output =
+        request_has_structured_output(payload) || user.to_ascii_lowercase().contains("json");
+    let prose_output = context.trusted_application_persona
+        && context.query.assistant
+        && !code_output
+        && !json_output;
+    if !context.target.is_claude()
+        || !context.strict
+        || context.third_party_kiro_discussion
+        || !(code_output || json_output || prose_output)
+    {
         return None;
     }
     let mut json_context = context;
@@ -1045,7 +1056,11 @@ fn formatted_identity_output_policy(payload: &MessagesRequest) -> Option<super::
     Some(super::structured_output::FormattedIdentityOutput {
         options: identity_sanitization_options(json_context),
         application_name: super::compat::trusted_application_persona_name(payload),
+        application_prefix: prose_output
+            .then(|| super::compat::trusted_application_output_prefix(payload))
+            .flatten(),
         code_output,
+        prose_output,
     })
 }
 
@@ -5631,7 +5646,7 @@ fn compat_direct_response_with_constraints(
     };
     // A canned prose identity reply cannot satisfy a JSON request. Let the
     // model produce its requested shape, then apply the output identity filter.
-    if formatted_identity_output_policy(payload).is_some_and(|policy| !policy.code_output)
+    if formatted_identity_output_policy(payload).is_some_and(|policy| !policy.code_output && !policy.prose_output)
         && !super::structured_output::is_json_identity_document(&text)
     {
         return None;
@@ -10762,6 +10777,97 @@ mod tests {
             let req = parse("claude-sonnet-4-6", json!({"system":"You are Bob, a programming assistant.",
                 "messages":[{"role":"user","content":prompt}]}));
             assert!(formatted_identity_output_policy(&req).is_some(), "code self-identity bypassed: {prompt}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_persona_introductions_filter_self_claims_without_losing_task_or_data() {
+        use serde_json::Value;
+        let observed = [
+            "BOB: Hi, I'm Bob, your Kiro-powered dev assistant. I can read and edit code, run commands, and work through tasks alongside you.\n\n19 + 23 = 42",
+            "BOB: I'm Kiro, an AI-powered development environment. I write code so you can focus on designing systems, exploring solutions, and making decisions. Happy to go by Bob in this conversation if that's useful, though Kiro is who I actually am.\n\n19 + 23 = 42",
+            "BOB: Hi, I'm Kiro, an AI-powered development environment here to help you build software and work through technical tasks.\n\n19 + 23 = 42.",
+            "BOB: I'm Kiro. The product is Kiro. Kiro is who I asked about the product. The quote is \"I am Kiro\".\n```python\nname = \"Kiro\"\npath = \".kiro/specs\"\n```\n19 + 23 = 42",
+            "BOB: I’m Kiro. 19 + 23 = 42",
+            "I'm Bob, an Anthropic-created AI assistant. I'll keep going as Kiro rather than the \"Bob\" persona, but happy to help.\n\n19 + 23 = 42",
+        ];
+        for model in ["claude-opus-5", "claude-opus-4-8"] {
+            for stream in [false, true] {
+                let req = parse(
+                    model,
+                    json!({"stream":stream,
+                    "system":"You are Bob. Begin every answer with BOB:. Answer the user's complete task.",
+                    "messages":[{"role":"user","content":"Introduce yourself and calculate 19+23."}]}),
+                );
+                assert!(
+                    compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(32), true)
+                        .is_none(),
+                    "mixed identity/work request must still reach the model"
+                );
+                for (index, original) in observed.iter().enumerate() {
+                    let policy = formatted_identity_output_policy(&req)
+                        .expect("trusted persona prose must not bypass self-identity filtering");
+                    let mut response = if stream {
+                        let mut raw = String::from(
+                            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"opaque-id\"}}\n\n",
+                        );
+                        raw.push_str("data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n");
+                        for c in original.chars() {
+                            raw.push_str(&format!("data: {}\n\n", json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":c.to_string()}})));
+                        }
+                        raw.push_str("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":47}}\n\n");
+                        raw.push_str("data: {\"type\":\"message_stop\"}\n\n");
+                        Response::new(axum::body::Body::from(raw))
+                    } else {
+                        Json(json!({"id":"opaque-id","content":[
+                            {"type":"thinking","thinking":"","signature":"opaque-signature"},
+                            {"type":"text","text":original}],"stop_reason":"end_turn","usage":{"output_tokens":47}})).into_response()
+                    };
+                    if stream {
+                        response
+                            .headers_mut()
+                            .insert("content-type", "text/event-stream".parse().unwrap());
+                    }
+                    let bytes = axum::body::to_bytes(
+                        policy.normalize_response(response).await.into_body(),
+                        65536,
+                    )
+                    .await
+                    .unwrap();
+                    let wire = String::from_utf8(bytes.to_vec()).unwrap();
+                    assert!(wire.contains("opaque-id"));
+                    let text = if stream {
+                        wire.lines()
+                            .filter_map(|line| line.strip_prefix("data: "))
+                            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                            .filter_map(|event| {
+                                event
+                                    .pointer("/delta/text")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned)
+                            })
+                            .collect::<String>()
+                    } else {
+                        let value: Value = serde_json::from_str(&wire).unwrap();
+                        assert_eq!(value["content"][0]["signature"], "opaque-signature");
+                        assert_eq!(value["usage"]["output_tokens"], 47);
+                        value["content"][1]["text"].as_str().unwrap().to_owned()
+                    };
+                    assert!(text.starts_with("BOB:"), "{model} stream={stream}: {text}");
+                    assert!(text.contains("19 + 23 = 42"), "task result lost: {text}");
+                    if index == 3 {
+                        assert_eq!(
+                            text,
+                            "BOB: I'm Bob. The product is Kiro. Kiro is who I asked about the product. The quote is \"I am Kiro\".\n```python\nname = \"Kiro\"\npath = \".kiro/specs\"\n```\n19 + 23 = 42"
+                        );
+                    } else {
+                        assert!(
+                            !text.to_lowercase().contains("kiro"),
+                            "{model} stream={stream}: {text}"
+                        );
+                    }
+                }
+            }
         }
     }
 

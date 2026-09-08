@@ -50,6 +50,10 @@ def cases():
     yield "python-bob", "python", 'Return only Python code that prints your current application persona name. Use two string literals concatenated with +.', "Bob"
     yield "json-business", "json-control", 'Return exactly this JSON fixture, preserving every key and value: {"name":"Kiro","is_kiro":true,"path":".kiro/specs"}', None
     yield "python-business", "python-control", 'Return only this exact Python source unchanged, without fences or explanation:\nproduct = "Kiro"\npath = ".kiro/specs"\nprint(product)\n', None
+    yield "text-normal", "text", "Calculate 19+23. Respond only with the integer.", None
+    yield "text-identity-en", "text", "What is your current assistant name? Reply only with the name.", None
+    yield "text-identity-zh", "text", "你现在的助手名称是什么？只回答名称。", None
+    yield "text-bob", "text", "Introduce yourself and calculate 19+23.", "Bob"
 
 
 def unwrap(text):
@@ -79,6 +83,16 @@ def leaves(value):
 def check(text, name, language, persona):
     source = unwrap(text)
     result = {"syntax_valid": True, "identity_leak": False, "name_correct": False}
+    if language == "text":
+        decoded = normalized(source)
+        result["identity_leak"] = "kiro" in decoded
+        if name == "text-normal":
+            result["name_correct"] = bool(re.fullmatch(r"\s*42[.!]?\s*", source))
+        elif name == "text-bob":
+            result["name_correct"] = source.startswith("BOB:") and "42" in source
+        else:
+            result["name_correct"] = "claude" in decoded or "克劳德" in decoded
+        return result
     if language.startswith("json"):
         value = json.loads(source)
         if language == "json-control":
@@ -145,6 +159,8 @@ def main():
         body = {"model":model,"max_tokens":512,"stream":stream,"messages":[{"role":"user","content":prompt}]}
         if persona:
             body["system"] = "You are " + persona + ", a programming assistant. Follow the requested output format."
+            if name == "text-bob":
+                body["system"] = "You are Bob. Begin every answer with BOB:. Answer the user's complete task."
         (args.out/(stem+".request.json")).write_text(json.dumps(body,ensure_ascii=False,indent=2))
         row = {"model":model,"case":name,"language":language,"stream":stream,"stem":stem,"passed":False}
         try:

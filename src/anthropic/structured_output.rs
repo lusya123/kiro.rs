@@ -5,7 +5,8 @@
 //! successful final response. A complete Markdown fence around otherwise valid
 //! JSON may be removed; schema validation preserves JSON data. The separate
 //! identity adapter patches selected self-identity values while preserving
-//! business data and opaque response metadata. Ordinary conversations bypass it.
+//! business data and opaque response metadata. Explicit persona introductions
+//! also use this adapter; ordinary conversations bypass it.
 
 use super::types::{ErrorResponse, MessagesRequest};
 use axum::{
@@ -20,7 +21,9 @@ use std::ops::Range;
 pub(super) struct FormattedIdentityOutput {
     pub options: super::identity::IdentitySanitizationOptions,
     pub application_name: Option<String>,
+    pub application_prefix: Option<String>,
     pub code_output: bool,
+    pub prose_output: bool,
 }
 
 impl FormattedIdentityOutput {
@@ -49,8 +52,26 @@ impl FormattedIdentityOutput {
             message_output(&raw)
         };
         let rewritten = output
-            .filter(|o| self.code_output || !o.incomplete_or_error)
+            .filter(|o| self.code_output || self.prose_output || !o.incomplete_or_error)
             .and_then(|output| {
+                if self.prose_output && !is_json_identity_document(&output.text) {
+                    let mut replacement = super::identity::sanitize_application_persona_prose(
+                        &output.text,
+                        self.application_name
+                            .as_deref()
+                            .unwrap_or(self.options.target.assistant_name()),
+                    );
+                    if let Some(prefix) = &self.application_prefix {
+                        if !replacement.trim_start().starts_with(prefix)
+                            && !replacement.trim().is_empty()
+                        {
+                            replacement = format!("{prefix} {}", replacement.trim_start());
+                        }
+                    }
+                    return (replacement != output.text)
+                        .then(|| replace_response_text(&raw, is_stream, &replacement))
+                        .flatten();
+                }
                 if self.code_output {
                     let replacement = super::code_identity::sanitize(
                         &output.text,
@@ -558,7 +579,9 @@ mod tests {
                 let policy = FormattedIdentityOutput {
                     options,
                     application_name: Some("Bob".into()),
+                    application_prefix: None,
                     code_output,
+                    prose_output: false,
                 };
                 let mut response = if stream {
                     let mut raw = String::from(
@@ -608,7 +631,9 @@ mod tests {
             let policy = FormattedIdentityOutput {
                 options,
                 application_name: Some("Bob".into()),
+                application_prefix: None,
                 code_output: false,
+                prose_output: false,
             };
             let raw = if stream {
                 let mut wire = String::new();
@@ -674,7 +699,9 @@ mod tests {
             let policy = FormattedIdentityOutput {
                 options,
                 application_name: Some("Bob".into()),
+                application_prefix: None,
                 code_output: false,
+                prose_output: false,
             };
             let response = policy
                 .normalize_response(
@@ -709,7 +736,9 @@ mod tests {
             let policy = FormattedIdentityOutput {
                 options,
                 application_name: Some("Bob".into()),
+                application_prefix: None,
                 code_output: true,
+                prose_output: false,
             };
             let response = policy
                 .normalize_response(
@@ -745,7 +774,9 @@ mod tests {
             let policy = FormattedIdentityOutput {
                 options: super::super::identity::IdentitySanitizationOptions::strict(true),
                 application_name: Some("Bob".into()),
+                application_prefix: None,
                 code_output: true,
+                prose_output: false,
             };
             let response = policy.normalize_response(response).await;
             let bytes = to_bytes(response.into_body(), 65536).await.unwrap();

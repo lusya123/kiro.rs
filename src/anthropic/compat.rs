@@ -2113,6 +2113,45 @@ pub(super) fn trusted_application_persona_name(payload: &MessagesRequest) -> Opt
     extract_system_persona(&instructions).map(|(name, _)| name)
 }
 
+/// A literal label explicitly requested by a trusted application. This does
+/// not infer a prefix from the persona name or from quoted examples.
+pub(super) fn trusted_application_output_prefix(payload: &MessagesRequest) -> Option<String> {
+    if !has_trusted_application_persona(payload) {
+        return None;
+    }
+    let system = payload
+        .system
+        .as_ref()?
+        .iter()
+        .map(|part| part.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let instructions = super::handlers::identity_instruction_text(&system);
+    instructions
+        .split(['.', '\n', '。'])
+        .filter_map(|sentence| {
+            let sentence = sentence.trim();
+            let lower = sentence.to_ascii_lowercase();
+            let anchor = [
+                "begin every answer with ",
+                "start every answer with ",
+                "begin every response with ",
+                "start every response with ",
+            ]
+            .into_iter()
+            .find(|anchor| lower.starts_with(anchor))?;
+            let prefix = sentence[anchor.len()..].trim();
+            (prefix.ends_with(':')
+                && prefix.chars().count() <= 64
+                && prefix
+                    .chars()
+                    .all(|ch| ch.is_alphanumeric() || matches!(ch, ':' | '_' | '-' | ' '))
+                && !contains_reserved_private_identity(prefix))
+            .then(|| prefix.to_owned())
+        })
+        .next_back()
+}
+
 fn text_only_message_content(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::String(_) => true,
