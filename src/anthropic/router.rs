@@ -96,7 +96,8 @@ pub fn create_router_with_native_bedrock(
         ));
 
     // 需要认证的 /cc/v1 路由（Claude Code 兼容端点）
-    // 与 /v1 的区别仅在发送时机：流式事件会先缓冲；输入 usage 仍是同一本地快照。
+    // 保留本地结构化输出等兼容扩展；/v1 的 AWS-B Kiro 路由执行公共能力校验。
+    // 流式事件会先缓冲；输入 usage 仍是同一本地快照。
     let cc_v1_routes = Router::new()
         .route("/messages", post(post_messages_cc))
         .route("/messages/count_tokens", post(count_tokens))
@@ -134,6 +135,82 @@ mod tests {
     use axum::response::Response;
     use serde_json::{Value, json};
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn pomo_opus_validation_matches_across_messages_cc_and_chat() {
+        let (base, server) = spawn_router(true).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for model in ["claude-opus-5", "claude-opus-4-8"] {
+            for path in ["/v1/messages", "/cc/v1/messages", "/v1/chat/completions"] {
+                for stream in [false, true] {
+                    for (extra, detail) in [
+                        (json!({"temperature":1.1}), "temperature: range: 0..1"),
+                        (json!({"messages":[{"role":"invalid","content":"hello"}]}), "Unexpected role"),
+                        (json!({"tools":[{"type":"advisor_20260301","name":"advisor"}]}), "tool type 'advisor_20260301' is not supported"),
+                    ] {
+                        let mut body = json!({"model":model,"stream":stream,"max_tokens":128,
+                            "messages":[{"role":"user","content":"hello"}]});
+                        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+                        let response = client.post(format!("{base}{path}"))
+                            .header("x-api-key","test-key").json(&body).send().await.unwrap();
+                        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path} {model} {extra}");
+                        assert!(response.headers()["content-type"].to_str().unwrap().starts_with("application/json"));
+                        let error: Value = response.json().await.unwrap();
+                        let expected = if path.ends_with("completions") { "upstream_error" } else { "<nil>" };
+                        assert_eq!(error["error"]["type"],expected,"{path}: {error}");
+                        let message = error["error"]["message"].as_str().unwrap();
+                        assert!(message.contains(detail),"{message}");
+                        let operation = if stream { "InvokeModelWithResponseStream" } else { "InvokeModel" };
+                        assert!(message.starts_with(operation),"{message}");
+                    }
+                }
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn aws_b_opus_messages_reject_fallbacks_before_upstream() {
+        let (base, server) = spawn_router(true).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for model in ["claude-opus-5", "claude-opus-4-8"] {
+            for path in ["/v1/messages", "/cc/v1/messages"] {
+                for stream in [false, true] {
+                    for beta in [false, true] {
+                        for fallback in [
+                            Some(json!("default")), Some(json!("invalid")), Some(json!([])),
+                            Some(json!(["not-a-real-model"])), Some(json!({"model":"claude-opus-4-8"})),
+                            Some(json!(false)), Some(Value::Null), None,
+                        ] {
+                            let requested = fallback.as_ref().is_some_and(|value| !value.is_null());
+                            let mut body = json!({"model":model,"stream":stream,"max_tokens":128,
+                                "messages":[{"role":"user","content":"hello"}]});
+                            if let Some(value) = fallback { body["fallbacks"] = value; }
+                            let mut request = client.post(format!("{base}{path}"))
+                                .header("x-api-key", "test-key");
+                            if beta { request = request.header("anthropic-beta", "server-side-fallback-2026-07-01"); }
+                            let response = request.json(&body).send().await.unwrap();
+                            if requested {
+                                assert_eq!(response.status(), StatusCode::BAD_REQUEST,
+                                    "{path} {model} stream={stream} beta={beta}: {body}");
+                                assert!(response.headers()["content-type"].to_str().unwrap().starts_with("application/json"));
+                                let error: Value = response.json().await.unwrap();
+                                assert_eq!(error["type"], "error");
+                                assert_eq!(error["error"]["type"], "invalid_request_error");
+                                assert_eq!(error["error"]["message"], "`fallbacks` is not supported on Amazon Bedrock");
+                            } else {
+                                // No fallback (including null) must still reach the
+                                // provider, even with the beta header alone.
+                                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE,
+                                    "{path} {model} stream={stream} beta={beta}: {body}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        server.abort();
+    }
 
     async fn spawn_router(aws_b40_compat: bool) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -507,7 +584,7 @@ mod tests {
                 let body: Value = response.json().await.expect("validation error JSON");
                 assert_eq!(body["type"], "error", "{path}: {model}");
                 assert_eq!(
-                    body["error"]["type"], "invalid_request_error",
+                    body["error"]["type"], if matches!(model,"claude-opus-5"|"claude-opus-4-8") { "<nil>" } else { "invalid_request_error" },
                     "{path}: {model}"
                 );
             }
@@ -553,12 +630,59 @@ mod tests {
                 );
                 let body: Value = response.json().await.expect("validation error JSON");
                 assert_eq!(
-                    body["error"]["type"], "invalid_request_error",
+                    body["error"]["type"], if matches!(model,"claude-opus-5"|"claude-opus-4-8") { "<nil>" } else { "invalid_request_error" },
                     "{path}: {model}: {body}"
                 );
             }
         }
 
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn aws_b_manual_thinking_46_reaches_provider_after_budget_validation() {
+        let (base, server) = spawn_router(true).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for path in ["/v1/messages", "/cc/v1/messages"] {
+            for model in ["claude-sonnet-4-6", "claude-opus-4-6"] {
+                for budget in [1024, 2048, 4096] {
+                    let response = client.post(format!("{base}{path}"))
+                        .header("x-api-key", "test-key")
+                        .json(&json!({"model": model, "max_tokens": budget + 1024,
+                            "thinking": {"type": "enabled", "budget_tokens": budget},
+                            "messages": [{"role": "user", "content": "Calculate 19+23."}]}))
+                        .send().await.unwrap();
+                    // This router has no upstream provider. Reaching that boundary
+                    // distinguishes accepted parameters from a premature local 400.
+                    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path} {model} {budget}");
+                }
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn schema_output_is_an_extension_of_the_cc_endpoint() {
+        let (base, server) = spawn_router(true).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for path in ["/v1/messages", "/cc/v1/messages"] {
+            let response = client.post(format!("{base}{path}"))
+                .header("x-api-key", "test-key")
+                .json(&json!({
+                    "model": "claude-sonnet-4-6", "max_tokens": 512,
+                    "messages": [{"role": "user", "content": "Return the requested JSON object."}],
+                    "output_config": {"format": {"type": "json_schema", "schema": {
+                        "type": "object", "properties": {"Kiro": {"type": "string"}},
+                        "required": ["Kiro"], "additionalProperties": false
+                    }}}
+                })).send().await.unwrap();
+            let expected = if path == "/v1/messages" {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            assert_eq!(response.status(), expected, "{path}");
+        }
         server.abort();
     }
 
@@ -574,7 +698,7 @@ mod tests {
             (
                 "server-side fallback",
                 json!({
-                    "model": "claude-opus-5",
+                    "model": "claude-opus-4-8",
                     "max_tokens": 64,
                     "fallbacks": "default",
                     "messages": [{"role": "user", "content": "hello"}]
@@ -605,20 +729,6 @@ mod tests {
                     "max_tokens": 64,
                     "tools": [{"type": "code_execution_20260521", "name": "code_execution"}],
                     "messages": [{"role": "user", "content": "Use code execution to calculate 17+25."}]
-                }),
-            ),
-            (
-                "structured output",
-                json!({
-                    "model": "claude-sonnet-4-6",
-                    "max_tokens": 64,
-                    "output_config": {"format": {"type": "json_schema", "schema": {
-                        "type": "object",
-                        "properties": {"ok": {"type": "boolean"}},
-                        "required": ["ok"],
-                        "additionalProperties": false
-                    }}},
-                    "messages": [{"role": "user", "content": "Return an ok field."}]
                 }),
             ),
             (
@@ -656,12 +766,53 @@ mod tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{case}: {body}");
             let error: Value = response.json().await.expect("validation error JSON");
             assert_eq!(
-                error["error"]["type"], "invalid_request_error",
+                error["error"]["type"], if case != "server-side fallback" && body["model"] != "claude-sonnet-5" { "<nil>" } else { "invalid_request_error" },
                 "{case}: {error}"
             );
         }
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn opus_public_capability_validation_is_independent_of_other_native_routes() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for hybrid in [false, true] {
+            let native = hybrid.then(|| BedrockMantleProvider::for_test(
+                "http://127.0.0.1:1/anthropic/v1/messages".to_string(),
+                "unused-native-key", vec!["claude-sonnet-4-6".to_string()],
+            ).unwrap());
+            let app = create_router_with_native_bedrock("test-key", None, native, true, true);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            for model in ["claude-opus-5", "claude-opus-4-8"] {
+                for stream in [false, true] {
+                    for extra in [
+                        json!({"fallbacks":"default"}),
+                        json!({"tools":[{"type":"web_search_20250305","name":"web_search"}]}),
+                        json!({"tools":[{"type":"advisor_20260301","name":"advisor"}]}),
+                        json!({"tools":[{"type":"code_execution_20260521","name":"code_execution"}]}),
+                        json!({"max_tokens":2048,"thinking":{"type":"enabled","budget_tokens":1024}}),
+                        json!({"output_config":{"format":{"type":"json_schema","schema":{
+                            "type":"object","properties":{},"additionalProperties":false}}}}),
+                        json!({"messages":[{"role":"user","content":[{"type":"image",
+                            "source":{"type":"url","url":"https://example.com/image.png"}}]}]}),
+                    ] {
+                        let mut body = json!({"model":model,"max_tokens":256,"stream":stream,
+                            "messages":[{"role":"user","content":"hello"}]});
+                        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+                        let response = client.post(format!("http://{addr}/v1/messages"))
+                            .header("x-api-key","test-key").json(&body).send().await.unwrap();
+                        assert_eq!(response.status(), StatusCode::BAD_REQUEST,
+                            "hybrid={hybrid} model={model} stream={stream} extra={extra}");
+                        let error: Value = response.json().await.unwrap();
+                        assert_eq!(error["error"]["type"], if extra.get("fallbacks").is_some() { "invalid_request_error" } else { "<nil>" });
+                    }
+                }
+            }
+            server.abort();
+        }
     }
 
     #[tokio::test]
@@ -873,12 +1024,12 @@ mod tests {
             }))
             .send()
             .await
-            .expect("invalid native sampling request");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(
-            captured.lock().expect("capture lock").is_none(),
-            "sampling validation must run before the native upstream"
-        );
+            .expect("native sampling request");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), NATIVE_SSE);
+        let (_, sampling_body) = captured.lock().expect("capture lock").take().unwrap();
+        assert_eq!(sampling_body["temperature"], 0.7,
+            "native validation belongs to the selected upstream");
 
         let response = client
             .post(format!("http://{app_addr}/v1/messages"))
@@ -974,8 +1125,11 @@ mod tests {
             }))
             .send()
             .await
-            .expect("structured-output fallback request");
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            .expect("structured-output native request");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.expect("native schema body"), NATIVE_SSE);
+        let (_, schema_body) = captured.lock().expect("capture lock").take().unwrap();
+        assert_eq!(schema_body["output_config"]["format"]["schema"], json!({"type": "object"}));
 
         let response = client
             .post(format!("http://{app_addr}/v1/messages"))

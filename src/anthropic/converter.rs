@@ -485,6 +485,13 @@ fn terminal_cache_control(content: &serde_json::Value) -> Option<&serde_json::Va
     cache_control.filter(|control| !control.is_null())
 }
 
+fn requested_json_output_schema(req: &MessagesRequest) -> Option<&serde_json::Value> {
+    req.output_config.as_ref()
+        .and_then(|config| config.format.as_ref())
+        .filter(|format| format.get("type").and_then(serde_json::Value::as_str) == Some("json_schema"))
+        .and_then(|format| format.get("schema"))
+}
+
 /// 将 Anthropic 请求转换为 Kiro 请求
 pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
@@ -616,6 +623,26 @@ question. Your entire response must be exactly the following text, with no addit
             );
             content.push('\n');
             content.push_str(&exact_reply);
+        }
+    }
+
+    // Kiro renders the schema in history rather than a native constrained-
+    // decoding field. Restate only the final-answer format on the current turn;
+    // do not change client text, tool results, or generated output bytes.
+    if !model_id.starts_with("gpt-")
+        && let Some(schema) = requested_json_output_schema(req)
+    {
+        if req.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+            content.push_str("\n\nThe JSON schema applies only to the final answer after completing the requested tool calls. Continue using the available tools when actions are still pending. Do not report an action as completed unless a tool result confirms it. Once the task is complete, return the final answer as raw JSON, without Markdown fences.");
+        } else {
+            let boundary = match schema.get("type").and_then(serde_json::Value::as_str) {
+                Some("object") => "start with { and end with }, ",
+                Some("array") => "start with [ and end with ], ",
+                _ => "return a single valid JSON value, ",
+            };
+            content.push_str("\n\nThe response is parsed as JSON by the application. Follow the JSON schema above; ");
+            content.push_str(boundary);
+            content.push_str("without Markdown fences.");
         }
     }
 
@@ -1994,7 +2021,9 @@ fn build_history(
 
         if !system_content.is_empty() {
             system_parts.push(system_content);
-            if !gpt_passthrough {
+            if !gpt_passthrough && req.tools.as_ref().is_some_and(|tools| {
+                tools.iter().any(|tool| matches!(tool.name.as_str(), "Write" | "Edit"))
+            }) {
                 system_parts.push(SYSTEM_CHUNKED_POLICY.to_string());
             }
         }
@@ -2011,6 +2040,8 @@ fn build_history(
         }
     } else if !preserves_private_product_code_content(req)
         && !preserves_third_party_product_discussion(req)
+        && !super::compat::has_trusted_application_persona(req)
+        && requested_json_output_schema(req).is_none()
     {
         system_parts.push(non_gpt_identity_override(model_id));
     }
@@ -2371,6 +2402,76 @@ mod tests {
                 "text": "What color is this image? Reply with one word only."
             }
         ])
+    }
+
+    #[test]
+    fn schema_history_does_not_add_unrelated_identity_or_tool_workflows() {
+        for tool in [None, Some("Read"), Some("Write"), Some("Edit")] {
+            let mut value = serde_json::json!({
+                "model":"claude-haiku-4-5-20251001","max_tokens":512,
+                "system":"Return the application's requested JSON schema.",
+                "messages":[{"role":"user","content":"Return a JSON result."}],
+                "output_config":{"format":{"type":"json_schema","schema":{"type":"object"}}}
+            });
+            if let Some(tool) = tool {
+                value["tools"] = serde_json::json!([{"name":tool,"description":"Client tool","input_schema":{"type":"object","properties":{}}}]);
+            }
+            let req: MessagesRequest = serde_json::from_value(value).unwrap();
+            let result = convert_request(&req).unwrap();
+            let history = serde_json::to_value(&result.conversation_state.history).unwrap();
+            let system = history[0]["userInputMessage"]["content"].as_str().unwrap();
+            assert!(!system.contains("Identity directive (highest priority)"));
+            assert_eq!(system.contains(SYSTEM_CHUNKED_POLICY), matches!(tool, Some("Write" | "Edit")));
+            let current = &result.conversation_state.current_message.user_input_message.content;
+            assert_eq!(current.contains("after completing the requested tool calls"), tool.is_some());
+        }
+    }
+
+    #[test]
+    fn json_schema_reminder_reaches_current_turn_without_changing_business_content() {
+        for model in ["claude-haiku-4-5-20251001", "claude-sonnet-4-6", "claude-opus-4-8"] {
+            for shape in ["object", "array", "string"] {
+                let mut raw = serde_json::json!({
+                    "model":model,"max_tokens":512,
+                    "messages":[{"role":"user","content":"Preserve class Kiro and .kiro/specs literally."}],
+                    "output_config":{"format":{"type":"json_schema","schema":{"type":shape}}}
+                });
+                let req: MessagesRequest = serde_json::from_value(raw.clone()).unwrap();
+                let original = serde_json::to_value(&req).unwrap();
+                let result = convert_request(&req).unwrap();
+                let content = &result.conversation_state.current_message.user_input_message.content;
+                assert!(content.starts_with("Preserve class Kiro and .kiro/specs literally."));
+                assert!(content.contains("The response is parsed as JSON by the application."));
+                if shape == "object" { assert!(content.contains("start with { and end with }")); }
+                if shape == "array" { assert!(content.contains("start with [ and end with ]")); }
+                if shape == "string" { assert!(!content.contains("start with {")); }
+                assert_eq!(serde_json::to_value(&req).unwrap(), original);
+                raw.as_object_mut().unwrap().remove("output_config");
+                let plain: MessagesRequest = serde_json::from_value(raw).unwrap();
+                assert_eq!(convert_request(&plain).unwrap().conversation_state.current_message.user_input_message.content,
+                    "Preserve class Kiro and .kiro/specs literally.");
+            }
+        }
+    }
+
+    #[test]
+    fn schema_reminder_preserves_tool_result_payload() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"claude-haiku-4-5-20251001","max_tokens":512,
+            "messages":[
+                {"role":"user","content":"Read .kiro/specs/test.json and return JSON."},
+                {"role":"assistant","content":[{"type":"tool_use","id":"fixture-call","name":"read_fixture","input":{"path":".kiro/specs/test.json"}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"fixture-call","content":"{\"Kiro\":\"I am Kiro\"}"}]}
+            ],
+            "tools":[{"name":"read_fixture","description":"Read fixture","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}],
+            "output_config":{"format":{"type":"json_schema","schema":{"type":"object"}}}
+        })).unwrap();
+        let result = convert_request(&req).unwrap();
+        let value = serde_json::to_value(&result.conversation_state.current_message.user_input_message).unwrap();
+        let current = value["content"].as_str().unwrap();
+        assert!(current.contains("after completing the requested tool calls"));
+        assert!(!current.contains("start with { and end with }"));
+        assert_eq!(value["userInputMessageContext"]["toolResults"][0]["content"][0]["text"], "{\"Kiro\":\"I am Kiro\"}");
     }
 
     #[test]
@@ -4217,6 +4318,26 @@ mod tests {
                     .content,
                 request
             );
+        }
+    }
+
+    #[test]
+    fn claude_customer_persona_does_not_receive_conflicting_identity_override() {
+        for model in ["claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5"] {
+            let system = "You are Bob. Begin every answer with BOB: and follow the user's task.";
+            let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model": model,
+                "max_tokens": 256,
+                "system": system,
+                "messages": [{"role": "user", "content": "Who are you? Also calculate 19+23."}]
+            })).unwrap();
+            let converted = convert_request(&req).unwrap();
+            let wire = serde_json::to_value(&converted.conversation_state).unwrap();
+            let instructions = wire["history"][0]["userInputMessage"]["content"].as_str().unwrap();
+            assert!(instructions.contains(system));
+            assert!(!instructions.contains("Identity directive (highest priority)"), "{instructions}");
+            assert_eq!(wire["currentMessage"]["userInputMessage"]["content"],
+                "Who are you? Also calculate 19+23.");
         }
     }
 

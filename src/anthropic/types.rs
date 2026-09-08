@@ -94,7 +94,7 @@ pub struct Thinking {
         deserialize_with = "deserialize_budget_tokens"
     )]
     pub budget_tokens: i32,
-    /// `display`: "summarized" 时返回可读思考摘要;"omitted"(缺省)时思考块文本为空。
+    /// `display`: "summarized" 返回可读摘要，"omitted" 返回空文本；缺省由模型决定。
     #[serde(default)]
     pub display: Option<String>,
 }

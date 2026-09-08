@@ -2591,10 +2591,9 @@ impl StreamContext {
                 (idx, true)
             };
 
-        // AWS-P rewrites the backend id to Anthropic shape; AWS-B deliberately
-        // keeps the Bedrock id as part of its public profile.
+        // Normalize Converse IDs while preserving existing native Bedrock IDs.
         let output_id = if self.aws_b40_compat {
-            tool_use.tool_use_id.clone()
+            super::id::bedrock_tool_use_id(&tool_use.tool_use_id)
         } else {
             self.tool_output_ids
                 .entry(tool_use.tool_use_id.clone())
@@ -5142,7 +5141,7 @@ mod tests {
         assert!(
             message["id"]
                 .as_str()
-                .is_some_and(|id| id.starts_with("msg_bdrk_011C") && id.len() == 33)
+                .is_some_and(|id| id.starts_with("msg_bdrk_01") && id.len() == 33)
         );
         assert_eq!(response_usage["input_tokens"], 100);
         assert_eq!(response_usage["cache_read_input_tokens"], 40);
@@ -5500,6 +5499,26 @@ mod tests {
             raw,
             "response state must not rewrite request-local input usage"
         );
+    }
+
+    #[test]
+    fn pomo_tool_ids_hide_converse_shape_and_keep_fragment_association() {
+        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-4-6", 1, false, false, HashMap::new());
+        ctx.enable_aws_b40_compat();
+        let mut events = Vec::new();
+        for (input, stop) in [("{\"city\":", false), ("\"上海\"}", true)] {
+            events.extend(ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "weather".into(), tool_use_id: "tooluse_yiulrCVHZ5MVJa3AdVcgtf".into(), input: input.into(), stop,
+            }));
+        }
+        let starts: Vec<_> = events.iter().filter(|e| e.event == "content_block_start").collect();
+        assert_eq!(starts.len(), 1);
+        let id = starts[0].data["content_block"]["id"].as_str().unwrap();
+        let suffix = id.strip_prefix("toolu_bdrk_01").expect("POMO tool prefix");
+        assert_eq!(suffix.len(), 22);
+        assert!(suffix.bytes().all(|c| b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz".contains(&c)));
+        let input: String = events.iter().filter_map(|e| e.data["delta"]["partial_json"].as_str()).collect();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&input).unwrap(), json!({"city":"上海"}));
     }
 
     #[test]

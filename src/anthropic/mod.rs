@@ -27,6 +27,8 @@ mod billing;
 mod cache;
 mod claude_tok;
 mod code_execution;
+mod code_identity;
+mod pomo_compat;
 mod compat;
 mod converter;
 mod handlers;
@@ -40,6 +42,7 @@ mod responses_compat;
 mod router;
 mod signature;
 mod stream;
+mod structured_output;
 pub mod types;
 mod websearch;
 
