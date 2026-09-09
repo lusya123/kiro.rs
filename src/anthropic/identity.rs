@@ -776,6 +776,12 @@ pub fn sanitize_identity_json_value(
         serde_json::Value::Object(values) => {
             for (key, value) in values {
                 let key = key.to_ascii_lowercase();
+                // Identity reports can also carry verbatim application data.
+                // Those fields are not declarations of the assistant's name.
+                if matches!(key.replace(['_', '-'], "").as_str(),
+                    "path" | "filepath" | "code" | "sourcecode" | "payload" | "fixture") {
+                    continue;
+                }
                 let private_identity_boolean = matches!(
                     key.as_str(),
                     "is_kiro"
@@ -844,7 +850,7 @@ pub fn sanitize_identity_json_value(
                         || (key != "product_name" && (value.is_null() || wrong_identity_value)))
                 {
                     *value = serde_json::Value::String(options.target.assistant_name().to_string());
-                } else if generic_identity_name_field && !options.target.is_claude() {
+                } else if generic_identity_name_field {
                     *value = serde_json::Value::String(options.target.assistant_name().to_string());
                 } else if model_family_field
                     && !options.target.is_claude()
@@ -898,6 +904,339 @@ pub fn sanitize_identity_json_value(
         }
         _ => {}
     }
+}
+
+/// Reuse the existing identity wording rules for a code string/comment. A
+/// complete private-name label is only rewritten in an identity output slot.
+/// Embedded source snippets, paths and unrelated product mentions are data.
+pub(super) fn sanitize_code_identity_literal(text: &str, name: &str, label: bool) -> Option<String> {
+    let trimmed = text.trim();
+    if label && (looks_like_wrong_identity_label(trimmed, IdentityTarget::Claude)
+        || (trimmed.eq_ignore_ascii_case("Claude") && name != "Claude")) {
+        return Some(text.replacen(trimmed, name, 1));
+    }
+    if let Some(clean) = sanitize_japanese_self_claim(text, name) {
+        return Some(clean);
+    }
+    let prose = trimmed.trim_start_matches(['#', '/', '*', ' ']).to_lowercase();
+    let first_person = ["i am ", "i'm ", "i’m ", "my name is ", "my identity is ",
+        "my persona name is ", "my actual name is ", "my assistant name is ", "my application name is ",
+        "我是", "我的名字是", "我的名称是", "我的身份是",
+        "soy ", "me llamo ", "mi nombre es ", "je suis ", "je m'appelle ", "mon nom est ",
+        "ich bin ", "mein name ist ", "eu sou ", "sou ", "meu nome é ",
+        "я ", "меня зовут ", "저는", "제 이름은", "أنا ", "اسمي ",
+        "मैं ", "मेरा नाम", "sono ", "mi chiamo ", "tôi là "]
+        .iter().any(|phrase| prose.match_indices(phrase).any(|(start, _)|
+            !phrase.is_ascii() || start == 0
+                || !prose[..start].chars().next_back().is_some_and(char::is_alphanumeric)));
+    if !first_person { return None; }
+    let clean = replace_phrase_ci(text, "kiro-powered", "AI-powered");
+    let clean = sanitize_identity_text_for_request(&clean, true);
+    let clean = replace_identity_term_ci(&clean, "Claude", name);
+    (clean != text).then_some(clean)
+}
+
+fn sanitize_japanese_self_claim(text: &str, name: &str) -> Option<String> {
+    let mut clean = text.to_owned();
+    // Japanese inserts 自身 ("own") between a first-person pronoun and
+    // の名前/の名称/の本名. Recognize that possessive form as a self-claim,
+    // while leaving the existing sentence and quoted-data boundaries intact.
+    let own_name_claim = ["私", "僕", "ぼく", "俺", "おれ", "わたし", "わたくし", "自分"]
+        .iter()
+        .any(|pronoun| {
+            ["自身の名前は", "自身の名称は", "自身の本名は"]
+                .iter()
+                .any(|suffix| text.contains(&format!("{pronoun}{suffix}")))
+        });
+    // A self-introduction can omit the pronoun: 名前はBobです (...).
+    // Only accept a bare sentence head or the trusted persona's prefix;
+    // 製品の名前は / 製品説明: 名前は remain product descriptions.
+    let head = text.trim_start().to_lowercase();
+    let persona_prefix = format!("{}:", name.to_lowercase());
+    let head = head.strip_prefix(&persona_prefix).unwrap_or(&head).trim_start();
+    let implicit_name_claim = ["名前は", "名称は", "本名は"]
+        .iter().any(|anchor| head.starts_with(anchor));
+    let self_claim = ["私の名前は", "私の名称は", "私の本名は", "私自身は", "私は", "アシスタント名は", "としてお答えします",
+        "僕は", "ぼくは", "俺は", "おれは", "わたしは", "わたくしは", "自分は", "こちらは", "当アシスタントは",
+        "僕の名前は", "俺の名前は", "自分の名前は",
+        "正体は", "実体は", "本当は", "本来は", "実際には", "本来の名前は", "実際の名前は", "元の名前は"]
+        .iter().any(|anchor| text.contains(anchor)) || own_name_claim || implicit_name_claim;
+    if self_claim {
+        clean = replace_phrase_ci(&clean, &format!("Kiroなので{name}としては名乗れませんが、"), &format!("{name}です。"));
+        for left in ["", " "] {
+            for right in ["", " "] {
+                clean = replace_phrase_ci(&clean, &format!("{name}{left}ではなく{right}Kiro"), name);
+            }
+        }
+        // Once the clause declares the assistant's own identity, replace a
+        // standalone private name regardless of Japanese copula/punctuation.
+        // Quoted data, identifiers, paths and explicit product-use phrases stay
+        // literal; adjacent sentences are scoped by the caller.
+        clean = map_non_quoted_segments(&clean, |segment| {
+            let lower = segment.to_ascii_lowercase();
+            let mut output = String::with_capacity(segment.len());
+            let mut copied = 0;
+            for (start, _) in lower.match_indices("kiro") {
+                let end = start + 4;
+                let identifier = |ch: char| ch.is_ascii_alphanumeric() || "_./\\-".contains(ch);
+                if segment[..start].chars().next_back().is_some_and(identifier)
+                    || segment[end..].chars().next().is_some_and(identifier) {
+                    continue;
+                }
+                let following = segment[end..].trim_start();
+                if ["の", "について", "を使", "を利用", "を開発", "を説明", "を比較"]
+                    .iter().any(|phrase| following.starts_with(phrase)) {
+                    continue;
+                }
+                output.push_str(&segment[copied..start]);
+                output.push_str(name);
+                copied = end;
+            }
+            output.push_str(&segment[copied..]);
+            output
+        });
+    }
+    // This is an identity refusal, not a task result. Keep the following offer
+    // to help and any calculation in the same sentence intact.
+    clean = clean.replace("別の名前を名乗ることはできませんが、", "");
+    (clean != text).then_some(clean)
+}
+
+/// Recognize only self-identity/persona notes appended after a JSON answer.
+/// Every sentence must match; unrelated task results must not be discarded.
+pub fn is_identity_only_commentary(text: &str) -> bool {
+    let mut saw_sentence = false;
+    for sentence in text.split(['.', '!', '?', '\n', '。', '！', '？']) {
+        let lower = sentence.trim().to_ascii_lowercase();
+        if lower.is_empty() { continue; }
+        saw_sentence = true;
+        if !sentence_is_persona_rejection(&lower)
+            && !["my actual identity is", "my identity is", "i am kiro", "i'm kiro",
+                "my persona name is", "my actual name is", "my assistant name is", "my application name is",
+                "i won't adopt a different persona", "i cannot adopt a different persona",
+                "i can't adopt a different persona", "i will not adopt a different persona",
+                "我的真实身份是", "我的实际身份是", "我是kiro", "我是 kiro",
+                "我不会采用其他人设", "我不能采用其他人设"]
+                .iter().any(|marker| lower.contains(marker)) {
+            return false;
+        }
+    }
+    saw_sentence
+}
+
+pub(super) fn sanitize_identity_commentary(text: &str, name: &str) -> String {
+    text.split_inclusive('\n')
+        .filter(|line| !is_identity_only_commentary(line))
+        .map(|line| sanitize_code_identity_literal(line, name, false).unwrap_or_else(|| line.to_owned()))
+        .collect()
+}
+
+/// A trusted application persona preserves task output, but must still filter
+/// the model's own introductions. Scope the existing wording rules to each
+/// self-referential sentence; adjacent product descriptions, quotes and code
+/// are data, even when an introduction appears in the same response.
+pub(super) fn sanitize_application_persona_prose(text: &str, name: &str) -> String {
+    fn sentence(text: &str, name: &str) -> String {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return text.to_owned();
+        }
+        if trimmed.trim_end_matches(['。', '.', '!', '！']) == format!("{name}ではありません") {
+            return String::new();
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        // Drop an identity-only refusal to adopt the application's persona,
+        // including its quoted name, without leaving sentence fragments.
+        let persona_refusal = lower.contains("kiro")
+            && lower.contains("persona")
+            && [
+                "i'll keep ",
+                "i will keep ",
+                "i’ll keep ",
+                "i will continue ",
+                "i'll continue ",
+            ]
+            .iter()
+            .any(|phrase| lower.contains(phrase));
+        if persona_refusal {
+            return String::new();
+        }
+        map_non_quoted_segments(text, |prose| {
+            let trimmed = prose.trim();
+            if trimmed.is_empty() {
+                return prose.to_owned();
+            }
+            let lower = trimmed.to_ascii_lowercase();
+            let reversed_self_claim = [
+                " is who i am",
+                " is who i actually am",
+                " is who i really am",
+            ]
+            .iter()
+            .any(|phrase| lower.contains(phrase));
+            let replacement = if reversed_self_claim {
+                Some(replace_identity_term_ci(trimmed, "Kiro", name))
+            } else {
+                sanitize_code_identity_literal(trimmed, name, false)
+            };
+            let Some(replacement) = replacement else {
+                return prose.to_owned();
+            };
+            let start = prose.len() - prose.trim_start().len();
+            format!(
+                "{}{}{}",
+                &prose[..start],
+                replacement,
+                &prose[start + trimmed.len()..]
+            )
+        })
+    }
+    map_non_code_segments(text, |prose| {
+        let mut out = String::with_capacity(prose.len());
+        let mut start = 0;
+        let mut closing_quote = None;
+        let mut escaped = false;
+        let mut parentheses = 0usize;
+        for (index, ch) in prose.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' && closing_quote == Some('"') {
+                escaped = true;
+                continue;
+            }
+            if let Some(expected) = closing_quote {
+                if ch == expected {
+                    closing_quote = None;
+                }
+                continue;
+            }
+            closing_quote = match ch {
+                '"' => Some('"'),
+                '“' => Some('”'),
+                '「' => Some('」'),
+                '『' => Some('』'),
+                _ => None,
+            };
+            if closing_quote.is_none() {
+                match ch {
+                    '(' | '（' => parentheses += 1,
+                    ')' | '）' => parentheses = parentheses.saturating_sub(1),
+                    '\n' => parentheses = 0,
+                    _ => {},
+                }
+            }
+            // Parenthetical qualifications belong to the same introduction.
+            // A newline still bounds the context if a parenthesis is unclosed.
+            if closing_quote.is_none() && parentheses == 0 && is_sentence_boundary_at(prose, index, ch) {
+                let end = index + ch.len_utf8();
+                out.push_str(&sentence(&prose[start..end], name));
+                start = end;
+            }
+        }
+        out.push_str(&sentence(&prose[start..], name));
+        out
+    })
+}
+
+/// Apply the existing identity field rules to a JSON identity answer. Only
+/// selected identity scalar values are patched; keys, whitespace, numeric
+/// lexemes, code, paths and unrelated nested business objects stay byte-exact.
+pub fn sanitize_json_identity_document(
+    text: &str,
+    options: IdentitySanitizationOptions,
+    application_name: Option<&str>,
+) -> Option<String> {
+    use serde_json::value::RawValue;
+    if !options.protects_private_runtime() { return None; }
+    fn collect(
+        document: &str,
+        node: &RawValue,
+        options: IdentitySanitizationOptions,
+        application_name: Option<&str>,
+        patches: &mut Vec<(std::ops::Range<usize>, String)>,
+    ) -> Option<()> {
+        if node.get().starts_with('[') {
+            for child in serde_json::from_str::<Vec<&RawValue>>(node.get()).ok()? {
+                collect(document, child, options, application_name, patches)?;
+            }
+            return Some(());
+        }
+        if node.get().starts_with('"') {
+            let value: String = serde_json::from_str(node.get()).ok()?;
+            if let Some(replacement) = sanitize_code_identity_literal(
+                &value, application_name.unwrap_or(options.target.assistant_name()), true,
+            ) {
+                let start = (node.get().as_ptr() as usize).checked_sub(document.as_ptr() as usize)?;
+                patches.push((start..start + node.get().len(), serde_json::to_string(&replacement).ok()?));
+            }
+            return Some(());
+        }
+        if !node.get().starts_with('{') { return Some(()); }
+        let fields: std::collections::BTreeMap<String, &RawValue> = serde_json::from_str(node.get()).ok()?;
+        for (key, raw) in fields {
+            // Match snake_case, camelCase and the supported Chinese self-name
+            // fields without changing the original keys or traversing business data.
+            let lower = key.replace(['_', '-', ' '], "").to_ascii_lowercase();
+            if matches!(lower.as_str(), "identity" | "assistant" | "self" | "profile") {
+                collect(document, raw, options, application_name, patches)?;
+                continue;
+            }
+            let name_field = matches!(lower.as_str(), "name" | "persona" | "applicationname" | "selfname" | "assistantname" | "productname" | "displayname" | "名称" | "名字" | "助手名称" | "身份" | "description" | "introduction" | "自我介绍");
+            if name_field {
+                collect(document, raw, options, application_name, patches)?;
+                continue;
+            }
+            if matches!(lower.as_str(), "namebase64" | "assistantnamebase64" | "namehex" | "assistantnamehex" | "namerot13" | "assistantnamerot13") {
+                if let Ok(value) = serde_json::from_str::<String>(raw.get()) {
+                    if let Some(replacement) = super::code_identity::sanitize_encoded_identity_literal(
+                        &value, application_name.unwrap_or(options.target.assistant_name())) {
+                        let start = (raw.get().as_ptr() as usize).checked_sub(document.as_ptr() as usize)?;
+                        patches.push((start..start + raw.get().len(), serde_json::to_string(&replacement).ok()?));
+                    }
+                }
+                continue;
+            }
+            let canonical = match lower.as_str() {
+                "iskiro" => "is_kiro", "iscodewhisperer" => "is_codewhisperer",
+                "isaws" => "is_aws", "iskiroitself" => "is_kiro_itself",
+                "belongstoaws" => "belongs_to_aws", "awsaffiliated" => "aws_affiliated",
+                "isclaude" => "is_claude", "isanthropic" => "is_anthropic",
+                "ischatgpt" => "is_chatgpt", "isgpt" => "is_gpt", "isopenai" => "is_openai",
+                "createdby" => "created_by", "builtby" => "built_by",
+                "runtimeproduct" => "runtime_product", "hostproduct" => "host_product",
+                "apibackend" => "api_backend",
+                "kiro" | "codewhisperer" | "vendor" | "company" | "provider" | "developer" |
+                "maker" | "creator" | "host" | "backend" => lower.as_str(),
+                _ => continue,
+            };
+            let value: serde_json::Value = serde_json::from_str(raw.get()).ok()?;
+            if !value.is_string() && !value.is_boolean() { continue; }
+            // Reuse the existing field rules on one scalar, not arbitrary data.
+            let mut field = serde_json::json!({ canonical: value.clone() });
+            sanitize_identity_json_value(&mut field, options);
+            let replacement = field[canonical].clone();
+            if replacement == value { continue; }
+            let start = (raw.get().as_ptr() as usize).checked_sub(document.as_ptr() as usize)?;
+            patches.push((start..start + raw.get().len(), serde_json::to_string(&replacement).ok()?));
+        }
+        Some(())
+    }
+    let mut patches = Vec::new();
+    let root: &RawValue = serde_json::from_str(text).ok()?;
+    collect(text, root, options, application_name, &mut patches)?;
+    if patches.is_empty() { return None; }
+    patches.sort_by_key(|(range, _)| range.start);
+    let mut result = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (range, replacement) in patches {
+        result.push_str(text.get(cursor..range.start)?);
+        result.push_str(&replacement);
+        cursor = range.end;
+    }
+    result.push_str(text.get(cursor..)?);
+    Some(result)
 }
 
 fn sanitize_gpt_structured_identity_output(

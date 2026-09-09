@@ -49,6 +49,18 @@ pub struct AdditionalModelRequestFields {
     pub output_config: Option<KiroOutputConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<KiroReasoningConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<KiroThinkingConfig>,
+}
+
+/// Claude controls verified against Kiro's model-specific request validator.
+/// This interface accepts adaptive/disabled, not a manual token budget.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KiroThinkingConfig {
+    #[serde(rename = "type")]
+    pub thinking_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
 }
 
 /// Native reasoning effort accepted by supported Kiro models.

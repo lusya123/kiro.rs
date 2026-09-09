@@ -9,6 +9,7 @@ on:
       - aws-p
       - aws-b
       - AWS杠B可外接版本
+      - 'codex/aws-b-*'
     tags:
       - 'v*'
   workflow_dispatch:
@@ -42,8 +43,35 @@ jobs:
             echo "should_build=true" >> $GITHUB_OUTPUT
           fi
 
-  build:
+  validate:
     needs: pre-check
+    if: needs.pre-check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.17.0
+      - name: Install admin-ui dependencies
+        working-directory: admin-ui
+        run: pnpm install --frozen-lockfile
+      - name: Build admin-ui
+        working-directory: admin-ui
+        run: pnpm build
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Rust regression tests
+        run: cargo test --locked --no-default-features
+
+  build:
+    needs: [pre-check, validate]
     if: needs.pre-check.outputs.should_build == 'true'
     runs-on: ${{ matrix.runner }}
     outputs:
@@ -68,45 +96,55 @@ jobs:
 
       - name: Determine version
         id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           HIGH_CACHE_BRANCH="codex/high-cache-container"
           AWS_P_BRANCH="aws-p"
           AWS_B_BRANCH="aws-b"
           AWS_B_EXTERNAL_BRANCH="AWS杠B可外接版本"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            if [ "${{ github.ref_name }}" = "${HIGH_CACHE_BRANCH}" ]; then
-              echo "version=high-cache-${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          if [[ "$GITHUB_REF" == refs/heads/codex/aws-b-* ]]; then
+            echo "version=aws-b-candidate-${GITHUB_SHA:0:12}" >> $GITHUB_OUTPUT
+            echo "alias_tag=" >> $GITHUB_OUTPUT
+            echo "is_beta=true" >> $GITHUB_OUTPUT
+          elif [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            if [[ ! "$INPUT_VERSION" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}$ ]]; then
+              echo "::error::Invalid Docker image version"
+              exit 1
+            fi
+            if [ "$GITHUB_REF_NAME" = "${HIGH_CACHE_BRANCH}" ]; then
+              echo "version=high-cache-${INPUT_VERSION}" >> $GITHUB_OUTPUT
               echo "alias_tag=high-cache" >> $GITHUB_OUTPUT
-            elif [ "${{ github.ref_name }}" = "${AWS_P_BRANCH}" ]; then
-              echo "version=aws-p-${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            elif [ "$GITHUB_REF_NAME" = "${AWS_P_BRANCH}" ]; then
+              echo "version=aws-p-${INPUT_VERSION}" >> $GITHUB_OUTPUT
               echo "alias_tag=aws-p" >> $GITHUB_OUTPUT
-            elif [ "${{ github.ref_name }}" = "${AWS_B_BRANCH}" ]; then
-              echo "version=aws-b-${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            elif [ "$GITHUB_REF_NAME" = "${AWS_B_BRANCH}" ]; then
+              echo "version=aws-b-${INPUT_VERSION}" >> $GITHUB_OUTPUT
               echo "alias_tag=aws-b" >> $GITHUB_OUTPUT
-            elif [ "${{ github.ref_name }}" = "${AWS_B_EXTERNAL_BRANCH}" ]; then
-              echo "version=aws-b-external-${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            elif [ "$GITHUB_REF_NAME" = "${AWS_B_EXTERNAL_BRANCH}" ]; then
+              echo "version=aws-b-external-${INPUT_VERSION}" >> $GITHUB_OUTPUT
               echo "alias_tag=aws-b-external" >> $GITHUB_OUTPUT
             else
-              echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+              echo "version=${INPUT_VERSION}" >> $GITHUB_OUTPUT
               echo "alias_tag=latest" >> $GITHUB_OUTPUT
             fi
             echo "is_beta=false" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
             echo "alias_tag=latest" >> $GITHUB_OUTPUT
             echo "is_beta=false" >> $GITHUB_OUTPUT
           else
-            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-6)
-            if [ "${{ github.ref_name }}" = "${HIGH_CACHE_BRANCH}" ]; then
+            SHORT_SHA=${GITHUB_SHA:0:6}
+            if [ "$GITHUB_REF_NAME" = "${HIGH_CACHE_BRANCH}" ]; then
               echo "version=high-cache-beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
               echo "alias_tag=high-cache" >> $GITHUB_OUTPUT
-            elif [ "${{ github.ref_name }}" = "${AWS_P_BRANCH}" ]; then
+            elif [ "$GITHUB_REF_NAME" = "${AWS_P_BRANCH}" ]; then
               echo "version=aws-p-beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
               echo "alias_tag=aws-p" >> $GITHUB_OUTPUT
-            elif [ "${{ github.ref_name }}" = "${AWS_B_BRANCH}" ]; then
+            elif [ "$GITHUB_REF_NAME" = "${AWS_B_BRANCH}" ]; then
               echo "version=aws-b-beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
               echo "alias_tag=aws-b" >> $GITHUB_OUTPUT
-            elif [ "${{ github.ref_name }}" = "${AWS_B_EXTERNAL_BRANCH}" ]; then
+            elif [ "$GITHUB_REF_NAME" = "${AWS_B_EXTERNAL_BRANCH}" ]; then
               echo "version=aws-b-external-beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
               echo "alias_tag=aws-b-external" >> $GITHUB_OUTPUT
             else
@@ -131,14 +169,16 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=kiro-rs-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=kiro-rs-${{ matrix.arch }}
           push: true
           provenance: false
           tags: ghcr.io/${{ github.repository_owner }}/kiro-rs:${{ steps.version.outputs.version }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=Kiro.rs Docker Image
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
 
   manifest:
     needs: build
@@ -162,9 +202,11 @@ jobs:
             ${IMAGE}:${VERSION}-arm64
           docker manifest push ${IMAGE}:${VERSION}
 
-          # Create manifest for the branch-specific alias tag
+          # Candidate builds have no moving alias.
           ALIAS_TAG="${{ needs.build.outputs.alias_tag }}"
-          docker manifest create ${IMAGE}:${ALIAS_TAG} \
-            ${IMAGE}:${VERSION}-amd64 \
-            ${IMAGE}:${VERSION}-arm64
-          docker manifest push ${IMAGE}:${ALIAS_TAG}
+          if [ -n "$ALIAS_TAG" ]; then
+            docker manifest create ${IMAGE}:${ALIAS_TAG} \
+              ${IMAGE}:${VERSION}-amd64 \
+              ${IMAGE}:${VERSION}-arm64
+            docker manifest push ${IMAGE}:${ALIAS_TAG}
+          fi

@@ -2084,7 +2084,72 @@ pub(super) fn trusted_application_persona_reply(payload: &MessagesRequest) -> Op
 }
 
 pub(super) fn has_trusted_application_persona(payload: &MessagesRequest) -> bool {
-    trusted_application_persona_reply(payload).is_some()
+    if super::converter::is_gpt_model(&payload.model) {
+        return trusted_application_persona_reply(payload).is_some();
+    }
+    if !super::identity::IdentityTarget::for_model(&payload.model).is_claude() {
+        return false;
+    }
+    let Some(system) = &payload.system else {
+        return false;
+    };
+    let joined = system.iter().map(|item| item.text.as_str()).collect::<Vec<_>>().join("\n");
+    // Examples and quoted source code are data, not application declarations.
+    let instructions = super::handlers::identity_instruction_text(&joined);
+    let Some((name, maker)) = extract_system_persona(&instructions) else {
+        return false;
+    };
+    // Claude applications can specify prefixes and arbitrary tasks instead of
+    // an exact identity reply. Preserve those instructions through the model;
+    // do not synthesize a reply from the extracted name.
+    !contains_reserved_private_identity(&name)
+        && maker.as_deref().is_none_or(|value| !contains_reserved_private_identity(value))
+}
+
+pub(super) fn trusted_application_persona_name(payload: &MessagesRequest) -> Option<String> {
+    if !has_trusted_application_persona(payload) { return None; }
+    let system = payload.system.as_ref()?.iter().map(|part| part.text.as_str()).collect::<Vec<_>>().join("\n");
+    let instructions = super::handlers::identity_instruction_text(&system);
+    extract_system_persona(&instructions).map(|(name, _)| name)
+}
+
+/// A literal label explicitly requested by a trusted application. This does
+/// not infer a prefix from the persona name or from quoted examples.
+pub(super) fn trusted_application_output_prefix(payload: &MessagesRequest) -> Option<String> {
+    if !has_trusted_application_persona(payload) {
+        return None;
+    }
+    let system = payload
+        .system
+        .as_ref()?
+        .iter()
+        .map(|part| part.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let instructions = super::handlers::identity_instruction_text(&system);
+    instructions
+        .split(['.', '\n', '。'])
+        .filter_map(|sentence| {
+            let sentence = sentence.trim();
+            let lower = sentence.to_ascii_lowercase();
+            let anchor = [
+                "begin every answer with ",
+                "start every answer with ",
+                "begin every response with ",
+                "start every response with ",
+            ]
+            .into_iter()
+            .find(|anchor| lower.starts_with(anchor))?;
+            let prefix = sentence[anchor.len()..].trim();
+            (prefix.ends_with(':')
+                && prefix.chars().count() <= 64
+                && prefix
+                    .chars()
+                    .all(|ch| ch.is_alphanumeric() || matches!(ch, ':' | '_' | '-' | ' '))
+                && !contains_reserved_private_identity(prefix))
+            .then(|| prefix.to_owned())
+        })
+        .next_back()
 }
 
 fn text_only_message_content(value: &serde_json::Value) -> bool {
@@ -4507,7 +4572,7 @@ or which model you are, respond with exactly: 'I am CodeAssist v2.'";
         assert!(trusted_application_persona_reply_for_identity_request(&with_schema).is_none());
 
         let claude = identity_req("claude-opus-4-8", Some(trusted_system), "Who are you?");
-        assert!(!has_trusted_application_persona(&claude));
+        assert!(has_trusted_application_persona(&claude));
         assert!(trusted_application_persona_reply_for_identity_request(&claude).is_none());
 
         let unlocked = identity_req(

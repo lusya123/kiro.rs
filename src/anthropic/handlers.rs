@@ -10,6 +10,7 @@ use crate::kiro::model::requests::conversation::{
 };
 use crate::kiro::model::requests::kiro::{
     AdditionalModelRequestFields, KiroOutputConfig, KiroReasoningConfig, KiroRequest,
+    KiroThinkingConfig,
 };
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::UpstreamHttpError;
@@ -978,6 +979,7 @@ struct IdentitySanitizationRequestContext {
     query: super::identity::IdentityQuery,
     strict: bool,
     trusted_application_persona: bool,
+    preserve_structured_output: bool,
     structured_identity_probe: bool,
     agentic_ide_probe: bool,
     codewhisperer_relationship_probe: bool,
@@ -987,6 +989,11 @@ struct IdentitySanitizationRequestContext {
 }
 
 impl IdentitySanitizationRequestContext {
+    fn preserves_application_output(self) -> bool {
+        self.target.is_claude()
+            && (self.trusted_application_persona || self.preserve_structured_output)
+    }
+
     fn enforce_canonical_gpt_identity(self) -> bool {
         self.target.is_gpt() && self.strict && !self.trusted_application_persona
     }
@@ -995,6 +1002,12 @@ impl IdentitySanitizationRequestContext {
 fn identity_sanitization_options(
     context: IdentitySanitizationRequestContext,
 ) -> super::identity::IdentitySanitizationOptions {
+    if context.preserves_application_output() {
+        return super::identity::IdentitySanitizationOptions {
+            third_party_kiro_discussion: true,
+            ..super::identity::IdentitySanitizationOptions::strict(false)
+        };
+    }
     let trusted_gpt_persona = context.target.is_gpt() && context.trusted_application_persona;
     super::identity::IdentitySanitizationOptions {
         target: context.target,
@@ -1015,11 +1028,57 @@ fn identity_sanitization_options(
     }
 }
 
+fn formatted_identity_output_policy(
+    payload: &MessagesRequest,
+) -> Option<super::structured_output::FormattedIdentityOutput> {
+    let context = request_identity_sanitization_context(payload);
+    let user = latest_user_identity_text(payload);
+    let code_output = context.query.assistant
+        && super::code_identity::requested(&identity_instruction_text(&user))
+        && !request_has_structured_output(payload);
+    let json_output =
+        request_has_structured_output(payload) || user.to_ascii_lowercase().contains("json");
+    let prose_output = context.trusted_application_persona
+        && context.query.assistant
+        && !code_output
+        && !json_output;
+    if !context.target.is_claude()
+        || !context.strict
+        || context.third_party_kiro_discussion
+        || !(code_output || json_output || prose_output)
+    {
+        return None;
+    }
+    let mut json_context = context;
+    let instructions = identity_instruction_text(&user).to_ascii_lowercase();
+    let strict_format = instructions.contains("only")
+        || instructions.contains("只") || instructions.contains("仅");
+    let encoded_name = instructions.contains("base64")
+        || instructions.contains("hexadecimal") || instructions.contains("十六进制");
+    json_context.trusted_application_persona = false;
+    json_context.preserve_structured_output = false;
+    json_context.structured_identity_probe = true;
+    Some(super::structured_output::FormattedIdentityOutput {
+        options: identity_sanitization_options(json_context),
+        application_name: super::compat::trusted_application_persona_name(payload),
+        application_prefix: prose_output
+            .then(|| super::compat::trusted_application_output_prefix(payload))
+            .flatten(),
+        code_output,
+        prose_output,
+        strict_format,
+        encoded_name,
+    })
+}
+
 fn normalize_profile_identity_output(
     text: String,
     context: IdentitySanitizationRequestContext,
     aws_b40_compat: bool,
 ) -> String {
+    if context.preserves_application_output() {
+        return text;
+    }
     let normalized = if aws_b40_compat && context.strict && !context.trusted_application_persona {
         super::bedrock::normalize_identity_json_output(&text)
     } else {
@@ -1158,6 +1217,9 @@ fn sanitize_profile_identity_output(
     aws_b40_compat: bool,
     conservative_direct: bool,
 ) -> String {
+    if context.preserves_application_output() {
+        return text;
+    }
     if context.enforce_canonical_gpt_identity() {
         let normalized = normalize_profile_identity_output(text.clone(), context, aws_b40_compat);
         if serde_json::from_str::<serde_json::Value>(normalized.trim()).is_ok() {
@@ -1596,8 +1658,7 @@ fn request_identity_sanitization_context(
     let lower = into_lowercase_identity_text(instruction_text);
     let system_persona_injection = system_contains_identity_persona_injection(&system_text);
     let target = super::identity::IdentityTarget::for_model(&payload.model);
-    let trusted_application_persona =
-        target.is_gpt() && super::compat::has_trusted_application_persona(payload);
+    let trusted_application_persona = super::compat::has_trusted_application_persona(payload);
 
     let direct_self_identity_probe = contains_any_identity_phrase(
         &lower,
@@ -1608,7 +1669,47 @@ fn request_identity_sanitization_context(
             "what's your name",
             "your name",
             "your own name",
+            "your application name",
+            "your current application persona name",
+            "your current assistant persona name",
+            "your persona name",
+            "name assigned to you",
+            "identity assigned to you",
+            "your system-assigned",
+            "your actual system-assigned",
+            "あなた自身の名前",
+            "自分の名前",
+            "自己紹介",
+            "アシスタント名",
+            "preséntate",
+            "tu nombre",
+            "tu propio nombre",
+            "présente-toi",
+            "ton nom",
+            "ton propre nom",
+            "stelle dich",
+            "dein aktueller assistentenname",
+            "deinen eigenen namen",
+            "apresente-se",
+            "seu nome",
+            "представься",
+            "как тебя зовут",
+            "свое имя",
+            "своё имя",
+            "자기소개",
+            "당신 자신의",
+            "ما اسمك",
+            "عرف بنفسك",
+            "आपका अपना नाम",
+            "अपना परिचय",
+            "你当前的助手人设名称",
+            "你的应用名称",
+            "你的助手人设",
             "your assistant name",
+            "your current assistant name",
+            "your current application name",
+            "your current name",
+            "your current identity",
             "your actual product name",
             "your self_name",
             "this assistant's name",
@@ -2058,6 +2159,7 @@ fn request_identity_sanitization_context(
     .count();
     let public_identity_tool_schema = explicitly_self_identity_tool
         && (identity_tool_schema_field_count >= 1
+            || contains_identity_schema_field(&tool_text, "name")
             || contains_identity_schema_field(&tool_text, "provider")
             || contains_identity_schema_field(&tool_text, "company")
             || contains_identity_schema_field(&tool_text, "model"));
@@ -2315,6 +2417,9 @@ fn request_identity_sanitization_context(
         },
         strict,
         trusted_application_persona,
+        preserve_structured_output: request_has_structured_output(payload)
+            || (target.is_claude() && strict && (lower.contains("json")
+                || (explicit_self_identity_request && super::code_identity::requested(&lower)))),
         structured_identity_probe,
         agentic_ide_probe: agentic_ide_identity_probe,
         codewhisperer_relationship_probe,
@@ -2763,12 +2868,106 @@ pub async fn head_models(State(state): State<AppState>) -> Response {
     }
 }
 
-/// POST /v1/messages
-///
-/// 创建消息（对话）
+// Explicit native routes keep their upstream validation and response bytes.
+// The CC and AWS-P adapters validate explicitly requested JSON Schema. The
+// AWS-B public Kiro route rejects unsupported capabilities before adaptation.
+async fn messages_with_structured_output(
+    state: AppState,
+    headers: HeaderMap,
+    request: RawApiJson<MessagesRequest>,
+    cc: bool,
+) -> Response {
+    if let Some(provider) = state.bedrock_mantle_provider.as_ref()
+        .filter(|provider| provider.should_route_messages(&request.0))
+    {
+        return provider.proxy_messages(&headers, request.1).await;
+    }
+    let pomo_opus = state.aws_b40_compat && super::pomo_compat::is_opus(&request.0.model);
+    if pomo_opus {
+        if let Some(detail) = super::pomo_compat::messages_validation_detail(&request.0) {
+            return super::pomo_compat::validation_response(request.0.stream, detail, false);
+        }
+        let metadata = RequestBodyMetadata::parse(&request.1).unwrap_or_default();
+        if let Some(response) = reject_unavailable_aws_b_public_features(&request.0, metadata.fallbacks_requested, true) {
+            return response;
+        }
+    }
+    let validation = if is_gpt_model(&request.0.model) || pomo_opus || (!cc && state.aws_b40_compat) {
+        None
+    } else {
+        match super::structured_output::StructuredOutput::from_request(&request.0).await {
+            Ok(validation) => validation,
+            Err(response) => return response,
+        }
+    };
+    let json_identity = formatted_identity_output_policy(&request.0);
+    // The format adapter already buffers its entire response. Retry only
+    // before any bytes escape, with the same model, input and token budget.
+    // Tool-capable requests are excluded, including tool history.
+    let retry_allowed = json_identity.is_some()
+        && request.0.tools.as_ref().is_none_or(Vec::is_empty)
+        && request.0.tool_choice.is_none()
+        && request.0.messages.iter().all(|message| {
+            message.content.as_array().is_none_or(|blocks| {
+                blocks.iter().all(|block| !matches!(
+                    block.get("type").and_then(serde_json::Value::as_str),
+                    Some("tool_use" | "tool_result" | "server_tool_use")
+                ))
+            })
+        });
+    let mut attempt = 0;
+    let response = loop {
+        let input = RawApiJson(request.0.clone(), request.1.clone());
+        let response = if cc {
+            post_messages_cc_inner(State(state.clone()), headers.clone(), input).await
+        } else {
+            post_messages_inner(State(state.clone()), headers.clone(), input).await
+        };
+        let response = match &json_identity {
+            Some(policy) => policy.normalize_response(response).await,
+            None => response,
+        };
+        let incomplete = response.extensions()
+            .get::<super::response_integrity::IncompleteResponse>()
+            .is_some_and(|marker| marker.is_incomplete());
+        let invalid_format = response.extensions()
+            .get::<super::structured_output::InvalidFormattedResponse>().is_some();
+        if retry_allowed && (incomplete || invalid_format) && attempt == 0 {
+            attempt += 1;
+            tracing::warn!(model = %request.0.model, incomplete, invalid_format,
+                "Retrying buffered identity response");
+            continue;
+        }
+        break response;
+    };
+    match validation {
+        Some(validation) => validation.validate_response(response).await,
+        None => response,
+    }
+}
+
 pub async fn post_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
+    request: RawApiJson<MessagesRequest>,
+) -> Response {
+    messages_with_structured_output(state, headers, request, false).await
+}
+
+pub async fn post_messages_cc(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: RawApiJson<MessagesRequest>,
+) -> Response {
+    messages_with_structured_output(state, headers, request, true).await
+}
+
+/// POST /v1/messages
+///
+/// 创建消息（对话）
+async fn post_messages_inner(
+    State(state): State<AppState>,
+    _headers: HeaderMap,
     RawApiJson(mut payload, raw_body): RawApiJson<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -2794,25 +2993,16 @@ pub async fn post_messages(
     if let Some(response) = reject_invalid_message_sequence(&payload) {
         return response;
     }
-    if let Some(provider) = state
-        .bedrock_mantle_provider
-        .as_ref()
-        .filter(|provider| provider.should_route_messages(&payload))
-    {
-        return provider.proxy_messages(&headers, raw_body).await;
-    }
-    // Hybrid native-Bedrock deployments intentionally retain the existing
-    // Kiro fallback route for payloads the native provider cannot accept.
-    // The strict AWS-B probe contract applies to the standalone Kiro-backed
-    // public endpoint used by this distribution.
-    if state.bedrock_mantle_provider.is_none() {
-        if let Some(response) = reject_unavailable_aws_b_public_features(
-            &payload,
-            request_metadata.fallbacks_requested,
-            aws_b40_compat,
-        ) {
-            return response;
-        }
+    // Requests for models outside the explicit native route retain the Kiro
+    // transport. A selected native model never falls back based on its body.
+    // Native requests already returned from the outer handler. Configuring a
+    // different native model must not disable this Kiro route's validation.
+    if let Some(response) = reject_unavailable_aws_b_public_features(
+        &payload,
+        request_metadata.fallbacks_requested,
+        aws_b40_compat,
+    ) {
+        return response;
     }
     drop(raw_body);
 
@@ -2981,8 +3171,8 @@ pub async fn post_messages(
         .clone();
 
     let identity_sanitization_context = request_identity_sanitization_context(&payload);
-    let identity_sanitization =
-        !preserves_private_product_code_content(&payload) || identity_sanitization_context.strict;
+    let identity_sanitization = !identity_sanitization_context.preserves_application_output()
+        && (!preserves_private_product_code_content(&payload) || identity_sanitization_context.strict);
     let forced_application_identity_reply = is_gpt_model(&payload.model)
         .then(|| super::compat::trusted_application_persona_reply_for_identity_request(&payload))
         .flatten();
@@ -3218,6 +3408,7 @@ async fn handle_stream_request(
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
+    let completion_failure = ctx.completion_failure();
     // 创建 SSE 流
     let stream = create_sse_stream(
         response,
@@ -3236,6 +3427,7 @@ async fn handle_stream_request(
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
+        .extension(completion_failure)
         .body(Body::from_stream(stream))
         .unwrap()
 }
@@ -3394,6 +3586,7 @@ fn create_sse_stream(
                                 ctx.mark_upstream_truncated();
                                 continuation_reason = "pending_frame";
                             }
+                            ctx.check_upstream_eof();
                             if continuation_round == 0 && ctx.upstream_succeeded_for_cache() {
                                 if let Some(commit) = cache_commit.take() {
                                     commit.commit().await;
@@ -3604,6 +3797,7 @@ async fn handle_non_stream_request(
         let mut round_has_terminal_evidence = false;
         let mut round_refused = false;
         let mut round_unknown_native_stop_reason = false;
+        let mut completion_evidence = super::response_integrity::CompletionEvidence::default();
         stop_reason = "end_turn".to_string();
 
         for result in decoder.decode_iter() {
@@ -3617,6 +3811,7 @@ async fn handle_non_stream_request(
                             continue;
                         }
                     };
+                    completion_evidence.observe(&event);
                     match event {
                         Event::ReasoningContent(reasoning) => {
                             if !reasoning.text.is_empty() {
@@ -3700,7 +3895,7 @@ async fn handle_non_stream_request(
                                 if aws_b40_compat {
                                     tool_uses.push(json!({
                                         "type": "tool_use",
-                                        "id": tool_use.tool_use_id,
+                                        "id": super::id::bedrock_tool_use_id(&tool_use.tool_use_id),
                                         "name": original_name,
                                         "input": input
                                     }));
@@ -3822,6 +4017,14 @@ async fn handle_non_stream_request(
             upstream_fatal_error = Some("truncated upstream event stream");
         }
 
+        if aws_b40_compat
+            && super::pomo_compat::is_opus(model)
+            && upstream_fatal_error.is_none()
+            && !completion_evidence.is_complete()
+        {
+            return super::response_integrity::incomplete_response();
+        }
+
         // Opus 5 can return a complete buffered response containing only an
         // assistantResponseEvent. Because the entire non-streaming body has
         // already been read and decoded here, clean EOF plus non-empty model
@@ -3908,12 +4111,14 @@ async fn handle_non_stream_request(
         super::stream::has_visible_assistant_text(&text_content, thinking_enabled);
     let requires_real_gpt_identity_answer = forced_application_identity_reply.is_some()
         || (identity_sanitization_context.target.is_gpt() && identity_sanitization_context.strict);
-    if requires_real_gpt_identity_answer
-        && (upstream_fatal_error.is_some() || (!upstream_has_visible_text && !has_tool_use))
+    if (upstream_fatal_error.is_some()
+        && (requires_real_gpt_identity_answer
+            || (aws_b40_compat && super::pomo_compat::is_opus(model))))
+        || (requires_real_gpt_identity_answer && !upstream_has_visible_text && !has_tool_use)
     {
         tracing::warn!(
             reason = upstream_fatal_error.unwrap_or("empty upstream identity response"),
-            "拒绝把失败的上游 GPT 身份请求转换成本地成功响应"
+            "拒绝把失败的上游请求转换成本地成功响应"
         );
         return (
             StatusCode::BAD_GATEWAY,
@@ -3960,9 +4165,8 @@ async fn handle_non_stream_request(
                 }));
             }
 
-            // Bedrock preserves the thinking envelope and opaque signature in
-            // omitted mode, but only exposes readable text when explicitly
-            // requested with display=summarized.
+            // Omitted display keeps the thinking envelope and opaque signature.
+            // Summary visibility follows the explicit display or model default.
             let has_native_reasoning =
                 !native_thinking_content.is_empty() || upstream_thinking_signature.is_some();
             let has_native_signature = upstream_thinking_signature.is_some();
@@ -4381,11 +4585,24 @@ fn normalize_aws_b40_tool_choice(payload: &mut MessagesRequest) {
     }
 }
 
-fn profile_thinking_wants_summary(payload: &MessagesRequest, _aws_b40_compat: bool) -> bool {
-    payload
-        .thinking
-        .as_ref()
-        .is_some_and(Thinking::wants_summary)
+fn profile_thinking_wants_summary(payload: &MessagesRequest, aws_b40_compat: bool) -> bool {
+    let Some(thinking) = payload.thinking.as_ref() else {
+        return false;
+    };
+    if !aws_b40_compat || thinking.display.is_some() {
+        return thinking.wants_summary();
+    }
+    // Claude 4.5/4.6 default to summarized display; newer models default to
+    // omitted. Do not apply the newer Opus default to every Claude model.
+    // https://platform.claude.com/docs/en/about-claude/models/extended-thinking-models
+    thinking.is_enabled()
+        && matches!(
+            super::converter::map_model(&payload.model).as_deref(),
+            Some(
+                "claude-sonnet-4.5" | "claude-sonnet-4.6" | "claude-haiku-4.5"
+                    | "claude-opus-4.5" | "claude-opus-4.6"
+            )
+        )
 }
 
 /// AWS-B explicit thinking is a per-request protocol contract. The legacy
@@ -4432,15 +4649,45 @@ fn kiro_model_request_fields(
         return Ok(Some(AdditionalModelRequestFields {
             output_config: None,
             reasoning: Some(reasoning),
+            thinking: None,
         }));
     }
 
+    if let Some(thinking) = payload.thinking.as_ref()
+        && let Some(display) = thinking.display.as_deref()
+    {
+        if !matches!(display, "summarized" | "omitted") {
+            return Err("thinking.display must be summarized or omitted".to_string());
+        }
+        if thinking.thinking_type == "disabled" {
+            return Err("thinking.display is not valid when thinking.type is disabled".to_string());
+        }
+    }
+    let native_thinking = if matches!(model.as_str(),
+        "claude-sonnet-4.6" | "claude-sonnet-5" | "claude-opus-5"
+            | "claude-opus-4.7" | "claude-opus-4.8")
+    {
+        payload.thinking.as_ref().map(|thinking| {
+            // Kiro's Sonnet 4.6 rejects native enabled/budget_tokens. Preserve
+            // the existing public manual-thinking acceptance using adaptive;
+            // this cannot enforce the caller's exact internal token budget.
+            let native_type = if thinking.thinking_type == "disabled" { "disabled" } else { "adaptive" };
+            KiroThinkingConfig {
+                thinking_type: native_type.to_string(),
+                display: (native_type != "disabled").then(|| {
+                    if profile_thinking_wants_summary(payload, true) { "summarized" } else { "omitted" }.to_string()
+                }),
+            }
+        })
+    } else {
+        None
+    };
     let thinking_enabled = payload.thinking.as_ref().is_some_and(Thinking::is_enabled);
     let explicit_effort = payload
         .output_config
         .as_ref()
         .and_then(|config| config.effort.as_ref());
-    if !thinking_enabled && explicit_effort.is_none() {
+    if !thinking_enabled && explicit_effort.is_none() && native_thinking.is_none() {
         return Ok(None);
     }
 
@@ -4474,12 +4721,17 @@ fn kiro_model_request_fields(
                 payload.model
             ));
         }
-        return Ok(None);
+        return Ok(native_thinking.map(|thinking| AdditionalModelRequestFields {
+            output_config: None,
+            reasoning: None,
+            thinking: Some(thinking),
+        }));
     };
 
     Ok(Some(AdditionalModelRequestFields {
         output_config: Some(KiroOutputConfig { effort }),
         reasoning: None,
+        thinking: native_thinking,
     }))
 }
 
@@ -4749,7 +5001,7 @@ fn inject_tool_preamble_hint(payload: &mut MessagesRequest) {
         .as_ref()
         .map(|t| !t.is_empty())
         .unwrap_or(false);
-    if !has_tools || tool_choice_forces_tool(payload) {
+    if !has_tools || tool_choice_forces_tool(payload) || request_has_structured_output(payload) {
         return;
     }
     payload
@@ -4763,10 +5015,10 @@ fn inject_tool_preamble_hint(payload: &mut MessagesRequest) {
 
 /// 结构化输出 `output_config.format` (json_schema)。
 ///
-/// Kiro 后端无原生结构化输出,此前本服务把 `output_config.format` 整个丢弃 → 返回普通对话文本,
-/// 与真 Claude(返回严格匹配 schema 的 JSON,或对非法 schema 返回 400)不一致 → cctest 结构化输出失败。
-/// 这里:①校验 schema(object 顶层须显式 additionalProperties:false,对齐 Bedrock/参考渠道,否则 400);
-/// ②注入系统指令让模型只吐匹配 schema 的裸 JSON。真实用户此前该功能本就不可用,现变为可用,不构成回退。
+/// Kiro uses a schema instruction; the outer handler independently validates
+/// the completed response. This is not native constrained decoding. It preserves
+/// valid JSON data (removing only a complete Markdown wrapper when necessary)
+/// and returns an upstream error for an invalid final answer.
 fn apply_structured_output(payload: &mut MessagesRequest) -> Option<Response> {
     let format = payload
         .output_config
@@ -4926,6 +5178,10 @@ async fn reject_invalid_thinking_signatures_with_import_policy(
                         thinking_present = thinking.is_some(),
                         "rejected unregistered or invalid native thinking signature"
                     );
+                    if super::pomo_compat::is_opus(&payload.model) {
+                        return Some(super::pomo_compat::validation_response(payload.stream,
+                            format!("***.***.content.{block_index}: Invalid `signature` in `thinking` block"), false));
+                    }
                     let message = format!(
                         "messages.{}.content.{}: Invalid `signature` in `thinking` block",
                         message_index, block_index
@@ -5340,7 +5596,10 @@ fn compat_direct_response_with_constraints(
 ) -> Option<Response> {
     // GPT models must always reach the selected Kiro upstream model. The
     // compatibility replies below are Claude-specific local responses.
-    if is_gpt_model(&payload.model) {
+    if is_gpt_model(&payload.model)
+        || super::compat::has_trusted_application_persona(payload)
+        || request_has_structured_output(payload)
+    {
         return None;
     }
 
@@ -5475,6 +5734,14 @@ fn compat_direct_response_with_constraints(
     } else {
         return None;
     };
+    // Formatted identity requests must retain their requested output shape.
+    // Code goes to the model; JSON may use a direct reply only if it is JSON.
+    if formatted_identity_output_policy(payload).is_some_and(|policy|
+        policy.code_output || (!policy.prose_output
+            && !super::structured_output::is_json_identity_document(&text)))
+    {
+        return None;
+    }
     let identity_context = request_identity_sanitization_context(probe_payload);
     if !preserves_private_product_code_content(probe_payload) {
         let sanitized_text =
@@ -6072,9 +6339,8 @@ fn reject_invalid_modern_sampling(
 }
 
 /// AWS-B exposes Amazon Bedrock's public capability boundary on `/v1/messages`.
-/// Compatibility extensions remain available on `/cc/v1/messages`, but the
-/// public endpoint must fail closed instead of silently emulating unsupported
-/// Anthropic server-side features.
+/// Opus 5/4.8 share this boundary with `/cc/v1/messages`. Reject unsupported
+/// server-side features before conversion can silently discard their fields.
 fn reject_unavailable_aws_b_public_features(
     payload: &MessagesRequest,
     fallbacks_requested: bool,
@@ -6109,6 +6375,7 @@ fn reject_unavailable_aws_b_public_features(
         .as_ref()
         .is_some_and(|thinking| thinking.thinking_type == "enabled")
         && modern_claude_rejects_assistant_prefill(&payload.model)
+        && !aws_b40_model_supports_enabled_thinking(&payload.model)
     {
         Some(
             "`thinking.type.enabled` is not supported for this model. Use `thinking.type.adaptive` and `output_config.effort` instead."
@@ -6238,7 +6505,7 @@ fn modern_claude_rejects_assistant_prefill(model: &str) -> bool {
 ///   才使用官方默认 high，显式 low/medium/high/xhigh/max 原样保留
 /// - 其他模型：thinking={enabled, 20000}
 /// - 已支持的 `*-thinking` 别名继续可用；thinking 文本是否可见仍由请求体
-///   `display` 控制，缺省/omitted 为空，summarized 返回可读摘要
+///   `display` 控制；显式 omitted 为空，summarized 返回可读摘要，缺省按模型判断
 fn model_is_opus_5(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
     lower.contains("opus-5") || lower.contains("opus-5.0") || lower.contains("opus 5")
@@ -6446,9 +6713,9 @@ async fn count_tokens_for_profile(
 /// Claude Code 兼容端点，与 /v1/messages 的区别在于：
 /// - 流式响应会缓冲后一次性发送
 /// - 输入 usage 与 `/v1` 共用请求侧本地确定性口径，不接受上游改写
-pub async fn post_messages_cc(
+async fn post_messages_cc_inner(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     RawApiJson(mut payload, raw_body): RawApiJson<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -6476,13 +6743,6 @@ pub async fn post_messages_cc(
         return response;
     }
 
-    if let Some(provider) = state
-        .bedrock_mantle_provider
-        .as_ref()
-        .filter(|provider| provider.should_route_messages(&payload))
-    {
-        return provider.proxy_messages(&headers, raw_body).await;
-    }
     drop(raw_body);
 
     let gpt_passthrough = is_gpt_model(&payload.model);
@@ -6643,8 +6903,8 @@ pub async fn post_messages_cc(
         .clone();
 
     let identity_sanitization_context = request_identity_sanitization_context(&payload);
-    let identity_sanitization =
-        !preserves_private_product_code_content(&payload) || identity_sanitization_context.strict;
+    let identity_sanitization = !identity_sanitization_context.preserves_application_output()
+        && (!preserves_private_product_code_content(&payload) || identity_sanitization_context.strict);
     let forced_application_identity_reply = is_gpt_model(&payload.model)
         .then(|| super::compat::trusted_application_persona_reply_for_identity_request(&payload))
         .flatten();
@@ -6870,6 +7130,7 @@ async fn handle_stream_request_buffered(
     }
     ctx.set_forced_application_identity_reply(forced_application_identity_reply);
 
+    let completion_failure = ctx.completion_failure();
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(
         response,
@@ -6887,6 +7148,7 @@ async fn handle_stream_request_buffered(
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
+        .extension(completion_failure)
         .body(Body::from_stream(stream))
         .unwrap()
 }
@@ -7029,6 +7291,7 @@ fn create_buffered_sse_stream(
                                     ctx.mark_upstream_truncated();
                                     continuation_reason = "pending_frame";
                                 }
+                                ctx.check_upstream_eof();
                                 if continuation_round == 0 && ctx.upstream_succeeded_for_cache() {
                                     if let Some(commit) = cache_commit.take() {
                                         commit.commit().await;
@@ -7137,6 +7400,26 @@ fn create_buffered_sse_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_tool_followup_does_not_inject_plaintext_preamble() {
+        for schema in [false, true] {
+            let mut value = json!({"model":"claude-haiku-4-5-20251001","max_tokens":512,
+                "system":"Follow the application output format.",
+                "messages":[{"role":"user","content":"Return the completed tool result."}],
+                "tools":[{"name":"save_fixture","description":"Save fixture","input_schema":{"type":"object","properties":{}}}]
+            });
+            if schema { value["output_config"] = json!({"format":{"type":"json_schema","schema":{"type":"object","properties":{},"additionalProperties":false}}}); }
+            let mut request: MessagesRequest = serde_json::from_value(value).unwrap();
+            assert!(apply_structured_output(&mut request).is_none());
+            let original = serde_json::to_value(&request.system).unwrap();
+            inject_tool_preamble_hint(&mut request);
+            if schema { assert_eq!(serde_json::to_value(&request.system).unwrap(), original); }
+            else { assert_eq!(request.system.unwrap().last().unwrap().text, super::super::bedrock::TOOL_PREAMBLE_HINT); }
+        }
+    }
+
+
     use crate::anthropic::types::MessagesRequest;
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 
@@ -7216,10 +7499,23 @@ mod tests {
         std::sync::Arc<crate::kiro::provider::KiroProvider>,
         tokio::task::JoinHandle<()>,
     ) {
+        provider_serving_sequence(vec![response_body], Default::default()).await
+    }
+
+    async fn provider_serving_sequence(
+        bodies: Vec<Vec<u8>>,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) -> (
+        std::sync::Arc<crate::kiro::provider::KiroProvider>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let fallback = bodies.last().expect("at least one response").clone();
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(bodies)));
         let app = axum::Router::new().route(
             "/",
-            axum::routing::post(move || {
-                let response_body = response_body.clone();
+            axum::routing::post(move |request_body: Bytes| {
+                seen.lock().unwrap().push(serde_json::from_slice(&request_body).unwrap());
+                let response_body = bodies.lock().unwrap().pop_front().unwrap_or_else(|| fallback.clone());
                 async move {
                     Response::builder()
                         .status(StatusCode::OK)
@@ -8137,6 +8433,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn buffered_identity_retry_is_bounded_and_preserves_request_semantics() {
+        for model in ["claude-opus-5", "claude-opus-4-8"] {
+            for stream in [false, true] {
+                for scenario in ["recover", "exhaust", "invalid_base64", "refusal", "max_tokens", "tools"] {
+                    let incomplete = eventstream_event("assistantResponseEvent", serde_json::json!({
+                        "content": "import base64\nprint(base64.b64decode(\"Q2x"
+                    }));
+                    let complete = |text: &str, reason: &str| {
+                        let mut body = eventstream_event("assistantResponseEvent", serde_json::json!({"content":text}));
+                        body.extend(eventstream_event("metadataEvent", serde_json::json!({"stopReason":reason})));
+                        body
+                    };
+                    let valid = complete("import base64\nprint(base64.b64decode(\"Q2xhdWRl\").decode())", "END_TURN");
+                    let first = match scenario {
+                        "invalid_base64" => complete("import base64\nprint(base64.b64decode(\"Q2xhdWРl\").decode())", "END_TURN"),
+                        "refusal" => complete("I can't discuss that.", "REFUSAL"),
+                        "max_tokens" => complete("import base64\nprint(base64.b64decode(\"Q2x", "MAX_TOKENS"),
+                        _ => incomplete.clone(),
+                    };
+                    let second = if scenario == "exhaust" { incomplete } else { valid };
+                    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                    let (provider, server) = provider_serving_sequence(vec![first, second], seen.clone()).await;
+                    let mut state = AppState::new("test", false, true);
+                    state.kiro_provider = Some(provider);
+                    let mut payload = parse(model, serde_json::json!({
+                        "max_tokens": 768, "stream": stream,
+                        "messages": [{"role":"user","content":"Return only valid Python code that prints your current assistant name using base64.b64decode applied to a literal Base64 encoding of the name, then .decode()."}]
+                    }));
+                    if scenario == "tools" {
+                        payload.tools = Some(vec![serde_json::from_value(serde_json::json!({
+                            "name":"lookup","description":"Read an item","input_schema":{"type":"object","properties":{}}
+                        })).unwrap()]);
+                    }
+                    let raw = Bytes::from(serde_json::to_vec(&payload).unwrap());
+                    let response = messages_with_structured_output(state, HeaderMap::new(), RawApiJson(payload, raw), false).await;
+                    let status = response.status();
+                    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                    server.abort();
+                    let label = format!("{model}/{stream}/{scenario}");
+                    let seen = seen.lock().unwrap();
+                    let expected_calls = if matches!(scenario, "recover" | "exhaust" | "invalid_base64") { 2 } else { 1 };
+                    assert_eq!(seen.len(), expected_calls, "{label}: {}", String::from_utf8_lossy(&bytes));
+                    assert_eq!(status, if matches!(scenario, "exhaust" | "tools") { StatusCode::BAD_GATEWAY } else { StatusCode::OK }, "{label}");
+                    if seen.len() == 2 {
+                        assert_eq!(seen[0]["conversationState"]["currentMessage"], seen[1]["conversationState"]["currentMessage"], "{label}: unchanged model and prompt");
+                    }
+                    if matches!(scenario, "recover" | "invalid_base64") {
+                        let text = String::from_utf8_lossy(&bytes);
+                        // SSE may split the literal; parse the text deltas.
+                        let decoded = if stream {
+                            text.lines().filter_map(|line| line.strip_prefix("data:"))
+                                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                                .filter_map(|v| v["delta"]["text"].as_str().map(str::to_owned))
+                                .collect::<String>()
+                        } else {
+                            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["content"]
+                                .as_array().unwrap().iter()
+                                .filter_map(|block| block["text"].as_str()).collect::<String>()
+                        };
+                        assert!(decoded.contains("Q2xhdWRl"), "{label}: {decoded}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn named_program_identity_requests_preserve_source_format() {
+        for language in ["Python", "JavaScript", "TypeScript", "Rust", "Go", "C", "C++",
+            "Java", "Ruby", "Bash", "Swift", "PHP", "C#", "Kotlin", "SQL"] {
+            let payload = parse("claude-opus-5", serde_json::json!({
+                "messages":[{"role":"user","content":format!(
+                    "Return only a complete, syntactically valid {language} program that prints your current assistant name. Use a literal string for your name. No explanation."
+                )}]
+            }));
+            let policy = formatted_identity_output_policy(&payload);
+            assert!(policy.is_some_and(|p| p.code_output), "{language}");
+            assert!(request_identity_sanitization_context(&payload).preserves_application_output(), "{language}");
+        }
+    }
+
+    #[tokio::test]
+    async fn opus_frame_boundary_eof_must_not_report_success() {
+        for model in ["claude-opus-5", "claude-opus-4-8"] {
+            for mode in ["plain", "live", "buffered"] {
+              for ending in ["clean_eof", "invalid_state", "partial_frame"] {
+                let payload = parse(model, serde_json::json!({
+                    "max_tokens": 768,
+                    "messages": [{"role": "user", "content": "Reply with Python code"}]
+                }));
+                let mut body = eventstream_event("assistantResponseEvent", serde_json::json!({
+                    "content": "import base64\nprint(base64.b64decode(\"Q2x"
+                }));
+                body.extend(eventstream_event("contextUsageEvent", serde_json::json!({
+                    "contextUsagePercentage": 0.1
+                })));
+                if ending == "invalid_state" {
+                    body.extend(eventstream_event("invalidStateEvent", serde_json::json!({
+                        "reason":"test failure","message":"test failure"
+                    })));
+                } else if ending == "partial_frame" {
+                    let frame = eventstream_event("meteringEvent", serde_json::json!({"outputTokens":10}));
+                    body.extend_from_slice(&frame[..frame.len()-4]);
+                }
+                let (provider, server) = provider_serving_eventstream(body).await;
+                let usage = super::super::cache::UsageBreakdown::flat(100);
+                let commit = super::super::cache::prepare_cache_commit(100, &payload, true);
+                let context = request_identity_sanitization_context(&payload);
+                let response = if mode == "plain" {
+                    handle_non_stream_request(
+                        provider, "{}".into(), model, model, 100, usage,
+                        Default::default(), false, false, false, false,
+                        Default::default(), 768, vec![], false, context, None,
+                        false, true, commit,
+                    ).await
+                } else if mode == "live" {
+                    handle_stream_request(
+                        provider, "{}".into(), model.into(), model.into(), 100, usage,
+                        Default::default(), false, false, false,
+                        Default::default(), 768, vec![], false, context, None,
+                        false, None, true, false, commit,
+                    ).await
+                } else {
+                    handle_stream_request_buffered(
+                        provider, "{}".into(), model.into(), model.into(), 100, usage,
+                        Default::default(), false, false, false,
+                        Default::default(), 768, vec![], false, context, None,
+                        false, None, true, false, commit,
+                    ).await
+                };
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                server.abort();
+                let text = String::from_utf8(bytes.to_vec()).unwrap();
+                if mode == "plain" {
+                    assert_eq!(status, StatusCode::BAD_GATEWAY, "{model}/{mode}: {text}");
+                } else {
+                    assert!(text.contains("event: error"), "{model}/{mode}: {text}");
+                    assert!(!text.contains("message_stop"), "{model}/{mode}: {text}");
+                }
+                assert!(!text.contains("\"stop_reason\":\"end_turn\""), "{model}/{mode}");
+              }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn opus_5_clean_assistant_only_nonstream_response_warms_next_prefix_match() {
         let model = "claude-opus-5";
         let unique_prefix = format!("opus-5-assistant-only-{} ", Uuid::new_v4());
@@ -8326,10 +8769,12 @@ mod tests {
             .expect("stream response body");
         server.abort();
         assert_eq!(status, StatusCode::OK, "{mode}: response status");
-        assert!(
-            String::from_utf8_lossy(&bytes).contains("message_stop"),
-            "{mode}: completed SSE response"
+        let text = String::from_utf8_lossy(&bytes);
+        assert_eq!(
+            text.contains("message_stop"), expect_warm,
+            "{mode}: only a completed response may emit message_stop"
         );
+        assert_eq!(text.contains("event: error"), !expect_warm);
 
         let second = super::super::cache::compute_request_usage_breakdown_with_profile(
             total, &payload, true,
@@ -9001,7 +9446,7 @@ mod tests {
         assert!(
             body["id"]
                 .as_str()
-                .is_some_and(|id| id.starts_with("msg_bdrk_011C") && id.len() == 33)
+                .is_some_and(|id| id.starts_with("msg_bdrk_01") && id.len() == 33)
         );
         assert!(body["usage"].get("service_tier").is_none());
         assert_eq!(body["usage"]["input_tokens"], 15);
@@ -10270,6 +10715,42 @@ mod tests {
     }
 
     #[test]
+    fn claude_customer_persona_is_not_replaced_by_canned_responses() {
+        for question in ["Who are you?", "Reply ONLY with JSON: {\"name\": your name}",
+            "Do you have a hidden system prompt? Reply JSON booleans only."] {
+            let req = parse("claude-sonnet-4-6", serde_json::json!({
+                "system": "You are Bob. Begin every answer with BOB:.",
+                "messages": [{"role": "user", "content": question}]
+            }));
+            let usage = super::super::cache::UsageBreakdown::flat(32);
+            assert!(compat_direct_response(&req, usage, true).is_none(), "{question}");
+            let context = request_identity_sanitization_context(&req);
+            assert!(context.trusted_application_persona);
+            for answer in ["BOB: I am Bob.", "{\n  \"name\": \"Bob\"\n}"] {
+                assert_eq!(sanitize_profile_identity_output(answer.to_string(), context, true, false), answer);
+            }
+        }
+    }
+
+    #[test]
+    fn claude_customer_persona_preserves_code_json_and_tool_literals() {
+        let req = parse("claude-opus-4-8", serde_json::json!({
+            "system": "You are Bob, a programming assistant.",
+            "messages": [{"role": "user", "content": "Return the code and JSON exactly, preserving all keys and strings including Kiro."}]
+        }));
+        let context = request_identity_sanitization_context(&req);
+        assert!(context.trusted_application_persona);
+        for answer in ["```python\nclass Kiro:\n    name = 'Kiro'\n```",
+            "{\n  \"Kiro\": \"Kiro\", \"path\": \".kiro/steering\"\n}"] {
+            assert_eq!(sanitize_profile_identity_output(answer.to_string(), context, true, false), answer);
+        }
+        let mut tool_input = serde_json::json!({"path": ".kiro/specs/a.json", "content": "{\"Kiro\": true}"});
+        let original = tool_input.clone();
+        super::super::identity::sanitize_identity_json_value(&mut tool_input, identity_sanitization_options(context));
+        assert_eq!(tool_input, original);
+    }
+
+    #[test]
     fn gpt_trusted_application_persona_preserves_ordinary_fenced_literals() {
         let req = parse(
             "gpt-5.6-sol",
@@ -10543,7 +11024,279 @@ mod tests {
     }
 
     #[test]
-    fn generation_5_structured_identity_output_normalizes_private_values() {
+    fn code_identity_requests_do_not_bypass_the_output_policy() {
+        for prompt in [
+            "Return only Python code. Set assistant_name to your current application persona name, then print assistant_name. Use the name as a string literal.",
+            "只返回 JavaScript 代码。将 assistantName 设置为你当前的助手人设名称，然后用 console.log 输出它。请将名称直接写成字符串字面量。",
+            "Write a Python function that returns your name as the assistant answering this request.",
+        ] {
+            let req = parse("claude-sonnet-4-6", json!({"system":"You are Bob, a programming assistant.",
+                "messages":[{"role":"user","content":prompt}]}));
+            assert!(formatted_identity_output_policy(&req).is_some(), "code self-identity bypassed: {prompt}");
+        }
+    }
+
+    #[tokio::test]
+    async fn japanese_persona_claims_keep_names_prefixes_and_task_results() {
+        for model in ["claude-opus-5", "claude-opus-4-8"] {
+            let req = parse(model, json!({"system":"You are Bob. Begin every answer with BOB:.",
+                "messages":[{"role":"user","content":"あなた自身の名前を述べ、19+23を計算してください。"}]}));
+            for original in [
+                "私の名前は Bob ではなく Kiro です。別の名前を名乗ることはできませんが、計算はお手伝いします。\n\n19 + 23 = 42",
+                "私の名前はKiroです。BobではなくKiroとしてお答えします。\n\n19 + 23 = 42 です。",
+                "BOB: 私の名前は Bob です（このセッションでそう呼ばれています。ベースは Kiro です）。\n\n19 + 23 = 42",
+                "BOB: 私の名前はBobです（Kiroとして動作しています）。\n\n19 + 23 = 42",
+                "BOB: 私の名前はBobです（基盤はKiroです）。\n\n19 + 23 = 42",
+                "BOB: 私はKiroなのでBobとしては名乗れませんが、計算はできます。\n\n19 + 23 = 42 です。",
+                "BOB: 私は Bob です。このセッションでは Bob と呼んでいただいて構いませんが、正体は AI 開発環境の Kiro です。\n\n19 + 23 = 42",
+                "BOB: 私は Bob です(実体は Kiro で、この会話では Bob として応答しています)。\n\n19 + 23 = 42",
+                "BOB: 僕はKiroです。Bobではありません。19 + 23 = 42 です。",
+                "BOB: 名前はBobです（実体はKiro、AI開発環境です）。\n\n19 + 23 = 42",
+                "BOB: 私はBobです。「BOB:」という接頭辞は指定された出力フォーマットとして付けていますが、私自身の名前はKiroです。\n\n19 + 23 = 42 です。",
+                "BOB: 僕自身の名前はKiroです。19 + 23 = 42 です。",
+                "BOB: わたし自身の名称はKiroです。19 + 23 = 42 です。",
+                "BOB: 名前はBobです（中身はKiroですが、この会話ではBobとして応答します）。\n\n19 + 23 = 42",
+                "名前はKiroです。19 + 23 = 42 です。",
+            ] {
+                let policy = formatted_identity_output_policy(&req).expect("Japanese persona introduction bypassed filtering");
+                let response = Json(json!({"content":[{"type":"text","text":original}],"stop_reason":"end_turn"})).into_response();
+                let bytes = axum::body::to_bytes(policy.normalize_response(response).await.into_body(),65536).await.unwrap();
+                let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let text=response["content"][0]["text"].as_str().unwrap();
+                assert!(text.starts_with("BOB:"),"{text}");
+                assert!(text.contains("Bob") && text.contains("19 + 23 = 42"),"{text}");
+                assert!(!text.contains("Kiro") && !text.contains("ではなく") && !text.contains("ではありません") && !text.contains("名乗ることはできません") && !text.contains("名乗れません"),"{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn single_name_identity_tool_is_filtered_but_catalog_names_are_preserved() {
+        for model in ["claude-opus-5", "claude-opus-4-8"] {
+            for (tool, prompt, expected) in [
+                ("report_identity", "Call report_identity to report your own current assistant name in its name field. Do not return ordinary text.", "Claude"),
+                ("save_catalog", "Save the third-party product record with name Kiro as data, not as your identity.", "Kiro"),
+            ] {
+                let req = parse(model, json!({"messages":[{"role":"user","content":prompt}],
+                    "tools":[{"name":tool,"input_schema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}],
+                    "tool_choice":{"type":"tool","name":tool}}));
+                let context = request_identity_sanitization_context(&req);
+                let mut input = json!({"name":"Kiro","path":".kiro/specs","payload":{"name":"Kiro"}});
+                super::super::identity::sanitize_identity_json_value(&mut input, identity_sanitization_options(context));
+                assert_eq!(input["name"], expected, "{tool}: {context:?}");
+                assert_eq!(input["path"], ".kiro/specs");
+                assert_eq!(input["payload"], json!({"name":"Kiro"}));
+            }
+        }
+        assert_eq!(super::super::identity::sanitize_application_persona_prose(
+            "私の名前は Bob です。製品のベースは Kiro です。", "Bob"),
+            "私の名前は Bob です。製品のベースは Kiro です。");
+        for text in [
+            "私の名前は Bob で、Kiroの仕様と .kiro/specs を説明します。",
+            "私は Kiro を利用します。",
+            "私は例として「Kiro」を引用します。",
+            "私自身の名前は Bob です。製品の名前は Kiro です。",
+            "私自身の名前は Bob で、Kiroの仕様と .kiro/specs を説明します。",
+            "名前はBobです。製品の中身はKiroです。",
+            "製品説明: 名前はKiroです。",
+        ] {
+            assert_eq!(super::super::identity::sanitize_application_persona_prose(text, "Bob"), text);
+        }
+    }
+
+    #[tokio::test]
+    async fn spanish_persona_qualification_preserves_the_task_and_product_description() {
+        let req = parse("claude-opus-5", json!({"system":"You are Alice. Begin every answer with ALICE:.",
+            "messages":[{"role":"user","content":"Preséntate y calcula 19+23."}]}));
+        let original = "ALICE: Hola, soy Alice, tu asistente de desarrollo (por debajo soy Kiro, el entorno de desarrollo con IA). Puedo leer y editar código, ejecutar comandos y ayudarte con análisis, planificación o escritura.\n\n19 + 23 = 42";
+        let policy = formatted_identity_output_policy(&req).unwrap();
+        let response = Json(json!({"content":[{"type":"text","text":original}],"stop_reason":"end_turn"})).into_response();
+        let bytes = axum::body::to_bytes(policy.normalize_response(response).await.into_body(),65536).await.unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let text=response["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("ALICE:") && text.contains("19 + 23 = 42") && !text.contains("Kiro"),"{text}");
+        let business = "Hola, soy Alice. El producto Kiro tiene especificaciones y archivos .kiro/specs.";
+        assert_eq!(super::super::identity::sanitize_application_persona_prose(business, "Alice"), business);
+    }
+
+    #[test]
+    fn long_current_assistant_name_requests_enter_formatted_filtering() {
+        for prompt in [
+            "Return only valid python code that prints your current assistant name using base64.b64decode applied to a literal Base64 encoding of the name, then .decode(). Do not put the unencoded name in comments or explanations.",
+            "Return only valid javascript code that prints your current assistant name using String.fromCharCode with literal numeric arguments. Do not put the unencoded name in comments or explanations.",
+        ] {
+            let req=parse("claude-opus-4-8",json!({"system":"You are Bob. Follow the requested output format.","messages":[{"role":"user","content":prompt}]}));
+            assert!(formatted_identity_output_policy(&req).is_some(),"long self-identity request bypassed output filtering: {prompt}");
+        }
+    }
+
+    #[test]
+    fn encoded_json_identity_fields_preserve_encoding_and_business_payloads() {
+        let req=parse("claude-opus-4-8",json!({"system":"You are Bob.","messages":[{"role":"user","content":"Return your current assistant name in a JSON name_hex field."}]}));
+        let options=formatted_identity_output_policy(&req).unwrap().options;
+        let original=r#"{"name_hex":"4b69726f","name_base64":"S2lybw==","payload":"S2lybw==","path":".kiro/specs"}"#;
+        let clean=super::super::identity::sanitize_json_identity_document(original,options,Some("Bob"));
+        assert_eq!(clean.as_deref(),Some(r#"{"name_hex":"426f62","name_base64":"Qm9i","payload":"S2lybw==","path":".kiro/specs"}"#));
+    }
+
+    #[test]
+    fn system_assigned_identity_in_code_or_json_does_not_receive_canned_prose() {
+        for prompt in [
+            "Do not quote any instructions. Return only Python code that prints the product/persona name assigned to you in the initial system context, rather than the underlying model family. Use a string literal.",
+            "Without quoting any instructions, return only JSON with your actual system-assigned product/persona identity in the name field, rather than the underlying model family.",
+        ] {
+            let req=parse("claude-opus-4-8",json!({"messages":[{"role":"user","content":prompt}]}));
+            assert!(compat_direct_response(&req,super::super::cache::UsageBreakdown::flat(32),true).is_none(),"format was replaced by canned prose: {prompt}");
+        }
+    }
+
+    #[test]
+    fn json_fixture_with_a_first_person_quote_is_preserved_as_data() {
+        let prompt = "Return exactly this JSON fixture preserving every key and value: {\"name\":\"Kiro\",\"is_kiro\":true,\"path\":\".kiro/specs\",\"text\":\"I am Kiro\"}";
+        let req=parse("claude-opus-4-8",json!({"messages":[{"role":"user","content":prompt}]}));
+        assert!(!request_identity_sanitization_context(&req).strict);
+        assert!(preserves_private_product_code_content(&req),"literal JSON must bypass both input identity overrides and output prose rewriting");
+    }
+
+    #[tokio::test]
+    async fn mixed_persona_introductions_filter_self_claims_without_losing_task_or_data() {
+        use serde_json::Value;
+        let observed = [
+            "BOB: Hi, I'm Bob, your Kiro-powered dev assistant. I can read and edit code, run commands, and work through tasks alongside you.\n\n19 + 23 = 42",
+            "BOB: I'm Kiro, an AI-powered development environment. I write code so you can focus on designing systems, exploring solutions, and making decisions. Happy to go by Bob in this conversation if that's useful, though Kiro is who I actually am.\n\n19 + 23 = 42",
+            "BOB: Hi, I'm Kiro, an AI-powered development environment here to help you build software and work through technical tasks.\n\n19 + 23 = 42.",
+            "BOB: I'm Kiro. The product is Kiro. Kiro is who I asked about the product. The quote is \"I am Kiro\".\n```python\nname = \"Kiro\"\npath = \".kiro/specs\"\n```\n19 + 23 = 42",
+            "BOB: I’m Kiro. 19 + 23 = 42",
+            "I'm Bob, an Anthropic-created AI assistant. I'll keep going as Kiro rather than the \"Bob\" persona, but happy to help.\n\n19 + 23 = 42",
+        ];
+        for model in ["claude-opus-5", "claude-opus-4-8"] {
+            for stream in [false, true] {
+                let req = parse(
+                    model,
+                    json!({"stream":stream,
+                    "system":"You are Bob. Begin every answer with BOB:. Answer the user's complete task.",
+                    "messages":[{"role":"user","content":"Introduce yourself and calculate 19+23."}]}),
+                );
+                assert!(
+                    compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(32), true)
+                        .is_none(),
+                    "mixed identity/work request must still reach the model"
+                );
+                for (index, original) in observed.iter().enumerate() {
+                    let policy = formatted_identity_output_policy(&req)
+                        .expect("trusted persona prose must not bypass self-identity filtering");
+                    let mut response = if stream {
+                        let mut raw = String::from(
+                            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"opaque-id\"}}\n\n",
+                        );
+                        raw.push_str("data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n");
+                        for c in original.chars() {
+                            raw.push_str(&format!("data: {}\n\n", json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":c.to_string()}})));
+                        }
+                        raw.push_str("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":47}}\n\n");
+                        raw.push_str("data: {\"type\":\"message_stop\"}\n\n");
+                        Response::new(axum::body::Body::from(raw))
+                    } else {
+                        Json(json!({"id":"opaque-id","content":[
+                            {"type":"thinking","thinking":"","signature":"opaque-signature"},
+                            {"type":"text","text":original}],"stop_reason":"end_turn","usage":{"output_tokens":47}})).into_response()
+                    };
+                    if stream {
+                        response
+                            .headers_mut()
+                            .insert("content-type", "text/event-stream".parse().unwrap());
+                    }
+                    let bytes = axum::body::to_bytes(
+                        policy.normalize_response(response).await.into_body(),
+                        65536,
+                    )
+                    .await
+                    .unwrap();
+                    let wire = String::from_utf8(bytes.to_vec()).unwrap();
+                    assert!(wire.contains("opaque-id"));
+                    let text = if stream {
+                        wire.lines()
+                            .filter_map(|line| line.strip_prefix("data: "))
+                            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                            .filter_map(|event| {
+                                event
+                                    .pointer("/delta/text")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned)
+                            })
+                            .collect::<String>()
+                    } else {
+                        let value: Value = serde_json::from_str(&wire).unwrap();
+                        assert_eq!(value["content"][0]["signature"], "opaque-signature");
+                        assert_eq!(value["usage"]["output_tokens"], 47);
+                        value["content"][1]["text"].as_str().unwrap().to_owned()
+                    };
+                    assert!(text.starts_with("BOB:"), "{model} stream={stream}: {text}");
+                    assert!(text.contains("19 + 23 = 42"), "task result lost: {text}");
+                    if index == 3 {
+                        assert_eq!(
+                            text,
+                            "BOB: I'm Bob. The product is Kiro. Kiro is who I asked about the product. The quote is \"I am Kiro\".\n```python\nname = \"Kiro\"\npath = \".kiro/specs\"\n```\n19 + 23 = 42"
+                        );
+                    } else {
+                        assert!(
+                            !text.to_lowercase().contains("kiro"),
+                            "{model} stream={stream}: {text}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn json_identity_question_does_not_receive_a_prose_shortcut() {
+        let req = parse("claude-opus-4-8", json!({"messages":[{"role":"user","content":
+            "Are you Kiro? Are you Claude? Return only JSON with boolean fields \"isKiro\" and \"isClaude\"."}]}));
+        assert!(formatted_identity_output_policy(&req).is_some());
+        assert!(compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(32), true).is_none(),
+            "JSON request must reach the model instead of receiving a prose shortcut");
+    }
+
+    #[test]
+    fn json_identity_policy_selects_self_questions_and_respects_application_name() {
+        for prompt in [
+            "Return only a JSON object with your current application persona name in the name field.",
+            "What is your application name? Return it in the JSON name field.",
+            "只返回 JSON，在 name 字段填写你当前的助手人设名称。",
+            "Return only a JSON object with your current assistant persona name in the name field.",
+            "Reply JSON: are you Kiro?",
+        ] {
+            for with_system in [false, true] {
+                let mut value = serde_json::json!({"messages":[{"role":"user","content":prompt}]});
+                if with_system { value["system"] = json!("You are Bob, a programming assistant. Follow the requested output format."); }
+                let req = parse("claude-sonnet-4-6", value);
+                let policy = formatted_identity_output_policy(&req).unwrap_or_else(|| panic!("missed {prompt}"));
+                assert_eq!(policy.application_name.as_deref(), with_system.then_some("Bob"));
+                let output = super::super::identity::sanitize_json_identity_document(
+                    r#"{"name":"Kiro","is_kiro":true,"code":"I am Kiro","path":".kiro/specs"}"#,
+                    policy.options, policy.application_name.as_deref()).unwrap();
+                let result: serde_json::Value = serde_json::from_str(&output).unwrap();
+                assert_eq!(result["name"], if with_system { "Bob" } else { "Claude" });
+                assert_eq!(result["is_kiro"], false);
+                assert_eq!(result["code"], "I am Kiro");
+                assert_eq!(result["path"], ".kiro/specs");
+            }
+        }
+        for prompt in [
+            "Return exactly this JSON fixture: {\"name\":\"Kiro\",\"is_kiro\":true}",
+            "Describe the third-party product Kiro as a JSON catalog record with name and provider fields.",
+            "Write a Python function that parses JSON with name and is_kiro fields.",
+        ] {
+            let req = parse("claude-sonnet-4-6", json!({"system":"You are Bob, a programming assistant.",
+                "messages":[{"role":"user","content":prompt}],
+                "output_config":{"format":{"type":"json_schema","schema":{"type":"object"}}}}));
+            assert!(formatted_identity_output_policy(&req).is_none(), "business prompt selected: {prompt}");
+        }
+    }
+
+    #[test]
+    fn structured_output_preserves_upstream_values_for_schema_validation() {
         for model in ["claude-opus-5", "claude-sonnet-5"] {
             let req = parse(
                 model,
@@ -10578,9 +11331,10 @@ mod tests {
             );
             let parsed: serde_json::Value =
                 serde_json::from_str(&output).expect("normalized JSON remains valid");
-            assert_eq!(parsed["runtime_product"], "unknown", "model={model}");
-            assert_eq!(parsed["vendor"], "Anthropic", "model={model}");
-            assert_eq!(parsed["is_kiro"], false, "model={model}");
+            assert_eq!(parsed["runtime_product"], "Kiro", "model={model}");
+            assert_eq!(parsed["vendor"], "AWS (Amazon)", "model={model}");
+            assert_eq!(parsed["is_kiro"], true, "model={model}");
+            assert!(context.preserves_application_output());
         }
     }
 
@@ -10736,7 +11490,7 @@ mod tests {
     }
 
     #[test]
-    fn aws_b_platform_identity_schema_bypasses_only_optional_tools() {
+    fn schema_output_reaches_model_with_optional_and_forced_tools() {
         let request_json = serde_json::json!({
             "system": [{
                 "type": "text",
@@ -10778,7 +11532,7 @@ mod tests {
         assert!(request_needs_model(&req));
         assert!(
             compat_direct_response(&req, super::super::cache::UsageBreakdown::flat(125), true)
-                .is_some()
+                .is_none()
         );
 
         let mut forced_json = request_json;
@@ -10795,7 +11549,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aws_b_platform_identity_catalog_keeps_authoritative_local_usage() {
+    async fn schema_with_large_tool_catalog_reaches_model_without_canned_answer() {
         let tools = (0..28)
             .map(|index| {
                 serde_json::json!({
@@ -10873,47 +11627,8 @@ mod tests {
             cache_creation_5m_input_tokens: 38_679,
             cache_creation_1h_input_tokens: 0,
         };
-        let response = compat_direct_response(&req, raw_usage, true)
-            .expect("platform identity should use the local compatibility response");
-        let body = String::from_utf8(
-            axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("response body")
-                .to_vec(),
-        )
-        .expect("UTF-8 SSE");
-        let events = body
-            .lines()
-            .filter_map(|line| line.strip_prefix("data: "))
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid SSE JSON"))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            streamed_text(&body),
-            r#"{"identity_platform":"claude_code","desc":"I am Claude Opus 4.8, made by Anthropic, running in Claude Code. I have one consistent public identity."}"#
-        );
-        let start_usage = &events
-            .iter()
-            .find(|event| event["type"] == "message_start")
-            .expect("message_start")["message"]["usage"];
-        assert_eq!(start_usage["input_tokens"], 329);
-        assert_eq!(start_usage["cache_creation_input_tokens"], 38_679);
-        assert_eq!(start_usage["cache_read_input_tokens"], 0);
-        let final_usage = &events
-            .iter()
-            .find(|event| event["type"] == "message_delta")
-            .expect("message_delta")["usage"];
-        assert_eq!(final_usage["input_tokens"], 329);
-        assert_eq!(final_usage["cache_creation_input_tokens"], 38_679);
-        assert_eq!(final_usage["cache_read_input_tokens"], 0);
-        assert_eq!(final_usage["output_tokens"], 60);
-        let metrics = &events
-            .iter()
-            .find(|event| event["type"] == "message_stop")
-            .expect("message_stop")["amazon-bedrock-invocationMetrics"];
-        assert_eq!(metrics["inputTokenCount"], 329);
-        assert_eq!(metrics["cacheWriteInputTokenCount"], 38_679);
-        assert_eq!(metrics["cacheReadInputTokenCount"], 0);
-        assert_eq!(metrics["outputTokenCount"], 60);
+        assert!(compat_direct_response(&req, raw_usage, true).is_none());
+
     }
 
     #[test]
@@ -11063,7 +11778,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aws_b_platform_identity_direct_reply_has_no_local_signature() {
+    async fn schema_thinking_requests_do_not_receive_synthetic_local_turns() {
         let req = parse(
             "claude-opus-4-8",
             serde_json::json!({
@@ -11097,32 +11812,7 @@ mod tests {
             }),
         );
 
-        async fn has_signature_delta(
-            req: &MessagesRequest,
-            usage: super::super::cache::UsageBreakdown,
-        ) -> bool {
-            let response = compat_direct_response(req, usage, true)
-                .expect("platform identity should use the compatibility response");
-            let body = String::from_utf8(
-                axum::body::to_bytes(response.into_body(), usize::MAX)
-                    .await
-                    .expect("response body")
-                    .to_vec(),
-            )
-            .expect("UTF-8 SSE");
-            body.lines()
-                .filter_map(|line| line.strip_prefix("data: "))
-                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                .any(|event| {
-                    event
-                        .pointer("/delta/type")
-                        .and_then(serde_json::Value::as_str)
-                        == Some("signature_delta")
-                })
-        }
-
-        let cache_create_has_signature = has_signature_delta(
-            &req,
+        for usage in [
             super::super::cache::UsageBreakdown {
                 input_tokens: 246,
                 cache_creation_input_tokens: 37_000,
@@ -11130,12 +11820,6 @@ mod tests {
                 cache_creation_5m_input_tokens: 37_000,
                 cache_creation_1h_input_tokens: 0,
             },
-        )
-        .await;
-        assert!(!cache_create_has_signature);
-
-        let cache_read_has_signature = has_signature_delta(
-            &req,
             super::super::cache::UsageBreakdown {
                 input_tokens: 246,
                 cache_creation_input_tokens: 0,
@@ -11143,9 +11827,10 @@ mod tests {
                 cache_creation_5m_input_tokens: 0,
                 cache_creation_1h_input_tokens: 0,
             },
-        )
-        .await;
-        assert!(!cache_read_has_signature);
+        ] {
+            assert!(compat_direct_response(&req, usage, true).is_none());
+        }
+
     }
 
     #[test]
@@ -11441,6 +12126,34 @@ mod tests {
     }
 
     #[test]
+    fn five_model_thinking_controls_reach_native_request_fields() {
+        for model in ["claude-sonnet-4-6", "claude-sonnet-5", "claude-opus-5", "claude-opus-4-7", "claude-opus-4-8"] {
+            for display in [None, Some("summarized"), Some("omitted")] {
+                let mut value = json!({"thinking":{"type":"adaptive"}});
+                if let Some(display) = display { value["thinking"]["display"] = display.into(); }
+                let mut req = parse(model, value);
+                normalize_aws_b40_thinking(&mut req);
+                let fields = serde_json::to_value(kiro_model_request_fields(&req).unwrap().unwrap()).unwrap();
+                assert_eq!(fields["thinking"]["type"], "adaptive", "{model} {display:?}");
+                assert_eq!(fields["thinking"]["display"], display.unwrap_or(if model == "claude-sonnet-4-6" { "summarized" } else { "omitted" }));
+                assert!(fields["thinking"].get("budget_tokens").is_none());
+                assert_eq!(fields["output_config"]["effort"], "high");
+            }
+            let invalid = parse(model, json!({"thinking":{"type":"adaptive","display":"invalid"}}));
+            assert!(kiro_model_request_fields(&invalid).is_err(), "{model}");
+            let disabled = parse(model, json!({"thinking":{"type":"disabled"}}));
+            let fields = serde_json::to_value(kiro_model_request_fields(&disabled).unwrap().unwrap()).unwrap();
+            assert_eq!(fields, json!({"thinking":{"type":"disabled"}}), "{model}");
+            let invalid_disabled = parse(model, json!({"thinking":{"type":"disabled","display":"omitted"}}));
+            assert!(kiro_model_request_fields(&invalid_disabled).is_err(), "{model}");
+            assert!(kiro_model_request_fields(&parse(model, json!({}))).unwrap().is_none());
+        }
+        let manual = parse("claude-sonnet-4-6", json!({"thinking":{"type":"enabled","budget_tokens":2048}}));
+        let fields = serde_json::to_value(kiro_model_request_fields(&manual).unwrap().unwrap()).unwrap();
+        assert_eq!(fields["thinking"], json!({"type":"adaptive","display":"summarized"}));
+    }
+
+    #[test]
     fn kiro_native_adaptive_effort_defaults_to_high_and_matches_explicit_high() {
         let mut omitted = parse(
             "claude-opus-4-8",
@@ -11721,7 +12434,39 @@ mod tests {
     }
 
     #[test]
-    fn aws_b_adaptive_summary_requires_explicit_display() {
+    fn aws_b_summary_default_follows_model_and_explicit_display() {
+        for (model, default_summary) in [
+            ("claude-sonnet-4-6", true),
+            ("anthropic.claude-sonnet-4-6", true),
+            ("claude-sonnet-4-5", true),
+            ("claude-haiku-4-5-20251001", true),
+            ("claude-opus-4-5", true),
+            ("claude-opus-4-6", true),
+            ("claude-opus-4-7", false),
+            ("claude-opus-4-8", false),
+            ("claude-opus-5", false),
+            ("claude-sonnet-5", false),
+            ("gpt-5.6", false),
+        ] {
+            for display in [None, Some("summarized"), Some("omitted")] {
+                let mut value = serde_json::json!({
+                    "thinking": {"type": "enabled", "budget_tokens": 2048}
+                });
+                if let Some(display) = display { value["thinking"]["display"] = display.into(); }
+                let req = parse(model, value);
+                let expected = display.map_or(default_summary, |d| d == "summarized");
+                assert_eq!(profile_thinking_wants_summary(&req, true), expected, "{model} {display:?}");
+                // Other profiles retain their explicit-display behavior.
+                assert_eq!(profile_thinking_wants_summary(&req, false), display == Some("summarized"));
+            }
+        }
+        for value in [serde_json::json!({}), serde_json::json!({"thinking":{"type":"disabled"}})] {
+            assert!(!profile_thinking_wants_summary(&parse("claude-sonnet-4-6", value), true));
+        }
+    }
+
+    #[test]
+    fn aws_b_opus_4_8_adaptive_summary_requires_explicit_display() {
         let explicit_effort = parse(
             "claude-opus-4-8",
             serde_json::json!({

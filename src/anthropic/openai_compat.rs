@@ -1209,6 +1209,11 @@ pub async fn post_chat_completions(
             return finish_openai_response(openai_invalid_request(message), gpt_openai_shape);
         }
     };
+    if aws_b40_compat && super::pomo_compat::is_opus(&model)
+        && let Some(detail) = super::pomo_compat::chat_validation_detail(&oai) {
+        return super::pomo_compat::validation_response(
+            oai.get("stream").and_then(Value::as_bool).unwrap_or(false), detail, true);
+    }
     let max_tokens = openai_max_tokens(&oai);
     let stream_requested = oai.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let include_usage = oai

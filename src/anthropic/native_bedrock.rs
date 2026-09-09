@@ -124,14 +124,11 @@ impl BedrockMantleProvider {
                 .contains(&bedrock_model_id(&model).to_ascii_lowercase())
     }
 
-    /// Mantle does not accept Anthropic structured-output schemas. Keep those
-    /// requests on the existing transport, which implements that capability.
+    /// An explicit native model route applies to every Messages request.
+    /// AWS decides which options it supports and returns its own errors;
+    /// schemas must not silently switch the request to a different provider.
     pub fn should_route_messages(&self, request: &MessagesRequest) -> bool {
         self.should_route(&request.model)
-            && request
-                .output_config
-                .as_ref()
-                .is_none_or(|config| config.format.is_none())
     }
 
     pub async fn proxy_messages(&self, incoming_headers: &HeaderMap, raw_body: Bytes) -> Response {
@@ -316,6 +313,64 @@ fn rewrite_model(raw_body: &[u8]) -> anyhow::Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn native_proxy_preserves_request_content_and_response_bytes_including_errors() {
+        use axum::{Router, routing::post};
+        use std::sync::{Arc, Mutex};
+
+        for (status, content_type, response_body) in [
+            (StatusCode::OK, "application/json",
+             "{\"id\":\"upstream-id\",\"content\":[{\"type\":\"text\",\"text\":\"BOB: Kiro\"}],\"usage\":{\"input_tokens\":2801,\"output_tokens\":7}}"),
+            (StatusCode::OK, "text/event-stream",
+             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"opaque-upstream-signature\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+            (StatusCode::BAD_REQUEST, "application/json",
+             "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Invalid signature in thinking block\"}}"),
+        ] {
+            let captured = Arc::new(Mutex::new(None));
+            let handler_capture = captured.clone();
+            let router = Router::new().route("/v1/messages", post(move |headers: HeaderMap, body: Bytes| {
+                let captured = handler_capture.clone();
+                async move {
+                    *captured.lock().unwrap() = Some((headers, body));
+                    (status, [("content-type", content_type), ("request-id", "upstream-request-id")], response_body)
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let provider = BedrockMantleProvider::for_test(
+                format!("http://{address}/v1/messages"), "test-upstream-key",
+                vec!["claude-sonnet-4-6".to_string()],
+            ).unwrap();
+            let mut request = serde_json::json!({
+                "model": "claude-sonnet-4-6", "max_tokens": 8192,
+                "system": "You are Bob. Prefix every reply with BOB:.",
+                "thinking": {"type": "enabled", "budget_tokens": 4096},
+                "messages": [
+                    {"role": "assistant", "content": [{"type": "thinking", "thinking": "", "signature": "client-supplied-signature"}]},
+                    {"role": "user", "content": "Return JSON {\"Kiro\":true} and code class Kiro unchanged."}
+                ],
+                "output_config": {"format": {"type": "json_schema", "schema": {"type": "object", "properties": {"Kiro": {"type": "boolean"}}}}},
+                "future_option": {"keep": true},
+                "stream": content_type == "text/event-stream"
+            });
+            let parsed: MessagesRequest = serde_json::from_value(request.clone()).unwrap();
+            assert!(provider.should_route_messages(&parsed));
+            let mut headers = HeaderMap::new();
+            headers.insert("x-api-key", "client-key-not-for-upstream".parse().unwrap());
+            let response = provider.proxy_messages(&headers, Bytes::from(serde_json::to_vec(&request).unwrap())).await;
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()["request-id"], "upstream-request-id");
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            assert_eq!(bytes.as_ref(), response_body.as_bytes());
+            let (forwarded_headers, forwarded_body) = captured.lock().unwrap().take().unwrap();
+            assert_eq!(forwarded_headers["x-api-key"], "test-upstream-key");
+            request["model"] = serde_json::json!("anthropic.claude-sonnet-4-6");
+            assert_eq!(serde_json::from_slice::<Value>(&forwarded_body).unwrap(), request);
+            server.abort();
+        }
+    }
+
     #[test]
     fn model_alias_is_mapped_without_dropping_unknown_fields() {
         let raw = br#"{"model":"claude-opus-4-8","temperature":0.7,"messages":[]}"#;
@@ -362,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn structured_output_stays_on_the_existing_transport() {
+    fn structured_output_keeps_the_explicit_native_transport() {
         let provider = BedrockMantleProvider::for_test(
             "http://127.0.0.1:1/anthropic/v1/messages".to_string(),
             "test-key",
@@ -390,7 +445,7 @@ mod tests {
             }
         }))
         .unwrap();
-        assert!(!provider.should_route_messages(&structured));
+        assert!(provider.should_route_messages(&structured));
     }
 
     #[test]
