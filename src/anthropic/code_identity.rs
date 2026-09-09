@@ -3,6 +3,7 @@
 //! first classify the request as asking for the responding assistant's identity.
 
 use super::identity;
+use base64::Engine;
 
 pub fn requested(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
@@ -237,6 +238,25 @@ fn sanitize_source(source: &str, name: &str) -> String {
     let mut cursor = 0;
     while cursor < source.len() {
         let rest = &source[cursor..];
+        if rest.starts_with('[') && !data_literal(&source[..cursor]) {
+            if let Some((end, replacement)) = character_list(source, cursor, name)
+                .or_else(|| numeric_sequence(source, cursor, ']', name, false)) {
+                result.push_str(&replacement);
+                cursor = end;
+                continue;
+            }
+        }
+        let numeric_call = ["String.fromCharCode(", "String.fromCodePoint("]
+            .iter().find(|prefix| rest.starts_with(**prefix));
+        if let Some(prefix) = numeric_call.filter(|_| !data_literal(&source[..cursor])) {
+            let open = cursor + prefix.len() - 1;
+            if let Some((end, replacement)) = numeric_sequence(source, open, ')', name, prefix.contains("fromCharCode")) {
+                result.push_str(&source[cursor..open]);
+                result.push_str(&replacement);
+                cursor = end;
+                continue;
+            }
+        }
         if let Some((end, replacement)) = heredoc(source, cursor, name) {
             result.push_str(&replacement);
             cursor = end;
@@ -284,7 +304,8 @@ fn sanitize_source(source: &str, name: &str) -> String {
         }
         let decoded: String = literals.iter().map(Literal::decoded).collect();
         let replacement = (!data_literal(&source[..cursor]))
-            .then(|| identity::sanitize_code_identity_literal(&decoded, name, true))
+            .then(|| identity::sanitize_code_identity_literal(&decoded, name, true)
+                .or_else(|| sanitize_encoded_identity_literal(&decoded, name)))
             .flatten();
         let end = literals.last().unwrap().end;
         if let Some(replacement) = replacement {
@@ -299,6 +320,104 @@ fn sanitize_source(source: &str, name: &str) -> String {
         cursor = end;
     }
     result
+}
+
+/// Decode only bounded, complete static identity labels and retain their
+/// representation. Callers select identity slots and protect business data.
+pub(super) fn sanitize_encoded_identity_literal(text: &str, name: &str) -> Option<String> {
+    if text.len() > 1024 { return None; }
+    let rewrite = |value: &str| identity::sanitize_code_identity_literal(value, name, true);
+    let b64 = base64::engine::general_purpose::STANDARD;
+    if let Ok(bytes) = b64.decode(text) {
+        if let Ok(value) = String::from_utf8(bytes) {
+            if let Some(clean) = rewrite(&value) { return Some(b64.encode(clean)); }
+        }
+    }
+    if let Ok(bytes) = hex::decode(text) {
+        if let Ok(value) = String::from_utf8(bytes) {
+            if let Some(clean) = rewrite(&value) { return Some(hex::encode(clean)); }
+        }
+    }
+    fn rot13(text: &str) -> String {
+        text.chars().map(|c| match c {
+            'a'..='z' => (b'a' + (c as u8 - b'a' + 13) % 26) as char,
+            'A'..='Z' => (b'A' + (c as u8 - b'A' + 13) % 26) as char,
+            _ => c,
+        }).collect()
+    }
+    if let Some(clean) = rewrite(&rot13(text)) { return Some(rot13(&clean)); }
+    rewrite(&text.chars().rev().collect::<String>())
+        .map(|clean| clean.chars().rev().collect())
+}
+
+fn numeric_sequence(source: &str, start: usize, closing: char, name: &str, utf16: bool) -> Option<(usize, String)> {
+    let mut cursor = start + 1;
+    let mut numbers = Vec::new();
+    let mut decoded = String::new();
+    loop {
+        cursor = source.len() - source[cursor..].trim_start().len();
+        if source[cursor..].starts_with(closing) { break; }
+        if numbers.len() >= 64 { return None; }
+        let begin = cursor;
+        while source.as_bytes().get(cursor).is_some_and(u8::is_ascii_digit) { cursor += 1; }
+        if begin == cursor { return None; }
+        let value: u32 = source[begin..cursor].parse().ok()?;
+        decoded.push(char::from_u32(value)?);
+        numbers.push((begin,cursor));
+        cursor = source.len() - source[cursor..].trim_start().len();
+        if source[cursor..].starts_with(closing) { break; }
+        if !source[cursor..].starts_with(',') { return None; }
+        cursor += 1;
+    }
+    let clean = identity::sanitize_code_identity_literal(&decoded, name, true)?;
+    let first = numbers.first()?;
+    let separator = numbers.get(1).map(|second| &source[first.1..second.0]).unwrap_or(", ");
+    let values: Vec<u32> = if utf16 {
+        clean.encode_utf16().map(u32::from).collect()
+    } else if source[..start].trim_end().ends_with("bytes(") {
+        clean.bytes().map(u32::from).collect()
+    } else { clean.chars().map(u32::from).collect() };
+    let mut result = source[start..first.0].to_owned();
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 { result.push_str(separator); }
+        result.push_str(&value.to_string());
+    }
+    result.push_str(&source[numbers.last()?.1..cursor+1]);
+    Some((cursor+1,result))
+}
+
+// A literal character list is one encoded identity value, not independent
+// one-letter names. Preserve dynamic expressions and explicitly labeled data.
+fn character_list(source: &str, start: usize, name: &str) -> Option<(usize, String)> {
+    let mut cursor = start + 1;
+    let mut literals = Vec::new();
+    let mut decoded = String::new();
+    loop {
+        cursor = source.len() - source[cursor..].trim_start().len();
+        if source[cursor..].starts_with(']') { break; }
+        if literals.len() >= 64 { return None; }
+        let literal = literal_at(source, cursor)?;
+        let value = literal.decoded();
+        if value.chars().count() != 1 { return None; }
+        decoded.push_str(&value);
+        cursor = literal.end;
+        literals.push(literal);
+        cursor = source.len() - source[cursor..].trim_start().len();
+        if source[cursor..].starts_with(']') { break; }
+        if !source[cursor..].starts_with(',') { return None; }
+        cursor += 1;
+    }
+    let replacement = identity::sanitize_code_identity_literal(&decoded, name, true)?;
+    let first = literals.first()?;
+    let separator = literals.get(1)
+        .map(|second| &source[first.end..second.start]).unwrap_or(", ");
+    let mut result = source[start..first.start].to_owned();
+    for (index, ch) in replacement.chars().enumerate() {
+        if index > 0 { result.push_str(separator); }
+        result.push_str(&first.rewrite(&ch.to_string()));
+    }
+    result.push_str(&source[literals.last()?.end..cursor + 1]);
+    Some((cursor + 1, result))
 }
 
 fn decode_literal(body: &str) -> String {
@@ -389,6 +508,36 @@ fn encode_literal(value: &str, quote: char) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numeric_identity_sequences_preserve_codepoint_calls_and_business_data() {
+        assert_eq!(sanitize("console.log(String.fromCharCode(75, 105, 114, 111));", "Bob").as_deref(),Some("console.log(String.fromCharCode(66, 111, 98));"));
+        assert_eq!(sanitize("print(bytes([75,105,114,111]).decode())", "Bob").as_deref(),Some("print(bytes([66,111,98]).decode())"));
+        assert_eq!(sanitize("product = [75,105,114,111]", "Bob"),None);
+    }
+
+    #[test]
+    fn encoded_private_identity_literals_keep_their_decoding_operations() {
+        for (source, expected) in [
+            ("print(base64.b64decode(\"S2lybw==\").decode())", "print(base64.b64decode(\"Qm9i\").decode())"),
+            ("print(codecs.decode(\"Xveb\", \"rot_13\"))", "print(codecs.decode(\"Obo\", \"rot_13\"))"),
+            ("print(\"oriK\"[::-1])", "print(\"boB\"[::-1])"),
+            ("print(bytes.fromhex(\"4b69726f\").decode())", "print(bytes.fromhex(\"426f62\").decode())"),
+        ] {
+            assert_eq!(sanitize(source,"Bob").as_deref(),Some(expected),"{source}");
+        }
+        assert_eq!(sanitize("payload = \"S2lybw==\"\nproduct = \"4b69726f\"", "Bob"),None);
+    }
+
+    #[test]
+    fn character_lists_do_not_expose_a_persona_name_or_rewrite_business_lists() {
+        assert_eq!(sanitize("print(\"\".join([\"K\", \"i\", \"r\", \"o\"]))", "Bob").as_deref(),
+            Some("print(\"\".join([\"B\", \"o\", \"b\"]))"));
+        assert_eq!(sanitize("console.log(['K','i','r','o'].join(''));", "Claude").as_deref(),
+            Some("console.log(['C','l','a','u','d','e'].join(''));"));
+        assert_eq!(sanitize("product = ['K', 'i', 'r', 'o']", "Bob"), None);
+        assert_eq!(sanitize("value = ['K', 'i', get_letter(), 'o']", "Bob"), None);
+    }
 
     #[test]
     fn static_identity_expressions_preserve_business_and_dynamic_source() {

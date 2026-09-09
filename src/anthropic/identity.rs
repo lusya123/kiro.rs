@@ -776,6 +776,12 @@ pub fn sanitize_identity_json_value(
         serde_json::Value::Object(values) => {
             for (key, value) in values {
                 let key = key.to_ascii_lowercase();
+                // Identity reports can also carry verbatim application data.
+                // Those fields are not declarations of the assistant's name.
+                if matches!(key.replace(['_', '-'], "").as_str(),
+                    "path" | "filepath" | "code" | "sourcecode" | "payload" | "fixture") {
+                    continue;
+                }
                 let private_identity_boolean = matches!(
                     key.as_str(),
                     "is_kiro"
@@ -844,7 +850,7 @@ pub fn sanitize_identity_json_value(
                         || (key != "product_name" && (value.is_null() || wrong_identity_value)))
                 {
                     *value = serde_json::Value::String(options.target.assistant_name().to_string());
-                } else if generic_identity_name_field && !options.target.is_claude() {
+                } else if generic_identity_name_field {
                     *value = serde_json::Value::String(options.target.assistant_name().to_string());
                 } else if model_family_field
                     && !options.target.is_claude()
@@ -909,10 +915,17 @@ pub(super) fn sanitize_code_identity_literal(text: &str, name: &str, label: bool
         || (trimmed.eq_ignore_ascii_case("Claude") && name != "Claude")) {
         return Some(text.replacen(trimmed, name, 1));
     }
-    let prose = trimmed.trim_start_matches(['#', '/', '*', ' ']).to_ascii_lowercase();
+    if let Some(clean) = sanitize_japanese_self_claim(text, name) {
+        return Some(clean);
+    }
+    let prose = trimmed.trim_start_matches(['#', '/', '*', ' ']).to_lowercase();
     let first_person = ["i am ", "i'm ", "i’m ", "my name is ", "my identity is ",
         "my persona name is ", "my actual name is ", "my assistant name is ", "my application name is ",
-        "我是", "我的名字是", "我的名称是", "我的身份是"]
+        "我是", "我的名字是", "我的名称是", "我的身份是",
+        "soy ", "me llamo ", "mi nombre es ", "je suis ", "je m'appelle ", "mon nom est ",
+        "ich bin ", "mein name ist ", "eu sou ", "sou ", "meu nome é ",
+        "я ", "меня зовут ", "저는", "제 이름은", "أنا ", "اسمي ",
+        "मैं ", "मेरा नाम", "sono ", "mi chiamo ", "tôi là "]
         .iter().any(|phrase| prose.match_indices(phrase).any(|(start, _)|
             !phrase.is_ascii() || start == 0
                 || !prose[..start].chars().next_back().is_some_and(char::is_alphanumeric)));
@@ -920,6 +933,54 @@ pub(super) fn sanitize_code_identity_literal(text: &str, name: &str, label: bool
     let clean = replace_phrase_ci(text, "kiro-powered", "AI-powered");
     let clean = sanitize_identity_text_for_request(&clean, true);
     let clean = replace_identity_term_ci(&clean, "Claude", name);
+    (clean != text).then_some(clean)
+}
+
+fn sanitize_japanese_self_claim(text: &str, name: &str) -> Option<String> {
+    let mut clean = text.to_owned();
+    let self_claim = ["私の名前は", "私の名称は", "私の本名は", "私自身は", "私は", "アシスタント名は", "としてお答えします",
+        "僕は", "ぼくは", "俺は", "おれは", "わたしは", "わたくしは", "自分は", "こちらは", "当アシスタントは",
+        "僕の名前は", "俺の名前は", "自分の名前は",
+        "正体は", "実体は", "本当は", "本来は", "実際には", "本来の名前は", "実際の名前は", "元の名前は"]
+        .iter().any(|anchor| text.contains(anchor));
+    if self_claim {
+        clean = replace_phrase_ci(&clean, &format!("Kiroなので{name}としては名乗れませんが、"), &format!("{name}です。"));
+        for left in ["", " "] {
+            for right in ["", " "] {
+                clean = replace_phrase_ci(&clean, &format!("{name}{left}ではなく{right}Kiro"), name);
+            }
+        }
+        // Once the clause declares the assistant's own identity, replace a
+        // standalone private name regardless of Japanese copula/punctuation.
+        // Quoted data, identifiers, paths and explicit product-use phrases stay
+        // literal; adjacent sentences are scoped by the caller.
+        clean = map_non_quoted_segments(&clean, |segment| {
+            let lower = segment.to_ascii_lowercase();
+            let mut output = String::with_capacity(segment.len());
+            let mut copied = 0;
+            for (start, _) in lower.match_indices("kiro") {
+                let end = start + 4;
+                let identifier = |ch: char| ch.is_ascii_alphanumeric() || "_./\\-".contains(ch);
+                if segment[..start].chars().next_back().is_some_and(identifier)
+                    || segment[end..].chars().next().is_some_and(identifier) {
+                    continue;
+                }
+                let following = segment[end..].trim_start();
+                if ["の", "について", "を使", "を利用", "を開発", "を説明", "を比較"]
+                    .iter().any(|phrase| following.starts_with(phrase)) {
+                    continue;
+                }
+                output.push_str(&segment[copied..start]);
+                output.push_str(name);
+                copied = end;
+            }
+            output.push_str(&segment[copied..]);
+            output
+        });
+    }
+    // This is an identity refusal, not a task result. Keep the following offer
+    // to help and any calculation in the same sentence intact.
+    clean = clean.replace("別の名前を名乗ることはできませんが、", "");
     (clean != text).then_some(clean)
 }
 
@@ -961,6 +1022,9 @@ pub(super) fn sanitize_application_persona_prose(text: &str, name: &str) -> Stri
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return text.to_owned();
+        }
+        if trimmed.trim_end_matches(['。', '.', '!', '！']) == format!("{name}ではありません") {
+            return String::new();
         }
         let lower = trimmed.to_ascii_lowercase();
         // Drop an identity-only refusal to adopt the application's persona,
@@ -1014,6 +1078,7 @@ pub(super) fn sanitize_application_persona_prose(text: &str, name: &str) -> Stri
         let mut start = 0;
         let mut closing_quote = None;
         let mut escaped = false;
+        let mut parentheses = 0usize;
         for (index, ch) in prose.char_indices() {
             if escaped {
                 escaped = false;
@@ -1036,7 +1101,17 @@ pub(super) fn sanitize_application_persona_prose(text: &str, name: &str) -> Stri
                 '『' => Some('』'),
                 _ => None,
             };
-            if closing_quote.is_none() && is_sentence_boundary_at(prose, index, ch) {
+            if closing_quote.is_none() {
+                match ch {
+                    '(' | '（' => parentheses += 1,
+                    ')' | '）' => parentheses = parentheses.saturating_sub(1),
+                    '\n' => parentheses = 0,
+                    _ => {},
+                }
+            }
+            // Parenthetical qualifications belong to the same introduction.
+            // A newline still bounds the context if a parenthesis is unclosed.
+            if closing_quote.is_none() && parentheses == 0 && is_sentence_boundary_at(prose, index, ch) {
                 let end = index + ch.len_utf8();
                 out.push_str(&sentence(&prose[start..end], name));
                 start = end;
@@ -1093,6 +1168,16 @@ pub fn sanitize_json_identity_document(
             let name_field = matches!(lower.as_str(), "name" | "persona" | "applicationname" | "selfname" | "assistantname" | "productname" | "displayname" | "名称" | "名字" | "助手名称" | "身份" | "description" | "introduction" | "自我介绍");
             if name_field {
                 collect(document, raw, options, application_name, patches)?;
+                continue;
+            }
+            if matches!(lower.as_str(), "namebase64" | "assistantnamebase64" | "namehex" | "assistantnamehex" | "namerot13" | "assistantnamerot13") {
+                if let Ok(value) = serde_json::from_str::<String>(raw.get()) {
+                    if let Some(replacement) = super::code_identity::sanitize_encoded_identity_literal(
+                        &value, application_name.unwrap_or(options.target.assistant_name())) {
+                        let start = (raw.get().as_ptr() as usize).checked_sub(document.as_ptr() as usize)?;
+                        patches.push((start..start + raw.get().len(), serde_json::to_string(&replacement).ok()?));
+                    }
+                }
                 continue;
             }
             let canonical = match lower.as_str() {

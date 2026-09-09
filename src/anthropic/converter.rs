@@ -1855,6 +1855,7 @@ pub(super) fn preserves_private_product_code_content(req: &MessagesRequest) -> b
             "parser",
             "unit test",
             "test fixture",
+            "json fixture",
             "identifier",
             "literal",
             "代码",
