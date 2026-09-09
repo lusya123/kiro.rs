@@ -948,11 +948,19 @@ fn sanitize_japanese_self_claim(text: &str, name: &str) -> Option<String> {
                 .iter()
                 .any(|suffix| text.contains(&format!("{pronoun}{suffix}")))
         });
+    // A self-introduction can omit the pronoun: 名前はBobです (...).
+    // Only accept a bare sentence head or the trusted persona's prefix;
+    // 製品の名前は / 製品説明: 名前は remain product descriptions.
+    let head = text.trim_start().to_lowercase();
+    let persona_prefix = format!("{}:", name.to_lowercase());
+    let head = head.strip_prefix(&persona_prefix).unwrap_or(&head).trim_start();
+    let implicit_name_claim = ["名前は", "名称は", "本名は"]
+        .iter().any(|anchor| head.starts_with(anchor));
     let self_claim = ["私の名前は", "私の名称は", "私の本名は", "私自身は", "私は", "アシスタント名は", "としてお答えします",
         "僕は", "ぼくは", "俺は", "おれは", "わたしは", "わたくしは", "自分は", "こちらは", "当アシスタントは",
         "僕の名前は", "俺の名前は", "自分の名前は",
         "正体は", "実体は", "本当は", "本来は", "実際には", "本来の名前は", "実際の名前は", "元の名前は"]
-        .iter().any(|anchor| text.contains(anchor)) || own_name_claim;
+        .iter().any(|anchor| text.contains(anchor)) || own_name_claim || implicit_name_claim;
     if self_claim {
         clean = replace_phrase_ci(&clean, &format!("Kiroなので{name}としては名乗れませんが、"), &format!("{name}です。"));
         for left in ["", " "] {
