@@ -24,25 +24,10 @@ pub(super) struct FormattedIdentityOutput {
     pub application_prefix: Option<String>,
     pub code_output: bool,
     pub prose_output: bool,
-    pub strict_format: bool,
-    pub encoded_name: bool,
-}
-
-#[derive(Clone)]
-pub(super) struct InvalidFormattedResponse;
-
-fn invalid_formatted_response() -> Response {
-    let mut response = (
-        StatusCode::BAD_GATEWAY,
-        Json(ErrorResponse::new("api_error",
-            "Upstream response did not satisfy the requested identity output format")),
-    ).into_response();
-    response.extensions_mut().insert(InvalidFormattedResponse);
-    response
 }
 
 impl FormattedIdentityOutput {
-    pub async fn normalize_response(&self, response: Response) -> Response {
+    pub async fn normalize_response(self, response: Response) -> Response {
         if !response.status().is_success() {
             return response;
         }
@@ -66,12 +51,7 @@ impl FormattedIdentityOutput {
         } else {
             message_output(&raw)
         };
-        if parts.extensions.get::<super::response_integrity::IncompleteResponse>()
-            .is_some_and(|marker| marker.is_incomplete())
-        {
-            return super::response_integrity::incomplete_response();
-        }
-        let rewritten = output.as_ref()
+        let rewritten = output
             .filter(|o| self.code_output || self.prose_output || !o.incomplete_or_error)
             .and_then(|output| {
                 if self.prose_output && !is_json_identity_document(&output.text) {
@@ -126,14 +106,6 @@ impl FormattedIdentityOutput {
                     .then(|| replace_response_text(&raw, is_stream, &replacement))
                     .flatten()
             });
-        let checked_output = rewritten.as_ref().and_then(|bytes| {
-            if is_stream { stream_output(bytes) } else { message_output(bytes) }
-        });
-        if let Some(verified) = checked_output.as_ref().or(output.as_ref()) {
-            if !verified.incomplete_or_error && !self.valid_format(&verified.text) {
-                return invalid_formatted_response();
-            }
-        }
         match rewritten {
             Some(bytes) => {
                 parts.headers.remove(axum::http::header::CONTENT_LENGTH);
@@ -141,57 +113,6 @@ impl FormattedIdentityOutput {
             }
             None => Response::from_parts(parts, Body::from(raw)),
         }
-    }
-
-    fn valid_format(&self, text: &str) -> bool {
-        let name = self.application_name.as_deref()
-            .unwrap_or(self.options.target.assistant_name());
-        if text.trim().is_empty() && (self.strict_format || self.encoded_name) {
-            return false;
-        }
-        if self.code_output {
-            if self.strict_format && text.contains("```") {
-                let Some((_, body)) = text.trim().strip_prefix("```")
-                    .and_then(|s| s.split_once('\n')) else { return false; };
-                let Some((_, tail)) = body.split_once("\n```") else { return false; };
-                if !tail.trim().is_empty() { return false; }
-            }
-            return !self.encoded_name
-                || super::code_identity::encoded_name_is_valid(text, name) != Some(false);
-        }
-        if self.prose_output { return true; }
-        let (range, _) = identity_document_range(text);
-        let document = if self.strict_format {
-            fenced_json_range(text).map_or(text, |r| &text[r])
-        } else { &text[range] };
-        let Ok(value) = serde_json::from_str::<Value>(document) else {
-            // Preserve prose-only refusals. JSON-looking output must be a
-            // single complete document when the user explicitly asked for it.
-            return !self.strict_format || !text.contains(['{', '[', '`', '"']);
-        };
-        !self.encoded_name || valid_encoded_json_names(&value, name)
-    }
-}
-
-fn valid_encoded_json_names(value: &Value, name: &str) -> bool {
-    use base64::Engine;
-    match value {
-        Value::Array(items) => items.iter().all(|item| valid_encoded_json_names(item, name)),
-        Value::Object(fields) => fields.iter().all(|(key, value)| {
-            let key = key.replace(['_', '-', ' '], "").to_ascii_lowercase();
-            match key.as_str() {
-                "identity" | "assistant" | "self" | "profile" => valid_encoded_json_names(value, name),
-                "namebase64" | "assistantnamebase64" => value.as_str().is_some_and(|s| {
-                    base64::engine::general_purpose::STANDARD.decode(s).ok().as_deref()
-                        == Some(name.as_bytes())
-                }),
-                "namehex" | "assistantnamehex" => value.as_str().is_some_and(|s| {
-                    hex::decode(s).ok().as_deref() == Some(name.as_bytes())
-                }),
-                _ => true,
-            }
-        }),
-        _ => true,
     }
 }
 
@@ -594,44 +515,6 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
-    async fn format_guard_rejects_observed_corruption_without_repairing_business_data() {
-        for (code, text, valid) in [
-            (true, "import base64\nprint(base64.b64decode(\"Q2xhdWРl\").decode())", false),
-            (true, "import base64\nprint(base64.b64decode(\"Q2x", false),
-            (true, "```python\nprint('Claude')\n```\nHere is more prose.", false),
-            (true, "=\"\" href=\"```php&lt;?php echo &quot;Claude&quot;;\">```php\n<?php\necho \"Claude\";\n```", false),
-            (true, "```python\nimport base64\nprint(base64.b64decode(\"Q2xhdWRl\").decode())\n```", true),
-            (true, "console.log(Buffer.from('Q2xhdWRl', 'base64').toString());", true),
-            (true, "console.log(Buffer.from('Q2xhdWРl', 'base64').toString());", false),
-            (true, "payload = base64.b64decode('SGVsbG8=')\nprint('Claude')", true),
-            (false, "{\"name_hex\":\"436c60756465\"}", false),
-            (false, "{\"name_base64\":\"Q2xhdWРl\"}", false),
-            (false, "```json\n{\"name_hex\":\"436c6175646565\"}\n```\nWait, let me correct that encoding.\n```json\n{\"name_hex\":\"436c61756465\"}\n```", false),
-            (false, "{\"name_hex\":\"436c61756465\",\"payload\":{\"name_hex\":\"bad\"}}", true),
-            (false, "I can't discuss that.", true),
-        ] {
-            let mut options = super::super::identity::IdentitySanitizationOptions::strict(true);
-            options.structured_identity_probe = true;
-            let policy = FormattedIdentityOutput {
-                options, application_name: None, application_prefix: None,
-                code_output: code, prose_output: false, strict_format: true, encoded_name: true,
-            };
-            for stop in ["end_turn", "max_tokens", "refusal", "tool_use", "stop_sequence"] {
-                let response = Json(json!({
-                    "content":[{"type":"text","text":text}],"stop_reason":stop,
-                    "id":"opaque-id","usage":{"output_tokens":47}
-                })).into_response();
-                let response = policy.normalize_response(response).await;
-                assert_eq!(response.status().is_success(), valid || stop != "end_turn",
-                    "{stop} / {text}");
-                if !response.status().is_success() {
-                    assert!(response.extensions().get::<InvalidFormattedResponse>().is_some());
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
     async fn formatted_identity_variants_preserve_json_and_code_syntax() {
         let variants = [
             (false, r#""Kiro""#, r#""Bob""#),
@@ -699,8 +582,6 @@ mod tests {
                     application_prefix: None,
                     code_output,
                     prose_output: false,
-                    strict_format: false,
-                    encoded_name: false,
                 };
                 let mut response = if stream {
                     let mut raw = String::from(
@@ -753,8 +634,6 @@ mod tests {
                 application_prefix: None,
                 code_output: false,
                 prose_output: false,
-                strict_format: false,
-                encoded_name: false,
             };
             let raw = if stream {
                 let mut wire = String::new();
@@ -823,8 +702,6 @@ mod tests {
                 application_prefix: None,
                 code_output: false,
                 prose_output: false,
-                strict_format: false,
-                encoded_name: false,
             };
             let response = policy
                 .normalize_response(
@@ -862,8 +739,6 @@ mod tests {
                 application_prefix: None,
                 code_output: true,
                 prose_output: false,
-                strict_format: false,
-                encoded_name: false,
             };
             let response = policy
                 .normalize_response(
@@ -902,8 +777,6 @@ mod tests {
                 application_prefix: None,
                 code_output: true,
                 prose_output: false,
-                strict_format: false,
-                encoded_name: false,
             };
             let response = policy.normalize_response(response).await;
             let bytes = to_bytes(response.into_body(), 65536).await.unwrap();

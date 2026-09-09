@@ -38,7 +38,6 @@ mod middleware;
 mod native_bedrock;
 mod openai_compat;
 mod response_store;
-mod response_integrity;
 mod responses_compat;
 mod router;
 mod signature;

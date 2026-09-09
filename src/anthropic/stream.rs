@@ -836,8 +836,6 @@ use super::converter::get_context_window_size;
 
 /// 流处理上下文
 pub struct StreamContext {
-    completion_evidence: super::response_integrity::CompletionEvidence,
-    completion_failure: super::response_integrity::IncompleteResponse,
     /// SSE 状态管理器
     pub state_manager: SseStateManager,
     /// 请求的模型名称
@@ -1093,8 +1091,6 @@ impl StreamContext {
             context_input_tokens: None,
             additional_round_input_tokens: Vec::new(),
             continuation_started: false,
-            completion_evidence: Default::default(),
-            completion_failure: Default::default(),
             output_tokens: 0,
             thinking_tokens: 0,
             output_text_acc: String::new(),
@@ -1424,7 +1420,6 @@ impl StreamContext {
         // A context event can arrive after the visible output has already hit
         // max_tokens. It is still authoritative billing data and must not be
         // discarded with later content events.
-        self.completion_evidence.observe(event);
         if self.output_token_limit_reached
             && !matches!(
                 event,
@@ -3066,15 +3061,6 @@ impl StreamContext {
 
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
-        if self.completion_failure.is_incomplete() {
-            return vec![SseEvent::new("error", json!({
-                "type": "error",
-                "error": {
-                    "type": "api_error",
-                    "message": super::response_integrity::INCOMPLETE_MESSAGE
-                }
-            }))];
-        }
         let mut events = Vec::new();
         let upstream_has_visible_text =
             has_visible_assistant_text(&self.assistant_raw_content, self.thinking_enabled);
@@ -3089,9 +3075,7 @@ impl StreamContext {
             self.identity_sanitizer = None;
             self.identity_fence_pending.clear();
         }
-        if (self.upstream_fatal_event
-            && (self.has_gpt_identity_target()
-                || (self.aws_b40_compat && super::pomo_compat::is_opus(&self.model))))
+        if (self.upstream_fatal_event && self.has_gpt_identity_target())
             || (requires_real_gpt_identity_answer
                 && !upstream_has_visible_text
                 && !self.state_manager.has_tool_use())
@@ -3446,7 +3430,6 @@ impl StreamContext {
         self.native_reasoning_usage_accounted = false;
         self.upstream_tool_input_current_round.reset();
         self.native_stop_reason_received = false;
-        self.completion_evidence = Default::default();
     }
 
     #[allow(dead_code)]
@@ -3457,23 +3440,6 @@ impl StreamContext {
 
     pub fn mark_upstream_truncated(&mut self) {
         self.mark_upstream_fatal_event();
-    }
-
-    pub(super) fn completion_failure(&self) -> super::response_integrity::IncompleteResponse {
-        self.completion_failure.clone()
-    }
-
-    pub(super) fn check_upstream_eof(&mut self) {
-        if self.aws_b40_compat
-            && super::pomo_compat::is_opus(&self.model)
-            && !self.upstream_fatal_event
-            && !self.output_token_limit_reached
-            && self.state_manager.get_stop_reason() != "stop_sequence"
-            && !self.completion_evidence.is_complete()
-        {
-            self.completion_failure.mark();
-            self.mark_upstream_fatal_event();
-        }
     }
 
     pub fn mark_upstream_fatal_event(&mut self) {
@@ -3743,14 +3709,6 @@ impl BufferedStreamContext {
         self.event_buffer.extend(events);
     }
 
-    pub(super) fn completion_failure(&self) -> super::response_integrity::IncompleteResponse {
-        self.inner.completion_failure()
-    }
-
-    pub(super) fn check_upstream_eof(&mut self) {
-        self.inner.check_upstream_eof();
-    }
-
     /// 完成流处理并返回所有事件
     ///
     /// 此方法会：
@@ -3924,29 +3882,6 @@ fn truncate_to_estimated_token_limit(text: &str, max_tokens: i32) -> (String, bo
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn continuation_requires_its_own_completion_evidence() {
-        let mut ctx = StreamContext::new_with_thinking(
-            "claude-opus-4-8", 100, false,
-            super::super::cache::UsageBreakdown::flat(100), Default::default(),
-        );
-        ctx.enable_aws_b40_compat();
-        ctx.process_kiro_event(&Event::Metadata(serde_json::from_value(
-            json!({"stopReason":"MAX_TOKENS"})
-        ).unwrap()));
-        ctx.check_upstream_eof();
-        assert!(!ctx.completion_failure().is_incomplete());
-        ctx.begin_continuation_for_billing(120);
-        ctx.process_kiro_event(&Event::AssistantResponse(serde_json::from_value(
-            json!({"content":"unfinished"})
-        ).unwrap()));
-        ctx.check_upstream_eof();
-        assert!(ctx.completion_failure().is_incomplete());
-        let events = ctx.generate_final_events();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event, "error");
-    }
 
     #[test]
     fn test_sse_event_format() {
