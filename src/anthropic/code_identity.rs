@@ -16,6 +16,8 @@ pub fn requested(text: &str) -> bool {
                 matches!(
                     word,
                     "code"
+                        | "program"
+                        | "script"
                         | "source"
                         | "python"
                         | "javascript"
@@ -64,6 +66,51 @@ pub fn sanitize(text: &str, name: &str) -> Option<String> {
     // stop reason stays unchanged, but a visible self-name must still be cleaned.
     result.push_str(&sanitize_source(&code, name));
     (result != text).then_some(result)
+}
+
+/// Validate observed static decoder arguments without executing generated code.
+/// None means the source uses another form (or is prose/refusal); do not guess.
+pub(super) fn encoded_name_is_valid(source: &str, name: &str) -> Option<bool> {
+    let source = if source.trim_start().starts_with("```") {
+        let (_, body) = source.trim_start().split_once('\n')?;
+        body.rsplit_once("\n```").map_or(body, |(code, _)| code)
+    } else { source };
+    let mut cursor = 0;
+    let mut found = false;
+    while cursor < source.len() {
+        let rest = &source[cursor..];
+        if rest.starts_with('#') || rest.starts_with("//") {
+            cursor += rest.find('\n').unwrap_or(rest.len());
+            continue;
+        }
+        let Some(literal) = literal_at(source, cursor) else {
+            cursor += rest.chars().next()?.len_utf8();
+            continue;
+        };
+        let before = source[..cursor].trim_end();
+        let buffer_encoding = if before.ends_with("Buffer.from(") {
+            source[literal.end..].trim_start().strip_prefix(',')
+                .and_then(|s| literal_at(s.trim_start(), 0))
+                .map(|value| value.decoded())
+        } else { None };
+        let b64 = before.ends_with("base64.b64decode(")
+            || before.ends_with("atob(") || buffer_encoding.as_deref() == Some("base64");
+        let hex_value = before.ends_with("bytes.fromhex(")
+            || buffer_encoding.as_deref() == Some("hex");
+        if (b64 || hex_value) && !data_literal(before) {
+            found = true;
+            if literal.end == literal.body_end { return Some(false); }
+            let value = literal.decoded();
+            let decoded = if b64 {
+                base64::engine::general_purpose::STANDARD.decode(&value).ok()
+            } else {
+                hex::decode(&value).ok()
+            };
+            if decoded.as_deref() != Some(name.as_bytes()) { return Some(false); }
+        }
+        cursor = literal.end;
+    }
+    found.then_some(true)
 }
 
 fn fence(line: &str) -> Option<&'static str> {
