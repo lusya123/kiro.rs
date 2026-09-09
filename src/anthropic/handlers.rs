@@ -10831,6 +10831,9 @@ mod tests {
                 "BOB: 私は Bob です(実体は Kiro で、この会話では Bob として応答しています)。\n\n19 + 23 = 42",
                 "BOB: 僕はKiroです。Bobではありません。19 + 23 = 42 です。",
                 "BOB: 名前はBobです（実体はKiro、AI開発環境です）。\n\n19 + 23 = 42",
+                "BOB: 私はBobです。「BOB:」という接頭辞は指定された出力フォーマットとして付けていますが、私自身の名前はKiroです。\n\n19 + 23 = 42 です。",
+                "BOB: 僕自身の名前はKiroです。19 + 23 = 42 です。",
+                "BOB: わたし自身の名称はKiroです。19 + 23 = 42 です。",
             ] {
                 let policy = formatted_identity_output_policy(&req).expect("Japanese persona introduction bypassed filtering");
                 let response = Json(json!({"content":[{"type":"text","text":original}],"stop_reason":"end_turn"})).into_response();
@@ -10869,6 +10872,8 @@ mod tests {
             "私の名前は Bob で、Kiroの仕様と .kiro/specs を説明します。",
             "私は Kiro を利用します。",
             "私は例として「Kiro」を引用します。",
+            "私自身の名前は Bob です。製品の名前は Kiro です。",
+            "私自身の名前は Bob で、Kiroの仕様と .kiro/specs を説明します。",
         ] {
             assert_eq!(super::super::identity::sanitize_application_persona_prose(text, "Bob"), text);
         }

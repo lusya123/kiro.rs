@@ -938,11 +938,21 @@ pub(super) fn sanitize_code_identity_literal(text: &str, name: &str, label: bool
 
 fn sanitize_japanese_self_claim(text: &str, name: &str) -> Option<String> {
     let mut clean = text.to_owned();
+    // Japanese inserts 自身 ("own") between a first-person pronoun and
+    // の名前/の名称/の本名. Recognize that possessive form as a self-claim,
+    // while leaving the existing sentence and quoted-data boundaries intact.
+    let own_name_claim = ["私", "僕", "ぼく", "俺", "おれ", "わたし", "わたくし", "自分"]
+        .iter()
+        .any(|pronoun| {
+            ["自身の名前は", "自身の名称は", "自身の本名は"]
+                .iter()
+                .any(|suffix| text.contains(&format!("{pronoun}{suffix}")))
+        });
     let self_claim = ["私の名前は", "私の名称は", "私の本名は", "私自身は", "私は", "アシスタント名は", "としてお答えします",
         "僕は", "ぼくは", "俺は", "おれは", "わたしは", "わたくしは", "自分は", "こちらは", "当アシスタントは",
         "僕の名前は", "俺の名前は", "自分の名前は",
         "正体は", "実体は", "本当は", "本来は", "実際には", "本来の名前は", "実際の名前は", "元の名前は"]
-        .iter().any(|anchor| text.contains(anchor));
+        .iter().any(|anchor| text.contains(anchor)) || own_name_claim;
     if self_claim {
         clean = replace_phrase_ci(&clean, &format!("Kiroなので{name}としては名乗れませんが、"), &format!("{name}です。"));
         for left in ["", " "] {
