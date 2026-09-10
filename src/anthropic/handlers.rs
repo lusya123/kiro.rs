@@ -2874,7 +2874,7 @@ pub async fn head_models(State(state): State<AppState>) -> Response {
 async fn messages_with_structured_output(
     state: AppState,
     headers: HeaderMap,
-    request: RawApiJson<MessagesRequest>,
+    mut request: RawApiJson<MessagesRequest>,
     cc: bool,
 ) -> Response {
     if let Some(provider) = state.bedrock_mantle_provider.as_ref()
@@ -2882,6 +2882,7 @@ async fn messages_with_structured_output(
     {
         return provider.proxy_messages(&headers, request.1).await;
     }
+    ignore_history_thinking_signatures(&mut request.0);
     let pomo_opus = state.aws_b40_compat && super::pomo_compat::is_opus(&request.0.model);
     if pomo_opus {
         if let Some(detail) = super::pomo_compat::messages_validation_detail(&request.0) {
@@ -3009,13 +3010,6 @@ async fn post_messages_inner(
     let gpt_passthrough = is_gpt_model(&payload.model);
     let aws_b40_initial_thinking_requested = aws_b40_compat
         && (payload.thinking.is_some() || payload.model.to_ascii_lowercase().contains("thinking"));
-    // 外部网关允许回放未登记但结构合法的 provider signature；仍须在入口拒绝
-    // 非 base64、长度异常等畸形签名，避免把确定无效的请求送往上游。
-    if let Some(response) =
-        reject_invalid_thinking_signatures_with_import_policy(&payload, true, true).await
-    {
-        return response;
-    }
     if aws_b40_compat {
         normalize_aws_b40_thinking(&mut payload);
         normalize_aws_b40_tool_choice(&mut payload);
@@ -5100,120 +5094,23 @@ fn reject_invalid_thinking_request(payload: &MessagesRequest) -> Option<Response
     None
 }
 
-async fn reject_invalid_thinking_signatures(
-    payload: &MessagesRequest,
-    aws_b40_compat: bool,
-) -> Option<Response> {
-    reject_invalid_thinking_signatures_with_import_policy(
-        payload,
-        aws_b40_compat,
-        super::signature::native_signature_import_allowed(),
-    )
-    .await
-}
-
-async fn reject_invalid_thinking_signatures_with_import_policy(
-    payload: &MessagesRequest,
-    aws_b40_compat: bool,
-    allow_native_import: bool,
-) -> Option<Response> {
-    for (message_index, message) in payload.messages.iter().enumerate() {
-        let Some(blocks) = message.content.as_array() else {
-            continue;
-        };
-        for (block_index, block) in blocks.iter().enumerate() {
-            if block.get("type").and_then(|v| v.as_str()) != Some("thinking") {
-                continue;
-            }
-            let signature = block.get("signature").and_then(|v| v.as_str());
-            let thinking = block.get("thinking").and_then(|v| v.as_str());
-
-            if aws_b40_compat {
-                let valid = match (thinking, signature) {
-                    (Some(thinking), Some(signature)) if !signature.is_empty() => {
-                        let exact = super::signature::validate_native_signature(
-                            &payload.model,
-                            thinking,
-                            signature,
-                        )
-                        .await;
-                        if exact {
-                            true
-                        } else if allow_native_import {
-                            let import =
-                                super::signature::import_native_signature_during_migration(
-                                    &payload.model,
-                                    thinking,
-                                    signature,
-                                )
-                                .await;
-                            match import {
-                                super::signature::NativeSignatureImportResult::Imported
-                                | super::signature::NativeSignatureImportResult::RecoveredExactFingerprint => {
-                                    tracing::info!(
-                                        model = %payload.model,
-                                        message_index,
-                                        block_index,
-                                        signature_encoded_len = signature.len(),
-                                        import_result = ?import,
-                                        "accepted a previously unseen provider-envelope Bedrock thinking signature"
-                                    );
-                                    true
-                                }
-                                super::signature::NativeSignatureImportResult::RegisteredNearMatch
-                                | super::signature::NativeSignatureImportResult::InvalidStructure => false,
-                            }
-                        } else {
-                            false
-                        }
+/// External-channel Kiro requests ignore incoming thinking signatures entirely.
+/// Remove only this metadata before ContentBlock deserialization: a foreign
+/// non-string value must not discard the associated thinking text. Tool inputs
+/// and other business fields named `signature` are left intact. Explicit native
+/// routes return before this adapter and retain their original request bytes.
+fn ignore_history_thinking_signatures(payload: &mut MessagesRequest) {
+    for message in &mut payload.messages {
+        if let Some(blocks) = message.content.as_array_mut() {
+            for block in blocks {
+                if block.get("type").and_then(serde_json::Value::as_str) == Some("thinking") {
+                    if let Some(block) = block.as_object_mut() {
+                        block.remove("signature");
                     }
-                    _ => false,
-                };
-                if !valid {
-                    tracing::warn!(
-                        message_index,
-                        block_index,
-                        signature_present = signature.is_some(),
-                        signature_encoded_len = signature.map(str::len).unwrap_or(0),
-                        thinking_present = thinking.is_some(),
-                        "rejected unregistered or invalid native thinking signature"
-                    );
-                    if super::pomo_compat::is_opus(&payload.model) {
-                        return Some(super::pomo_compat::validation_response(payload.stream,
-                            format!("***.***.content.{block_index}: Invalid `signature` in `thinking` block"), false));
-                    }
-                    let message = format!(
-                        "messages.{}.content.{}: Invalid `signature` in `thinking` block",
-                        message_index, block_index
-                    );
-                    return Some(thinking_error_response(payload.stream, message));
                 }
-                continue;
-            }
-
-            let Some(signature) = signature else {
-                continue;
-            };
-            if let Err(diagnostics) = super::signature::validate_signature(signature) {
-                tracing::warn!(
-                    message_index,
-                    block_index,
-                    signature_encoded_len = diagnostics.encoded_len,
-                    signature_decoded_len = ?diagnostics.decoded_len,
-                    signature_ends_with_field3 = diagnostics.ends_with_field3,
-                    signature_has_bedrock_profile_markers = diagnostics.has_bedrock_profile_markers,
-                    signature_validation_failure = ?diagnostics.failure,
-                    "rejected invalid thinking signature"
-                );
-                let message = format!(
-                    "messages.{}.content.{}: Invalid `signature` in `thinking` block",
-                    message_index, block_index
-                );
-                return Some(thinking_error_response(payload.stream, message));
             }
         }
     }
-    None
 }
 
 fn thinking_error_response(stream: bool, message: impl Into<String>) -> Response {
@@ -6748,12 +6645,6 @@ async fn post_messages_cc_inner(
     let gpt_passthrough = is_gpt_model(&payload.model);
     let aws_b40_initial_thinking_requested = aws_b40_compat
         && (payload.thinking.is_some() || payload.model.to_ascii_lowercase().contains("thinking"));
-    // 与公共入口保持一致：接受结构合法的外部 provider signature，拒绝畸形值。
-    if let Some(response) =
-        reject_invalid_thinking_signatures_with_import_policy(&payload, true, true).await
-    {
-        return response;
-    }
     if aws_b40_compat {
         normalize_aws_b40_thinking(&mut payload);
         normalize_aws_b40_tool_choice(&mut payload);
@@ -7571,6 +7462,154 @@ mod tests {
             "test".to_string(),
         );
         (std::sync::Arc::new(provider), server)
+    }
+
+    #[tokio::test]
+    async fn external_signature_replay_preserves_history_through_http_and_upstream() {
+        use serde_json::Value;
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let body = eventstream_event(
+            "assistantResponseEvent",
+            json!({
+                "content": "42", "messageStatus": "COMPLETED"
+            }),
+        );
+        let (provider, upstream) = provider_serving_sequence(vec![body], seen.clone()).await;
+        let provider = std::sync::Arc::try_unwrap(provider)
+            .ok()
+            .expect("sole provider owner");
+        let app =
+            super::super::router::create_router_with_provider("test-key", Some(provider), true, true);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let registered = super::super::signature::generate_model_signature("claude-opus-5").unwrap();
+        super::super::signature::register_native_signature(
+            "claude-opus-5",
+            "12 + 30 = 42",
+            &registered,
+        )
+        .await;
+        let mut tampered = registered.as_bytes().to_vec();
+        tampered[30] = if tampered[30] == b'A' { b'B' } else { b'A' };
+        let signatures = [
+            None,
+            Some(Value::Null),
+            Some(json!("")),
+            Some(json!("not-base64!!")),
+            Some(json!("AA==")),
+            Some(json!("Et0EClkIDRgCKkCm-truncated")),
+            Some(json!(42)),
+            Some(json!({"foreign":"metadata"})),
+            Some(json!(["opaque"])),
+            Some(json!(registered)),
+            Some(json!(String::from_utf8(tampered).unwrap())),
+        ];
+        let mut failures = Vec::new();
+        for model in [
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4-5-20251101",
+            "claude-sonnet-5",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5-20251001",
+        ] {
+            for path in ["/v1/messages", "/cc/v1/messages"] {
+                for stream in [false, true] {
+                    for (case, signature) in signatures.iter().enumerate() {
+                        seen.lock().unwrap().clear();
+                        let mut thinking = json!({"type":"thinking","thinking":"12 + 30 = 42"});
+                        if let Some(signature) = signature {
+                            thinking["signature"] = signature.clone();
+                        }
+                        let request = json!({
+                            "model":model,"max_tokens":128,"stream":stream,
+                            "tools":[{"name":"save_result","description":"Save result","input_schema":{
+                                "type":"object","properties":{"signature":{"type":"string"}}
+                            }}],
+                            "messages":[
+                                {"role":"user","content":"Calculate 12+30 and save the result."},
+                                {"role":"assistant","content":[thinking,
+                                    {"type":"tool_use","id":"toolu_signature_replay","name":"save_result","input":{"signature":"business-signature"}}
+                                ]},
+                                {"role":"user","content":[
+                                    {"type":"tool_result","tool_use_id":"toolu_signature_replay","content":"Saved 42"},
+                                    {"type":"text","text":"Return the saved number."}
+                                ]}
+                            ]
+                        });
+                        let response = client
+                            .post(format!("http://{addr}{path}"))
+                            .header("x-api-key", "test-key")
+                            .json(&request)
+                            .send()
+                            .await
+                            .unwrap();
+                        let status = response.status();
+                        let text = response.text().await.unwrap();
+                        if status != StatusCode::OK {
+                            failures.push(format!(
+                                "{model} {path} stream={stream} case={case}: {status}: {text}"
+                            ));
+                            continue;
+                        }
+                        if stream {
+                            assert_eq!(streamed_text(&text), "42", "{text}");
+                            assert!(text.contains("event: message_stop"), "{text}");
+                        } else {
+                            let response: Value = serde_json::from_str(&text).unwrap();
+                            assert!(
+                                response["content"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .any(|block| block["text"] == "42"),
+                                "{text}"
+                            );
+                            assert_eq!(response["stop_reason"], "end_turn");
+                        }
+                        let captured = seen.lock().unwrap();
+                        assert_eq!(captured.len(), 1, "one upstream call per request");
+                        let history = captured[0]
+                            .pointer("/conversationState/history")
+                            .unwrap()
+                            .as_array()
+                            .unwrap();
+                        let assistant = history
+                            .iter()
+                            .filter_map(|m| m.get("assistantResponseMessage"))
+                            .find(|m| m.get("toolUses").is_some())
+                            .expect("tool history preserved");
+                        assert!(
+                            assistant["content"]
+                                .as_str()
+                                .unwrap()
+                                .contains("12 + 30 = 42"),
+                            "lost thinking: {assistant}"
+                        );
+                        assert_eq!(
+                            assistant["toolUses"][0]["input"]["signature"],
+                            "business-signature"
+                        );
+                        assert_eq!(
+                            assistant["toolUses"][0]["toolUseId"],
+                            "toolu_signature_replay"
+                        );
+                        assert!(assistant.get("signature").is_none());
+                    }
+                }
+            }
+        }
+        server.abort();
+        upstream.abort();
+        assert!(
+            failures.is_empty(),
+            "{} rejected replays:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     }
 
     fn legacy_identity_instruction_text(text: &str) -> String {
@@ -9052,289 +9091,6 @@ mod tests {
             serde_json::json!({"temperature": 0.7, "top_k": 10}),
         );
         assert!(reject_invalid_modern_sampling(&sonnet, true).is_none());
-    }
-
-    #[tokio::test]
-    async fn aws_b_accepts_registered_native_signature_and_rejects_signature_tampering() {
-        let signature = "opaque-native-upstream-signature".repeat(16);
-        super::super::signature::register_native_signature(
-            "claude-opus-4-8",
-            "checked",
-            &signature,
-        )
-        .await;
-        let valid = parse(
-            "anthropic.claude-opus-4-8",
-            serde_json::json!({
-                "messages": [
-                    {
-                        "role": "assistant",
-                        "content": [{
-                            "type": "thinking",
-                            "thinking": "checked",
-                            "signature": signature
-                        }]
-                    },
-                    {"role": "user", "content": "continue"}
-                ]
-            }),
-        );
-        assert!(
-            reject_invalid_thinking_signatures(&valid, true)
-                .await
-                .is_none(),
-            "canonical model aliases must share the exact native registration"
-        );
-
-        let mut tampered_signature = valid.messages[0].content[0]["signature"]
-            .as_str()
-            .unwrap()
-            .as_bytes()
-            .to_vec();
-        tampered_signature[30] = if tampered_signature[30] == b'A' {
-            b'B'
-        } else {
-            b'A'
-        };
-        let mut tampered = valid.clone();
-        tampered.messages[0].content[0]["signature"] =
-            serde_json::Value::String(String::from_utf8(tampered_signature).unwrap());
-        assert_eq!(
-            reject_invalid_thinking_signatures(&tampered, true)
-                .await
-                .expect("a modified native signature must be rejected")
-                .status(),
-            StatusCode::BAD_REQUEST
-        );
-
-        let mut changed_thinking = valid.clone();
-        changed_thinking.messages[0].content[0]["thinking"] =
-            serde_json::Value::String("changed".to_string());
-        assert!(
-            reject_invalid_thinking_signatures(&changed_thinking, true)
-                .await
-                .is_none(),
-            "the opaque provider signature is not bound to the public thinking summary"
-        );
-
-        let local_hmac = super::super::signature::generate_signature();
-        let strict_profile = parse(
-            "claude-opus-4-8",
-            serde_json::json!({
-                "messages": [{
-                    "role": "assistant",
-                    "content": [{
-                        "type": "thinking",
-                        "thinking": "legacy",
-                        "signature": local_hmac
-                    }]
-                }, {"role": "user", "content": "continue"}]
-            }),
-        );
-        assert!(
-            reject_invalid_thinking_signatures(&strict_profile, false)
-                .await
-                .is_none(),
-            "non-AWS profiles must retain local HMAC validation"
-        );
-    }
-
-    #[tokio::test]
-    async fn message_entrypoints_bypass_unknown_thinking_signatures_before_provider_selection() {
-        let signature = super::super::signature::generate_model_signature("claude-opus-5")
-            .expect("provider-shaped signature");
-        let mut raw_signature = BASE64.decode(signature).expect("signature base64");
-        let mac_index = raw_signature.len() - 34;
-        raw_signature[mac_index] ^= 1;
-        let unknown_provider_signature = BASE64.encode(raw_signature);
-        let request = parse(
-            "claude-opus-5",
-            serde_json::json!({
-                "messages": [
-                    {
-                        "role": "assistant",
-                        "content": [{
-                            "type": "thinking",
-                            "thinking": "provider-issued history",
-                            "signature": unknown_provider_signature
-                        }]
-                    },
-                    {"role": "user", "content": "continue the analysis"}
-                ]
-            }),
-        );
-
-        let v1 = post_messages(
-            State(AppState::new("test-key", true, true)),
-            HeaderMap::new(),
-            RawApiJson(request.clone(), Bytes::new()),
-        )
-        .await;
-        assert_eq!(
-            v1.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "/v1/messages must pass the unknown signature and reach provider selection"
-        );
-
-        let cc = post_messages_cc(
-            State(AppState::new("test-key", true, true)),
-            HeaderMap::new(),
-            RawApiJson(request, Bytes::new()),
-        )
-        .await;
-        assert_eq!(
-            cc.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "/cc/v1/messages must pass the unknown signature and reach provider selection"
-        );
-    }
-
-    #[tokio::test]
-    async fn aws_b_rejects_empty_malformed_and_unknown_native_signatures() {
-        for signature in ["!!!not-base64!!!", "", "unknown-opaque-signature"] {
-            let request = parse(
-                "claude-opus-4-8",
-                serde_json::json!({
-                    "messages": [
-                        {
-                            "role": "assistant",
-                            "content": [{
-                                "type": "thinking",
-                                "thinking": "imported history",
-                                "signature": signature
-                            }]
-                        },
-                        {"role": "user", "content": "continue"}
-                    ]
-                }),
-            );
-
-            assert_eq!(
-                reject_invalid_thinking_signatures(&request, true)
-                    .await
-                    .expect("unregistered, empty, or malformed native signatures must fail closed")
-                    .status(),
-                StatusCode::BAD_REQUEST
-            );
-        }
-
-        for signature_value in [serde_json::Value::Null, serde_json::json!(123)] {
-            let request = parse(
-                "claude-opus-4-8",
-                serde_json::json!({
-                    "messages": [
-                        {
-                            "role": "assistant",
-                            "content": [{
-                                "type": "thinking",
-                                "thinking": "missing or non-string signature",
-                                "signature": signature_value
-                            }]
-                        },
-                        {"role": "user", "content": "continue"}
-                    ]
-                }),
-            );
-            assert_eq!(
-                reject_invalid_thinking_signatures(&request, true)
-                    .await
-                    .expect("missing and non-string native signatures must be rejected")
-                    .status(),
-                StatusCode::BAD_REQUEST
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn aws_b_bounded_migration_imports_old_bedrock_signature_but_rejects_tampering() {
-        let signature = super::super::signature::native_bedrock_signature_for_test("claude-honey");
-        let legacy = parse(
-            "claude-opus-5",
-            serde_json::json!({
-                "messages": [
-                    {
-                        "role": "assistant",
-                        "content": [{
-                            "type": "thinking",
-                            "thinking": "",
-                            "signature": signature
-                        }]
-                    },
-                    {"role": "user", "content": "continue"}
-                ]
-            }),
-        );
-
-        assert_eq!(
-            reject_invalid_thinking_signatures_with_import_policy(&legacy, true, false)
-                .await
-                .expect("an unregistered signature stays closed outside the migration window")
-                .status(),
-            StatusCode::BAD_REQUEST
-        );
-        assert!(
-            reject_invalid_thinking_signatures_with_import_policy(&legacy, true, true)
-                .await
-                .is_none(),
-            "a structurally valid matching pre-registry Bedrock signature is imported once"
-        );
-
-        let mut tampered = legacy.clone();
-        let mut bytes = tampered.messages[0].content[0]["signature"]
-            .as_str()
-            .unwrap()
-            .as_bytes()
-            .to_vec();
-        let index = bytes.len() / 2;
-        bytes[index] = if bytes[index] == b'A' { b'B' } else { b'A' };
-        tampered.messages[0].content[0]["signature"] =
-            serde_json::Value::String(String::from_utf8(bytes).unwrap());
-        assert_eq!(
-            reject_invalid_thinking_signatures_with_import_policy(&tampered, true, true)
-                .await
-                .expect("a near-match of an imported signature remains rejected")
-                .status(),
-            StatusCode::BAD_REQUEST
-        );
-
-        let same_channel_different_model = parse(
-            "claude-sonnet-5",
-            serde_json::json!({"messages": legacy.messages}),
-        );
-        assert!(
-            reject_invalid_thinking_signatures_with_import_policy(
-                &same_channel_different_model,
-                true,
-                true,
-            )
-            .await
-            .is_none(),
-            "a valid Bedrock signature belongs to the AWS-B channel, not one requested model"
-        );
-    }
-
-    #[tokio::test]
-    async fn aws_b_rejects_thinking_block_without_signature() {
-        let request = parse(
-            "claude-opus-4-8",
-            serde_json::json!({
-                "messages": [
-                    {
-                        "role": "assistant",
-                        "content": [{"type": "thinking", "thinking": "no signature at all"}]
-                    },
-                    {"role": "user", "content": "continue"}
-                ]
-            }),
-        );
-
-        assert_eq!(
-            reject_invalid_thinking_signatures(&request, true)
-                .await
-                .expect("a native thinking block must include its signature")
-                .status(),
-            StatusCode::BAD_REQUEST
-        );
     }
 
     #[test]

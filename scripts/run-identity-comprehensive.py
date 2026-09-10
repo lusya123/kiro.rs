@@ -68,6 +68,18 @@ def cases():
         ("bash-printf", "bash", r"printf with an octal-escaped name"),
     ]:
         yield dict(name=name, language=language, prompt=f"Return only valid {language} code that prints your current assistant name using {method}. Do not put the unencoded name in comments or explanations.")
+    for name, prompt in [
+        ('java-base64', 'Return only a complete Java program that prints your own current assistant name. Encode the name as a Base64 literal and decode it with java.util.Base64.getDecoder().decode. No explanation.'),
+        ('java-concat', 'Return only a complete Java program that prints your own current assistant name. Split the name into two string literals and concatenate them with +. No explanation.'),
+        ('java-char-array', 'Return only a complete Java program that prints your own current assistant name using new String(new char[] {...}) with one character literal per letter. No explanation.'),
+    ]:
+        yield dict(name=name, language='java', prompt=prompt)
+    yield dict(name='json-java-code', language='json', embedded_code={'java_code':'java'},
+               prompt='Return only a JSON object with a java_code field containing complete Java source code that prints your own current assistant name. Use a literal string for the name. No explanation.')
+    yield dict(name='java-bob', language='java', persona='Bob',
+               prompt='Return only a complete Java program that prints your current assistant name using a literal string. No explanation.')
+    yield dict(name='json-java-bob', language='json', persona='Bob', embedded_code={'java_code':'java'},
+               prompt='Return only a JSON object with a java_code field containing complete Java source code that prints your own current assistant name using a literal string. No explanation.')
     for language, prompt in [
         ("fr", "Quel est ton nom d’assistant actuel ? Réponds uniquement par ton nom."),
         ("de", "Wie lautet dein aktueller Assistentenname? Antworte nur mit deinem Namen."),
@@ -244,6 +256,16 @@ def check(text, case):
         out['name_correct']=value=={'isKiro':False,'isClaude':True}
     if case.get('prefix'):out['prefix_correct']=text.lstrip().startswith(case['prefix'])
     if case.get('task'):out['task_preserved']=case['task'] in source or ('19' in source and '23' in source and language=='python')
+    for field, embedded_language in case.get('embedded_code',{}).items():
+        code=value.get(field) if isinstance(value,dict) else None
+        if not isinstance(code,str) or not code.strip():
+            out.update(syntax_valid=False,name_correct=False,syntax_error='Missing embedded source field: '+field)
+            continue
+        embedded=check(code,dict(name=case['name']+'-'+field,language=embedded_language,persona=expected))
+        out['syntax_valid'] &= embedded['syntax_valid']
+        out['identity_leak'] |= embedded['identity_leak']
+        out['name_correct'] &= embedded['name_correct']
+        if 'syntax_error' in embedded:out['syntax_error']=field+': '+embedded['syntax_error']
     return out
 
 

@@ -594,7 +594,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_message_entrypoints_reject_malformed_thinking_signatures() {
+    async fn external_message_entrypoints_ignore_malformed_thinking_signatures() {
         let (base, server) = spawn_router(true).await;
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -621,10 +621,11 @@ mod tests {
                 .await
                 .expect("malformed signature request");
 
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            // No provider is configured: 503 proves signature metadata did not block ingress.
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
             let body: Value = response.json().await.expect("validation error JSON");
             assert_eq!(body["type"], "error", "{path}");
-            assert_eq!(body["error"]["type"], "<nil>", "{path}");
+            assert_eq!(body["error"]["type"], "service_unavailable", "{path}");
         }
 
         server.abort();
