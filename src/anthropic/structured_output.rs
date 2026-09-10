@@ -130,6 +130,14 @@ impl FormattedIdentityOutput {
             if is_stream { stream_output(bytes) } else { message_output(bytes) }
         });
         if let Some(verified) = checked_output.as_ref().or(output.as_ref()) {
+            if !verified.incomplete_or_error {
+                if let Some(replacement) = self.corrected_encoding_answer(&verified.text) {
+                    if let Some(bytes) = replace_response_text(&raw, is_stream, &replacement) {
+                        parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                        return Response::from_parts(parts, Body::from(bytes));
+                    }
+                }
+            }
             if !verified.incomplete_or_error && !self.valid_format(&verified.text) {
                 return invalid_formatted_response();
             }
@@ -141,6 +149,48 @@ impl FormattedIdentityOutput {
             }
             None => Response::from_parts(parts, Body::from(raw)),
         }
+    }
+
+    fn corrected_encoding_answer(&self, text: &str) -> Option<String> {
+        if !self.strict_format || !self.encoded_name || self.prose_output || text.len() > 65536 {
+            return None;
+        }
+        let first = complete_fenced_answer(text)?;
+        let next_start = first.tail.find("\n```")? + 1;
+        if !explicit_encoding_correction(&first.tail[..next_start]) { return None; }
+        let last = complete_fenced_answer(&first.tail[next_start..])?;
+        if !last.tail.trim().is_empty() || !first.language.eq_ignore_ascii_case(last.language) {
+            return None;
+        }
+        let name = self.application_name.as_deref().unwrap_or(self.options.target.assistant_name());
+        if self.code_output {
+            if super::code_identity::encoded_name_is_valid(last.body, name) != Some(true) {
+                return None;
+            }
+            let first_shape = super::code_identity::encoded_name_source_shape(first.body)?;
+            let last_shape = super::code_identity::encoded_name_source_shape(last.body)?;
+            return (first_shape == last_shape).then(|| last.whole.to_owned());
+        }
+        if !first.language.is_empty() && !first.language.eq_ignore_ascii_case("json") {
+            return None;
+        }
+        // Restrict JSON correction to the single requested encoded-name
+        // field. Never choose between documents with differing business data.
+        let first_value: Value = serde_json::from_str(first.body).ok()?;
+        let last_value: Value = serde_json::from_str(last.body).ok()?;
+        let first_fields = first_value.as_object()?;
+        let last_fields = last_value.as_object()?;
+        if first_fields.len() != 1 || last_fields.len() != 1 { return None; }
+        let (key, value) = first_fields.iter().next()?;
+        if !value.is_string() || !last_fields.contains_key(key) { return None; }
+        let normalized = key.replace(['_', '-', ' '], "").to_ascii_lowercase();
+        if !matches!(normalized.as_str(),
+            "namebase64" | "assistantnamebase64" | "namehex" | "assistantnamehex")
+            || !valid_encoded_json_names(&last_value, name)
+        {
+            return None;
+        }
+        Some(last.body.to_owned())
     }
 
     fn valid_format(&self, text: &str) -> bool {
@@ -171,6 +221,35 @@ impl FormattedIdentityOutput {
         };
         !self.encoded_name || valid_encoded_json_names(&value, name)
     }
+}
+
+struct FencedAnswer<'a> {
+    language: &'a str,
+    body: &'a str,
+    whole: &'a str,
+    tail: &'a str,
+}
+
+fn complete_fenced_answer(text: &str) -> Option<FencedAnswer<'_>> {
+    let text = text.trim_start();
+    let (opening, rest) = text.split_once('\n')?;
+    let language = opening.trim_end_matches('\r').strip_prefix("```")?;
+    if language.contains('`') { return None; }
+    let close = rest.find("\n```")?;
+    let end = opening.len() + 1 + close + 4;
+    let tail = &text[end..];
+    if !tail.is_empty() && !tail.starts_with(['\r', '\n']) { return None; }
+    Some(FencedAnswer { language, body: &rest[..close+1], whole: &text[..end], tail })
+}
+
+fn explicit_encoding_correction(text: &str) -> bool {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase();
+    matches!(text.as_str(),
+        "wait, let me give you clean valid code:"
+        | "wait, let me provide a correct encoding."
+        | "wait, let me correct that encoding."
+        | "correction — that output was malformed. here is the valid json:"
+        | "wait — that's wrong. let me redo it properly.")
 }
 
 fn valid_encoded_json_names(value: &Value, name: &str) -> bool {
@@ -594,6 +673,49 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
+    async fn explicit_encoding_corrections_keep_only_the_complete_equivalent_answer() {
+        let code_before = "import base64\nprint(base64.b64decode(\"Q2xhdWРl\").decode())\n";
+        let code_after = "import base64\nprint(base64.b64decode(\"Q2xhdWRl\").decode())\n";
+        let variants = [
+            (true, format!("```python\n{code_before}```\n\nWait, let me give you clean valid code:\n\n```python\n{code_after}```"), format!("```python\n{code_after}```")),
+            (false, "```json\n{\"name_hex\":\"436cokupleaseignore\"}\n```\n\nCorrection — that output was malformed. Here is the valid JSON:\n\n```json\n{\"name_hex\":\"436c61756465\"}\n```".into(), "{\"name_hex\":\"436c61756465\"}\n".into()),
+            (false, "```json\n{\"name_hex\":\"436cical\"}\n```\n\nWait — that's wrong. Let me redo it properly.\n\n```json\n{\"name_hex\":\"436c61756465\"}\n```".into(), "{\"name_hex\":\"436c61756465\"}\n".into()),
+        ];
+        for (code_output, original, expected) in variants {
+            for stream in [false, true] {
+                for stop in ["end_turn", "max_tokens"] {
+                    let policy = FormattedIdentityOutput {
+                        options: super::super::identity::IdentitySanitizationOptions::strict(true),
+                        application_name: None, application_prefix: None,
+                        code_output, prose_output: false, strict_format: true, encoded_name: true,
+                    };
+                    let response = if stream {
+                        let events = [
+                            json!({"type":"message_start","message":{"id":"opaque-id"}}),
+                            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":original}}),
+                            json!({"type":"message_delta","delta":{"stop_reason":stop},"usage":{"output_tokens":47}}),
+                            json!({"type":"message_stop"}),
+                        ];
+                        Response::builder().header("content-type","text/event-stream")
+                            .body(Body::from(events.iter().map(|e|format!("data: {e}\n\n")).collect::<String>())).unwrap()
+                    } else {
+                        Json(json!({"id":"opaque-id","content":[{"type":"text","text":original}],
+                            "stop_reason":stop,"usage":{"output_tokens":47}})).into_response()
+                    };
+                    let response = policy.normalize_response(response).await;
+                    assert_eq!(response.status(), StatusCode::OK, "{stream}/{stop}: {original}");
+                    let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+                    let output = if stream { stream_output(&bytes) } else { message_output(&bytes) }.unwrap();
+                    assert_eq!(output.text, if stop == "end_turn" { &expected } else { &original }.as_str());
+                    let wire = String::from_utf8_lossy(&bytes);
+                    assert!(wire.contains("opaque-id") && wire.contains("47") && wire.contains(stop));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn format_guard_rejects_observed_corruption_without_repairing_business_data() {
         for (code, text, valid) in [
             (true, "import base64\nprint(base64.b64decode(\"Q2xhdWРl\").decode())", false),
@@ -606,7 +728,7 @@ mod tests {
             (true, "payload = base64.b64decode('SGVsbG8=')\nprint('Claude')", true),
             (false, "{\"name_hex\":\"436c60756465\"}", false),
             (false, "{\"name_base64\":\"Q2xhdWРl\"}", false),
-            (false, "```json\n{\"name_hex\":\"436c6175646565\"}\n```\nWait, let me correct that encoding.\n```json\n{\"name_hex\":\"436c61756465\"}\n```", false),
+            (false, "```json\n{\"name_hex\":\"436c6175646565\"}\n```\nWait, let me correct that encoding.\n```json\n{\"name_hex\":\"436c61756465\"}\n```", true),
             (false, "{\"name_hex\":\"436c61756465\",\"payload\":{\"name_hex\":\"bad\"}}", true),
             (false, "I can't discuss that.", true),
         ] {
@@ -629,6 +751,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn encoding_corrections_do_not_choose_conflicting_data_or_incomplete_code() {
+        let bridge = "\n\nWait, let me provide a correct encoding.\n\n";
+        let wrap = |language: &str, body: &str| format!("```{language}\n{body}\n```");
+        let bad = "print(base64.b64decode(\"Q2xhdWРl\").decode())";
+        let good = "print(base64.b64decode(\"Q2xhdWRl\").decode())";
+        let mut policy = FormattedIdentityOutput {
+            options: super::super::identity::IdentitySanitizationOptions::strict(true),
+            application_name: None, application_prefix: None,
+            code_output: true, prose_output: false, strict_format: true, encoded_name: true,
+        };
+        for (first, last) in [
+            (format!("path = 'a'\n{bad}"), format!("path = 'b'\n{good}")),
+            (bad.into(), format!("{good}\nsend_request()")),
+            (good.into(), bad.into()),
+            ("payload = base64.b64decode('broken')".into(), "payload = base64.b64decode('Q2xhdWRl')".into()),
+            ("print(base64.b64decode(\"Q2x".into(), good.into()),
+            (bad.trim_end_matches(')').to_owned(), good.trim_end_matches(')').to_owned()),
+        ] {
+            assert!(policy.corrected_encoding_answer(&format!(
+                "{}{bridge}{}", wrap("python", &first), wrap("python", &last)
+            )).is_none());
+        }
+        let pair = format!("{}{bridge}{}", wrap("python", bad), wrap("python", good));
+        for text in [
+            pair.replace(bridge, "\nTwo possible alternatives:\n"),
+            format!("Additional answer\n{pair}"),
+            format!("{pair}\nAdditional answer"),
+            format!("{pair}\n{}", wrap("python", good)),
+        ] {
+            assert!(policy.corrected_encoding_answer(&text).is_none());
+        }
+        policy.code_output = false;
+        let first = wrap("json", "{\"name_hex\":\"bad\",\"payload\":1}");
+        let last = wrap("json", "{\"name_hex\":\"436c61756465\",\"payload\":2}");
+        assert!(policy.corrected_encoding_answer(&format!("{first}{bridge}{last}")).is_none());
     }
 
     #[tokio::test]

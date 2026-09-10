@@ -71,12 +71,80 @@ pub fn sanitize(text: &str, name: &str) -> Option<String> {
 /// Validate observed static decoder arguments without executing generated code.
 /// None means the source uses another form (or is prose/refusal); do not guess.
 pub(super) fn encoded_name_is_valid(source: &str, name: &str) -> Option<bool> {
+    let arguments = encoded_name_arguments(source);
+    if arguments.is_empty() { return None; }
+    Some(arguments.iter().all(|(literal, b64)| {
+        if literal.end == literal.body_end { return false; }
+        let value = literal.decoded();
+        let decoded = if *b64 {
+            base64::engine::general_purpose::STANDARD.decode(&value).ok()
+        } else {
+            hex::decode(&value).ok()
+        };
+        decoded.as_deref() == Some(name.as_bytes())
+    }))
+}
+
+/// Compare complete programs while ignoring only static self-name decoder
+/// arguments. Every other byte, including business data and operations, remains.
+pub(super) fn encoded_name_source_shape(source: &str) -> Option<String> {
+    let arguments = encoded_name_arguments(source);
+    let source = arguments.first()?.0.source;
+    if !closed_source_delimiters(source) { return None; }
+    let mut shape = String::new();
+    let mut copied = 0;
+    for (literal, _) in arguments {
+        if literal.end == literal.body_end { return None; }
+        shape.push_str(&source[copied..literal.body_start]);
+        shape.push_str("__SELF_ENCODING__");
+        copied = literal.body_end;
+    }
+    shape.push_str(&source[copied..]);
+    Some(shape)
+}
+
+// A conservative completeness check for correction selection, not a language
+// parser. Unknown syntax can remain unnormalized; incomplete source cannot win.
+fn closed_source_delimiters(source: &str) -> bool {
+    let mut stack = Vec::new();
+    let mut cursor = 0;
+    while cursor < source.len() {
+        let rest = &source[cursor..];
+        if rest.starts_with('#') || rest.starts_with("//") {
+            cursor += rest.find('\n').unwrap_or(rest.len());
+            continue;
+        }
+        if rest.starts_with("/*") {
+            let Some(end) = rest.find("*/") else { return false; };
+            cursor += end + 2;
+            continue;
+        }
+        if let Some(literal) = literal_at(source, cursor) {
+            if literal.end == literal.body_end { return false; }
+            cursor = literal.end;
+            continue;
+        }
+        let ch = rest.chars().next().unwrap();
+        match ch {
+            '(' | '[' | '{' => stack.push(ch),
+            ')' | ']' | '}' => {
+                let expected = match ch { ')' => '(', ']' => '[', _ => '{' };
+                if stack.pop() != Some(expected) { return false; }
+            }
+            _ => {}
+        }
+        cursor += ch.len_utf8();
+    }
+    stack.is_empty()
+}
+
+fn encoded_name_arguments(source: &str) -> Vec<(Literal<'_>, bool)> {
     let source = if source.trim_start().starts_with("```") {
-        let (_, body) = source.trim_start().split_once('\n')?;
+        let Some((_, body)) = source.trim_start().split_once('\n') else { return Vec::new(); };
         body.rsplit_once("\n```").map_or(body, |(code, _)| code)
     } else { source };
     let mut cursor = 0;
-    let mut found = false;
+    let mut arguments = Vec::new();
     while cursor < source.len() {
         let rest = &source[cursor..];
         if rest.starts_with('#') || rest.starts_with("//") {
@@ -84,7 +152,7 @@ pub(super) fn encoded_name_is_valid(source: &str, name: &str) -> Option<bool> {
             continue;
         }
         let Some(literal) = literal_at(source, cursor) else {
-            cursor += rest.chars().next()?.len_utf8();
+            cursor += rest.chars().next().unwrap().len_utf8();
             continue;
         };
         let before = source[..cursor].trim_end();
@@ -97,20 +165,12 @@ pub(super) fn encoded_name_is_valid(source: &str, name: &str) -> Option<bool> {
             || before.ends_with("atob(") || buffer_encoding.as_deref() == Some("base64");
         let hex_value = before.ends_with("bytes.fromhex(")
             || buffer_encoding.as_deref() == Some("hex");
-        if (b64 || hex_value) && !data_literal(before) {
-            found = true;
-            if literal.end == literal.body_end { return Some(false); }
-            let value = literal.decoded();
-            let decoded = if b64 {
-                base64::engine::general_purpose::STANDARD.decode(&value).ok()
-            } else {
-                hex::decode(&value).ok()
-            };
-            if decoded.as_deref() != Some(name.as_bytes()) { return Some(false); }
-        }
         cursor = literal.end;
+        if (b64 || hex_value) && !data_literal(before) {
+            arguments.push((literal, b64));
+        }
     }
-    found.then_some(true)
+    arguments
 }
 
 fn fence(line: &str) -> Option<&'static str> {
