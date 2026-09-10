@@ -1050,6 +1050,11 @@ fn formatted_identity_output_policy(
         return None;
     }
     let mut json_context = context;
+    let instructions = identity_instruction_text(&user).to_ascii_lowercase();
+    let strict_format = instructions.contains("only")
+        || instructions.contains("只") || instructions.contains("仅");
+    let encoded_name = instructions.contains("base64")
+        || instructions.contains("hexadecimal") || instructions.contains("十六进制");
     json_context.trusted_application_persona = false;
     json_context.preserve_structured_output = false;
     json_context.structured_identity_probe = true;
@@ -1061,6 +1066,8 @@ fn formatted_identity_output_policy(
             .flatten(),
         code_output,
         prose_output,
+        strict_format,
+        encoded_name,
     })
 }
 
@@ -2894,14 +2901,44 @@ async fn messages_with_structured_output(
         }
     };
     let json_identity = formatted_identity_output_policy(&request.0);
-    let response = if cc {
-        post_messages_cc_inner(State(state), headers, request).await
-    } else {
-        post_messages_inner(State(state), headers, request).await
-    };
-    let response = match json_identity {
-        Some(policy) => policy.normalize_response(response).await,
-        None => response,
+    // The format adapter already buffers its entire response. Retry only
+    // before any bytes escape, with the same model, input and token budget.
+    // Tool-capable requests are excluded, including tool history.
+    let retry_allowed = json_identity.is_some()
+        && request.0.tools.as_ref().is_none_or(Vec::is_empty)
+        && request.0.tool_choice.is_none()
+        && request.0.messages.iter().all(|message| {
+            message.content.as_array().is_none_or(|blocks| {
+                blocks.iter().all(|block| !matches!(
+                    block.get("type").and_then(serde_json::Value::as_str),
+                    Some("tool_use" | "tool_result" | "server_tool_use")
+                ))
+            })
+        });
+    let mut attempt = 0;
+    let response = loop {
+        let input = RawApiJson(request.0.clone(), request.1.clone());
+        let response = if cc {
+            post_messages_cc_inner(State(state.clone()), headers.clone(), input).await
+        } else {
+            post_messages_inner(State(state.clone()), headers.clone(), input).await
+        };
+        let response = match &json_identity {
+            Some(policy) => policy.normalize_response(response).await,
+            None => response,
+        };
+        let incomplete = response.extensions()
+            .get::<super::response_integrity::IncompleteResponse>()
+            .is_some_and(|marker| marker.is_incomplete());
+        let invalid_format = response.extensions()
+            .get::<super::structured_output::InvalidFormattedResponse>().is_some();
+        if retry_allowed && (incomplete || invalid_format) && attempt == 0 {
+            attempt += 1;
+            tracing::warn!(model = %request.0.model, incomplete, invalid_format,
+                "Retrying buffered identity response");
+            continue;
+        }
+        break response;
     };
     match validation {
         Some(validation) => validation.validate_response(response).await,
@@ -3367,6 +3404,7 @@ async fn handle_stream_request(
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
+    let completion_failure = ctx.completion_failure();
     // 创建 SSE 流
     let stream = create_sse_stream(
         response,
@@ -3385,6 +3423,7 @@ async fn handle_stream_request(
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
+        .extension(completion_failure)
         .body(Body::from_stream(stream))
         .unwrap()
 }
@@ -3543,6 +3582,7 @@ fn create_sse_stream(
                                 ctx.mark_upstream_truncated();
                                 continuation_reason = "pending_frame";
                             }
+                            ctx.check_upstream_eof();
                             if continuation_round == 0 && ctx.upstream_succeeded_for_cache() {
                                 if let Some(commit) = cache_commit.take() {
                                     commit.commit().await;
@@ -3753,6 +3793,7 @@ async fn handle_non_stream_request(
         let mut round_has_terminal_evidence = false;
         let mut round_refused = false;
         let mut round_unknown_native_stop_reason = false;
+        let mut completion_evidence = super::response_integrity::CompletionEvidence::default();
         stop_reason = "end_turn".to_string();
 
         for result in decoder.decode_iter() {
@@ -3766,6 +3807,7 @@ async fn handle_non_stream_request(
                             continue;
                         }
                     };
+                    completion_evidence.observe(&event);
                     match event {
                         Event::ReasoningContent(reasoning) => {
                             if !reasoning.text.is_empty() {
@@ -3971,6 +4013,14 @@ async fn handle_non_stream_request(
             upstream_fatal_error = Some("truncated upstream event stream");
         }
 
+        if aws_b40_compat
+            && super::pomo_compat::is_opus(model)
+            && upstream_fatal_error.is_none()
+            && !completion_evidence.is_complete()
+        {
+            return super::response_integrity::incomplete_response();
+        }
+
         // Opus 5 can return a complete buffered response containing only an
         // assistantResponseEvent. Because the entire non-streaming body has
         // already been read and decoded here, clean EOF plus non-empty model
@@ -4057,12 +4107,14 @@ async fn handle_non_stream_request(
         super::stream::has_visible_assistant_text(&text_content, thinking_enabled);
     let requires_real_gpt_identity_answer = forced_application_identity_reply.is_some()
         || (identity_sanitization_context.target.is_gpt() && identity_sanitization_context.strict);
-    if requires_real_gpt_identity_answer
-        && (upstream_fatal_error.is_some() || (!upstream_has_visible_text && !has_tool_use))
+    if (upstream_fatal_error.is_some()
+        && (requires_real_gpt_identity_answer
+            || (aws_b40_compat && super::pomo_compat::is_opus(model))))
+        || (requires_real_gpt_identity_answer && !upstream_has_visible_text && !has_tool_use)
     {
         tracing::warn!(
             reason = upstream_fatal_error.unwrap_or("empty upstream identity response"),
-            "拒绝把失败的上游 GPT 身份请求转换成本地成功响应"
+            "拒绝把失败的上游请求转换成本地成功响应"
         );
         return (
             StatusCode::BAD_GATEWAY,
@@ -7071,6 +7123,7 @@ async fn handle_stream_request_buffered(
     }
     ctx.set_forced_application_identity_reply(forced_application_identity_reply);
 
+    let completion_failure = ctx.completion_failure();
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(
         response,
@@ -7088,6 +7141,7 @@ async fn handle_stream_request_buffered(
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
+        .extension(completion_failure)
         .body(Body::from_stream(stream))
         .unwrap()
 }
@@ -7230,6 +7284,7 @@ fn create_buffered_sse_stream(
                                     ctx.mark_upstream_truncated();
                                     continuation_reason = "pending_frame";
                                 }
+                                ctx.check_upstream_eof();
                                 if continuation_round == 0 && ctx.upstream_succeeded_for_cache() {
                                     if let Some(commit) = cache_commit.take() {
                                         commit.commit().await;
@@ -7339,6 +7394,57 @@ fn create_buffered_sse_stream(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn aws_b_identity_entrypoints_keep_thinking_signature_validation() {
+        let app = super::super::router::create_router_with_provider("test-key", None, true, true);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for model in ["claude-opus-5", "claude-opus-4-8"] {
+            let registered = super::super::signature::generate_model_signature(model).unwrap();
+            super::super::signature::register_native_signature(model, "27", &registered).await;
+            let mut changed = registered.as_bytes().to_vec();
+            changed[30] = if changed[30] == b'A' { b'B' } else { b'A' };
+            let signatures = [
+                (Some(serde_json::json!(registered)), true),
+                (None, false),
+                (Some(serde_json::Value::Null), false),
+                (Some(serde_json::json!("")), false),
+                (Some(serde_json::json!(42)), false),
+                (Some(serde_json::json!("not-base64!!")), false),
+                (Some(serde_json::json!(String::from_utf8(changed).unwrap())), false),
+            ];
+            for path in ["/v1/messages", "/cc/v1/messages"] {
+                for stream in [false, true] {
+                    for (signature, valid) in &signatures {
+                        let mut thinking = serde_json::json!({"type":"thinking","thinking":"27"});
+                        if let Some(value) = signature { thinking["signature"] = value.clone(); }
+                        let payload = serde_json::json!({
+                            "model":model,"max_tokens":128,"stream":stream,
+                            "messages":[
+                                {"role":"user","content":"Calculate 13+14."},
+                                {"role":"assistant","content":[thinking,{"type":"text","text":"27"}]},
+                                {"role":"user","content":"Return only JSON with your current assistant name in name."}
+                            ]
+                        });
+                        let response = client.post(format!("http://{addr}{path}"))
+                            .header("x-api-key", "test-key").json(&payload).send().await.unwrap();
+                        let status = response.status();
+                        let body = response.text().await.unwrap();
+                        // A valid signature reaches provider selection (none configured).
+                        // Invalid metadata must still fail before the identity adapter retries.
+                        assert_eq!(status, if *valid { StatusCode::SERVICE_UNAVAILABLE } else {
+                            StatusCode::BAD_REQUEST
+                        }, "{model} {path} stream={stream} valid={valid}: {body}");
+                        if !valid { assert!(body.contains("signature"), "{body}"); }
+                    }
+                }
+            }
+        }
+        server.abort();
+    }
+
     #[test]
     fn schema_tool_followup_does_not_inject_plaintext_preamble() {
         for schema in [false, true] {
@@ -7436,10 +7542,23 @@ mod tests {
         std::sync::Arc<crate::kiro::provider::KiroProvider>,
         tokio::task::JoinHandle<()>,
     ) {
+        provider_serving_sequence(vec![response_body], Default::default()).await
+    }
+
+    async fn provider_serving_sequence(
+        bodies: Vec<Vec<u8>>,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) -> (
+        std::sync::Arc<crate::kiro::provider::KiroProvider>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let fallback = bodies.last().expect("at least one response").clone();
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(bodies)));
         let app = axum::Router::new().route(
             "/",
-            axum::routing::post(move || {
-                let response_body = response_body.clone();
+            axum::routing::post(move |request_body: Bytes| {
+                seen.lock().unwrap().push(serde_json::from_slice(&request_body).unwrap());
+                let response_body = bodies.lock().unwrap().pop_front().unwrap_or_else(|| fallback.clone());
                 async move {
                     Response::builder()
                         .status(StatusCode::OK)
@@ -8357,6 +8476,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn buffered_identity_retry_is_bounded_and_preserves_request_semantics() {
+        for model in ["claude-opus-5", "claude-opus-4-8"] {
+            for stream in [false, true] {
+                for scenario in ["recover", "exhaust", "invalid_base64", "refusal", "max_tokens", "tools"] {
+                    let incomplete = eventstream_event("assistantResponseEvent", serde_json::json!({
+                        "content": "import base64\nprint(base64.b64decode(\"Q2x"
+                    }));
+                    let complete = |text: &str, reason: &str| {
+                        let mut body = eventstream_event("assistantResponseEvent", serde_json::json!({"content":text}));
+                        body.extend(eventstream_event("metadataEvent", serde_json::json!({"stopReason":reason})));
+                        body
+                    };
+                    let valid = complete("import base64\nprint(base64.b64decode(\"Q2xhdWRl\").decode())", "END_TURN");
+                    let first = match scenario {
+                        "invalid_base64" => complete("import base64\nprint(base64.b64decode(\"Q2xhdWРl\").decode())", "END_TURN"),
+                        "refusal" => complete("I can't discuss that.", "REFUSAL"),
+                        "max_tokens" => complete("import base64\nprint(base64.b64decode(\"Q2x", "MAX_TOKENS"),
+                        _ => incomplete.clone(),
+                    };
+                    let second = if scenario == "exhaust" { incomplete } else { valid };
+                    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                    let (provider, server) = provider_serving_sequence(vec![first, second], seen.clone()).await;
+                    let mut state = AppState::new("test", false, true);
+                    state.kiro_provider = Some(provider);
+                    let mut payload = parse(model, serde_json::json!({
+                        "max_tokens": 768, "stream": stream,
+                        "messages": [{"role":"user","content":"Return only valid Python code that prints your current assistant name using base64.b64decode applied to a literal Base64 encoding of the name, then .decode()."}]
+                    }));
+                    if scenario == "tools" {
+                        payload.tools = Some(vec![serde_json::from_value(serde_json::json!({
+                            "name":"lookup","description":"Read an item","input_schema":{"type":"object","properties":{}}
+                        })).unwrap()]);
+                    }
+                    let raw = Bytes::from(serde_json::to_vec(&payload).unwrap());
+                    let response = messages_with_structured_output(state, HeaderMap::new(), RawApiJson(payload, raw), false).await;
+                    let status = response.status();
+                    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                    server.abort();
+                    let label = format!("{model}/{stream}/{scenario}");
+                    let seen = seen.lock().unwrap();
+                    let expected_calls = if matches!(scenario, "recover" | "exhaust" | "invalid_base64") { 2 } else { 1 };
+                    assert_eq!(seen.len(), expected_calls, "{label}: {}", String::from_utf8_lossy(&bytes));
+                    assert_eq!(status, if matches!(scenario, "exhaust" | "tools") { StatusCode::BAD_GATEWAY } else { StatusCode::OK }, "{label}");
+                    if seen.len() == 2 {
+                        assert_eq!(seen[0]["conversationState"]["currentMessage"], seen[1]["conversationState"]["currentMessage"], "{label}: unchanged model and prompt");
+                    }
+                    if matches!(scenario, "recover" | "invalid_base64") {
+                        let text = String::from_utf8_lossy(&bytes);
+                        // SSE may split the literal; parse the text deltas.
+                        let decoded = if stream {
+                            text.lines().filter_map(|line| line.strip_prefix("data:"))
+                                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                                .filter_map(|v| v["delta"]["text"].as_str().map(str::to_owned))
+                                .collect::<String>()
+                        } else {
+                            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["content"]
+                                .as_array().unwrap().iter()
+                                .filter_map(|block| block["text"].as_str()).collect::<String>()
+                        };
+                        assert!(decoded.contains("Q2xhdWRl"), "{label}: {decoded}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn named_program_identity_requests_preserve_source_format() {
+        for language in ["Python", "JavaScript", "TypeScript", "Rust", "Go", "C", "C++",
+            "Java", "Ruby", "Bash", "Swift", "PHP", "C#", "Kotlin", "SQL"] {
+            let payload = parse("claude-opus-5", serde_json::json!({
+                "messages":[{"role":"user","content":format!(
+                    "Return only a complete, syntactically valid {language} program that prints your current assistant name. Use a literal string for your name. No explanation."
+                )}]
+            }));
+            let policy = formatted_identity_output_policy(&payload);
+            assert!(policy.is_some_and(|p| p.code_output), "{language}");
+            assert!(request_identity_sanitization_context(&payload).preserves_application_output(), "{language}");
+        }
+    }
+
+    #[tokio::test]
+    async fn opus_frame_boundary_eof_must_not_report_success() {
+        for model in ["claude-opus-5", "claude-opus-4-8"] {
+            for mode in ["plain", "live", "buffered"] {
+              for ending in ["clean_eof", "invalid_state", "partial_frame"] {
+                let payload = parse(model, serde_json::json!({
+                    "max_tokens": 768,
+                    "messages": [{"role": "user", "content": "Reply with Python code"}]
+                }));
+                let mut body = eventstream_event("assistantResponseEvent", serde_json::json!({
+                    "content": "import base64\nprint(base64.b64decode(\"Q2x"
+                }));
+                body.extend(eventstream_event("contextUsageEvent", serde_json::json!({
+                    "contextUsagePercentage": 0.1
+                })));
+                if ending == "invalid_state" {
+                    body.extend(eventstream_event("invalidStateEvent", serde_json::json!({
+                        "reason":"test failure","message":"test failure"
+                    })));
+                } else if ending == "partial_frame" {
+                    let frame = eventstream_event("meteringEvent", serde_json::json!({"outputTokens":10}));
+                    body.extend_from_slice(&frame[..frame.len()-4]);
+                }
+                let (provider, server) = provider_serving_eventstream(body).await;
+                let usage = super::super::cache::UsageBreakdown::flat(100);
+                let commit = super::super::cache::prepare_cache_commit(100, &payload, true);
+                let context = request_identity_sanitization_context(&payload);
+                let response = if mode == "plain" {
+                    handle_non_stream_request(
+                        provider, "{}".into(), model, model, 100, usage,
+                        Default::default(), false, false, false, false,
+                        Default::default(), 768, vec![], false, context, None,
+                        false, true, commit,
+                    ).await
+                } else if mode == "live" {
+                    handle_stream_request(
+                        provider, "{}".into(), model.into(), model.into(), 100, usage,
+                        Default::default(), false, false, false,
+                        Default::default(), 768, vec![], false, context, None,
+                        false, None, true, false, commit,
+                    ).await
+                } else {
+                    handle_stream_request_buffered(
+                        provider, "{}".into(), model.into(), model.into(), 100, usage,
+                        Default::default(), false, false, false,
+                        Default::default(), 768, vec![], false, context, None,
+                        false, None, true, false, commit,
+                    ).await
+                };
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                server.abort();
+                let text = String::from_utf8(bytes.to_vec()).unwrap();
+                if mode == "plain" {
+                    assert_eq!(status, StatusCode::BAD_GATEWAY, "{model}/{mode}: {text}");
+                } else {
+                    assert!(text.contains("event: error"), "{model}/{mode}: {text}");
+                    assert!(!text.contains("message_stop"), "{model}/{mode}: {text}");
+                }
+                assert!(!text.contains("\"stop_reason\":\"end_turn\""), "{model}/{mode}");
+              }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn opus_5_clean_assistant_only_nonstream_response_warms_next_prefix_match() {
         let model = "claude-opus-5";
         let unique_prefix = format!("opus-5-assistant-only-{} ", Uuid::new_v4());
@@ -8546,10 +8812,12 @@ mod tests {
             .expect("stream response body");
         server.abort();
         assert_eq!(status, StatusCode::OK, "{mode}: response status");
-        assert!(
-            String::from_utf8_lossy(&bytes).contains("message_stop"),
-            "{mode}: completed SSE response"
+        let text = String::from_utf8_lossy(&bytes);
+        assert_eq!(
+            text.contains("message_stop"), expect_warm,
+            "{mode}: only a completed response may emit message_stop"
         );
+        assert_eq!(text.contains("event: error"), !expect_warm);
 
         let second = super::super::cache::compute_request_usage_breakdown_with_profile(
             total, &payload, true,
