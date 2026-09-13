@@ -6297,7 +6297,7 @@ fn reject_invalid_modern_sampling(
     let rejects_sampling = model.as_deref().is_some_and(|model| {
         matches!(
             model,
-            "claude-opus-5" | "claude-opus-4.8" | "claude-opus-4.7" | "claude-sonnet-5"
+            "claude-opus-4.8" | "claude-opus-4.7"
         )
     });
     if !rejects_sampling {
